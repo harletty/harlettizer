@@ -1,0 +1,75 @@
+# Integration gate on every push and PR to main.
+#
+# `cargo fmt --check` is gated from the first commit: unlike the decoder repo,
+# this tree has no pre-rustfmt history to reformat, so there is nothing to
+# grandfather in.
+#
+# Clippy is advisory for now. It becomes a gate once the first codec crate
+# lands and we know which lints are genuinely wrong for a hot audio loop —
+# gating it before that would only teach contributors to add `#[allow]`.
+#
+# The test suite must never need external material: `cargo xtask corpus` is a
+# development tool, and its unit tests build their own fixtures.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info is the largest thing a dev-profile build produces, in memory
+  # while rustc holds it and on disk afterwards, and nothing here debugs a CI
+  # binary. Without this, the first cold-cache build after the workspace grew
+  # was killed by the runner part-way through `hz-cli` — exit 143, no
+  # diagnostic, which is what running out of room looks like from inside.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    # Long enough for a cold cache and short enough that a hang is reported as
+    # one rather than sitting for six hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Without this, adding one dependency throws the whole cache away and
+          # the next run rebuilds a workspace that takes six minutes cold —
+          # including a git dependency and everything under it. Falling back to
+          # the newest cache for this OS rebuilds only what actually changed.
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Build
+        run: cargo build --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Test
+        run: cargo test --all
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets -- -W clippy::all
+        continue-on-error: true

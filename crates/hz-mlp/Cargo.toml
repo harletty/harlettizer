@@ -1,0 +1,24 @@
+[package]
+name = "hz-mlp"
+description = "MLP and TrueHD lossless encoding for harlettizer"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Dependency-free apart from the shared error type. A codec is a pile of
+# arithmetic over a bit buffer; anything it pulls in is something that has to
+# be trusted in a hot loop and audited for the embedded target.
+[dependencies]
+hz-core.workspace = true
+rayon = { workspace = true, optional = true }
+
+[features]
+# Search the channels of an access unit at once. Off by default: the crate is
+# dependency-free without it, and a caller that is already running one encode
+# per core does not want a second level of it. The streams it writes are
+# byte-identical either way — the channels of a unit are independent once the
+# matrices are applied, so there is nothing for an order to change.
+parallel = ["dep:rayon"]

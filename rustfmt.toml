@@ -1,0 +1,3 @@
+# Defaults, gated in CI from the first commit — this tree has no pre-rustfmt
+# history to reformat, so there is no reason to let it drift.
+edition = "2024"

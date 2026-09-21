@@ -1,0 +1,36 @@
+[package]
+name = "xtask"
+description = "Development harness for harlettizer: survey runs and reports"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+hz-analysis.workspace = true
+hz-cluster.workspace = true
+hz-core.workspace = true
+hz-io.workspace = true
+hz-meta.workspace = true
+hz-mlp = { workspace = true, features = ["parallel"] }
+hz-render.workspace = true
+# An independent reader for the object metadata payload, used as an oracle and
+# nothing else — see docs/objects.md for why the installed decoder is not
+# enough on its own.
+#
+# Off by default because compiling it needs **13.4 GiB**, measured; a hosted
+# runner for a private repository has 7 GB, and one crate wanting twice the
+# machine is not something a job's parallelism can be tuned around. Turn it on
+# where there is room: `cargo xtask --features oracle`.
+truehd = { version = "0.7.1", optional = true }
+serde.workspace = true
+serde_yaml_ng.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[features]
+# An independent reader for the object metadata payload. See above for the cost.
+oracle = ["dep:truehd"]

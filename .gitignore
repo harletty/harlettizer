@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+/reports
+/tmp
+*.log
+
+# Decoded audio and bitstreams. The harness writes these beside whatever it is
+# pointed at; decoded audio is not source and does not belong in a repository.
+*.pcm
+*.thd
+*.wav
+*.w64
+*.caf

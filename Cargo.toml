@@ -1,0 +1,50 @@
+# harlettizer — the encoder counterpart to harletty.
+#
+# Crates are added phase by phase (see PLAN.md). The dependency rule is that
+# the codec crates (hz-ac3, hz-mlp, hz-ac4) never depend on each other; they
+# all sit on hz-core / hz-analysis / hz-render, and only hz-cli knows all of
+# them.
+[workspace]
+resolver = "3"
+members = [
+    "crates/hz-analysis",
+    "crates/hz-cli",
+    "crates/hz-cluster",
+    "crates/hz-core",
+    "crates/hz-io",
+    "crates/hz-meta",
+    "crates/hz-mlp",
+    "crates/hz-render",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+license = "GPL-3.0-or-later"
+edition = "2024"
+rust-version = "1.87.0"
+repository = "https://github.com/harletty/harlettizer"
+authors = ["harletty"]
+
+[workspace.dependencies]
+hz-cluster = { path = "crates/hz-cluster" }
+hz-core = { path = "crates/hz-core" }
+hz-analysis = { path = "crates/hz-analysis" }
+hz-io = { path = "crates/hz-io" }
+hz-meta = { path = "crates/hz-meta" }
+hz-mlp = { path = "crates/hz-mlp" }
+hz-render = { path = "crates/hz-render" }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml_ng = "0.10"
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+quick-xml = "0.41"
+# Optional, and only ever behind a `parallel` feature: the codec crates stay
+# dependency-free so that nothing has to be trusted inside a hot loop or
+# audited for the embedded target.
+rayon = "1"
+
+# Encoders run over whole programmes: an unoptimised debug build turns a two-hour
+# title into an afternoon. Keep dependencies optimised even in dev.
+[profile.dev.package."*"]
+opt-level = 2

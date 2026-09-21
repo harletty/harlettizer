@@ -1,0 +1,12 @@
+[package]
+name = "hz-render"
+description = "Speaker layouts and presentation folding for harlettizer"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hz-core.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "hz-core"
+description = "Shared types for the harlettizer encoding engine"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free. This crate sits underneath every other crate
+# in the workspace, including the ones that may one day run on constrained
+# hardware, so anything added here is paid for everywhere.
+[dependencies]

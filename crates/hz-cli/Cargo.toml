@@ -1,0 +1,23 @@
+[package]
+name = "hz-cli"
+description = "The harlettizer command line"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "harlettizer"
+path = "src/main.rs"
+
+[dependencies]
+hz-core.workspace = true
+hz-analysis.workspace = true
+hz-cluster.workspace = true
+hz-io.workspace = true
+hz-meta.workspace = true
+hz-mlp = { workspace = true, features = ["parallel"] }
+hz-render.workspace = true
+clap.workspace = true
