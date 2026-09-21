@@ -35,6 +35,32 @@ Decoded again, the elements come back **bit for bit** — 1 444 240 frames acros
 all twelve channels, largest difference zero — and the object positions come
 back where the master put them, at the sample the master named.
 
+## Reading a master's waveforms where they are
+
+```bash
+harlettizer encode vf.atmos --out vf.thd --overlay 5 --mono-prefix work/wave
+```
+
+A master set carries its waveforms interleaved in one file, and a delivered
+one arrives that way. A master that is still being made — decoded from a
+stream, re-voiced, re-mixed — is naturally one mono file per waveform, and
+interleaving them only so that `encode` can read them back apart copies the
+whole programme once more: some twenty gigabytes for a film of seventeen
+waveforms. `--mono-prefix` reads them where they are instead, as
+`<prefix>_0.wav`, `<prefix>_1.wav`… in the master's own order — its bed, then
+its objects — which is the order an interleaved file holds them in and the name
+`harletty decode --mono-prefix` writes them under.
+
+The header still says which waveform is which and how many there are; only the
+samples come from elsewhere. So every file has to be there, mono integer PCM,
+all of one rate, one width and one length, and one file past the count the
+header declares is refused as well: a master whose header and audio disagree is
+one put together wrong, which is better said than read.
+
+It changes where the samples come from and nothing else. Twenty-two waveforms,
+encoded once from their CAF and once from the mono files that CAF was built
+from, gave the same stream byte for byte.
+
 ## Folding a scene into the elements a stream carries
 
 ```bash

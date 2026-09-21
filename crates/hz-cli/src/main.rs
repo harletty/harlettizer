@@ -64,6 +64,20 @@ enum Command {
         #[arg(long)]
         frames: Option<u64>,
 
+        /// Read the master's audio from one mono WAV per waveform,
+        /// `<PREFIX>_<n>.wav` with n from 0 in the master's own order (its
+        /// bed, then its objects), rather than from the interleaved file its
+        /// header names.
+        ///
+        /// For a master that is being made rather than one that was
+        /// delivered: decoded (`harletty decode --mono-prefix` writes exactly
+        /// this), re-voiced, re-mixed. Interleaving the waveforms only for
+        /// this to read them back apart costs a copy of the programme — tens
+        /// of gigabytes for a film. Every file must be mono integer PCM of
+        /// one rate, one width and one length. Only for a master set.
+        #[arg(long, value_name = "PREFIX")]
+        mono_prefix: Option<PathBuf>,
+
         /// Search less hard: one second-filter design, decided at every
         /// other restart.
         ///
@@ -407,6 +421,7 @@ fn main() -> ExitCode {
             input,
             out,
             frames,
+            mono_prefix,
             fast,
             cluster,
             overlay,
@@ -483,6 +498,7 @@ fn main() -> ExitCode {
                     input,
                     out,
                     frames,
+                    mono_prefix,
                     fast,
                     cluster,
                     overlay,

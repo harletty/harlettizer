@@ -11,6 +11,7 @@ use hz_io::adm::chna::Chna;
 use hz_io::adm::model::{AudioChannelFormat, AudioFormatExtended, Position};
 use hz_io::container::FrameSource;
 use hz_io::container::caf::CafReader;
+use hz_io::container::mono::MonoSet;
 use hz_io::container::pcm::PcmFormat;
 use hz_io::container::wav::WavReader;
 use hz_io::master::MasterSet;
@@ -37,19 +38,38 @@ pub(crate) struct Source {
 }
 
 impl Source {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    /// Open `path`; `mono_prefix`, for a master set, reads its waveforms from
+    /// their own files instead of from the interleaved audio its header
+    /// names.
+    pub(crate) fn open(path: &Path, mono_prefix: Option<&Path>) -> Result<Self> {
         if path.extension().and_then(|e| e.to_str()) == Some("atmos") {
             let set = MasterSet::open(path)?;
             let events = set.read_events(0)?;
-            let audio = set.components[0]
-                .audio
-                .path()
-                .ok_or_else(|| Error::MissingComponent {
-                    referenced_by: path.to_path_buf(),
-                    reference: set.config.presentations[0].audio.clone(),
-                })?;
-            let reader = CafReader::open(audio)?;
-            let format = *reader.format();
+            let reader: Box<dyn FrameSource> =
+                match mono_prefix {
+                    Some(prefix) => {
+                        // As many files as the header declares waveforms: the
+                        // header is what says which is which.
+                        let presentation = &set.config.presentations[0];
+                        let waveforms = presentation
+                            .bed_instances
+                            .iter()
+                            .map(|bed| bed.channels.len())
+                            .sum::<usize>()
+                            + presentation.objects.len();
+                        Box::new(MonoSet::open(prefix, waveforms)?)
+                    }
+                    None => {
+                        let audio = set.components[0].audio.path().ok_or_else(|| {
+                            Error::MissingComponent {
+                                referenced_by: path.to_path_buf(),
+                                reference: set.config.presentations[0].audio.clone(),
+                            }
+                        })?;
+                        Box::new(CafReader::open(audio)?)
+                    }
+                };
+            let format = *reader.pcm_format();
 
             let projected = project::to_adm(
                 path,
@@ -57,7 +77,7 @@ impl Source {
                 0,
                 &events,
                 format.channels,
-                reader.frames(),
+                reader.frame_count(),
                 format.sample_rate_hz(),
             )?;
             for note in &projected.notes {
@@ -65,7 +85,7 @@ impl Source {
             }
 
             Ok(Self {
-                reader: Box::new(reader),
+                reader,
                 described: Described {
                     chna: projected.chna,
                     adm: projected.adm,
@@ -74,6 +94,12 @@ impl Source {
                 format,
             })
         } else {
+            if mono_prefix.is_some() {
+                return Err(Error::unsupported(
+                    path,
+                    "--mono-prefix reads a master set's waveforms; a BW64 file carries its own",
+                ));
+            }
             let reader = WavReader::open(path)?;
             let description = bw64::read(path, &reader)?
                 .ok_or_else(|| Error::malformed(path, "no ADM: this is a plain WAV"))?;

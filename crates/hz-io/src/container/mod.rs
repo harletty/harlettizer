@@ -5,6 +5,7 @@
 //! container modules deal with framing.
 
 pub mod caf;
+pub mod mono;
 pub mod pcm;
 pub mod wav;
 
@@ -14,7 +15,7 @@ use hz_core::Result;
 
 /// Interleaved integer frames out of a container, whichever container it is.
 ///
-/// The two readers here differ in their headers and agree on everything after
+/// The readers here differ in their headers and agree on everything after
 /// them: same `pcm` decode, same sign-extended `i32` at the file's own width,
 /// same "how many frames landed" contract. A caller that has opened one and
 /// only wants its audio should not have to know which — and one that matches

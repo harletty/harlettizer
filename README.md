@@ -111,6 +111,7 @@ elements:
 | `--drc <MODE>` | `measured` | The dynamic range word each presentation states: `measured`, a gain in decibels, or `off`. Metadata only; a decoder asked for full range ignores it and the samples are unchanged |
 | `--fast` | off | Search less hard: one second-filter design, decided at every other restart. About a quarter off the time of an encode for a fraction of a per cent of stream |
 | `--frames <N>` | | Stop after this many frames of audio |
+| `--mono-prefix <PREFIX>` | | Read a master set's waveforms from `<PREFIX>_<n>.wav`, one mono file each in the master's own order, rather than from the interleaved file its header names — what `harletty decode --mono-prefix` writes. For a master being made rather than delivered, where interleaving only to read the files back apart would copy the whole programme. The stream is byte-identical either way |
 | `--progress` | off | One `progress <n>%` line on standard error each time the whole percent changes — at most a hundred and one lines however long the programme — for a caller driving a bar. Standard output is untouched and the stream is byte-identical either way |
 
 What the summary says:

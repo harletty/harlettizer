@@ -111,6 +111,9 @@ pub struct Config {
     pub out: PathBuf,
     /// Stop after this many frames of audio.
     pub frames: Option<u64>,
+    /// Read a master set's waveforms from `<prefix>_<n>.wav` rather than
+    /// from its interleaved audio: see [`hz_io::container::mono`].
+    pub mono_prefix: Option<PathBuf>,
     /// Search less hard: see [`hz_mlp::Effort`].
     pub fast: bool,
     /// Fold the master's objects into this many elements rather than giving
@@ -986,7 +989,7 @@ struct Live {
 }
 
 pub fn run(config: Config) -> Result<()> {
-    let mut source = Source::open(&config.input)?;
+    let mut source = Source::open(&config.input, config.mono_prefix.as_deref())?;
     if config.cluster.is_some() && config.overlay.is_some() {
         return Err(Error::unsupported(
             &config.input,
