@@ -64,6 +64,9 @@ cargo build --release -p hz-cli
 Rust 1.87 or later. Pure Rust: no C toolchain, no vendor SDK, no git
 dependency.
 
+Each release also carries the built binary for Linux (x86-64), Windows
+(x86-64) and macOS (Apple silicon), zipped with the licences it ships under.
+
 ## Usage
 
 ### `convert`
