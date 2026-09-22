@@ -144,6 +144,7 @@ To look at what was written:
 ```bash
 harletty decode programme.thd --presentation 3 --output-path programme_back   # the elements, as a master set
 cargo xtask thd programme.thd                                                 # the stream's structure and integrity
+cargo xtask ffmpeg-check programme.thd                                        # whether every player can open it
 ```
 
 ### What a stream carries

@@ -206,6 +206,13 @@ and losing on `prog_*` is not taken.
 
 `cargo test -p hz-mlp` decodes every presentation of every stream it writes
 through the reference decoder in `tests/decoder/` and verifies the lossless
-check each restart header carries. `cargo xtask mlp` is the oracle: FFmpeg (up
-to eight channels) and `harletty` on real material, every presentation,
-non-zero on any mismatch.
+check each restart header carries. That decoder reads at most eight matrices
+under restart sync words A and B, as FFmpeg does, not the fifteen the field
+can say: a stream past eight is one no player outside Dolby's opens. `cargo
+xtask mlp` is the oracle: FFmpeg (samples compared up to eight channels) and
+`harletty` on real material, every presentation, non-zero on any mismatch.
+Every stream it writes, and every one `cargo xtask overlay-check` writes, also
+goes through `cargo xtask ffmpeg-check`: each substream's matrices counted
+against what a decoder reads, and the whole stream decoded by FFmpeg at
+`-v warning`, failing on any line it prints — its exit status is zero even on
+a stream it refused throughout.

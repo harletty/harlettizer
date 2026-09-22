@@ -11,6 +11,7 @@ mod container;
 mod coords;
 mod corpus;
 mod drc;
+mod ffmpeg_check;
 mod loudness;
 mod make_master;
 mod mlp;
@@ -460,6 +461,14 @@ enum Command {
         config: Option<PathBuf>,
     },
 
+    /// Check that streams are ones every player can open: count each
+    /// substream's matrices against what a decoder reads, and decode the
+    /// whole stream with FFmpeg, failing on any line it prints.
+    FfmpegCheck {
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+    },
+
     /// Write a small synthetic master file set to convert against.
     MakeMaster {
         /// Path of the `.atmos` config; the other components sit beside it.
@@ -740,6 +749,7 @@ fn main() -> ExitCode {
             all,
             config,
         }),
+        Command::FfmpegCheck { inputs } => ffmpeg_check::run(ffmpeg_check::Options { inputs }),
         Command::MakeMaster {
             output,
             objects,

@@ -132,6 +132,9 @@ pub fn run(options: Options) -> Result<()> {
     // is being checked as the samples are, and a refused stream is left on
     // disk precisely so it can be measured.
     let refused = !encoded.status.success();
+    // Before truehdd, which reads the widest substream and would take a
+    // stream no player outside Dolby's can open.
+    let playable = super::ffmpeg_check::check(&stream)?;
 
     let decode = Command::new("truehdd")
         .arg("decode")
@@ -207,6 +210,13 @@ pub fn run(options: Options) -> Result<()> {
                 "{} elements are not what the overlay promised",
                 report.failures
             ),
+        ));
+    }
+    if !playable {
+        return Err(Error::malformed(
+            &stream,
+            "FFmpeg, the decoder in every player that is not Dolby's, refuses the stream; \
+             see above",
         ));
     }
     if refused {
