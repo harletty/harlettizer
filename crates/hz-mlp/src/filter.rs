@@ -798,7 +798,8 @@ fn best_entropy_within(residuals: &[i32], budget: usize) -> Option<(u8, u32, usi
             let (low, high) = huffman::range(codebook, width, 0);
             lowest >= low && highest <= high
         };
-        let Some(narrowest) = narrowest_width(holds) else {
+        let estimate = estimated_width(codebook, lowest, highest);
+        let Some(narrowest) = narrowest_width_from(holds, estimate) else {
             continue;
         };
         for width in narrowest..=(narrowest + SWEEP).min(MAX_HUFF_LSBS) {
@@ -823,6 +824,9 @@ fn best_entropy_within(residuals: &[i32], budget: usize) -> Option<(u8, u32, usi
 ///
 /// `holds` has to be monotone — false below the answer, true from it up —
 /// which the format's codings are: a wider field only ever spans more.
+///
+/// Kept as what [`narrowest_width_from`] has to agree with.
+#[cfg(test)]
 fn narrowest_width(holds: impl Fn(u32) -> bool) -> Option<u32> {
     if !holds(MAX_HUFF_LSBS) {
         return None;
@@ -838,6 +842,45 @@ fn narrowest_width(holds: impl Fn(u32) -> bool) -> Option<u32> {
         }
     }
     Some(low)
+}
+
+/// The narrowest width `holds` accepts, or `None` if none up to the widest
+/// does, walking from `estimate` rather than halving from the whole range.
+///
+/// `holds` has to be monotone, as for [`narrowest_width`], and then this is
+/// the same answer: if the estimate holds, the answer is the lowest width at
+/// or under it that still does, and if it does not, the first width above it
+/// that does. With an estimate within a width or two of the answer — see
+/// [`estimated_width`] — that is two or three calls where the halving made six,
+/// each one a pass over the codebook's range, twelve per candidate filter.
+fn narrowest_width_from(holds: impl Fn(u32) -> bool, estimate: u32) -> Option<u32> {
+    let mut width = estimate.min(MAX_HUFF_LSBS);
+    if holds(width) {
+        while width > 0 && holds(width - 1) {
+            width -= 1;
+        }
+        return Some(width);
+    }
+    while width < MAX_HUFF_LSBS {
+        width += 1;
+        if holds(width) {
+            return Some(width);
+        }
+    }
+    None
+}
+
+/// Near the narrowest width a codebook holds a block in, from the block's
+/// extremes: the codebooks span about `2^width` either side of nought with no
+/// codebook, and about eight times that with one.
+fn estimated_width(codebook: u8, lowest: i64, highest: i64) -> u32 {
+    let reach = (-lowest).max(highest + 1).max(1) as u64;
+    let bits = u64::BITS - (reach - 1).leading_zeros();
+    if codebook == huffman::NONE {
+        bits + 1
+    } else {
+        bits.saturating_sub(3)
+    }
 }
 
 /// The filter state a decoder would hold after these: the last samples and the
@@ -1067,6 +1110,60 @@ mod tests {
             );
         }
         out
+    }
+
+    /// Walking from an estimate finds the width halving does, for every
+    /// codebook and every pair of extremes — around nought, far from it, at
+    /// the codec's ends and past what any width holds.
+    #[test]
+    fn the_narrowest_width_from_an_estimate_is_the_halved_one() {
+        let mut state = 0x6a09_e667u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut pairs: Vec<(i64, i64)> = vec![
+            (0, 0),
+            (-1, -1),
+            (0, 1),
+            (-1, 0),
+            (-7, 7),
+            (-8, 7),
+            (-7, 8),
+            (-(1 << 23), (1 << 23) - 1),
+            (-(1 << 30), 1 << 30),
+            (5, 5),
+            (-5, -5),
+        ];
+        for _ in 0..20_000 {
+            let scale = next() % 32;
+            let a = (i64::from(next() as i32)) >> (31 - scale.min(31));
+            let b = (i64::from(next() as i32)) >> (31 - scale.min(31));
+            pairs.push((a.min(b), a.max(b)));
+        }
+        for (lowest, highest) in pairs {
+            for codebook in huffman::NONE..=huffman::MAX_CODEBOOK {
+                let holds = |width: u32| {
+                    let (low, high) = huffman::range(codebook, width, 0);
+                    lowest >= low && highest <= high
+                };
+                assert_eq!(
+                    narrowest_width_from(holds, estimated_width(codebook, lowest, highest)),
+                    narrowest_width(holds),
+                    "codebook {codebook}, [{lowest}, {highest}]"
+                );
+                // And from any estimate at all, however far off.
+                for estimate in [0, 5, 12, 24, 40] {
+                    assert_eq!(
+                        narrowest_width_from(holds, estimate),
+                        narrowest_width(holds),
+                        "codebook {codebook}, [{lowest}, {highest}] from {estimate}"
+                    );
+                }
+            }
+        }
     }
 
     /// The unchecked cost is the checked one wherever the search calls it:

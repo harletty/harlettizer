@@ -99,10 +99,27 @@ fn correlate(samples: &[f64], out: &mut [f64]) {
     // real term. So every sum is the one [`correlate_chunked`] makes, to the
     // bit, and so is every predictor and every stream.
     let mut buffer = [0.0f64; MAX_ORDER + AT_ONCE];
-    for (index, slot) in buffer[MAX_ORDER..MAX_ORDER + n].iter_mut().enumerate() {
-        let offset = (index as f64 - centre) / (centre + 1.0);
-        *slot = samples[index] * (1.0 - offset * offset);
-    }
+    // The window depends on the length and nothing else, and the filter
+    // search fits over the same length block after block: worked out once
+    // and kept, by the same arithmetic, so each weight is the one this loop
+    // would have made — a division a sample saved, and nothing else changed.
+    WELCH.with(|window| {
+        let mut window = window.borrow_mut();
+        if window.len() != n {
+            window.clear();
+            window.extend((0..n).map(|index| {
+                let offset = (index as f64 - centre) / (centre + 1.0);
+                1.0 - offset * offset
+            }));
+        }
+        for ((slot, sample), weight) in buffer[MAX_ORDER..MAX_ORDER + n]
+            .iter_mut()
+            .zip(samples)
+            .zip(window.iter())
+        {
+            *slot = sample * weight;
+        }
+    });
     let mut sums = [0.0f64; MAX_ORDER + 1];
     for position in MAX_ORDER..MAX_ORDER + n {
         let here = buffer[position];
@@ -111,6 +128,12 @@ fn correlate(samples: &[f64], out: &mut [f64]) {
         }
     }
     out.copy_from_slice(&sums[..out.len()]);
+}
+
+thread_local! {
+    /// The Welch window of the last length [`correlate`] was asked for, per
+    /// thread.
+    static WELCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`correlate`] a chunk at a time and a lag at a time, for a block longer
