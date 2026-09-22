@@ -705,6 +705,72 @@ fn a_matrix_that_moves_round_trips() {
 /// permutation that is not its own inverse.
 #[test]
 fn a_hierarchy_of_presentations_round_trips() {
+    let (planes, presentations) = fold_programme();
+    let config = config(planes.len(), 48_000, SampleBits::TwentyFour);
+    let mut encoder = Encoder::new(config).expect("twelve elements");
+    encoder.set_presentations(&presentations);
+    let stream = encode(&mut encoder, &planes);
+    let substreams = decoder::substreams(&stream).expect("a major sync");
+    assert_eq!(substreams, 4);
+    let stats = encoder.stats();
+    assert_eq!(stats.folds_asked, 2, "two restart intervals, both asked");
+    assert_eq!(
+        stats.folds_carried, stats.folds_asked,
+        "every interval carries its folds"
+    );
+    assert_folds_hold(&stream, &planes, &presentations);
+}
+
+/// Decorrelating the hierarchy's early channels takes bits off the stream and
+/// changes nothing a decoder hands back: the elements exactly, each narrow
+/// presentation its fold, and no early substream past the eight matrices
+/// FFmpeg reads. Against the same programme with it turned off, which is the
+/// stream as it was before.
+#[test]
+fn decorrelating_the_hierarchy_saves_bits_and_changes_nothing_decoded() {
+    let (planes, presentations) = fold_programme();
+    let written = |decorrelate: bool| {
+        let config = config(planes.len(), 48_000, SampleBits::TwentyFour);
+        let mut encoder = Encoder::new(config).expect("twelve elements");
+        encoder.set_decorrelation(decorrelate);
+        encoder.set_presentations(&presentations);
+        let stream = encode(&mut encoder, &planes);
+        assert_eq!(encoder.stats().folds_carried, 2, "both intervals fold");
+        stream
+    };
+    let plain = written(false);
+    let decorrelated = written(true);
+    assert!(
+        decorrelated.len() < plain.len(),
+        "{} bytes decorrelated against {} without",
+        decorrelated.len(),
+        plain.len()
+    );
+    assert_folds_hold(&decorrelated, &planes, &presentations);
+
+    let mut at = 0;
+    let mut count = 0;
+    while at < decorrelated.len() {
+        let unit = hz_mlp::reader::access_unit(&decorrelated[at..], 4, false).expect("a unit");
+        for (which, substream) in unit.substreams.iter().enumerate().take(3) {
+            if substream.restart.is_some() {
+                assert!(
+                    substream.matrices.len() <= hz_mlp::matrix::MAX_MATRICES,
+                    "substream {which} declares {} matrices",
+                    substream.matrices.len()
+                );
+            }
+        }
+        at += unit.bytes;
+        count += 1;
+    }
+    assert!(count > 0);
+}
+
+/// A programme of twelve elements and its 2.0, 5.1 and 7.1 folds: beds
+/// routed and objects panned, over two restart intervals of noise and tones
+/// at twenty bits in a twenty-four bit container.
+fn fold_programme() -> (Vec<Vec<i32>>, Vec<hz_mlp::hierarchy::Presentation>) {
     use hz_mlp::hierarchy::Presentation;
     const ELEMENTS: usize = 12;
     // One restart interval and a little of the next.
@@ -771,19 +837,17 @@ fn a_hierarchy_of_presentations_round_trips() {
         .map(|(channels, rows)| Presentation { channels, rows })
         .collect();
 
-    let config = config(ELEMENTS, 48_000, SampleBits::TwentyFour);
-    let mut encoder = Encoder::new(config).expect("twelve elements");
-    encoder.set_presentations(&presentations);
-    let stream = encode(&mut encoder, &planes);
-    let substreams = decoder::substreams(&stream).expect("a major sync");
-    assert_eq!(substreams, 4);
-    let stats = encoder.stats();
-    assert_eq!(stats.folds_asked, 2, "two restart intervals, both asked");
-    assert_eq!(
-        stats.folds_carried, stats.folds_asked,
-        "every interval carries its folds"
-    );
+    (planes, presentations)
+}
 
+/// The elements come back exactly, and each narrow presentation is its fold.
+fn assert_folds_hold(
+    stream: &[u8],
+    planes: &[Vec<i32>],
+    presentations: &[hz_mlp::hierarchy::Presentation],
+) {
+    const ELEMENTS: usize = 12;
+    let frames = planes[0].len();
     // The elements, exactly, and in order.
     let full = decoder::decode(&stream, 3).expect("the elements decode");
     assert_eq!(full.channels, ELEMENTS);
