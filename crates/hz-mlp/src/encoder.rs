@@ -266,6 +266,23 @@ impl Threads {
     fn new(_channels: usize) -> Self {
         Self
     }
+
+    /// `f` over every item, on the pool where there is one, in the items'
+    /// order either way — so that whatever is decided from the results is
+    /// decided the same as it would be one at a time.
+    #[cfg(feature = "parallel")]
+    fn map<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+        use rayon::prelude::*;
+        match &self.0 {
+            Some(pool) => pool.install(|| items.par_iter().map(f).collect()),
+            None => items.iter().map(f).collect(),
+        }
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn map<T, R>(&self, items: &[T], f: impl Fn(&T) -> R) -> Vec<R> {
+        items.iter().map(f).collect()
+    }
 }
 
 /// What one access unit says about itself, decided before it is written.
@@ -1983,8 +2000,10 @@ impl Encoder {
         steps: &[Primitive],
     ) -> bool {
         let width = self.coded.frame_size;
-        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
-        for unit in units {
+        // Each unit on its own: nothing carries from one to the next, and the
+        // answer is whether every one of them fits, which no order changes.
+        let fits = |unit: &Held| {
+            let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
             for (channel, plane) in scratch.iter_mut().enumerate() {
                 let element = element_of.get(channel).copied().unwrap_or(channel);
                 let shift = shifts.get(element).copied().unwrap_or(0);
@@ -2000,15 +2019,13 @@ impl Encoder {
             for step in steps.iter().rev() {
                 crate::arrange::unapply_within(step, &mut scratch, width);
             }
-            if scratch.iter().any(|plane| {
+            !scratch.iter().any(|plane| {
                 plane
                     .iter()
                     .any(|sample| !(-DOMAIN..DOMAIN).contains(sample))
-            }) {
-                return false;
-            }
-        }
-        true
+            })
+        };
+        self.threads.map(units, fits).into_iter().all(|fit| fit)
     }
 
     /// The shifts this interval will hold, or none where it holds none.
@@ -2297,32 +2314,38 @@ impl Encoder {
         // How loud each early presentation's fold gets over the interval, in
         // the samples a decoder hands back — what a presentation's shifts
         // have to leave room for.
-        let peaks: Vec<Vec<f64>> = self.wants[..self.wants.len().saturating_sub(1)]
-            .iter()
-            .map(|presentation| {
-                presentation
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        let mut peak = 0.0f64;
-                        for unit in units {
-                            for frame in unit.samples.chunks_exact(elements).take(unit.frames) {
-                                let value: f64 = row
-                                    .iter()
-                                    .zip(frame)
-                                    .map(|(gain, sample)| gain * f64::from(*sample))
-                                    .sum();
-                                peak = peak.max(value.abs());
-                            }
-                        }
-                        peak
-                    })
-                    .collect()
+        let early = &self.wants[..self.wants.len().saturating_sub(1)];
+        let rows: Vec<&Vec<f64>> = early.iter().flat_map(|p| p.rows.iter()).collect();
+        let mut loudest = self
+            .threads
+            .map(&rows, |row| {
+                let mut peak = 0.0f64;
+                for unit in units {
+                    for frame in unit.samples.chunks_exact(elements).take(unit.frames) {
+                        let value: f64 = row
+                            .iter()
+                            .zip(frame)
+                            .map(|(gain, sample)| gain * f64::from(*sample))
+                            .sum();
+                        peak = peak.max(value.abs());
+                    }
+                }
+                peak
             })
+            .into_iter();
+        let peaks: Vec<Vec<f64>> = early
+            .iter()
+            .map(|presentation| loudest.by_ref().take(presentation.rows.len()).collect())
             .collect();
-        let Some(written) =
-            Self::presentation_rows(&cascade.held, &internal, elements, fold_log, false, &peaks)
-        else {
+        let Some(written) = Self::presentation_rows(
+            &self.threads,
+            &cascade.held,
+            &internal,
+            elements,
+            fold_log,
+            false,
+            &peaks,
+        ) else {
             return Err(Refusal::Unwritable);
         };
         let (steps, (rows, assignment, stated)) = self.decorrelate(
@@ -2348,7 +2371,9 @@ impl Encoder {
     /// Every early presentation's rows over what the channels hold, each at
     /// whichever output shift takes the fewest; `None` if any cannot be
     /// written.
+    #[allow(clippy::too_many_arguments)]
     fn presentation_rows(
+        threads: &Threads,
         held: &[Vec<f64>],
         internal: &[crate::hierarchy::Presentation],
         elements: usize,
@@ -2383,24 +2408,10 @@ impl Encoder {
             // [`crate::hierarchy::rows_over_choosing_shifts`]. The two are
             // weighed on the rows first and then on the largest shift, the
             // precision the presentation gives up.
-            let uniform = (0..=crate::frame::MAX_OUTPUT_SHIFT).filter_map(|state| {
-                crate::hierarchy::rows_over(
-                    held,
-                    presentation,
-                    &vec![state; elements],
-                    crate::hierarchy::PRESENTATION_BITS,
-                )
-                .map(|(rows, order)| (rows, order, vec![state; presentation.channels]))
-            });
-            let chosen = crate::hierarchy::rows_over_choosing_shifts(
-                held,
-                presentation,
-                crate::hierarchy::PRESENTATION_BITS,
-            )
-            .map(|(rows, order, mut shifts)| {
-                shifts.resize(presentation.channels, 0);
-                (rows, order, shifts)
-            });
+            // Every candidate is written and judged on its own, so they are
+            // written and judged side by side, and then chosen from in the
+            // order they were always tried in: the per-channel shifts first,
+            // then one shift for every channel from nought up.
             //
             // 🔴 And only as precise as a fold has to be: a coefficient's
             // rounding comes out scaled up by its channel's shift, so a large
@@ -2411,7 +2422,6 @@ impl Encoder {
             // none is, the rows are what one shift for every channel wrote
             // before, unless `strict`, which is how a decorrelating step asks
             // whether it can be afforded.
-            let candidates: Vec<_> = chosen.into_iter().chain(uniform).collect();
             //
             // 🔴 And the shift has to leave the fold room at its loudest. A
             // channel's output is its row's result shifted up, so it is
@@ -2430,15 +2440,42 @@ impl Encoder {
                     peak + f64::from(*shift + 1).exp2() + FOLD_MARGIN < FULL_SCALE
                 })
             };
-            let precise: Vec<_> = candidates
-                .iter()
-                .filter(|(rows, order, shifts)| {
-                    fits(order, shifts)
-                        && presentation_error(held, presentation, rows, order, shifts)
-                            <= PRESENTATION_PRECISION
-                })
-                .cloned()
+            let tries: Vec<Option<u8>> = std::iter::once(None)
+                .chain((0..=crate::frame::MAX_OUTPUT_SHIFT).map(Some))
                 .collect();
+            let written = threads.map(&tries, |shift| {
+                let candidate = match shift {
+                    None => crate::hierarchy::rows_over_choosing_shifts(
+                        held,
+                        presentation,
+                        crate::hierarchy::PRESENTATION_BITS,
+                    )
+                    .map(|(rows, order, mut shifts)| {
+                        shifts.resize(presentation.channels, 0);
+                        (rows, order, shifts)
+                    }),
+                    Some(state) => crate::hierarchy::rows_over(
+                        held,
+                        presentation,
+                        &vec![*state; elements],
+                        crate::hierarchy::PRESENTATION_BITS,
+                    )
+                    .map(|(rows, order)| (rows, order, vec![*state; presentation.channels])),
+                }?;
+                let (rows, order, shifts) = &candidate;
+                let precise = fits(order, shifts)
+                    && presentation_error(held, presentation, rows, order, shifts)
+                        <= PRESENTATION_PRECISION;
+                Some((candidate, precise))
+            });
+            let mut candidates = Vec::with_capacity(written.len());
+            let mut precise = Vec::new();
+            for (candidate, is_precise) in written.into_iter().flatten() {
+                if is_precise {
+                    precise.push(candidate.clone());
+                }
+                candidates.push(candidate);
+            }
             let pool = if !precise.is_empty() {
                 precise
             } else if strict {
@@ -2631,7 +2668,15 @@ impl Encoder {
                 }
             }
             let kept = std::mem::replace(&mut holds[k], remainder);
-            match Self::presentation_rows(&holds, internal, self.channels, false, true, peaks) {
+            match Self::presentation_rows(
+                &self.threads,
+                &holds,
+                internal,
+                self.channels,
+                false,
+                true,
+                peaks,
+            ) {
                 Some(rows) => {
                     decorrelating.push(step);
                     best = Some(rows);
@@ -3484,19 +3529,22 @@ mod tests {
                 .collect(),
         };
         let internal = [identity(2), identity(2)];
+        let threads = Threads::new(2);
 
         let quiet = [vec![0.0, 0.5 * FULL_SCALE]];
         let (_, _, stated) =
-            Encoder::presentation_rows(&held, &internal, 2, false, true, &quiet).expect("rows");
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, true, &quiet)
+                .expect("rows");
         assert_eq!(stated[0], [0, 6]);
 
         let loud = [vec![0.0, 0.9999 * FULL_SCALE]];
         assert!(
-            Encoder::presentation_rows(&held, &internal, 2, false, true, &loud).is_none(),
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, true, &loud).is_none(),
             "a step is refused rather than written to wrap"
         );
         let (_, _, stated) =
-            Encoder::presentation_rows(&held, &internal, 2, false, false, &loud).expect("rows");
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, false, &loud)
+                .expect("rows");
         assert!(
             stated[0].windows(2).all(|pair| pair[0] == pair[1]),
             "without the step, one shift for every channel as before: {:?}",
