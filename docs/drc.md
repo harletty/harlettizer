@@ -165,7 +165,8 @@ programme would be fitting noise.
   right, and 1 to 1.7 dB of residual spread at a given level says the
   reference's is not exactly it — an asymmetric attack and release would be the
   next thing to try.
-- Not yet in the encoder. `harlettizer encode` still states unity; see below.
+- Not the encoder's own invention. `harlettizer encode` states these curves
+  by default; see below.
 
 ## What the encoder states, and what it does not
 
@@ -195,34 +196,67 @@ states none, which is what every stream written before this said.
 ### The encoder states the measured curve
 
 `--drc measured`, which is the default. Each presentation's level goes through
-a one-pole detector at [`TAU_MS`](../crates/hz-analysis/src/drc.rs) and the
-[`WIDE`] table, and the word is restated every 128 units. On a real master,
-against the reference stream of the same content:
+a one-pole detector at [`TAU_MS`](../crates/hz-analysis/src/drc.rs) and a
+measured table, and the word is restated every 128 units.
+
+**The level is what a decoder stopping at that presentation plays.** Where the
+stream carries folds (`--presentations`), that is the fold: every element
+through the presentation's rows. Where it does not, a narrow presentation is a
+copy of the leading elements, and those are what is measured.
+
+**The curve is the one shipped streams state for that presentation**:
+[`STEREO`] for a two-channel fold, [`WIDE`] for everything wider and for a
+two-channel presentation that is a copy rather than a fold — a copy has had no
+summation to hold back.
+
+It was not always so. Until 22 September 2026 every presentation was measured
+on its leading elements and took [`WIDE`], which was right while the narrow
+presentations were copies and stayed unchanged once they became folds. On the
+programme slice, `--cluster 12 --presentations`:
 
 | | words | substream 0 | substream 3 | changes |
 |---|---|---|---|---|
 | reference | 282 | −1.69..+0.00 dB | +0.00..+0.28 dB | 62 / 32 |
-| ours | 283 | +1.13 dB, fixed | −1.03..+1.13 dB | 0 / 68 |
+| ours, leading elements | 283 | +1.13 dB, fixed | −1.03..+1.13 dB | 0 / 68 |
+| ours, the fold | 283 | −4.33..−1.22 dB | −1.03..+1.13 dB | 53 / 68 |
 
-The cadence matches and the shape is a curve rather than a constant. Two things
-do not match, and both have the same cause.
+Two quiet objects read for a stereo that sums twelve put substream 0 at the
+wide curve's boost where the reference cuts. `cargo xtask drc --against`
+measures how far each word is from a curve at the level a decoder actually hands
+back:
 
-🔴 **This encoder's narrow presentations are not downmixes.** A decoder stopping
-after substream 0 gets the first two channels as they were written, not a fold
-of all sixteen; the reference computes its folds from dense matrices this
-encoder does not yet write. So the level the curve reads is not the level a
-decoder hears, and it reads *low* — which is why our substream 0 sits at a
-boost where the reference's cuts, and why it does not move at all.
+```bash
+harletty decode --presentation 0 --format pcm --output-path ours_p0 ours.thd
+cargo xtask drc ours.thd --substream 0 --audio ours_p0.pcm --channels 2 --against stereo
+```
 
-That is also why [`STEREO`] — the steeper curve shipped streams state for a
-real two-channel downmix — is **not** applied. Stating it would compress for a
-summation that never happened. When the presentation matrices land, the level
-becomes the right one and the narrow presentations should take the curve that
-was measured for them.
+| substream 0 against [`STEREO`] | mean | rms |
+|---|---|---|
+| the leading elements | +2.67 dB | 2.80 dB |
+| the fold | −0.01 dB | 0.11 dB |
 
-Until then the honest description is: the stream states a gain that follows its
-own presentations' levels through the curve shipped streams follow. `--drc off`
-states none, and `--drc <dB>` states a constant.
+The 0.11 dB left is the word's own step, 0.094 dB. Substream 1 against
+[`WIDE`] went from +0.67 dB mean, 0.81 rms, to 0.00 and 0.06: a 5.1 of the
+leading six elements is not the 5.1 fold either.
+
+That the fold now sits 1 to 3 dB below the reference's own words on this slice
+is the curve's spread, not the level's: the reference's substream 0 is itself
++0.97 dB from [`STEREO`] here, inside the 1.74 dB its streams scatter by at a
+given level.
+
+### A word answers to the level about 100 ms ahead, and so does the reference's
+
+The encoder holds a restart interval before writing it, and the word it states
+at the start of the interval is the one the detector reached at its end: 127
+units, 107 ms, ahead of the unit it is stated on. That looks like a word stated
+early, and it was on the list to fix. Measured first, it is what shipped
+streams do: `--against` finds the offset at which the words fit best, and on
+two reference streams with dynamic programme — ninety seconds and eight minutes
+— it is 95 to 141 units ahead on both narrow presentations, 79 to 118 ms. A
+compressor that sees a peak coming turns down before it arrives. Ours fits best
+124 units ahead, inside that range, so the timing is kept.
+
+`--drc off` states none, and `--drc <dB>` states a constant.
 
 ## One number that is not a choice
 
@@ -243,3 +277,6 @@ A/52 quotes 0.25 dB resolution for `dynrng`, and the tests here allow 0.14 dB
 of error rather than 0.125. The mantissa is a fraction with an implied leading
 one, so its steps are widest at the bottom of its range — 32→33 is 0.267 dB
 while 62→63 is 0.14. The quoted figure is the worst case, not a constant.
+
+[`STEREO`]: ../crates/hz-analysis/src/drc.rs
+[`WIDE`]: ../crates/hz-analysis/src/drc.rs
