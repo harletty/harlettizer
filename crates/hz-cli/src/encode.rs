@@ -554,6 +554,10 @@ struct Overlaid {
     mix: Vec<Vec<f64>>,
     /// Where every element is this block, for the presentations.
     positions: Vec<[f64; 3]>,
+    /// And the gain the payload states for each, in the same order: what a
+    /// decoder rendering the elements applies, so what the presentations
+    /// have to fold them at to sound like it.
+    stated: Vec<f64>,
     /// Which elements a source reaches this block or reached last — the rest
     /// are copied through rather than mixed, and so are not rounded either.
     touched: Vec<bool>,
@@ -729,6 +733,17 @@ impl Fold {
         match &self.shape {
             Shape::Clustered(clustered) => clustered.previous.as_ref().map(|at| &at.positions[..]),
             Shape::Overlaid(overlaid) => Some(&overlaid.positions[..]),
+        }
+    }
+
+    /// The gain the payload states for each of those elements, in the same
+    /// order, where it states any but unity. A cluster is a mix the fold made
+    /// at the level it renders at, so it has none; an overlay's elements are
+    /// the master's, at the master's gains.
+    fn stated(&self) -> Option<&[f64]> {
+        match &self.shape {
+            Shape::Clustered(_) => None,
+            Shape::Overlaid(overlaid) => Some(&overlaid.stated[..]),
         }
     }
 }
@@ -1214,6 +1229,7 @@ pub fn run(config: Config) -> Result<()> {
                         fitting: Vec::new(),
                         mix: Vec::new(),
                         positions: Vec::new(),
+                        stated: Vec::new(),
                         touched: Vec::new(),
                         copy_from: Vec::new(),
                         copied: 0,
@@ -1579,17 +1595,16 @@ pub fn run(config: Config) -> Result<()> {
                             // elements have moved, and a fold of elements that
                             // have moved is a different fold. Between them the
                             // stream keeps the arrangement it has.
-                            // On the same cadence as the payload, and for
-                            // the same reason: a payload goes out when the
-                            // elements have moved, and a fold of elements that
-                            // have moved is a different fold.
                             let mut presentations = None;
                             if due.is_some()
                                 && carries_folds
                                 && let Some(positions) = fold.positions()
                             {
-                                presentations =
-                                    presentations_of(positions, None, lfe_channel.is_some());
+                                presentations = presentations_of(
+                                    positions,
+                                    fold.stated(),
+                                    lfe_channel.is_some(),
+                                );
                             }
 
                             Ok(spans
@@ -2696,6 +2711,7 @@ fn overlay_span(
     // the sources, and a spare slot's element is the source that took it.
     overlaid.carriers.clear();
     overlaid.positions.clear();
+    overlaid.stated.clear();
     let mut stated = [1.0f64; hz_mlp::format::MAX_CHANNELS];
     for (part_index, state) in states.iter().take(overlaid.elements) {
         let element = *part_index;
@@ -2713,6 +2729,7 @@ fn overlay_span(
         // nothing here can see any other kind.
         let gain = stated_gain(state.gain);
         stated[element] = gain;
+        overlaid.stated.push(gain);
         if gain <= 0.0 {
             continue;
         }
@@ -2724,11 +2741,13 @@ fn overlay_span(
     }
     // A source that took a spare element of its own is an element the
     // presentations fold like any other, and it is never a carrier: the scene
-    // a source is panned onto is the master's, not the other sources'.
+    // a source is panned onto is the master's, not the other sources'. Its
+    // audio is the source's own, and the payload states the source's gain
+    // for it, so that is the gain it is folded at.
     for index in &overlaid.slots {
-        overlaid
-            .positions
-            .push(states[overlaid.elements + index].1.position);
+        let state = &states[overlaid.elements + index].1;
+        overlaid.positions.push(state.position);
+        overlaid.stated.push(stated_gain(state.gain));
     }
 
     // Fit the sources onto them.
@@ -4052,6 +4071,7 @@ mod tests {
                 fitting: Vec::new(),
                 mix: Vec::new(),
                 positions: Vec::new(),
+                stated: Vec::new(),
                 touched: Vec::new(),
                 copy_from: Vec::new(),
                 copied: 0,
@@ -4244,6 +4264,96 @@ mod tests {
             (ratio - 2.0).abs() < 0.01,
             "the source went in at {ratio:.4} of its level, not twice it"
         );
+    }
+
+    /// An overlay's presentations fold each element at the gain the payload
+    /// states for it, as a plain encode's do: a decoder rendering the
+    /// elements turns the centre down by 6 dB, so a 2.0, 5.1 or 7.1 that
+    /// folded it at unity would play it 6 dB louder than the full programme.
+    /// Every master seen states 0 dB throughout, which is how this went
+    /// unwired without anything sounding wrong.
+    #[test]
+    fn an_overlays_folds_take_the_gain_each_element_states() {
+        // A 7.1 bed and one overhead object before the source: nine elements,
+        // so that every fold is narrower than the programme and is written.
+        let wider = || {
+            let mut parts = overlay_parts(&[[0.0, 1.0, 0.0]]);
+            if let Some(Part::Object { source_channel, .. }) = parts.last_mut() {
+                *source_channel += 1;
+            }
+            parts.insert(
+                8,
+                Part::Object {
+                    source_channel: 8,
+                    keyframes: vec![Keyframe {
+                        position: [0.0, 0.0, 1.0],
+                        ..Keyframe::default()
+                    }],
+                    bed: None,
+                },
+            );
+            parts
+        };
+        let mut quiet = wider();
+        if let Part::Object { keyframes, .. } = &mut quiet[3] {
+            keyframes[0].gain = 0.5;
+        }
+        let loud = wider();
+
+        let elements = loud.len() - 1;
+        let channels = loud.len();
+        let frames = 256;
+        let block = noisy_block(channels, frames);
+
+        let folds = |parts: &[Part]| -> Vec<Presentation> {
+            let states = states_of(parts);
+            let mut fold = overlay_fold(parts, 1, elements);
+            let mut out = vec![0i32; frames * elements];
+            fold_span(
+                &mut fold,
+                std::path::Path::new("a master"),
+                &states,
+                parts,
+                &block,
+                channels,
+                frames,
+                Some(0),
+                elements,
+                &mut out,
+            )
+            .expect("the span folds");
+            let positions = fold.positions().expect("an overlay has positions");
+            let stated = fold.stated().expect("and gains");
+            assert_eq!(stated.len(), positions.len(), "one gain an element");
+            presentations_of(positions, fold.stated(), true).expect("wider than every fold")
+        };
+        let at_unity = folds(&loud);
+        let at_half = folds(&quiet);
+
+        let centre = 3usize; // the LFE, then L, R, C
+        let six_down = stated_gain(0.5);
+        let mut reached = 0;
+        for (unity, half) in at_unity.iter().zip(&at_half).take(3) {
+            for (row_unity, row_half) in unity.rows.iter().zip(&half.rows) {
+                for element in 0..row_unity.len() {
+                    let wanted = if element == centre {
+                        row_unity[element] * six_down
+                    } else {
+                        row_unity[element]
+                    };
+                    assert!(
+                        (row_half[element] - wanted).abs() < 1e-12,
+                        "{} channels, element {element}: {} against {wanted}",
+                        unity.channels,
+                        row_half[element]
+                    );
+                }
+                if row_unity[centre] > 0.0 {
+                    reached += 1;
+                }
+            }
+        }
+        assert!(reached >= 3, "the centre reached a channel of every fold");
     }
 
     /// **The other half of the point.** What an overlay writes for the

@@ -951,6 +951,13 @@ costs no audio bits. Carrying two folded channels as audio instead, in the
 slots of the silent elements, was measured at **+8 %** (14 668 390 bytes
 against 13 605 276), which is the price of not doing it that way.
 
+That paragraph describes the stream before the presentations were built, and
+is still true of one written without `--presentations`. With it, the three
+narrower substreams carry real folds of every element, stated as dense rows
+the way the reference's are, and a 7.1 decoder hears every object — see
+[Carrying the folds](#carrying-the-folds-for-six-per-cent-not-forty) below,
+and what FFmpeg's matrix limit did to its cost.
+
 The same tool on the same two streams, where the coding choices differ:
 
 | | the reference | this encoder |
@@ -1792,6 +1799,44 @@ slice, and the stream is **3.5 %** above the reference's — with the fold-free
 stream 2.1 % below it. Every presentation still decodes without a word from
 the reference decoder, the elements byte for byte, the 7.1 matching the
 reference's own at −100 dB and better on every channel.
+
+### What FFmpeg's matrix limit cost
+
+The 5.8 % above was measured with coding matrices free to go into any
+substream. FFmpeg's decoder, the one in every player that is not Dolby's,
+reads at most eight matrices a substream under restart sync words A and B —
+see [`matrix::MAX_MATRICES`](../crates/hz-mlp/src/matrix.rs) — and the 7.1's
+eight presentation rows already take all eight. So no coding matrix fits into
+channels 0 to 7 any more; only channels 8 to 11, in the last substream, still
+get them. Written past the limit, the stream was refused unit by unit by
+every such player while `harletty` and the test tree's decoder read it fine.
+
+On the slice, measured on 22 September 2026:
+
+| | bytes | × reference |
+|---|---|---|
+| plain master, no folds | 13 282 388 | 0.988 |
+| plain master, folds | 14 811 256 | 1.102 |
+| `--cluster 12`, no folds | 13 078 364 | 0.973 |
+| `--cluster 12`, folds | 14 586 432 | 1.085 |
+| the same, before the limit | 13 893 014 | 1.033 |
+
+**Carrying the folds costs 11.5 % over the fold-free stream today**, not
+5.8 %, and the limit alone is 5.0 points of it. On a thirty-one-minute overlay
+encode the limit cost less, 2.8 % (1 449 250 184 → 1 489 895 714 bytes), and
+that is the figure to hold a feature-length encode to.
+
+The reference pays nothing for the same constraint. Its stored channels are
+already decorrelated, and the correction is folded into the presentation rows
+it declares anyway, which it would declare regardless; its 7.1 substream
+carries eight rows and no coding matrix. Doing the same here means
+decorrelating the hierarchy's channels against the ones below them, putting
+the steps in the last substream's cascade, and recomputing the presentation
+rows over the decorrelated channels — which needs the rows to read channels
+below their own, which they cannot yet. That is the next thing to try on the
+size of a folded stream. `cargo xtask ffmpeg-check` holds every stream the
+harness writes to the limit, and the test tree's decoder reads no more than
+FFmpeg does.
 
 ## The search that ran for minutes, and the reservation that ends it
 
