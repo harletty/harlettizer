@@ -45,8 +45,9 @@ object comes back where the master put it, at the sample the master named.
 - **Immersive streams** — nine to sixteen elements over four substreams, the
   object metadata read back by a real decoder as the programme it describes,
   and a real programme at about the size of its reference stream. With
-  `--presentations` the stream carries genuine folds, a few per cent larger
-  than without.
+  `--presentations` the stream carries genuine folds, about 11 % larger than
+  without — 5 points of which are the eight-matrix limit of FFmpeg's decoder;
+  see [docs/mlp.md](docs/mlp.md).
 - **Speed** — about 3 ms per channel-second of audio at full effort on a
   desktop machine: four minutes of a twelve-element programme in 17 s on
   sixteen cores.
@@ -87,16 +88,24 @@ and its frame rate, since ADM times are absolute.
 harlettizer encode programme.atmos --out programme.thd --cluster 12 --fold-depth 18 --presentations
 ```
 
-Four minutes of a programme, sixteen objects and an LFE into twelve
-elements:
+Thirty seconds of a programme, eleven objects and an LFE into twelve
+elements, at the default depth and with no signing key configured:
 
 ```
-  programme    16 objects and an LFE, 12 elements
-  encoded      288000 access units, 11520000 samples
-  metadata     3797 payloads, one every 76 units
+  programme    11 objects and an LFE, 12 elements
+  encoded      36106 access units, 1444240 samples
+  metadata     285 payloads, one every 127 units
+  protection   no key configured, so a constant stands in the field; see docs/encode.md
   fold         0.0000 mean over the presentations, 0.000 at its worst, as a fraction of the object's own gains
-  depth        elements rounded to 18 bits
+  weighed by   the plain power, what a meter reads
+  noticed      0.00 % of the element-windows wobble past the blur, 0.00 % of what is playing sitting in one; 0.00°/s of movement the mix never asked for, against 0.00°/s it did — see hz_cluster::motion
+  held by      a dead band: an element stays where it was unless moving pays 25 % of what staying costs
+  steadied by  a hold over 0 blocks behind and 2 ahead
+  floor        -102.6 dBFS at the playback level a dialnorm of -31 implies; 3.33 objects a block under it
+  depth        elements rounded to 20 bits
+  headroom     0 blocks where an element's coherent peak was bounded in the fit, 0 blocks where the limiter brought every element down, the mix peaking at 0.22 of full scale before it
   drc          from the measured curve, per presentation, restated every 128 units
+  presentations the folds themselves, in every one of 283 restart intervals
   wrote        programme.thd
 ```
 
@@ -122,17 +131,36 @@ What the summary says:
 - **programme** — what the master holds and how many elements the stream will
   carry. Nine is the fewest the format's shape allows and sixteen the most; a
   smaller programme is padded with inactive elements the syntax has a flag for.
+- **encoded** — how many access units and samples went into the stream.
 - **metadata** — how many object audio metadata payloads went out. One goes out
   when some element's state changes, and otherwise every 128 access units.
+- **protection** — whether each payload's frame is signed, and with which key;
+  see [docs/encode.md](docs/encode.md).
 - **fold** — what the clustering cost: how far every object lands from where
   the mix put it once folded into the elements, measured from the metadata
   alone over every presentation the stream will be played through. An encoder
   that folds a scene and does not say what it cost is asking to be trusted.
-- **clipping** — an element is a sum, and a sum of objects that agree is louder
+- **weighed by**, **noticed**, **held by**, **steadied by**, **floor** — how
+  the fold weighed the blocks, how much the elements moved that the mix did
+  not ask for, and the rules that kept them still; `--cluster` only.
+- **depth** — how many bits the folded elements were rounded to.
+- **headroom** — what kept the folded elements inside the codec's domain: the
+  fit's bound, the limiter, and how loud the mix got before them.
+- **clipped** — an element is a sum, and a sum of objects that agree is louder
   than any of them. Samples past the codec's twenty-four bits are clamped rather
-  than wrapped, and counted here when there are any.
-- **presentations** — with `--presentations`, whether the stream carries the
-  folds, or why an interval could not.
+  than wrapped, and counted here when there are any; the line is absent when
+  there are none.
+- **drc** — the dynamic range word each presentation states, or none.
+- **presentations** — whether the stream carries the folds, in how many
+  restart intervals, or why an interval could not.
+
+`--overlay` adds its own lines: **overlay**, **untouched**, **beds** and
+**carried by** say what was kept and where the sources went (see
+[docs/encode.md](docs/encode.md)), and four guards say what it cost —
+**drift**, how far the carriers put a source from where it asked to be;
+**fell back**, how often a source was put on the nearest bed outright;
+**unasked**, movement a carrier added under a source that did not move; and
+**stranded**, a source audible while every element was silenced.
 
 Two environment variables make the encoder talk, for diagnosis: `HZ_TIME=1`
 times its phases and prints them at the end, and `HZ_FOLD=1` says at every
