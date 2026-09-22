@@ -44,20 +44,21 @@ A restarting unit is two blocks — the unpredicted eight, then the rest. Every
 other unit is one.
 
 `Encoder::push` takes one access unit and returns **nothing** for the first 127
-of every 128; the 128th returns a whole interval at once — **the one two
+of every 128; the 128th returns a whole interval at once — **the one three
 before**. That is the API, not an implementation detail: everything decided per
 interval — the matrices, each channel's second filter, `max_shift`,
 `max_output_bits` — is decided on the interval it applies to, which has to
-exist first; and the encoder works on three intervals at once, one's folds
-worked out while the one before it is decided and the one before that is
-written. Each of the three reads nothing the others change, so the stream is
+exist first; and the encoder works on four intervals at once, one's folds
+worked out while the one before it is prepared, the one before that is decided
+block by block and the one before that is written. Each of the three reads nothing the others change, so the stream is
 byte for byte what one at a time wrote. Folds beside writing took a quarter of
 an encode off the clock with folds (the programme slice 1.96 s to 1.48 s, five
 minutes of an overlay 19.4 s to 14.3 s); writing beside deciding took the
-five minutes to 11.8 s, with the autocorrelation's lanes. `finish` takes a
+five minutes to 11.8 s, with the autocorrelation's lanes; deciding the blocks
+beside the preparing, on a pool of their own, took them to 10.1 s. `finish` takes a
 last, possibly short, unit and hands back everything not yet handed back. A
 caller appends what it is given either way, and reads the statistics once it
-has finished. Latency: 384 units.
+has finished. Latency: 512 units.
 
 ## What is written, and what is left unsaid
 

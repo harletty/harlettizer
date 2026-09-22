@@ -262,6 +262,22 @@ impl Threads {
         )
     }
 
+    /// A pool of exactly `threads` threads.
+    #[cfg(feature = "parallel")]
+    fn exactly(threads: usize) -> Self {
+        Self(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads.max(1))
+                .build()
+                .ok(),
+        )
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn exactly(_threads: usize) -> Self {
+        Self
+    }
+
     #[cfg(not(feature = "parallel"))]
     fn new(_channels: usize) -> Self {
         Self
@@ -456,24 +472,12 @@ pub struct Encoder {
     /// Per channel, the dead low bits taken off this unit, which the decoder
     /// puts back after everything else.
     output_shift: Vec<u8>,
-    /// The last residuals each channel was coded with, most recent last. A
-    /// decoder carries them as the second filter's state, so this encoder has
-    /// to as well — and they are the residuals of whatever filter was actually
-    /// chosen, not of any candidate.
-    past_residuals: Vec<Vec<i32>>,
     /// The second filter each channel carries through the current restart
     /// interval, decided at its start on the interval it is about to meet — an
     /// index into the designs, or none. See [`crate::filter::pick_second`].
     second_mode: Vec<Option<usize>>,
     /// How hard that decision searches.
     effort: Effort,
-    /// The whole interval's per-channel decisions, made in one pass before any
-    /// of it is written — see [`Encoder::decide_interval`]. Indexed
-    /// `[channel][unit]`, with the restarting unit's first block apart.
-    interval_decided: Vec<Vec<Decided>>,
-    interval_restart: Vec<Decided>,
-    /// And its residuals, `[channel]` by unit, laid out like `prepared`.
-    interval_planes: Vec<Vec<i32>>,
     /// What each channel's search decided, this unit and in the unpredicted
     /// block of a restarting one. Held rather than returned so that spreading
     /// Where the per-channel search runs.
@@ -493,6 +497,12 @@ pub struct Encoder {
     evolution_pending: bool,
     /// The interval that is decided and not yet written.
     decided: Option<Record>,
+    /// What decides each block of an interval, channel by channel, and its
+    /// buffers. Out of the encoder while it works on one interval beside the
+    /// preparing of the next — see [`IntervalDecider`].
+    back: Option<IntervalDecider>,
+    /// The interval that is prepared and not yet decided block by block.
+    fronted: Option<Front>,
     /// How many intervals have been decided, which is what a second filter
     /// decided every other restart counts.
     intervals_decided: u64,
@@ -642,6 +652,7 @@ impl Stats {
 impl Encoder {
     pub fn new(config: Config) -> Result<Self, Unsupported> {
         let coded = config.resolve()?;
+        let threads = std::sync::Arc::new(Threads::new(config.channels));
         Ok(Self {
             coded,
             sample_rate: config.sample_rate,
@@ -651,11 +662,7 @@ impl Encoder {
                 .map(|_| History::new(filter::SECOND_CONTEXT, coded.frame_size))
                 .collect(),
             output_shift: vec![0; config.channels],
-            past_residuals: vec![Vec::new(); config.channels],
             second_mode: vec![None; config.channels],
-            interval_decided: vec![Vec::new(); config.channels],
-            interval_restart: vec![Decided::default(); config.channels],
-            interval_planes: vec![Vec::new(); config.channels],
             effort: Effort::default(),
             matrices: Vec::new(),
             presentations: Vec::new(),
@@ -668,7 +675,7 @@ impl Encoder {
             permutation: (0..config.channels).collect(),
             phase_times: [std::time::Duration::ZERO; 8],
             timed: std::env::var_os("HZ_TIME").is_some(),
-            threads: std::sync::Arc::new(Threads::new(config.channels)),
+            threads: std::sync::Arc::clone(&threads),
             deferred: None,
             writer: Some(Writer {
                 coded,
@@ -733,6 +740,31 @@ impl Encoder {
                 max_output_bits: crate::frame::CODEC_BITS as u8,
             }),
             decided: None,
+            back: Some(IntervalDecider {
+                channels: config.channels,
+                coded,
+                // A pool of its own, of half as many threads as channels, and
+                // never fewer than four or than the channels there are: a
+                // stereo on one thread decided its two channels one after the
+                // other. Sharing the encoder's, the blocks took threads the
+                // preparing of the next interval was waiting for, and that is
+                // the longer of the two: five minutes of an overlay at twelve
+                // channels took 11.3 s so, and on a pool of its own 13.5 s at
+                // three threads, 11.5 at four, 10.1 at six, 10.2 at eight
+                // and 10.7 at sixteen.
+                threads: std::sync::Arc::new(Threads::exactly(
+                    config.channels.div_ceil(2).max(config.channels.min(4)),
+                )),
+                interval_decided: vec![Vec::new(); config.channels],
+                interval_planes: vec![Vec::new(); config.channels],
+                interval_restart: vec![Decided::default(); config.channels],
+                past_residuals: vec![Vec::new(); config.channels],
+                prepared: Vec::new(),
+                past: Vec::new(),
+                second_mode: Vec::new(),
+                stats: Stats::default(),
+            }),
+            fronted: None,
             intervals_decided: 0,
             evolution: Vec::new(),
             evolution_id: 0,
@@ -806,6 +838,10 @@ impl Encoder {
             starved: written.starved,
             lowest_advance: written.lowest_advance,
             peak_unit_bytes: written.peak_unit_bytes,
+            filters_restated: self
+                .back
+                .as_ref()
+                .map_or(0, |back| back.stats.filters_restated),
             ..self.stats.clone()
         }
     }
@@ -997,12 +1033,13 @@ impl Encoder {
     /// The encoder holds an interval before it writes one, because the
     /// decisions that stand for an interval — the matrices, the second filter
     /// each channel carries — are better made on the interval they will be
-    /// applied to than on the one before it. And it works on three intervals
-    /// at once — one's folds, the one before it decided, the one before that
-    /// written — see [`Encoder::advance`]. So all but one push in
-    /// [`RESTART_INTERVAL`] hands back nothing and the last hands back the lot
-    /// *of the interval two before*; the first interval's bytes come with the
-    /// third's last push, and [`Encoder::finish`] hands back what is left. A
+    /// applied to than on the one before it. And it works on four intervals
+    /// at once — one's folds, the one before it prepared, the one before that
+    /// decided block by block, the one before that written — see
+    /// [`Encoder::advance`]. So all but one push in [`RESTART_INTERVAL`] hands
+    /// back nothing and the last hands back the lot *of the interval three
+    /// before*; the first interval's bytes come with the fourth's last push,
+    /// and [`Encoder::finish`] hands back what is left. A
     /// caller appends what it is given either way, which is what every caller
     /// already did; what it reads of [`Encoder::stats`] is what has been
     /// written, which is everything once it has finished.
@@ -1098,20 +1135,23 @@ impl Encoder {
     }
 
     /// An interval is complete: work out its folds while the one before it
-    /// is decided and the one before that is written, and hand that one back.
+    /// is prepared, the one before that is decided block by block and the
+    /// one before that is written, and hand that one back.
     ///
-    /// # Why two intervals late
+    /// # Why three intervals late
     ///
     /// Working out an interval's folds is a search over its own samples and
     /// nothing else, and with folds it was a quarter of an encode, on one
     /// thread. Writing an interval is on one thread too, and reads nothing the
     /// deciding of the next one changes — every interval opens with a restart
-    /// header, so what the decoder held before it is nothing either way. So the
-    /// three run side by side, each on its own interval, the writing with the
-    /// [`Writer`] taken out of the encoder and the deciding with the rest. The
-    /// price is that [`Encoder::push`] hands back each interval two intervals
-    /// after it is complete, and [`Encoder::finish`] hands back the last
-    /// three. The stream is byte for byte the same: every interval is worked
+    /// header, so what the decoder held before it is nothing either way. And
+    /// deciding an interval's blocks keeps a thread a channel busy and no
+    /// more, while preparing the next reads only the samples before it. So
+    /// the four run side by side, each on its own interval: the writing with
+    /// the [`Writer`] and the blocks with the [`IntervalDecider`] taken out of
+    /// the encoder, the preparing with the rest. The price is that
+    /// [`Encoder::push`] hands back each interval three intervals after it is
+    /// complete, and [`Encoder::finish`] hands back the last four. The stream is byte for byte the same: every interval is worked
     /// out and decided from the same samples, the same request and the same
     /// decisions before it, and written with the dynamic range the caller had
     /// asked for when it was complete.
@@ -1133,28 +1173,45 @@ impl Encoder {
         let planning = self.planning();
         let dynamic_range = self.dynamic_range;
         let planned = self.deferred.take();
+        let fronted = self.fronted.take();
         let decided = self.decided.take();
         let mut writer = self.writer.take().expect("the writer is in the encoder");
-        // Three intervals at once: this one's folds worked out, the one before
-        // it decided, and the one before that written. None reads what
-        // another changes — see [`Planning`] and [`Writer`].
-        let (planning, record, written, writer) = std::thread::scope(|scope| {
+        let mut back = self
+            .back
+            .take()
+            .expect("the block decider is in the encoder");
+        // Four intervals at once: this one's folds worked out, the one before
+        // it prepared, the one before that decided block by block, and the one
+        // before that written. None reads what another changes — see
+        // [`Planning`], [`IntervalDecider`] and [`Writer`].
+        let (planning, front, backed, written, writer, back) = std::thread::scope(|scope| {
             let plan = scope.spawn(|| planning.plan(&held));
             let write = scope.spawn(move || {
                 let written = decided.map(|record| writer.write(record));
                 (written, writer)
             });
-            let record = planned.map(|planned| self.decide(planned));
+            let decide = scope.spawn(move || {
+                let backed = fronted.map(|front| back.decide(front));
+                (backed, back)
+            });
+            let front = planned.map(|planned| self.decide(planned));
             let (written, writer) = write.join().expect("writing an interval does not panic");
+            let (backed, back) = decide
+                .join()
+                .expect("deciding an interval's blocks does not panic");
             (
-                plan.join().expect("deciding an interval does not panic"),
-                record,
+                plan.join().expect("working out an interval does not panic"),
+                front,
+                backed,
                 written,
                 writer,
+                back,
             )
         });
         self.writer = Some(writer);
-        self.decided = record;
+        self.back = Some(back);
+        self.fronted = front;
+        self.decided = self.take_what_was_decided(backed);
         self.deferred = Some(Deferred {
             held,
             planning,
@@ -1180,16 +1237,46 @@ impl Encoder {
         out
     }
 
-    /// Everything not yet written, written: the interval decided, then the
-    /// one worked out and not yet decided.
+    /// An interval whose blocks were just decided, with the time it took
+    /// counted.
+    fn take_what_was_decided(
+        &mut self,
+        backed: Option<(Record, std::time::Duration)>,
+    ) -> Option<Record> {
+        let (record, took) = backed?;
+        if self.timed {
+            self.phase_times[6] += took;
+        }
+        Some(record)
+    }
+
+    /// Decide an interval's blocks here and now, rather than beside anything.
+    fn decide_blocks(&mut self, front: Front) -> Record {
+        let backed = self
+            .back
+            .as_mut()
+            .expect("the block decider is in the encoder")
+            .decide(front);
+        self.take_what_was_decided(Some(backed))
+            .expect("an interval was just decided")
+    }
+
+    /// Everything not yet written, written, in order: the interval decided,
+    /// then the one prepared, then the one worked out.
     fn drain(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(record) = self.decided.take() {
             let written = self.writer_mut().write(record);
             out.extend_from_slice(&self.take_what_was_written(Some(written)));
         }
+        if let Some(front) = self.fronted.take() {
+            let record = self.decide_blocks(front);
+            let written = self.writer_mut().write(record);
+            out.extend_from_slice(&self.take_what_was_written(Some(written)));
+        }
         if let Some(planned) = self.deferred.take() {
-            let record = self.decide(planned);
+            let front = self.decide(planned);
+            let record = self.decide_blocks(front);
             let written = self.writer_mut().write(record);
             out.extend_from_slice(&self.take_what_was_written(Some(written)));
         }
@@ -1235,7 +1322,7 @@ impl Encoder {
 
     /// Decide an interval that is complete and worked out, and hand over
     /// what the writing needs.
-    fn decide(&mut self, deferred: Deferred) -> Record {
+    fn decide(&mut self, deferred: Deferred) -> Front {
         let Deferred {
             held,
             planning,
@@ -1246,26 +1333,31 @@ impl Encoder {
         }
         self.timed_phase(3, |encoder| encoder.prepare(&held));
         self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
-        self.timed_phase(6, |encoder| encoder.decide_interval(held.len()));
         self.intervals_decided += 1;
         let channels = self.channels;
-        // The buffers the deciding filled go with the interval; the next one
+        let width = self.coded.frame_size;
+        // What the blocks of this interval are decided against is the past
+        // before it; what the next interval is prepared against is the past
+        // after it — and the past is the prepared samples and nothing else,
+        // so it moves on here rather than once the blocks are decided.
+        let before = self.past.clone();
+        for (history, plane) in self.past.iter_mut().zip(&self.prepared) {
+            for unit in plane.chunks_exact(width).take(held.len()) {
+                history.push(unit);
+            }
+        }
+        let second_mode = self.second_mode.clone();
+        // The buffers the preparing filled go with the interval; the next one
         // starts from empty ones of the same shape, which it sizes itself.
-        Record {
+        let record = Record {
             held,
             dynamic_range,
             prepared: std::mem::replace(&mut self.prepared, vec![Vec::new(); channels]),
             prepared_shifts: std::mem::take(&mut self.prepared_shifts),
             prepared_checks: std::mem::take(&mut self.prepared_checks),
-            interval_decided: std::mem::replace(
-                &mut self.interval_decided,
-                vec![Vec::new(); channels],
-            ),
-            interval_planes: std::mem::replace(
-                &mut self.interval_planes,
-                vec![Vec::new(); channels],
-            ),
-            interval_restart: self.interval_restart.clone(),
+            interval_decided: Vec::new(),
+            interval_planes: Vec::new(),
+            interval_restart: Vec::new(),
             matrices: self.matrices.clone(),
             presentations: self.presentations.clone(),
             arrangement: self.arrangement.clone(),
@@ -1273,6 +1365,11 @@ impl Encoder {
             presentation_shift: self.presentation_shift.clone(),
             max_shift: self.max_shift,
             max_output_bits: self.max_output_bits,
+        };
+        Front {
+            record,
+            past: before,
+            second_mode,
         }
     }
 
@@ -1451,167 +1548,6 @@ impl Encoder {
         } else {
             (whole.to_vec(), still)
         }
-    }
-
-    /// Decide every channel of the whole interval, in one pass.
-    ///
-    /// # Why this is not done unit by unit
-    ///
-    /// It used to be: each access unit forked its channels across the pool and
-    /// joined them again. Forty samples of work a channel is less than the
-    /// fork costs, and over a five-minute programme that is 360 000 forks —
-    /// the phase scaled 3.2× on twelve threads where the second-filter search,
-    /// which forks once an interval, scaled 7.7×.
-    ///
-    /// So the fork moves out here: one per interval, and each thread walks its
-    /// own channel through all 128 units. That is allowed because a channel's
-    /// search reads only that channel — its samples, its history, its
-    /// residual tail, and what the decoder holds *for it*. The one field of
-    /// the model that spans channels is the output shift, and no decision
-    /// consults it.
-    ///
-    /// Each thread therefore carries its own copy of the three things that
-    /// cross units — the sample history, the residual tail, and the channel's
-    /// `Held` — and the sequence it replays is exactly the serial one: a
-    /// restarting unit clears the channel, states its unpredicted block, then
-    /// decides the rest against that; every other unit decides against what
-    /// the block before it left. The writer states the same codings again as
-    /// it emits them, which is where the model this walk mirrors actually
-    /// moves.
-    fn decide_interval(&mut self, units: usize) {
-        let width = self.coded.frame_size;
-        for (channel, plane) in self.interval_planes.iter_mut().enumerate() {
-            plane.clear();
-            plane.resize(units * width, 0);
-            self.interval_decided[channel].clear();
-            self.interval_decided[channel].resize(units, Decided::default());
-        }
-
-        let prepared = &self.prepared;
-        let past = &self.past;
-        let past_residuals = &self.past_residuals;
-        let modes = &self.second_mode;
-        let split_at = RESTART_BLOCK;
-
-        let body = |channel: usize,
-                    planes: &mut Vec<i32>,
-                    decided: &mut Vec<Decided>,
-                    restart_slot: &mut Decided,
-                    restated: &mut u64| {
-            // The three things that cross units, this channel's own.
-            let mut history = past[channel].clone();
-            let mut residuals = past_residuals[channel].clone();
-            // What the decoder holds for this channel when the interval
-            // starts, which is nothing: every interval opens with a restart
-            // header, and a restart header throws away what it held.
-            let mut held = crate::model::Held::default();
-
-            for index in 0..units {
-                let samples = &prepared[channel][index * width..(index + 1) * width];
-                let plane = &mut planes[index * width..(index + 1) * width];
-                let restart = index == 0;
-                let split = if restart { split_at } else { 0 };
-
-                if restart {
-                    // A restart header throws away what the decoder was
-                    // holding for this channel.
-                    held = crate::model::Held::default();
-                    let (coding, _) = filter::plain(&samples[..split], &mut plane[..split]);
-                    let write_iir = held.restates_iir(&coding.filter);
-                    *restart_slot = Decided {
-                        // Stated unconditionally: see `decide_restart_block`.
-                        write_fir: true,
-                        write_iir,
-                        write_params: true,
-                        coding,
-                    };
-                    *restated += 1;
-                    held.state(&coding);
-                }
-
-                let state = if restart {
-                    filter::state_from(&samples[..split], &plane[..split])
-                } else {
-                    filter::state_from(history.window(), &residuals)
-                };
-                let (coding, _) = filter::choose_with(
-                    modes[channel],
-                    history.window(),
-                    state,
-                    &samples[split..],
-                    &mut plane[split..],
-                    &if restart {
-                        crate::filter::Filter::default()
-                    } else {
-                        held.in_force()
-                    },
-                );
-                let write_fir = held.restates_fir(&coding.filter);
-                let write_iir = held.restates_iir(&coding.filter);
-                decided[index] = Decided {
-                    write_fir,
-                    write_iir,
-                    write_params: write_fir || write_iir || held.restates(&coding),
-                    coding,
-                };
-                if write_fir {
-                    *restated += 1;
-                }
-                held.state(&coding);
-
-                // What the decoder will carry: the matrixed samples, and the
-                // residuals that were actually written.
-                history.push(samples);
-                residuals.clear();
-                residuals.extend_from_slice(&plane[plane.len().saturating_sub(MAX_IIR_ORDER)..]);
-            }
-            (history, residuals)
-        };
-
-        let mut restated = vec![0u64; self.channels];
-        let carried: Vec<(History, Vec<i32>)> = {
-            #[cfg(feature = "parallel")]
-            if let Some(pool) = &self.threads.0 {
-                use rayon::prelude::*;
-                let planes = &mut self.interval_planes;
-                let decided = &mut self.interval_decided;
-                let restarts = &mut self.interval_restart;
-                pool.install(|| {
-                    planes
-                        .par_iter_mut()
-                        .zip(decided.par_iter_mut())
-                        .zip(restarts.par_iter_mut())
-                        .zip(restated.par_iter_mut())
-                        .enumerate()
-                        .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
-                        .collect()
-                })
-            } else {
-                self.interval_planes
-                    .iter_mut()
-                    .zip(self.interval_decided.iter_mut())
-                    .zip(self.interval_restart.iter_mut())
-                    .zip(restated.iter_mut())
-                    .enumerate()
-                    .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
-                    .collect()
-            }
-            #[cfg(not(feature = "parallel"))]
-            self.interval_planes
-                .iter_mut()
-                .zip(self.interval_decided.iter_mut())
-                .zip(self.interval_restart.iter_mut())
-                .zip(restated.iter_mut())
-                .enumerate()
-                .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
-                .collect()
-        };
-
-        for (channel, (history, residuals)) in carried.into_iter().enumerate() {
-            self.past[channel] = history;
-            self.past_residuals[channel] = residuals;
-        }
-        self.stats.filters_restated += restated.iter().sum::<u64>();
     }
 
     /// Prepare every unit of the held interval: de-interleave it through the
@@ -3280,6 +3216,236 @@ impl Planning {
             eprintln!("fold: {count} channels decorrelated");
         }
         (candidate, rows)
+    }
+}
+
+/// An interval prepared and not yet decided block by block: what the writing
+/// will need, and what the block decisions read that the preparing of the
+/// next interval moves on — the past before this interval, and each
+/// channel's second filter.
+#[derive(Debug)]
+struct Front {
+    record: Record,
+    past: Vec<History>,
+    second_mode: Vec<Option<usize>>,
+}
+
+/// What decides each block of an interval, channel by channel.
+///
+/// A channel's blocks are decided one after another, each from the filter the
+/// one before it left, so an interval keeps as many threads busy as it has
+/// channels and no more. Taken out of the encoder so that it runs beside the
+/// preparing of the next interval, which fills the rest: it reads the
+/// interval's prepared samples, the past before it and its second filters,
+/// all handed over in a [`Front`], and nothing the preparing changes.
+#[derive(Debug)]
+struct IntervalDecider {
+    channels: usize,
+    coded: Coded,
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    threads: std::sync::Arc<Threads>,
+    /// The whole interval's per-channel decisions, made in one pass before any
+    /// of it is written — see [`Encoder::decide_interval`]. Indexed
+    /// `[channel][unit]`, with the restarting unit's first block apart.
+    interval_decided: Vec<Vec<Decided>>,
+    /// And its residuals, `[channel]` by unit, laid out like `prepared`.
+    interval_planes: Vec<Vec<i32>>,
+    interval_restart: Vec<Decided>,
+    /// The last residuals each channel was coded with, most recent last. A
+    /// decoder carries them as the second filter's state, so this encoder has
+    /// to as well — and they are the residuals of whatever filter was actually
+    /// chosen, not of any candidate.
+    past_residuals: Vec<Vec<i32>>,
+    prepared: Vec<Vec<i32>>,
+    past: Vec<History>,
+    second_mode: Vec<Option<usize>>,
+    /// What deciding the blocks counts; see [`Encoder::stats`].
+    stats: Stats,
+}
+
+impl IntervalDecider {
+    /// Decide an interval's blocks, and hand over the record for writing.
+    fn decide(&mut self, front: Front) -> (Record, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let Front {
+            mut record,
+            past,
+            second_mode,
+        } = front;
+        let units = record.held.len();
+        self.prepared = std::mem::take(&mut record.prepared);
+        self.past = past;
+        self.second_mode = second_mode;
+        self.decide_interval(units);
+        let channels = self.channels;
+        record.prepared = std::mem::take(&mut self.prepared);
+        record.interval_decided =
+            std::mem::replace(&mut self.interval_decided, vec![Vec::new(); channels]);
+        record.interval_planes =
+            std::mem::replace(&mut self.interval_planes, vec![Vec::new(); channels]);
+        record.interval_restart = self.interval_restart.clone();
+        (record, start.elapsed())
+    }
+
+    /// Decide every channel of the whole interval, in one pass.
+    ///
+    /// # Why this is not done unit by unit
+    ///
+    /// It used to be: each access unit forked its channels across the pool and
+    /// joined them again. Forty samples of work a channel is less than the
+    /// fork costs, and over a five-minute programme that is 360 000 forks —
+    /// the phase scaled 3.2× on twelve threads where the second-filter search,
+    /// which forks once an interval, scaled 7.7×.
+    ///
+    /// So the fork moves out here: one per interval, and each thread walks its
+    /// own channel through all 128 units. That is allowed because a channel's
+    /// search reads only that channel — its samples, its history, its
+    /// residual tail, and what the decoder holds *for it*. The one field of
+    /// the model that spans channels is the output shift, and no decision
+    /// consults it.
+    ///
+    /// Each thread therefore carries its own copy of the three things that
+    /// cross units — the sample history, the residual tail, and the channel's
+    /// `Held` — and the sequence it replays is exactly the serial one: a
+    /// restarting unit clears the channel, states its unpredicted block, then
+    /// decides the rest against that; every other unit decides against what
+    /// the block before it left. The writer states the same codings again as
+    /// it emits them, which is where the model this walk mirrors actually
+    /// moves.
+    fn decide_interval(&mut self, units: usize) {
+        let width = self.coded.frame_size;
+        for (channel, plane) in self.interval_planes.iter_mut().enumerate() {
+            plane.clear();
+            plane.resize(units * width, 0);
+            self.interval_decided[channel].clear();
+            self.interval_decided[channel].resize(units, Decided::default());
+        }
+
+        let prepared = &self.prepared;
+        let past = &self.past;
+        let past_residuals = &self.past_residuals;
+        let modes = &self.second_mode;
+        let split_at = RESTART_BLOCK;
+
+        let body = |channel: usize,
+                    planes: &mut Vec<i32>,
+                    decided: &mut Vec<Decided>,
+                    restart_slot: &mut Decided,
+                    restated: &mut u64| {
+            // The three things that cross units, this channel's own.
+            let mut history = past[channel].clone();
+            let mut residuals = past_residuals[channel].clone();
+            // What the decoder holds for this channel when the interval
+            // starts, which is nothing: every interval opens with a restart
+            // header, and a restart header throws away what it held.
+            let mut held = crate::model::Held::default();
+
+            for index in 0..units {
+                let samples = &prepared[channel][index * width..(index + 1) * width];
+                let plane = &mut planes[index * width..(index + 1) * width];
+                let restart = index == 0;
+                let split = if restart { split_at } else { 0 };
+
+                if restart {
+                    // A restart header throws away what the decoder was
+                    // holding for this channel.
+                    held = crate::model::Held::default();
+                    let (coding, _) = filter::plain(&samples[..split], &mut plane[..split]);
+                    let write_iir = held.restates_iir(&coding.filter);
+                    *restart_slot = Decided {
+                        // Stated unconditionally: see `decide_restart_block`.
+                        write_fir: true,
+                        write_iir,
+                        write_params: true,
+                        coding,
+                    };
+                    *restated += 1;
+                    held.state(&coding);
+                }
+
+                let state = if restart {
+                    filter::state_from(&samples[..split], &plane[..split])
+                } else {
+                    filter::state_from(history.window(), &residuals)
+                };
+                let (coding, _) = filter::choose_with(
+                    modes[channel],
+                    history.window(),
+                    state,
+                    &samples[split..],
+                    &mut plane[split..],
+                    &if restart {
+                        crate::filter::Filter::default()
+                    } else {
+                        held.in_force()
+                    },
+                );
+                let write_fir = held.restates_fir(&coding.filter);
+                let write_iir = held.restates_iir(&coding.filter);
+                decided[index] = Decided {
+                    write_fir,
+                    write_iir,
+                    write_params: write_fir || write_iir || held.restates(&coding),
+                    coding,
+                };
+                if write_fir {
+                    *restated += 1;
+                }
+                held.state(&coding);
+
+                // What the decoder will carry: the matrixed samples, and the
+                // residuals that were actually written.
+                history.push(samples);
+                residuals.clear();
+                residuals.extend_from_slice(&plane[plane.len().saturating_sub(MAX_IIR_ORDER)..]);
+            }
+            (history, residuals)
+        };
+
+        let mut restated = vec![0u64; self.channels];
+        let carried: Vec<(History, Vec<i32>)> = {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = &self.threads.0 {
+                use rayon::prelude::*;
+                let planes = &mut self.interval_planes;
+                let decided = &mut self.interval_decided;
+                let restarts = &mut self.interval_restart;
+                pool.install(|| {
+                    planes
+                        .par_iter_mut()
+                        .zip(decided.par_iter_mut())
+                        .zip(restarts.par_iter_mut())
+                        .zip(restated.par_iter_mut())
+                        .enumerate()
+                        .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
+                        .collect()
+                })
+            } else {
+                self.interval_planes
+                    .iter_mut()
+                    .zip(self.interval_decided.iter_mut())
+                    .zip(self.interval_restart.iter_mut())
+                    .zip(restated.iter_mut())
+                    .enumerate()
+                    .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            self.interval_planes
+                .iter_mut()
+                .zip(self.interval_decided.iter_mut())
+                .zip(self.interval_restart.iter_mut())
+                .zip(restated.iter_mut())
+                .enumerate()
+                .map(|(channel, (((p, d), r), n))| body(channel, p, d, r, n))
+                .collect()
+        };
+
+        for (channel, (history, residuals)) in carried.into_iter().enumerate() {
+            self.past[channel] = history;
+            self.past_residuals[channel] = residuals;
+        }
+        self.stats.filters_restated += restated.iter().sum::<u64>();
     }
 }
 
