@@ -36,6 +36,18 @@
 //! `--tau` sweeps its time constant: the reference's gains follow one of about
 //! 600 to 900 ms, which is what the correlation peaks at on every reference
 //! stream tried.
+//!
+//! `--against wide` or `--against stereo` holds each word to what that curve
+//! gives at the decoded level, which is how to check a stream this project
+//! wrote rather than learn from one it did not:
+//!
+//! ```text
+//! cargo xtask drc ours.thd --substream 0 --audio ours_p0.pcm --channels 2 --against stereo
+//! ```
+//!
+//! It says how far the words are from the curve at the unit each is stated
+//! on, and at which offset they are closest — a word that answers to the
+//! level of a unit other than its own is a word stated early or late.
 
 use hz_core::{Error, Result};
 use std::path::PathBuf;
@@ -55,6 +67,8 @@ pub struct Options {
     pub substream: usize,
     /// The level detector's time constant, in milliseconds.
     pub tau: f64,
+    /// A measured curve to hold each word to, at the decoded level.
+    pub against: Option<String>,
 }
 
 /// One stated gain, and where it was stated.
@@ -168,6 +182,17 @@ pub fn run(options: Options) -> Result<()> {
         );
     }
 
+    let against = match options.against.as_deref() {
+        None => None,
+        Some("wide") => Some(hz_analysis::drc::WIDE),
+        Some("stereo") => Some(hz_analysis::drc::STEREO),
+        Some(other) => {
+            return Err(Error::unsupported(
+                &options.input,
+                format!("no measured curve called {other}; wide or stereo"),
+            ));
+        }
+    };
     if let Some(audio) = &options.audio {
         curve(
             &words,
@@ -175,7 +200,13 @@ pub fn run(options: Options) -> Result<()> {
             options.channels,
             options.substream,
             options.tau,
+            against,
         )?;
+    } else if against.is_some() {
+        return Err(Error::unsupported(
+            &options.input,
+            "--against needs the decoded presentation, with --audio",
+        ));
     }
 
     // The whole point of the summary: a gain that never moves is not a
@@ -227,6 +258,7 @@ fn curve(
     channels: usize,
     substream: usize,
     tau_ms: f64,
+    against: Option<hz_analysis::drc::Measured>,
 ) -> Result<()> {
     const UNIT: usize = 40;
     let bytes = std::fs::read(audio).map_err(|e| Error::io(audio, e))?;
@@ -268,6 +300,10 @@ fn curve(
     for (unit, into) in level.iter_mut().enumerate() {
         held += alpha * (power[unit] - held);
         *into = held;
+    }
+
+    if let Some(measured) = against {
+        against_curve(words, &level, substream, measured);
     }
 
     let mut pairs: Vec<(f64, f64)> = words
@@ -335,6 +371,63 @@ fn curve(
         edge += 3.0;
     }
     Ok(())
+}
+
+/// How far a substream's words are from a measured curve at the level decoded
+/// beside them, and at which offset they are closest.
+///
+/// A word stated at unit `u` is compared with the curve at the level of unit
+/// `u + offset`. At an offset of nought that is the word a decoder applies
+/// from `u` against what the curve asks for there. The offset that minimises
+/// the error says which unit's level the word really answers to: positive
+/// means the word was decided on a later unit's level, and so arrived early.
+fn against_curve(
+    words: &[Word],
+    level: &[f64],
+    substream: usize,
+    measured: hz_analysis::drc::Measured,
+) {
+    /// Offsets tried either side, in units: two restart intervals.
+    const REACH: i64 = 256;
+    let mine: Vec<&Word> = words.iter().filter(|w| w.substream == substream).collect();
+    let error_at = |offset: i64| -> Option<(f64, f64, usize)> {
+        let (mut sum, mut squares, mut count) = (0.0, 0.0, 0usize);
+        for word in &mine {
+            let at = word.unit as i64 + offset;
+            if at < 0 || at as usize >= level.len() {
+                continue;
+            }
+            let wanted = measured.gain_db(10.0 * level[at as usize].max(1e-12).log10());
+            let error = gain_db(word.gain) - wanted;
+            sum += error;
+            squares += error * error;
+            count += 1;
+        }
+        (count > 0).then(|| (sum / count as f64, (squares / count as f64).sqrt(), count))
+    };
+    let Some((mean, rms, count)) = error_at(0) else {
+        println!("  against      no word lands inside the decoded audio");
+        return;
+    };
+    let (best, best_rms) = (-REACH..=REACH)
+        .filter_map(|offset| error_at(offset).map(|(_, rms, _)| (offset, rms)))
+        .fold((0, f64::INFINITY), |(o, r), (offset, rms)| {
+            if rms < r { (offset, rms) } else { (o, r) }
+        });
+    println!();
+    println!(
+        "  against      {}, over {count} words of substream {substream}: {mean:+.2} dB mean, \
+         {rms:.2} dB rms at the unit each is stated on",
+        measured.name
+    );
+    println!(
+        "               closest {best:+} units {}: {best_rms:.2} dB rms",
+        match best {
+            0 => "away, which is on time".to_string(),
+            b if b > 0 => format!("ahead ({:.0} ms early)", b as f64 * 40.0 / 48.0),
+            b => format!("behind ({:.0} ms late)", -b as f64 * 40.0 / 48.0),
+        }
+    );
 }
 
 /// The field is sixty-fourths of a power of two.

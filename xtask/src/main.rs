@@ -439,6 +439,12 @@ enum Command {
         /// The level detector's time constant, in milliseconds.
         #[arg(long, value_name = "MS", default_value_t = 700.0)]
         tau: f64,
+
+        /// Hold each word to a measured curve at the decoded level — `wide`
+        /// or `stereo` — and find the offset in units at which they agree
+        /// best. Needs `--audio`.
+        #[arg(long, value_name = "CURVE")]
+        against: Option<String>,
     },
 
     /// Read a TrueHD stream's structure and check its integrity.
@@ -729,6 +735,7 @@ fn main() -> ExitCode {
             channels,
             substream,
             tau,
+            against,
         } => drc::run(drc::Options {
             input,
             each,
@@ -737,6 +744,7 @@ fn main() -> ExitCode {
             channels,
             substream,
             tau,
+            against,
         }),
         Command::Thd {
             input,
