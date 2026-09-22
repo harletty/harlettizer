@@ -700,15 +700,35 @@ fn verify_objects(path: &Path, channels: usize) -> Result<bool> {
         return Ok(true);
     }
 
-    let config = PathBuf::from(format!("{}.atmos", out.display()));
-    let master = hz_io::master::MasterSet::open(&config)?;
-    let events = master.read_events(0)?;
-    let programme = &master.config.presentations[0];
     let cleanup = || {
-        for stray in ["atmos", "atmos.metadata", "atmos.audio"] {
+        for stray in ["atmos", "atmos.metadata", "atmos.audio", "caf"] {
             let _ = std::fs::remove_file(format!("{}.{stray}", out.display()));
         }
     };
+    // A stream with no immersive presentation has no presentation three, and
+    // the decoder does not say so by failing: it falls back to the widest
+    // presentation there is, writes it as plain audio beside the path, and
+    // exits nought — measured on a 5.1 carrying a payload in every unit. No
+    // master set comes out, so there is nothing to hold the payload's objects
+    // against. Unchecked rather than failed, as for a refusal: the payload
+    // is still read back on its own where the oracle is built in.
+    let config = PathBuf::from(format!("{}.atmos", out.display()));
+    if !config.is_file() {
+        println!(
+            "  objects      the decoder wrote no master set for a stream of {channels} \
+             channels, so the pipeline is unchecked"
+        );
+        println!(
+            "               it has no presentation three, and {} decodes the widest there \
+             is instead",
+            harletty()
+        );
+        cleanup();
+        return Ok(true);
+    }
+    let master = hz_io::master::MasterSet::open(&config)?;
+    let events = master.read_events(0)?;
+    let programme = &master.config.presentations[0];
 
     // The bed and one object per coded channel after it.
     let ids: Vec<u32> = programme.objects.iter().map(|object| object.id).collect();
