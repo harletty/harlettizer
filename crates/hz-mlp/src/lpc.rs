@@ -74,9 +74,49 @@ pub fn fit(samples: &[f64], max_order: usize) -> Predictors {
 /// "this signal has no structure" and turns the whole predictor off. Chunking
 /// has no size to get wrong.
 fn correlate(samples: &[f64], out: &mut [f64]) {
-    /// Windowed samples held at once. Every call from the filter search is
-    /// shorter than this, so the loop below runs once; longer ones are
-    /// correct, not fast.
+    /// The longest block taken with every lag at once. The filter search fits
+    /// over its context and the block, at most 512 and 160 samples, so every
+    /// call from it is shorter than this.
+    const AT_ONCE: usize = 1024;
+
+    let n = samples.len();
+    let max_lag = out.len().saturating_sub(1);
+    if n == 0 || n > AT_ONCE || max_lag > MAX_ORDER {
+        correlate_chunked(samples, out);
+        return;
+    }
+    let centre = (n as f64 - 1.0) / 2.0;
+
+    // Every lag at once.
+    //
+    // Lag by lag, each sum is one chain of additions, and a chain runs at the
+    // speed of one addition's latency however wide the machine is. Walked
+    // position by position with an accumulator per lag, the nine chains run
+    // side by side. Each still takes **its own terms in its own order**:
+    // ascending position, and the terms a lag reaches before the signal
+    // starts are products with the zeroes in front of it, which add nothing —
+    // nought plus either nought is nought, and they all come before the first
+    // real term. So every sum is the one [`correlate_chunked`] makes, to the
+    // bit, and so is every predictor and every stream.
+    let mut buffer = [0.0f64; MAX_ORDER + AT_ONCE];
+    for (index, slot) in buffer[MAX_ORDER..MAX_ORDER + n].iter_mut().enumerate() {
+        let offset = (index as f64 - centre) / (centre + 1.0);
+        *slot = samples[index] * (1.0 - offset * offset);
+    }
+    let mut sums = [0.0f64; MAX_ORDER + 1];
+    for position in MAX_ORDER..MAX_ORDER + n {
+        let here = buffer[position];
+        for (lag, sum) in sums.iter_mut().enumerate() {
+            *sum += here * buffer[position - lag];
+        }
+    }
+    out.copy_from_slice(&sums[..out.len()]);
+}
+
+/// [`correlate`] a chunk at a time and a lag at a time, for a block longer
+/// than it takes at once.
+fn correlate_chunked(samples: &[f64], out: &mut [f64]) {
+    /// Windowed samples held at once.
     const CHUNK: usize = 512;
 
     out.fill(0.0);
@@ -328,6 +368,39 @@ mod tests {
                 "{} samples correlated to nothing",
                 samples.len()
             );
+        }
+    }
+
+    /// Every lag at once makes the same sums, to the bit, as a chunk at a
+    /// time and a lag at a time — at every length the filter search asks
+    /// for, across the chunk's seam, and past what is taken at once.
+    #[test]
+    fn every_lag_at_once_is_the_same_to_the_bit() {
+        let mut state = 0x2545_f491u32;
+        for n in [1usize, 2, 8, 9, 40, 511, 512, 513, 552, 672, 1024, 1025] {
+            for scale in [1.0f64, 1e-6, 8.0e6] {
+                let samples: Vec<f64> = (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        (f64::from(state as i32) / f64::from(i32::MAX)) * scale
+                    })
+                    .collect();
+                for lags in 1..=MAX_ORDER + 1 {
+                    let mut fast = vec![0.0f64; lags];
+                    correlate(&samples, &mut fast);
+                    let mut slow = vec![0.0f64; lags];
+                    correlate_chunked(&samples, &mut slow);
+                    for (lag, (a, b)) in fast.iter().zip(&slow).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{n} samples at {scale}, lag {lag}: {a} against {b}"
+                        );
+                    }
+                }
+            }
         }
     }
 
