@@ -1829,14 +1829,48 @@ that is the figure to hold a feature-length encode to.
 The reference pays nothing for the same constraint. Its stored channels are
 already decorrelated, and the correction is folded into the presentation rows
 it declares anyway, which it would declare regardless; its 7.1 substream
-carries eight rows and no coding matrix. Doing the same here means
-decorrelating the hierarchy's channels against the ones below them, putting
-the steps in the last substream's cascade, and recomputing the presentation
-rows over the decorrelated channels — which needs the rows to read channels
-below their own, which they cannot yet. That is the next thing to try on the
-size of a folded stream. `cargo xtask ffmpeg-check` holds every stream the
-harness writes to the limit, and the test tree's decoder reads no more than
-FFmpeg does.
+carries eight rows and no coding matrix. `cargo xtask ffmpeg-check` holds
+every stream the harness writes to the limit, and the test tree's decoder
+reads no more than FFmpeg does.
+
+### Decorrelating the hierarchy, one channel at a time
+
+The same idea, done here: each early channel has what the channels below it
+predict of it taken out, by a lifting step in the last substream's cascade —
+which has room — and the early substreams' rows are rewritten over what the
+channels then hold, at no extra rows. See `Encoder::decorrelate`.
+
+What it can be worth was measured first, with the steps forced in and the old
+rows left standing — narrow presentations that decode wrongly, and a size that
+is the coding gain alone:
+
+| | slice, `--cluster 12` | 31 min of an overlay |
+|---|---|---|
+| every step forced in | −5.5 % | −3.7 % |
+| a step kept only where the rows can still be written | **−1.56 %** | **−1.44 %** |
+| all the steps of an interval or none | −0.49 % | — |
+
+What stops the rest is not the order of the rows, which `rows_over` already
+chooses, but their size. The saving is the elements two channels share, and a
+channel with them taken out holds a small remainder: rebuilding a presentation
+from it takes coefficients of 30 to 130, where the field stops under two —
+mostly in the 5.1, and the 7.1 has no spare row to scale one up with. So each
+step is kept only if every presentation can still be written after it.
+
+Put down on the way: decorrelating only within a substream (+0.88 %, worse
+than nothing), and keeping the prediction orthogonal over the elements to what
+the channel holds, so that it keeps its size (no gain at all — the two cannot
+be had apart). The threshold a step has to clear is modelled from the raw
+energy, which predicts the coded cost badly; one step at a time, 500 bits and
+2 000 come to within 0.04 % of each other.
+
+Validated on the slice and on five minutes of an overlay: the elements byte
+for byte, every narrow presentation matching the one written without it to a
+correlation of 1.000000 and within 0.0004 dB, FFmpeg silent. With it, the
+slice folded with `--cluster 12` is 14 358 334 bytes: 1.068 of the reference,
+and folds cost 9.8 % over the fold-free stream. The rest, up to the 3.7 %,
+needs rows that can reach a small channel — a presentation's shifts per
+channel, which the reference states, are the next thing to try.
 
 ## The search that ran for minutes, and the reservation that ends it
 

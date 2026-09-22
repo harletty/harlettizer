@@ -535,6 +535,9 @@ pub struct Encoder {
     /// second directory word at all, which is two bytes an access unit saved
     /// over saying "still nothing".
     dynamic_range: [Option<DynamicRange>; MAX_SUBSTREAMS],
+    /// Whether a hierarchy's early channels are decorrelated — see
+    /// [`Encoder::decorrelate`]. On unless turned off.
+    decorrelation: bool,
     /// What to carry in the next access unit's extra data, and under which
     /// Evolution identifier. Held in one buffer that is refilled rather than
     /// reallocated, and emptied once written: object metadata belongs to the
@@ -753,6 +756,7 @@ impl Encoder {
             evolution_pending: false,
             protection: None,
             dynamic_range: [None; MAX_SUBSTREAMS],
+            decorrelation: true,
             since_range: [0; MAX_SUBSTREAMS],
             since_restart: 0,
             frames_written: 0,
@@ -856,6 +860,15 @@ impl Encoder {
         if substream < self.coded.substreams {
             self.dynamic_range[substream] = gain;
         }
+    }
+
+    /// Whether to decorrelate the early channels of a hierarchy of
+    /// presentations, which is on by default and changes nothing a decoder
+    /// hands back — only how much of the stream it takes. Off, the stream is
+    /// what it was before the decorrelation existed, which is what measuring
+    /// it needs.
+    pub fn set_decorrelation(&mut self, on: bool) {
+        self.decorrelation = on;
     }
 
     /// What a decoder stopping after `substream` hands back.
@@ -2281,9 +2294,41 @@ impl Encoder {
             return Err(Refusal::OverTheDomain);
         }
 
-        let mut rows = Vec::with_capacity(scaled.len() - 1);
-        let mut assignment = Vec::with_capacity(scaled.len() - 1);
-        let mut stated: Vec<Vec<u8>> = Vec::with_capacity(scaled.len() - 1);
+        let Some(written) = Self::presentation_rows(&cascade.held, &internal, elements, fold_log)
+        else {
+            return Err(Refusal::Unwritable);
+        };
+        let (steps, (rows, assignment, stated)) = self.decorrelate(
+            units,
+            shifts,
+            &element_of,
+            cascade.steps,
+            cascade.held,
+            &internal,
+            written,
+            fold_log,
+        );
+        Ok(Built {
+            steps,
+            rows,
+            assignment,
+            stated,
+            element_of,
+        })
+    }
+
+    /// Every early presentation's rows over what the channels hold, each at
+    /// whichever output shift takes the fewest; `None` if any cannot be
+    /// written.
+    fn presentation_rows(
+        held: &[Vec<f64>],
+        internal: &[crate::hierarchy::Presentation],
+        elements: usize,
+        fold_log: bool,
+    ) -> Option<PresentationRows> {
+        let mut rows = Vec::with_capacity(internal.len() - 1);
+        let mut assignment = Vec::with_capacity(internal.len() - 1);
+        let mut stated: Vec<Vec<u8>> = Vec::with_capacity(internal.len() - 1);
         for presentation in &internal[..internal.len() - 1] {
             // 🔴 A presentation's own shifts are **free**, and this is what the
             // reference's restating of them per substream is for. The encoder's
@@ -2306,7 +2351,7 @@ impl Encoder {
                 .filter_map(|state| {
                     let uniform = vec![state; elements];
                     crate::hierarchy::rows_over(
-                        &cascade.held,
+                        held,
                         presentation,
                         &uniform,
                         crate::hierarchy::PRESENTATION_BITS,
@@ -2325,18 +2370,191 @@ impl Encoder {
                         presentation.channels
                     );
                 }
-                return Err(Refusal::Unwritable);
+                return None;
             };
             rows.push(row);
             assignment.push(order);
         }
-        Ok(Built {
-            steps: cascade.steps,
-            rows,
-            assignment,
-            stated,
-            element_of,
-        })
+        Some((rows, assignment, stated))
+    }
+
+    /// Take out of each early channel what the channels below it predict of
+    /// it, where the presentations can still be written over what is left.
+    ///
+    /// # Why
+    ///
+    /// The hierarchy's channels overlap: the 5.1's centre is also in the
+    /// stereo pair, the 7.1's backs are in the 5.1's surrounds, and every one
+    /// of them is a mix of the same elements. Stored as they are, the codec
+    /// pays for the shared part twice. Coding matrices used to take it out —
+    /// until FFmpeg's limit of eight matrices a substream under restart sync
+    /// words A and B, which the 7.1's eight rows already fill, left them no
+    /// room in channels 0 to 7. That cost folded streams five per cent.
+    ///
+    /// The reference pays nothing for it, because its channels are stored
+    /// already decorrelated and the correction lives in rows it declares
+    /// anyway. This does the same: a lifting step per channel, in the last
+    /// substream's cascade, which has room, and the early substreams' rows
+    /// rewritten over the decorrelated channels, at no extra rows.
+    ///
+    /// # How
+    ///
+    /// Channel `k`, from one up to the widest early presentation, is fitted by
+    /// least squares over the interval to channels `0..k` as the cascade
+    /// stores them, and a step `x[k] += Σ w·x[j]` goes in front of the cascade
+    /// where the fit takes out more than [`DECORRELATION_BITS`]. A decoder
+    /// runs these steps first and in rising `k`, each reading channels already
+    /// restored; the encoder undoes them last and in falling `k`, each reading
+    /// channels it has not touched yet — the same sums either way, so the
+    /// round trip is exact.
+    ///
+    /// # Why one at a time
+    ///
+    /// A channel with its prediction taken out holds a small remainder, and
+    /// the rows that rebuild a presentation from it then ask for coefficients
+    /// far past the field's two: measured at 30 to 130, mostly in the 5.1, and
+    /// the 7.1 has no spare row to scale one up with. Taken all at once, the
+    /// steps left the rows writable in one interval in seven, for 0.5 % of the
+    /// stream. So each step is kept only if every presentation can still be
+    /// written after it, and the rest are skipped: 1.56 % on the programme
+    /// slice and 1.44 % on thirty-one minutes of an overlay, against 5.5 % and
+    /// 3.7 % had every step been writable.
+    ///
+    /// # Measured and put down
+    ///
+    /// - **Only from the channel's own substream**, which keeps the rows
+    ///   simpler: +0.88 %, worse than nothing.
+    /// - **A prediction kept orthogonal, over the elements, to what the
+    ///   channel holds**, so that it keeps its size and the rows stay small:
+    ///   no gain at all. The saving *is* the shared elements, which is what
+    ///   makes the remainder small; the two cannot be had apart.
+    /// - **The threshold** is not the modelled gain it looks like: the raw
+    ///   energy predicts the coded cost badly, and taken all at once the
+    ///   steps above 400 bits saved 2.0 % where those above 5 000 saved 5.5 %.
+    ///   One at a time, 500 and 2 000 come to within 0.04 % of each other.
+    #[allow(clippy::too_many_arguments)]
+    fn decorrelate(
+        &self,
+        units: &[Held],
+        shifts: &[u8],
+        element_of: &[usize],
+        steps: Vec<Primitive>,
+        held: Vec<Vec<f64>>,
+        internal: &[crate::hierarchy::Presentation],
+        written: PresentationRows,
+        fold_log: bool,
+    ) -> (Vec<Primitive>, PresentationRows) {
+        let upto = internal
+            .len()
+            .checked_sub(2)
+            .map_or(0, |widest| internal[widest].channels.min(self.channels));
+        let room = DECORRELATING_STEPS_AT_MOST.saturating_sub(steps.len());
+        if !self.decorrelation || upto < 2 || room == 0 {
+            return (steps, written);
+        }
+
+        // The Gram matrix of the stored channels over the interval.
+        let width = self.coded.frame_size;
+        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
+        let mut gram = vec![vec![0.0f64; upto]; upto];
+        let mut samples = 0usize;
+        for unit in units {
+            for (channel, plane) in scratch.iter_mut().enumerate() {
+                let element = element_of.get(channel).copied().unwrap_or(channel);
+                let shift = shifts.get(element).copied().unwrap_or(0);
+                for (frame, slot) in plane.iter_mut().enumerate() {
+                    *slot = if frame < unit.frames {
+                        unit.samples[frame * self.channels + element] >> shift
+                    } else {
+                        0
+                    };
+                }
+            }
+            for step in steps.iter().rev() {
+                crate::arrange::unapply_within(step, &mut scratch, width);
+            }
+            for frame in 0..unit.frames {
+                for i in 0..upto {
+                    let a = f64::from(scratch[i][frame]);
+                    for j in 0..=i {
+                        gram[i][j] += a * f64::from(scratch[j][frame]);
+                    }
+                }
+            }
+            samples += unit.frames;
+        }
+        for i in 0..upto {
+            for j in 0..i {
+                gram[j][i] = gram[i][j];
+            }
+        }
+
+        let mut decorrelating = Vec::new();
+        let mut holds = held.clone();
+        let mut best = None;
+        for k in 1..upto {
+            if decorrelating.len() >= room {
+                break;
+            }
+            let before = gram[k][k];
+            if before <= 0.0 {
+                continue;
+            }
+            let Some(weights) = least_squares(&gram, k) else {
+                continue;
+            };
+            let explained: f64 = weights.iter().zip(&gram[k][..k]).map(|(w, g)| w * g).sum();
+            let after = (before - explained).max(before * 1e-9);
+            if 0.5 * (before / after).log2() * (samples as f64) < DECORRELATION_BITS {
+                continue;
+            }
+            let mut gains = vec![0.0f64; self.channels];
+            gains[k] = 1.0;
+            gains[..k].copy_from_slice(&weights);
+            let Some(step) = Primitive::rounded(k, &gains, crate::matrix::FRACTION) else {
+                continue;
+            };
+            // What the channel holds once the step's prediction is taken out,
+            // at the coefficients the stream will carry — against what each
+            // source holds *before* any step, since the step reads it
+            // restored.
+            let mut remainder = holds[k].clone();
+            for (j, source) in held.iter().enumerate().take(k) {
+                let w = f64::from(step.coefficients[j]) / f64::from(crate::matrix::UNITY);
+                if w != 0.0 {
+                    for (into, from) in remainder.iter_mut().zip(source) {
+                        *into -= w * from;
+                    }
+                }
+            }
+            let kept = std::mem::replace(&mut holds[k], remainder);
+            match Self::presentation_rows(&holds, internal, self.channels, false) {
+                Some(rows) => {
+                    decorrelating.push(step);
+                    best = Some(rows);
+                }
+                None => holds[k] = kept,
+            }
+        }
+        let Some(rows) = best else {
+            return (steps, written);
+        };
+
+        // And whether the codec's domain holds what they leave, which is run
+        // rather than reasoned about for the same reason the cascade's is.
+        let count = decorrelating.len();
+        let mut candidate = decorrelating;
+        candidate.extend_from_slice(&steps);
+        if !self.the_cascade_fits(units, shifts, element_of, &candidate) {
+            if fold_log {
+                eprintln!("fold: decorrelating {count} channels leaves them over the domain");
+            }
+            return (steps, written);
+        }
+        if fold_log {
+            eprintln!("fold: {count} channels decorrelated");
+        }
+        (candidate, rows)
     }
 
     /// Choose the matrices for the interval this unit opens.
@@ -3028,6 +3246,56 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
     // The high bits mark it as a TrueHD shortening rather than a plain end of
     // stream; the low thirteen are the count.
     [END_OF_STREAM, u32::from(shorten_by & 0x1fff) | 0xe000]
+}
+
+/// Rows, output order and stated shifts of every early presentation.
+type PresentationRows = (Vec<Vec<Primitive>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// The most steps the last substream's cascade may take once it decorrelates,
+/// which leaves four of its sixteen for coding matrices.
+const DECORRELATING_STEPS_AT_MOST: usize = 12;
+
+/// What a decorrelating step has to take out of its channel over an interval,
+/// as the fit models it, in bits. See [`Encoder::decorrelate`] for what it is
+/// and is not.
+const DECORRELATION_BITS: f64 = 500.0;
+
+/// The weights that predict channel `k` from channels `0..k` by least squares,
+/// from their Gram matrix; `None` if the channels are too nearly dependent to
+/// say.
+fn least_squares(gram: &[Vec<f64>], k: usize) -> Option<Vec<f64>> {
+    let scale = (0..k).map(|i| gram[i][i]).fold(0.0f64, f64::max);
+    if scale <= 0.0 {
+        return None;
+    }
+    // The normal equations, with the right-hand side as a last column and a
+    // touch of ridge so that a silent channel does not make them singular.
+    let mut a: Vec<Vec<f64>> = (0..k)
+        .map(|i| {
+            let mut row = gram[i][..=k].to_vec();
+            row[i] += scale * 1e-9;
+            row
+        })
+        .collect();
+    for col in 0..k {
+        let pivot = (col..k).max_by(|x, y| a[*x][col].abs().total_cmp(&a[*y][col].abs()))?;
+        if a[pivot][col].abs() < scale * 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        for row in col + 1..k {
+            let factor = a[row][col] / a[col][col];
+            for c in col..=k {
+                a[row][c] -= factor * a[col][c];
+            }
+        }
+    }
+    let mut w = vec![0.0; k];
+    for i in (0..k).rev() {
+        let sum: f64 = (i + 1..k).map(|j| a[i][j] * w[j]).sum();
+        w[i] = (a[i][k] - sum) / a[i][i];
+    }
+    Some(w)
 }
 
 #[cfg(test)]
