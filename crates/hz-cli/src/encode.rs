@@ -1741,6 +1741,9 @@ pub fn run(config: Config) -> Result<()> {
                         let produced = produced?;
                         if let Some(presentations) = &produced.presentations {
                             encoder.set_presentations(presentations);
+                            if let Some(loudness) = &mut loudness {
+                                loudness.fold(presentations);
+                            }
                         }
                         let mut due = produced.payloads.into_iter();
                         let mut done = 0usize;
@@ -1827,6 +1830,9 @@ pub fn run(config: Config) -> Result<()> {
                     plain_presentations(&live, &parts, &mut fold_positions, &mut fold_stated)
                 {
                     encoder.set_presentations(&presentations);
+                    if let Some(loudness) = &mut loudness {
+                        loudness.fold(&presentations);
+                    }
                 }
                 folds_due = false;
             }
@@ -2303,35 +2309,50 @@ struct Produced {
     presentations: Option<Vec<Presentation>>,
 }
 
-/// Hand one access unit to the encoder and write what comes back.
-///
-/// The last unit of a stream is short and is *kept*: the format pads it and
-/// marks how many of its samples to throw away, which is what `finish` writes.
 /// What each presentation states, and the detector that decides it.
 ///
 /// One detector per presentation, held across the whole stream: the level a
 /// measured curve answers to is a leaky integral over about 700 ms, which is
 /// twenty-six access units, so it cannot be recomputed per unit from nothing.
 ///
-/// # Which curve, and why not the steeper one
+/// # What level, and which curve
 ///
-/// [`hz_analysis::drc::STEREO`] is the curve reference streams state for their
-/// two-channel presentation, and it is much steeper than the wide one — that
-/// gap is what a downmix costs, since the fewer the channels the more the sum
-/// needs holding back. **It is not stated here**, because this encoder's
-/// narrow presentations are not downmixes: a decoder stopping after
-/// substream 0 gets the first two channels as they were written, not a fold
-/// of all of them. The reference computes its folds from dense matrices this
-/// encoder does not yet write — see `PLAN.md` — and until it does, stating a
-/// downmix's curve would compress for a summation that never happened.
+/// **The level is the one a decoder stopping at that presentation plays.**
+/// Where the stream carries folds, that is the fold — every element through
+/// the presentation's rows — and not the leading elements, which is what the
+/// narrow presentations were before there were folds to carry. Reading the
+/// leading elements then measured two quiet objects for a stereo that sums
+/// twelve, and the word boosted where the reference cuts: on the programme
+/// slice a constant +1.13 dB, 2.67 dB above what the stereo curve asks for at
+/// the level a decoder actually hands back.
 ///
-/// So every presentation gets [`hz_analysis::drc::WIDE`], driven by its own
-/// level. The moment the presentation matrices land, the narrow ones should
-/// take the curve that was measured for them.
+/// **The curve is the one shipped streams state for that presentation.**
+/// [`hz_analysis::drc::STEREO`] for a two-channel fold: much steeper than the
+/// wide one, because the fewer the channels the more the sum needs holding
+/// back. [`hz_analysis::drc::WIDE`] for everything wider, which is also what
+/// shipped streams state for their six-channel presentation, and for a
+/// two-channel presentation that is not a fold — a copy of two elements has
+/// had no summation to hold back.
+///
+/// # When the word is stated, and why that is early
+///
+/// The encoder holds a restart interval before writing it and states the word
+/// as it stands when the interval is complete, so a word answers to the level
+/// at the end of its interval: up to 107 ms ahead of the unit it is stated
+/// on. That is what shipped streams do too — their words match the level 80 to
+/// 120 ms ahead best, measured with `cargo xtask drc --against` on two
+/// reference streams — so it is kept.
 struct Loudness {
     detectors: Vec<hz_analysis::drc::Level>,
     /// How many channels each presentation carries, cumulative.
     widths: Vec<usize>,
+    /// The narrow presentations' rows over the elements, the latest the
+    /// stream was handed, where it carries folds; empty where it does not.
+    /// Refilled in place, so that restating the folds allocates nothing once
+    /// the rows exist.
+    folds: Vec<Vec<Vec<f64>>>,
+    /// One frame of the fold being measured, reused.
+    folded: Vec<f64>,
 }
 
 impl Loudness {
@@ -2342,15 +2363,48 @@ impl Loudness {
                 .map(|_| hz_analysis::drc::Level::new(rate))
                 .collect(),
             widths: widths.to_vec(),
+            folds: Vec::new(),
+            folded: Vec::new(),
+        }
+    }
+
+    /// The presentations the stream was just handed. The narrow ones are what
+    /// their levels are measured through from now on; the widest is the
+    /// elements, which are measured as they are.
+    fn fold(&mut self, presentations: &[Presentation]) {
+        let narrow = presentations.len().saturating_sub(1);
+        self.folds.resize_with(narrow, Vec::new);
+        for (into, presentation) in self.folds.iter_mut().zip(presentations) {
+            into.clone_from(&presentation.rows);
         }
     }
 
     /// Feed one access unit and state what each presentation now asks for.
+    fn state(&mut self, encoder: &mut Encoder, unit: &[i32], elements: usize, frames: usize) {
+        let mut gains = [None; hz_mlp::format::MAX_SUBSTREAMS];
+        self.measure(unit, elements, frames, &mut gains);
+        for (substream, gain) in gains.iter().enumerate() {
+            if let Some(word) =
+                gain.and_then(|gain| hz_mlp::format::DynamicRange::from_db(gain, DRC_REFRESH))
+            {
+                encoder.set_dynamic_range(substream, Some(word));
+            }
+        }
+    }
+
+    /// Feed one access unit, and say in decibels what each presentation now
+    /// asks for.
     ///
     /// The power is summed over the presentation's channels and averaged over
     /// the unit, which is how the curve was measured and so how it has to be
     /// fed.
-    fn state(&mut self, encoder: &mut Encoder, unit: &[i32], elements: usize, frames: usize) {
+    fn measure(
+        &mut self,
+        unit: &[i32],
+        elements: usize,
+        frames: usize,
+        gains: &mut [Option<f64>; hz_mlp::format::MAX_SUBSTREAMS],
+    ) {
         if frames == 0 {
             return;
         }
@@ -2360,21 +2414,47 @@ impl Loudness {
                 continue;
             }
             let mut power = 0.0f64;
-            for frame in 0..frames {
-                for channel in 0..width {
-                    let value = f64::from(unit[frame * elements + channel]) / FULL_SCALE;
-                    power += value * value;
+            let curve = match self.folds.get(substream) {
+                Some(rows) if !rows.is_empty() => {
+                    self.folded.resize(rows.len(), 0.0);
+                    for frame in unit.chunks_exact(elements).take(frames) {
+                        self.folded.fill(0.0);
+                        for (out, row) in self.folded.iter_mut().zip(rows) {
+                            for (gain, sample) in row.iter().zip(frame) {
+                                *out += gain * f64::from(*sample);
+                            }
+                        }
+                        for value in &self.folded {
+                            let value = value / FULL_SCALE;
+                            power += value * value;
+                        }
+                    }
+                    if rows.len() == 2 {
+                        hz_analysis::drc::STEREO
+                    } else {
+                        hz_analysis::drc::WIDE
+                    }
                 }
-            }
+                _ => {
+                    for frame in 0..frames {
+                        for channel in 0..width {
+                            let value = f64::from(unit[frame * elements + channel]) / FULL_SCALE;
+                            power += value * value;
+                        }
+                    }
+                    hz_analysis::drc::WIDE
+                }
+            };
             let level = self.detectors[substream].feed(power / frames as f64);
-            let gain = hz_analysis::drc::WIDE.gain_db(level);
-            if let Some(word) = hz_mlp::format::DynamicRange::from_db(gain, DRC_REFRESH) {
-                encoder.set_dynamic_range(substream, Some(word));
-            }
+            gains[substream] = Some(curve.gain_db(level));
         }
     }
 }
 
+/// Hand one access unit to the encoder and write what comes back.
+///
+/// The last unit of a stream is short and is *kept*: the format pads it and
+/// marks how many of its samples to throw away, which is what `finish` writes.
 fn emit(
     encoder: &mut Encoder,
     stream: &mut impl Write,
@@ -4354,6 +4434,99 @@ mod tests {
             }
         }
         assert!(reached >= 3, "the centre reached a channel of every fold");
+    }
+
+    /// With folds, a narrow presentation's word answers to the fold's level
+    /// through the curve measured for it — the stereo curve for two channels,
+    /// the wide one above — and not to the leading elements. Here the leading
+    /// two elements are silent and the rest loud, so reading them would ask
+    /// for the wide curve's boost where the fold is loud enough to cut.
+    #[test]
+    fn a_folds_word_answers_to_the_fold_through_its_own_curve() {
+        const ELEMENTS: usize = 12;
+        const FRAMES: usize = 40;
+        let rate = 48_000.0 / FRAMES as f64;
+        // Every element into both channels of the stereo, and each of six
+        // channels taking two elements.
+        let stereo = Presentation {
+            channels: 2,
+            rows: vec![vec![0.3; ELEMENTS]; 2],
+        };
+        let surround = Presentation {
+            channels: 6,
+            rows: (0..6)
+                .map(|channel| {
+                    let mut row = vec![0.0; ELEMENTS];
+                    row[2 * channel] = 1.0;
+                    row[2 * channel + 1] = 1.0;
+                    row
+                })
+                .collect(),
+        };
+        let identity = |channels: usize| Presentation {
+            channels,
+            rows: (0..channels)
+                .map(|channel| {
+                    let mut row = vec![0.0; ELEMENTS];
+                    row[channel] = 1.0;
+                    row
+                })
+                .collect(),
+        };
+        let presentations = [stereo, surround, identity(8), identity(ELEMENTS)];
+        let widths = [2, 6, 8, ELEMENTS];
+
+        // The leading two elements silent, the rest a constant at a tenth of
+        // full scale.
+        let level = 0.1 * FULL_SCALE;
+        let mut unit = vec![0i32; FRAMES * ELEMENTS];
+        for frame in unit.chunks_exact_mut(ELEMENTS) {
+            for sample in &mut frame[2..] {
+                *sample = level as i32;
+            }
+        }
+        let sample = f64::from(level as i32) / FULL_SCALE;
+
+        let settle = |loudness: &mut Loudness| {
+            let mut gains = [None; hz_mlp::format::MAX_SUBSTREAMS];
+            for _ in 0..2_000 {
+                loudness.measure(&unit, ELEMENTS, FRAMES, &mut gains);
+            }
+            gains
+        };
+        // What a detector fed a constant power settles at, through a curve.
+        let settled = |power: f64, curve: hz_analysis::drc::Measured| {
+            let mut detector = hz_analysis::drc::Level::new(rate);
+            let mut level = 0.0;
+            for _ in 0..2_000 {
+                level = detector.feed(power);
+            }
+            curve.gain_db(level)
+        };
+
+        let mut folded = Loudness::new(&widths, rate);
+        folded.fold(&presentations);
+        let gains = settle(&mut folded);
+        // Stereo: each channel is 0.3 of ten loud elements.
+        let stereo_power = 2.0 * (0.3 * 10.0 * sample).powi(2);
+        let wanted = settled(stereo_power, hz_analysis::drc::STEREO);
+        assert!(
+            (gains[0].unwrap() - wanted).abs() < 1e-9,
+            "{:?} against {wanted}",
+            gains[0]
+        );
+        assert!(wanted < 0.0, "a fold this loud is cut, not boosted");
+        // Six channels: the first silent, five carrying two loud elements.
+        let surround_power = 5.0 * (2.0 * sample).powi(2);
+        let wanted = settled(surround_power, hz_analysis::drc::WIDE);
+        assert!((gains[1].unwrap() - wanted).abs() < 1e-9);
+
+        // Without folds, the leading elements and the wide curve, as a stream
+        // whose narrow presentations are copies of them plays.
+        let mut copied = Loudness::new(&widths, rate);
+        let gains = settle(&mut copied);
+        assert!((gains[0].unwrap() - settled(0.0, hz_analysis::drc::WIDE)).abs() < 1e-9);
+        assert!(gains[0].unwrap() > 0.0, "two silent elements are boosted");
     }
 
     /// **The other half of the point.** What an overlay writes for the
