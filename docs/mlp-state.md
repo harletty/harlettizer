@@ -44,12 +44,16 @@ A restarting unit is two blocks — the unpredicted eight, then the rest. Every
 other unit is one.
 
 `Encoder::push` takes one access unit and returns **nothing** for the first 127
-of every 128; the 128th returns the whole interval at once. That is the API,
-not an implementation detail: everything decided per interval — the matrices,
-each channel's second filter, `max_shift`, `max_output_bits` — is decided on
-the interval it applies to, which has to exist first. `finish` takes a last,
-possibly short, unit and flushes what is held; with nothing it just flushes. A
-caller appends what it is given either way. Latency: 128 units.
+of every 128; the 128th returns a whole interval at once — **the one before**.
+That is the API, not an implementation detail: everything decided per interval
+— the matrices, each channel's second filter, `max_shift`, `max_output_bits` —
+is decided on the interval it applies to, which has to exist first; and an
+interval's folds are worked out while the interval before it is written, which
+with folds took a quarter of an encode off the clock (the programme slice
+1.96 s to 1.48 s, five minutes of an overlay 19.4 s to 14.3 s, byte for byte
+the same). `finish` takes a last, possibly short, unit
+and hands back everything not yet handed back. A caller appends what it is
+given either way. Latency: 256 units.
 
 ## What is written, and what is left unsaid
 

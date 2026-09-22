@@ -266,6 +266,23 @@ impl Threads {
     fn new(_channels: usize) -> Self {
         Self
     }
+
+    /// `f` over every item, on the pool where there is one, in the items'
+    /// order either way — so that whatever is decided from the results is
+    /// decided the same as it would be one at a time.
+    #[cfg(feature = "parallel")]
+    fn map<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+        use rayon::prelude::*;
+        match &self.0 {
+            Some(pool) => pool.install(|| items.par_iter().map(f).collect()),
+            None => items.iter().map(f).collect(),
+        }
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn map<T, R>(&self, items: &[T], f: impl Fn(&T) -> R) -> Vec<R> {
+        items.iter().map(f).collect()
+    }
 }
 
 /// What one access unit says about itself, decided before it is written.
@@ -498,7 +515,10 @@ pub struct Encoder {
     /// What each channel's search decided, this unit and in the unpredicted
     /// block of a restarting one. Held rather than returned so that spreading
     /// Where the per-channel search runs.
-    threads: Threads,
+    threads: std::sync::Arc<Threads>,
+    /// The interval that is complete and not yet written — see
+    /// [`Encoder::advance`].
+    deferred: Option<Deferred>,
     /// The interval prepared for coding: per channel, every unit's samples
     /// with the dead bits off and the matrices applied, one after another.
     prepared: Vec<Vec<i32>>,
@@ -732,7 +752,8 @@ impl Encoder {
             permutation: (0..config.channels).collect(),
             phase_times: [std::time::Duration::ZERO; 8],
             timed: std::env::var_os("HZ_TIME").is_some(),
-            threads: Threads::new(config.channels),
+            threads: std::sync::Arc::new(Threads::new(config.channels)),
+            deferred: None,
             prepared: vec![Vec::new(); config.channels],
             prepared_shifts: Vec::new(),
             prepared_checks: Vec::new(),
@@ -974,10 +995,14 @@ impl Encoder {
     /// The encoder holds an interval before it writes one, because the
     /// decisions that stand for an interval — the matrices, the second filter
     /// each channel carries — are better made on the interval they will be
-    /// applied to than on the one before it. So all but one push in
-    /// [`RESTART_INTERVAL`] hands back nothing and the last hands back the
-    /// lot; a caller appends what it is given either way, which is what every
-    /// caller already did.
+    /// applied to than on the one before it. And it writes an interval only
+    /// once the next one is complete too, so that the next one's folds are
+    /// worked out while this one is written — see [`Encoder::advance`]. So all
+    /// but one push in [`RESTART_INTERVAL`] hands back nothing and the last
+    /// hands back the lot *of the interval before*; the first interval's
+    /// bytes come with the second's last push, and [`Encoder::finish`] hands
+    /// back what is left. A caller appends what it is given either way, which
+    /// is what every caller already did.
     pub fn push(&mut self, interleaved: &[i32]) -> Vec<u8> {
         assert_eq!(
             interleaved.len(),
@@ -986,7 +1011,7 @@ impl Encoder {
         );
         self.hold(interleaved, self.coded.frame_size, 0);
         if self.pending.len() as u64 == RESTART_INTERVAL {
-            self.flush()
+            self.advance()
         } else {
             Vec::new()
         }
@@ -1022,7 +1047,9 @@ impl Encoder {
     ///
     /// An empty tail writes nothing: a stream whose length is a whole number
     /// of units is already finished, and a unit that is entirely padding
-    /// decodes to no samples and makes a decoder say so.
+    /// decodes to no samples and makes a decoder say so. What it hands back
+    /// is everything not yet handed back — the interval [`Encoder::push`] was
+    /// holding back, and the last one.
     ///
     /// # Panics
     /// If `interleaved` is longer than one unit.
@@ -1035,7 +1062,10 @@ impl Encoder {
         if frames > 0 {
             self.hold(interleaved, frames, self.coded.frame_size - frames);
         }
-        let out = self.flush();
+        let mut out = self.advance();
+        if let Some(last) = self.deferred.take() {
+            out.extend_from_slice(&self.write_interval(last));
+        }
         if self.timed {
             let names = [
                 "build", "copy", "suggest", "prepare", "matrices", "second", "interval", "write",
@@ -1066,34 +1096,107 @@ impl Encoder {
         out
     }
 
-    /// Write everything being held.
+    /// An interval is complete: decide what it will be while the one before
+    /// it is written, and hand that one back.
     ///
-    /// One interval at a time, so the decisions that stand for an interval are
-    /// made on it. A final flush may be short, which is the only time an
-    /// interval is not [`RESTART_INTERVAL`] units long.
-    fn flush(&mut self) -> Vec<u8> {
+    /// # Why an interval late
+    ///
+    /// Deciding an interval's folds is a search over its own samples and
+    /// nothing else, and with folds it was a quarter of an encode, on one
+    /// thread, between writing one interval and deciding the next. Done beside
+    /// the writing of the interval before, it costs no time at all; the price
+    /// is that [`Encoder::push`] hands back each interval when the one after
+    /// it is complete rather than when it is, and [`Encoder::finish`] hands
+    /// back the last two. The stream is byte for byte the same: every interval
+    /// is decided from the same samples and the same request, and written with
+    /// the dynamic range the caller had asked for when it was complete.
+    fn advance(&mut self) -> Vec<u8> {
         let held = std::mem::take(&mut self.pending);
         if held.is_empty() {
             return Vec::new();
         }
-        // Everything an interval's restart header describes is settled here
-        // and nowhere else, and in this order: what the presentations are,
-        // then the shifts they will be written in, then the cascade that puts
-        // them in the channels. Before anything reads the interval, because
-        // what the interval *is* — which element each channel carries, and
-        // whether the channels are elements at all — is what this decides.
+        // What an interval's restart header describes is decided from what
+        // was asked for when it is complete, and before anything reads it.
         // 🔴 The coding matrices used to be suggested on the elements and then
         // costed on the hierarchy, and found nothing: every weight was fitted
         // to a signal the channel no longer carried.
-        if self.since_restart == 0 {
-            if let Some(next) = self.waiting.take() {
-                self.wants = next;
-            }
-            self.timed_phase(0, |encoder| {
-                encoder.settle_the_shifts(&held);
-                encoder.build_the_presentations(&held);
-            });
+        if self.since_restart == 0
+            && let Some(next) = self.waiting.take()
+        {
+            self.wants = next;
         }
+        let planning = self.planning();
+        let dynamic_range = self.dynamic_range;
+        let (planning, out) = match self.deferred.take() {
+            None => (planning.plan(&held), Vec::new()),
+            Some(previous) => std::thread::scope(|scope| {
+                let next = scope.spawn(|| planning.plan(&held));
+                let out = self.write_interval(previous);
+                (
+                    next.join().expect("deciding an interval does not panic"),
+                    out,
+                )
+            }),
+        };
+        self.deferred = Some(Deferred {
+            held,
+            planning,
+            dynamic_range,
+        });
+        out
+    }
+
+    /// A [`Planning`] for the next interval, with what it reads.
+    fn planning(&self) -> Planning {
+        Planning {
+            wants: self.wants.clone(),
+            channels: self.channels,
+            coded: FrameSize {
+                frame_size: self.coded.frame_size,
+            },
+            decorrelation: self.decorrelation,
+            threads: std::sync::Arc::clone(&self.threads),
+            interval_shift: None,
+            arrangement: Vec::new(),
+            presentations: Vec::new(),
+            assignment: Vec::new(),
+            presentation_shift: Vec::new(),
+            permutation: Vec::new(),
+            stats: Stats::default(),
+            took: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Take what was decided for an interval about to be written.
+    fn take_the_plan(&mut self, planning: Planning) {
+        self.interval_shift = planning.interval_shift;
+        self.arrangement = planning.arrangement;
+        self.presentations = planning.presentations;
+        self.assignment = planning.assignment;
+        self.presentation_shift = planning.presentation_shift;
+        self.permutation = planning.permutation;
+        self.stats.folds_asked += planning.stats.folds_asked;
+        self.stats.folds_carried += planning.stats.folds_carried;
+        self.stats.folds_over_the_domain += planning.stats.folds_over_the_domain;
+        if self.timed {
+            self.phase_times[0] += planning.took;
+        }
+    }
+
+    /// Write an interval that is complete and decided.
+    fn write_interval(&mut self, deferred: Deferred) -> Vec<u8> {
+        let Deferred {
+            held,
+            planning,
+            dynamic_range,
+        } = deferred;
+        if self.since_restart == 0 {
+            self.take_the_plan(planning);
+        }
+        // The dynamic range as it stood when the interval was complete, which
+        // is what writing it then would have stated; what the caller has asked
+        // for since is the next interval's, and goes back after.
+        let live = std::mem::replace(&mut self.dynamic_range, dynamic_range);
         self.timed_phase(3, |encoder| encoder.prepare(&held));
         self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
         self.timed_phase(6, |encoder| encoder.decide_interval(held.len()));
@@ -1114,6 +1217,7 @@ impl Encoder {
         // The buffers go back rather than being dropped: an interval is a
         // megabyte or so at sixteen channels and there is one of them a third
         // of a second.
+        self.dynamic_range = live;
         self.spare.extend(held);
         out
     }
@@ -1969,386 +2073,12 @@ impl Encoder {
             .for_each(|(channel, mode)| body(channel, mode));
     }
 
-    /// Does everything this interval stores stay inside the codec's domain?
-    ///
-    /// The samples as they will really be written: shifted down by what the
-    /// interval settled on, then with the cascade taken off. Anything outside
-    /// twenty-four bits is a stream a decoder refuses, so the arrangement is
-    /// dropped and the interval written without folds.
-    fn the_cascade_fits(
-        &self,
-        units: &[Held],
-        shifts: &[u8],
-        element_of: &[usize],
-        steps: &[Primitive],
-    ) -> bool {
-        let width = self.coded.frame_size;
-        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
-        for unit in units {
-            for (channel, plane) in scratch.iter_mut().enumerate() {
-                let element = element_of.get(channel).copied().unwrap_or(channel);
-                let shift = shifts.get(element).copied().unwrap_or(0);
-                for (frame, slot) in plane.iter_mut().enumerate().take(width) {
-                    let sample = if frame < unit.frames {
-                        unit.samples[frame * self.channels + element]
-                    } else {
-                        0
-                    };
-                    *slot = sample >> shift;
-                }
-            }
-            for step in steps.iter().rev() {
-                crate::arrange::unapply_within(step, &mut scratch, width);
-            }
-            if scratch.iter().any(|plane| {
-                plane
-                    .iter()
-                    .any(|sample| !(-DOMAIN..DOMAIN).contains(sample))
-            }) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// The shifts this interval will hold, or none where it holds none.
-    ///
-    /// The smallest any of its units offers, per channel, because a shift is
-    /// only free if every unit really has those bits — take one unit's four
-    /// and a later unit with two loses two of the programme.
-    fn settle_the_shifts(&mut self, held: &[Held]) {
-        self.interval_shift = None;
-        if self.wants.is_empty() {
-            return;
-        }
-        let mut shifts = vec![crate::frame::MAX_OUTPUT_SHIFT; self.channels];
-        let mut said = vec![false; self.channels];
-        for unit in held {
-            for (channel, shift) in shifts.iter_mut().enumerate() {
-                let mut bits = 0u32;
-                for frame in 0..unit.frames {
-                    let sample = unit.samples[frame * self.channels + channel];
-                    if sample != 0 {
-                        bits |= sample.unsigned_abs();
-                    }
-                }
-                if bits != 0 {
-                    said[channel] = true;
-                    *shift = (*shift)
-                        .min((bits.trailing_zeros() as u8).min(crate::frame::MAX_OUTPUT_SHIFT));
-                }
-            }
-        }
-        // A channel that is silent all interval has nothing to say about it.
-        for (channel, shift) in shifts.iter_mut().enumerate() {
-            if !said[channel] {
-                *shift = 0;
-            }
-        }
-        self.interval_shift = Some(shifts);
-    }
-
-    /// Build the arrangement and the rows each substream declares.
-    ///
-    /// 🔴 In the units the shifts make. A channel shifted down by three and one
-    /// shifted down by four are not the same units, so a row mixing them has to
-    /// carry the ratio — which is what the reference's own rows do, and what
-    /// gives its amplifying matrices the headroom they need. Written over the
-    /// elements, presentation `j`'s row wants `2^(s_e - s_j)` of element `e`.
-    ///
-    /// Everything is cleared where it cannot be done, so the stream is written
-    /// without folds rather than written wrong.
-    fn build_the_presentations(&mut self, units: &[Held]) {
-        self.arrangement.clear();
-        self.presentations.clear();
-        self.assignment.clear();
-        self.presentation_shift.clear();
-        self.permutation = (0..self.channels).collect();
-        if self.wants.is_empty() {
-            return;
-        }
-        self.stats.folds_asked += 1;
-        let Some(shifts) = self.interval_shift.clone() else {
-            return;
-        };
-
-        // 🔴 Per channel first, and a common shift if that cannot be written.
-        //
-        // A row whose destination is shifted by nothing and whose sources are
-        // shifted by four has to ask for sixteen times what it wants, and the
-        // field holds under two — measured at 136 on a real programme. The
-        // reference does not have that problem because it **restates the
-        // shifts in every substream**, so each presentation is written in units
-        // that suit it: its stereo substream says `[3, 4]` for the same two
-        // channels its 5.1 substream says `[3, 2]` for.
-        //
-        // This encoder states one set for the whole unit, so where the shifts
-        // spread too far to write it takes the smallest of them for every
-        // channel — which costs the dead bits the others had, and is what a
-        // programme with one unrounded channel among rounded ones ends up
-        // paying until the shifts are stated per substream.
-        if let Ok(built) = self.try_to_build(units, &shifts) {
-            self.take_what_was_built(built);
-            return;
-        }
-        let least = shifts
-            .iter()
-            .take(self.channels)
-            .copied()
-            .min()
-            .unwrap_or(0);
-        let common = vec![least; shifts.len()];
-        match self.try_to_build(units, &common) {
-            Ok(built) => {
-                self.interval_shift = Some(common);
-                self.take_what_was_built(built);
-            }
-            Err(Refusal::OverTheDomain) => self.stats.folds_over_the_domain += 1,
-            Err(Refusal::Unwritable) => {}
-        }
-    }
-
-    /// Keep what a build produced.
-    fn take_what_was_built(&mut self, built: Built) {
-        self.stats.folds_carried += 1;
-        if std::env::var_os("HZ_FOLD").is_some() {
-            eprintln!(
-                "fold: built, {} steps, presentations {:?} rows, stated shifts {:?}",
-                built.steps.len(),
-                built.rows.iter().map(Vec::len).collect::<Vec<_>>(),
-                built
-                    .stated
-                    .iter()
-                    .map(|s| s.first().copied())
-                    .collect::<Vec<_>>()
-            );
-        }
-        self.arrangement = built.steps;
-        self.presentations = built.rows;
-        self.assignment = built.assignment;
-        self.presentation_shift = built.stated;
-        // The elements go into the internal channels the cascade was built
-        // for, the shifts settled per element follow them there, and the last
-        // substream says which output each internal channel is so a full
-        // decode hands the elements back in order.
-        if let Some(shifts) = &self.interval_shift {
-            let permuted: Vec<u8> = built
-                .element_of
-                .iter()
-                .map(|element| shifts.get(*element).copied().unwrap_or(0))
-                .collect();
-            self.interval_shift = Some(permuted);
-        }
-        self.assignment.push(
-            built
-                .element_of
-                .iter()
-                .map(|element| *element as u8)
-                .collect(),
-        );
-        self.permutation = built.element_of;
-    }
-
-    /// The arrangement and the declared rows, in the units these shifts make.
-    ///
-    /// Written over the elements, a presentation's row wants `2^s[e]` of
-    /// element `e` — a channel shifted down by four is in units sixteen times
-    /// smaller, so a row that wants a quarter of it has to ask for four. The
-    /// destination's own shift is the other half of the ratio and belongs to
-    /// whichever internal channel ends up computing the row, which the
-    /// factorisation decides, so it goes in there.
-    fn try_to_build(&self, units: &[Held], shifts: &[u8]) -> Result<Built, Refusal> {
-        let elements = self.channels;
-        let scaled: Vec<crate::hierarchy::Presentation> = self
-            .wants
-            .iter()
-            .map(|presentation| crate::hierarchy::Presentation {
-                channels: presentation.channels,
-                rows: presentation
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .enumerate()
-                            .map(|(element, gain)| {
-                                gain * f64::from(shifts.get(element).copied().unwrap_or(0)).exp2()
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        // How loud each element is over the interval, as bits: what a channel
-        // holding it raw costs, and half of what decides where it goes.
-        let loudness: Vec<f64> = (0..elements)
-            .map(|element| {
-                let mut sum = 0.0f64;
-                let mut count = 0usize;
-                for unit in units {
-                    for frame in 0..unit.frames {
-                        let sample = f64::from(
-                            unit.samples[frame * self.channels + element]
-                                >> shifts.get(element).copied().unwrap_or(0),
-                        );
-                        sum += sample * sample;
-                        count += 1;
-                    }
-                }
-                (sum / count.max(1) as f64).sqrt().max(1.0).log2()
-            })
-            .collect();
-
-        // Which element goes in which internal channel — see
-        // [`crate::arrange::place_elements`] for what it optimises. The
-        // hierarchy is built once to learn its shape, which channels are
-        // slots no fold row takes among it; the matching then decides every
-        // channel's element at once, hosts and slots together; and the
-        // hierarchy is built again with the slots' elements first, so that
-        // is what fills them. Everything below is over internal channels.
-        let sketch = crate::hierarchy::build(&scaled, elements).ok_or(Refusal::Unwritable)?;
-        let channel_of = crate::arrange::place_elements(
-            &sketch.rows,
-            &sketch.within,
-            elements,
-            &loudness,
-            &sketch.filled,
-        );
-        let mut element_of = vec![usize::MAX; elements];
-        for (element, channel) in channel_of.iter().enumerate() {
-            if *channel >= elements || element_of[*channel] != usize::MAX {
-                return Err(Refusal::Unwritable);
-            }
-            element_of[*channel] = element;
-        }
-        let mut prefer: Vec<usize> = (0..elements)
-            .filter(|channel| sketch.filled.get(*channel).copied().unwrap_or(false))
-            .map(|channel| element_of[channel])
-            .collect();
-        let rest: Vec<usize> = (0..elements)
-            .filter(|element| !prefer.contains(element))
-            .collect();
-        prefer.extend(rest);
-        let built = crate::hierarchy::build_preferring(&scaled, elements, &prefer)
-            .ok_or(Refusal::Unwritable)?;
-        if built.within != sketch.within || built.filled != sketch.filled {
-            return Err(Refusal::Unwritable);
-        }
-        let rows: Vec<Vec<f64>> = built
-            .rows
-            .iter()
-            .map(|row| crate::arrange::through(row, &channel_of))
-            .collect();
-        let internal: Vec<crate::hierarchy::Presentation> = scaled
-            .iter()
-            .map(|presentation| crate::hierarchy::Presentation {
-                channels: presentation.channels,
-                rows: presentation
-                    .rows
-                    .iter()
-                    .map(|row| crate::arrange::through(row, &channel_of))
-                    .collect(),
-            })
-            .collect();
-
-        let fold_log = std::env::var_os("HZ_FOLD").is_some();
-        let Some(cascade) = crate::arrange::arrange(&rows, &built.within, elements) else {
-            if fold_log {
-                eprintln!("fold: no cascade hosts the rows, shifts {shifts:?}");
-            }
-            return Err(Refusal::Unwritable);
-        };
-        if fold_log {
-            eprintln!(
-                "fold: loudness {:?}\n      element_of {:?}\n      hosts {:?} scales {:?}\n      {} steps, amplification {:.2}x",
-                loudness
-                    .iter()
-                    .map(|l| (l * 10.0).round() / 10.0)
-                    .collect::<Vec<_>>(),
-                element_of,
-                cascade.hosts,
-                cascade
-                    .scales
-                    .iter()
-                    .map(|s| (s * 1000.0).round() / 1000.0)
-                    .collect::<Vec<_>>(),
-                cascade.steps.len(),
-                cascade.amplification()
-            );
-        }
-        // 🔴 And whether the coded domain can hold it, which is **run** rather
-        // than reasoned about. A cascade stores more than it was given — see
-        // [`crate::arrange::Arrangement::amplification`] — and a decoder
-        // enforces twenty-four bits by refusing the stream outright.
-        //
-        // The dead bits are the headroom and each channel has its own, so what
-        // a channel really stores is what the arithmetic makes of this
-        // interval's own samples. Bounding it instead means bounding a sum of
-        // magnitudes, which assumes every element peaks at once and in step:
-        // measured at 3.16x full scale on a programme whose cascade fits with
-        // room to spare. The encoder is holding the samples; it can just look.
-        if !self.the_cascade_fits(units, shifts, &element_of, &cascade.steps) {
-            if fold_log {
-                eprintln!("fold: the cascade does not fit the codec's domain");
-            }
-            return Err(Refusal::OverTheDomain);
-        }
-
-        // How loud each early presentation's fold gets over the interval, in
-        // the samples a decoder hands back — what a presentation's shifts
-        // have to leave room for.
-        let peaks: Vec<Vec<f64>> = self.wants[..self.wants.len().saturating_sub(1)]
-            .iter()
-            .map(|presentation| {
-                presentation
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        let mut peak = 0.0f64;
-                        for unit in units {
-                            for frame in unit.samples.chunks_exact(elements).take(unit.frames) {
-                                let value: f64 = row
-                                    .iter()
-                                    .zip(frame)
-                                    .map(|(gain, sample)| gain * f64::from(*sample))
-                                    .sum();
-                                peak = peak.max(value.abs());
-                            }
-                        }
-                        peak
-                    })
-                    .collect()
-            })
-            .collect();
-        let Some(written) =
-            Self::presentation_rows(&cascade.held, &internal, elements, fold_log, false, &peaks)
-        else {
-            return Err(Refusal::Unwritable);
-        };
-        let (steps, (rows, assignment, stated)) = self.decorrelate(
-            units,
-            shifts,
-            &element_of,
-            cascade.steps,
-            cascade.held,
-            &internal,
-            written,
-            &peaks,
-            fold_log,
-        );
-        Ok(Built {
-            steps,
-            rows,
-            assignment,
-            stated,
-            element_of,
-        })
-    }
-
     /// Every early presentation's rows over what the channels hold, each at
     /// whichever output shift takes the fewest; `None` if any cannot be
     /// written.
+    #[allow(clippy::too_many_arguments)]
     fn presentation_rows(
+        threads: &Threads,
         held: &[Vec<f64>],
         internal: &[crate::hierarchy::Presentation],
         elements: usize,
@@ -2383,24 +2113,10 @@ impl Encoder {
             // [`crate::hierarchy::rows_over_choosing_shifts`]. The two are
             // weighed on the rows first and then on the largest shift, the
             // precision the presentation gives up.
-            let uniform = (0..=crate::frame::MAX_OUTPUT_SHIFT).filter_map(|state| {
-                crate::hierarchy::rows_over(
-                    held,
-                    presentation,
-                    &vec![state; elements],
-                    crate::hierarchy::PRESENTATION_BITS,
-                )
-                .map(|(rows, order)| (rows, order, vec![state; presentation.channels]))
-            });
-            let chosen = crate::hierarchy::rows_over_choosing_shifts(
-                held,
-                presentation,
-                crate::hierarchy::PRESENTATION_BITS,
-            )
-            .map(|(rows, order, mut shifts)| {
-                shifts.resize(presentation.channels, 0);
-                (rows, order, shifts)
-            });
+            // Every candidate is written and judged on its own, so they are
+            // written and judged side by side, and then chosen from in the
+            // order they were always tried in: the per-channel shifts first,
+            // then one shift for every channel from nought up.
             //
             // 🔴 And only as precise as a fold has to be: a coefficient's
             // rounding comes out scaled up by its channel's shift, so a large
@@ -2411,7 +2127,6 @@ impl Encoder {
             // none is, the rows are what one shift for every channel wrote
             // before, unless `strict`, which is how a decorrelating step asks
             // whether it can be afforded.
-            let candidates: Vec<_> = chosen.into_iter().chain(uniform).collect();
             //
             // 🔴 And the shift has to leave the fold room at its loudest. A
             // channel's output is its row's result shifted up, so it is
@@ -2430,15 +2145,42 @@ impl Encoder {
                     peak + f64::from(*shift + 1).exp2() + FOLD_MARGIN < FULL_SCALE
                 })
             };
-            let precise: Vec<_> = candidates
-                .iter()
-                .filter(|(rows, order, shifts)| {
-                    fits(order, shifts)
-                        && presentation_error(held, presentation, rows, order, shifts)
-                            <= PRESENTATION_PRECISION
-                })
-                .cloned()
+            let tries: Vec<Option<u8>> = std::iter::once(None)
+                .chain((0..=crate::frame::MAX_OUTPUT_SHIFT).map(Some))
                 .collect();
+            let written = threads.map(&tries, |shift| {
+                let candidate = match shift {
+                    None => crate::hierarchy::rows_over_choosing_shifts(
+                        held,
+                        presentation,
+                        crate::hierarchy::PRESENTATION_BITS,
+                    )
+                    .map(|(rows, order, mut shifts)| {
+                        shifts.resize(presentation.channels, 0);
+                        (rows, order, shifts)
+                    }),
+                    Some(state) => crate::hierarchy::rows_over(
+                        held,
+                        presentation,
+                        &vec![*state; elements],
+                        crate::hierarchy::PRESENTATION_BITS,
+                    )
+                    .map(|(rows, order)| (rows, order, vec![*state; presentation.channels])),
+                }?;
+                let (rows, order, shifts) = &candidate;
+                let precise = fits(order, shifts)
+                    && presentation_error(held, presentation, rows, order, shifts)
+                        <= PRESENTATION_PRECISION;
+                Some((candidate, precise))
+            });
+            let mut candidates = Vec::with_capacity(written.len());
+            let mut precise = Vec::new();
+            for (candidate, is_precise) in written.into_iter().flatten() {
+                if is_precise {
+                    precise.push(candidate.clone());
+                }
+                candidates.push(candidate);
+            }
             let pool = if !precise.is_empty() {
                 precise
             } else if strict {
@@ -2471,193 +2213,6 @@ impl Encoder {
             assignment.push(order);
         }
         Some((rows, assignment, stated))
-    }
-
-    /// Take out of each early channel what the channels below it predict of
-    /// it, where the presentations can still be written over what is left.
-    ///
-    /// # Why
-    ///
-    /// The hierarchy's channels overlap: the 5.1's centre is also in the
-    /// stereo pair, the 7.1's backs are in the 5.1's surrounds, and every one
-    /// of them is a mix of the same elements. Stored as they are, the codec
-    /// pays for the shared part twice. Coding matrices used to take it out —
-    /// until FFmpeg's limit of eight matrices a substream under restart sync
-    /// words A and B, which the 7.1's eight rows already fill, left them no
-    /// room in channels 0 to 7. That cost folded streams five per cent.
-    ///
-    /// The reference pays nothing for it, because its channels are stored
-    /// already decorrelated and the correction lives in rows it declares
-    /// anyway. This does the same: a lifting step per channel, in the last
-    /// substream's cascade, which has room, and the early substreams' rows
-    /// rewritten over the decorrelated channels, at no extra rows.
-    ///
-    /// # How
-    ///
-    /// Channel `k`, from one up to the widest early presentation, is fitted by
-    /// least squares over the interval to channels `0..k` as the cascade
-    /// stores them, and a step `x[k] += Σ w·x[j]` goes in front of the cascade
-    /// where the fit takes out more than [`DECORRELATION_BITS`]. A decoder
-    /// runs these steps first and in rising `k`, each reading channels already
-    /// restored; the encoder undoes them last and in falling `k`, each reading
-    /// channels it has not touched yet — the same sums either way, so the
-    /// round trip is exact.
-    ///
-    /// # Why one at a time
-    ///
-    /// A channel with its prediction taken out holds a small remainder, and
-    /// the rows that rebuild a presentation from it then ask for coefficients
-    /// far past the field's two: measured at 30 to 130, mostly in the 5.1, and
-    /// the 7.1 has no spare row to scale one up with. Taken all at once, the
-    /// steps left the rows writable in one interval in seven, for 0.5 % of the
-    /// stream. So each step is kept only if every presentation can still be
-    /// written after it, and the rest are skipped.
-    ///
-    /// What made most of them writable is a shift per presentation channel —
-    /// see [`crate::hierarchy::rows_over_choosing_shifts`] — which says a row
-    /// asking for a hundred at a hundred-and-twenty-eighth of its size. With a
-    /// shift for every channel alike this came to 1.56 % of the programme
-    /// slice; with one per channel, and held to the precision and the room
-    /// at full scale a fold needs, 2.7 %, against 5.5 % had every step been
-    /// writable.
-    ///
-    /// # Measured and put down
-    ///
-    /// - **Only from the channel's own substream**, which keeps the rows
-    ///   simpler: +0.88 %, worse than nothing.
-    /// - **A prediction kept orthogonal, over the elements, to what the
-    ///   channel holds**, so that it keeps its size and the rows stay small:
-    ///   no gain at all. The saving *is* the shared elements, which is what
-    ///   makes the remainder small; the two cannot be had apart.
-    /// - **The threshold** is not the modelled gain it looks like: the raw
-    ///   energy predicts the coded cost badly, and a step it rates at a few
-    ///   hundred bits can cost more than it saves. On the slice, with a shift
-    ///   per channel and before the precision was held: 500 bits 1.6 %, 2 000
-    ///   3.0 %, **5 000 4.0 %**, 10 000 3.7 %, 20 000 2.8 %.
-    #[allow(clippy::too_many_arguments)]
-    fn decorrelate(
-        &self,
-        units: &[Held],
-        shifts: &[u8],
-        element_of: &[usize],
-        steps: Vec<Primitive>,
-        held: Vec<Vec<f64>>,
-        internal: &[crate::hierarchy::Presentation],
-        written: PresentationRows,
-        peaks: &[Vec<f64>],
-        fold_log: bool,
-    ) -> (Vec<Primitive>, PresentationRows) {
-        let upto = internal
-            .len()
-            .checked_sub(2)
-            .map_or(0, |widest| internal[widest].channels.min(self.channels));
-        let room = DECORRELATING_STEPS_AT_MOST.saturating_sub(steps.len());
-        if !self.decorrelation || upto < 2 || room == 0 {
-            return (steps, written);
-        }
-
-        // The Gram matrix of the stored channels over the interval.
-        let width = self.coded.frame_size;
-        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
-        let mut gram = vec![vec![0.0f64; upto]; upto];
-        let mut samples = 0usize;
-        for unit in units {
-            for (channel, plane) in scratch.iter_mut().enumerate() {
-                let element = element_of.get(channel).copied().unwrap_or(channel);
-                let shift = shifts.get(element).copied().unwrap_or(0);
-                for (frame, slot) in plane.iter_mut().enumerate() {
-                    *slot = if frame < unit.frames {
-                        unit.samples[frame * self.channels + element] >> shift
-                    } else {
-                        0
-                    };
-                }
-            }
-            for step in steps.iter().rev() {
-                crate::arrange::unapply_within(step, &mut scratch, width);
-            }
-            for frame in 0..unit.frames {
-                for i in 0..upto {
-                    let a = f64::from(scratch[i][frame]);
-                    for j in 0..=i {
-                        gram[i][j] += a * f64::from(scratch[j][frame]);
-                    }
-                }
-            }
-            samples += unit.frames;
-        }
-        for i in 0..upto {
-            for j in 0..i {
-                gram[j][i] = gram[i][j];
-            }
-        }
-
-        let mut decorrelating = Vec::new();
-        let mut holds = held.clone();
-        let mut best = None;
-        for k in 1..upto {
-            if decorrelating.len() >= room {
-                break;
-            }
-            let before = gram[k][k];
-            if before <= 0.0 {
-                continue;
-            }
-            let Some(weights) = least_squares(&gram, k) else {
-                continue;
-            };
-            let explained: f64 = weights.iter().zip(&gram[k][..k]).map(|(w, g)| w * g).sum();
-            let after = (before - explained).max(before * 1e-9);
-            if 0.5 * (before / after).log2() * (samples as f64) < DECORRELATION_BITS {
-                continue;
-            }
-            let mut gains = vec![0.0f64; self.channels];
-            gains[k] = 1.0;
-            gains[..k].copy_from_slice(&weights);
-            let Some(step) = Primitive::rounded(k, &gains, crate::matrix::FRACTION) else {
-                continue;
-            };
-            // What the channel holds once the step's prediction is taken out,
-            // at the coefficients the stream will carry — against what each
-            // source holds *before* any step, since the step reads it
-            // restored.
-            let mut remainder = holds[k].clone();
-            for (j, source) in held.iter().enumerate().take(k) {
-                let w = f64::from(step.coefficients[j]) / f64::from(crate::matrix::UNITY);
-                if w != 0.0 {
-                    for (into, from) in remainder.iter_mut().zip(source) {
-                        *into -= w * from;
-                    }
-                }
-            }
-            let kept = std::mem::replace(&mut holds[k], remainder);
-            match Self::presentation_rows(&holds, internal, self.channels, false, true, peaks) {
-                Some(rows) => {
-                    decorrelating.push(step);
-                    best = Some(rows);
-                }
-                None => holds[k] = kept,
-            }
-        }
-        let Some(rows) = best else {
-            return (steps, written);
-        };
-
-        // And whether the codec's domain holds what they leave, which is run
-        // rather than reasoned about for the same reason the cascade's is.
-        let count = decorrelating.len();
-        let mut candidate = decorrelating;
-        candidate.extend_from_slice(&steps);
-        if !self.the_cascade_fits(units, shifts, element_of, &candidate) {
-            if fold_log {
-                eprintln!("fold: decorrelating {count} channels leaves them over the domain");
-            }
-            return (steps, written);
-        }
-        if fold_log {
-            eprintln!("fold: {count} channels decorrelated");
-        }
-        (candidate, rows)
     }
 
     /// Choose the matrices for the interval this unit opens.
@@ -3351,6 +2906,636 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
     [END_OF_STREAM, u32::from(shorten_by & 0x1fff) | 0xe000]
 }
 
+/// What an interval's restart header will describe, decided from the interval
+/// alone: its shifts, the cascade that puts its folds in the channels, and the
+/// rows each early substream declares.
+///
+/// A thing of its own so that the next interval's can be worked out while this
+/// one is being written. It reads nothing the writing changes — what was asked
+/// for, the shape of the stream, and the interval's own samples — and the
+/// encoder takes what it decided just before writing the interval it is for.
+#[derive(Debug)]
+struct Planning {
+    wants: Vec<crate::hierarchy::Presentation>,
+    channels: usize,
+    coded: FrameSize,
+    decorrelation: bool,
+    threads: std::sync::Arc<Threads>,
+    interval_shift: Option<Vec<u8>>,
+    arrangement: Vec<Primitive>,
+    presentations: Vec<Vec<Primitive>>,
+    assignment: Vec<Vec<u8>>,
+    presentation_shift: Vec<Vec<u8>>,
+    permutation: Vec<usize>,
+    stats: Stats,
+    /// How long deciding took, for `HZ_TIME`.
+    took: std::time::Duration,
+}
+
+/// The one thing about the stream's shape [`Planning`] reads.
+#[derive(Debug, Clone, Copy)]
+struct FrameSize {
+    frame_size: usize,
+}
+
+/// An interval that is complete and not yet written: its units, what was
+/// decided for it, and the dynamic range the caller had asked for when it was
+/// complete — which is what writing it at once would have stated.
+#[derive(Debug)]
+struct Deferred {
+    held: Vec<Held>,
+    planning: Planning,
+    dynamic_range: [Option<DynamicRange>; MAX_SUBSTREAMS],
+}
+
+impl Planning {
+    /// Decide an interval.
+    fn plan(mut self, held: &[Held]) -> Self {
+        let start = std::time::Instant::now();
+        self.settle_the_shifts(held);
+        self.build_the_presentations(held);
+        self.took = start.elapsed();
+        self
+    }
+
+    /// The shifts this interval will hold, or none where it holds none.
+    ///
+    /// The smallest any of its units offers, per channel, because a shift is
+    /// only free if every unit really has those bits — take one unit's four
+    /// and a later unit with two loses two of the programme.
+    fn settle_the_shifts(&mut self, held: &[Held]) {
+        self.interval_shift = None;
+        if self.wants.is_empty() {
+            return;
+        }
+        let mut shifts = vec![crate::frame::MAX_OUTPUT_SHIFT; self.channels];
+        let mut said = vec![false; self.channels];
+        for unit in held {
+            for (channel, shift) in shifts.iter_mut().enumerate() {
+                let mut bits = 0u32;
+                for frame in 0..unit.frames {
+                    let sample = unit.samples[frame * self.channels + channel];
+                    if sample != 0 {
+                        bits |= sample.unsigned_abs();
+                    }
+                }
+                if bits != 0 {
+                    said[channel] = true;
+                    *shift = (*shift)
+                        .min((bits.trailing_zeros() as u8).min(crate::frame::MAX_OUTPUT_SHIFT));
+                }
+            }
+        }
+        // A channel that is silent all interval has nothing to say about it.
+        for (channel, shift) in shifts.iter_mut().enumerate() {
+            if !said[channel] {
+                *shift = 0;
+            }
+        }
+        self.interval_shift = Some(shifts);
+    }
+
+    /// Build the arrangement and the rows each substream declares.
+    ///
+    /// 🔴 In the units the shifts make. A channel shifted down by three and one
+    /// shifted down by four are not the same units, so a row mixing them has to
+    /// carry the ratio — which is what the reference's own rows do, and what
+    /// gives its amplifying matrices the headroom they need. Written over the
+    /// elements, presentation `j`'s row wants `2^(s_e - s_j)` of element `e`.
+    ///
+    /// Everything is cleared where it cannot be done, so the stream is written
+    /// without folds rather than written wrong.
+    fn build_the_presentations(&mut self, units: &[Held]) {
+        self.arrangement.clear();
+        self.presentations.clear();
+        self.assignment.clear();
+        self.presentation_shift.clear();
+        self.permutation = (0..self.channels).collect();
+        if self.wants.is_empty() {
+            return;
+        }
+        self.stats.folds_asked += 1;
+        let Some(shifts) = self.interval_shift.clone() else {
+            return;
+        };
+
+        // 🔴 Per channel first, and a common shift if that cannot be written.
+        //
+        // A row whose destination is shifted by nothing and whose sources are
+        // shifted by four has to ask for sixteen times what it wants, and the
+        // field holds under two — measured at 136 on a real programme. The
+        // reference does not have that problem because it **restates the
+        // shifts in every substream**, so each presentation is written in units
+        // that suit it: its stereo substream says `[3, 4]` for the same two
+        // channels its 5.1 substream says `[3, 2]` for.
+        //
+        // This encoder states one set for the whole unit, so where the shifts
+        // spread too far to write it takes the smallest of them for every
+        // channel — which costs the dead bits the others had, and is what a
+        // programme with one unrounded channel among rounded ones ends up
+        // paying until the shifts are stated per substream.
+        if let Ok(built) = self.try_to_build(units, &shifts) {
+            self.take_what_was_built(built);
+            return;
+        }
+        let least = shifts
+            .iter()
+            .take(self.channels)
+            .copied()
+            .min()
+            .unwrap_or(0);
+        let common = vec![least; shifts.len()];
+        match self.try_to_build(units, &common) {
+            Ok(built) => {
+                self.interval_shift = Some(common);
+                self.take_what_was_built(built);
+            }
+            Err(Refusal::OverTheDomain) => self.stats.folds_over_the_domain += 1,
+            Err(Refusal::Unwritable) => {}
+        }
+    }
+
+    /// Keep what a build produced.
+    fn take_what_was_built(&mut self, built: Built) {
+        self.stats.folds_carried += 1;
+        if std::env::var_os("HZ_FOLD").is_some() {
+            eprintln!(
+                "fold: built, {} steps, presentations {:?} rows, stated shifts {:?}",
+                built.steps.len(),
+                built.rows.iter().map(Vec::len).collect::<Vec<_>>(),
+                built
+                    .stated
+                    .iter()
+                    .map(|s| s.first().copied())
+                    .collect::<Vec<_>>()
+            );
+        }
+        self.arrangement = built.steps;
+        self.presentations = built.rows;
+        self.assignment = built.assignment;
+        self.presentation_shift = built.stated;
+        // The elements go into the internal channels the cascade was built
+        // for, the shifts settled per element follow them there, and the last
+        // substream says which output each internal channel is so a full
+        // decode hands the elements back in order.
+        if let Some(shifts) = &self.interval_shift {
+            let permuted: Vec<u8> = built
+                .element_of
+                .iter()
+                .map(|element| shifts.get(*element).copied().unwrap_or(0))
+                .collect();
+            self.interval_shift = Some(permuted);
+        }
+        self.assignment.push(
+            built
+                .element_of
+                .iter()
+                .map(|element| *element as u8)
+                .collect(),
+        );
+        self.permutation = built.element_of;
+    }
+
+    /// The arrangement and the declared rows, in the units these shifts make.
+    ///
+    /// Written over the elements, a presentation's row wants `2^s[e]` of
+    /// element `e` — a channel shifted down by four is in units sixteen times
+    /// smaller, so a row that wants a quarter of it has to ask for four. The
+    /// destination's own shift is the other half of the ratio and belongs to
+    /// whichever internal channel ends up computing the row, which the
+    /// factorisation decides, so it goes in there.
+    fn try_to_build(&self, units: &[Held], shifts: &[u8]) -> Result<Built, Refusal> {
+        let elements = self.channels;
+        let scaled: Vec<crate::hierarchy::Presentation> = self
+            .wants
+            .iter()
+            .map(|presentation| crate::hierarchy::Presentation {
+                channels: presentation.channels,
+                rows: presentation
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(element, gain)| {
+                                gain * f64::from(shifts.get(element).copied().unwrap_or(0)).exp2()
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        // How loud each element is over the interval, as bits: what a channel
+        // holding it raw costs, and half of what decides where it goes.
+        let loudness: Vec<f64> = (0..elements)
+            .map(|element| {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for unit in units {
+                    for frame in 0..unit.frames {
+                        let sample = f64::from(
+                            unit.samples[frame * self.channels + element]
+                                >> shifts.get(element).copied().unwrap_or(0),
+                        );
+                        sum += sample * sample;
+                        count += 1;
+                    }
+                }
+                (sum / count.max(1) as f64).sqrt().max(1.0).log2()
+            })
+            .collect();
+
+        // Which element goes in which internal channel — see
+        // [`crate::arrange::place_elements`] for what it optimises. The
+        // hierarchy is built once to learn its shape, which channels are
+        // slots no fold row takes among it; the matching then decides every
+        // channel's element at once, hosts and slots together; and the
+        // hierarchy is built again with the slots' elements first, so that
+        // is what fills them. Everything below is over internal channels.
+        let sketch = crate::hierarchy::build(&scaled, elements).ok_or(Refusal::Unwritable)?;
+        let channel_of = crate::arrange::place_elements(
+            &sketch.rows,
+            &sketch.within,
+            elements,
+            &loudness,
+            &sketch.filled,
+        );
+        let mut element_of = vec![usize::MAX; elements];
+        for (element, channel) in channel_of.iter().enumerate() {
+            if *channel >= elements || element_of[*channel] != usize::MAX {
+                return Err(Refusal::Unwritable);
+            }
+            element_of[*channel] = element;
+        }
+        let mut prefer: Vec<usize> = (0..elements)
+            .filter(|channel| sketch.filled.get(*channel).copied().unwrap_or(false))
+            .map(|channel| element_of[channel])
+            .collect();
+        let rest: Vec<usize> = (0..elements)
+            .filter(|element| !prefer.contains(element))
+            .collect();
+        prefer.extend(rest);
+        let built = crate::hierarchy::build_preferring(&scaled, elements, &prefer)
+            .ok_or(Refusal::Unwritable)?;
+        if built.within != sketch.within || built.filled != sketch.filled {
+            return Err(Refusal::Unwritable);
+        }
+        let rows: Vec<Vec<f64>> = built
+            .rows
+            .iter()
+            .map(|row| crate::arrange::through(row, &channel_of))
+            .collect();
+        let internal: Vec<crate::hierarchy::Presentation> = scaled
+            .iter()
+            .map(|presentation| crate::hierarchy::Presentation {
+                channels: presentation.channels,
+                rows: presentation
+                    .rows
+                    .iter()
+                    .map(|row| crate::arrange::through(row, &channel_of))
+                    .collect(),
+            })
+            .collect();
+
+        let fold_log = std::env::var_os("HZ_FOLD").is_some();
+        let Some(cascade) = crate::arrange::arrange(&rows, &built.within, elements) else {
+            if fold_log {
+                eprintln!("fold: no cascade hosts the rows, shifts {shifts:?}");
+            }
+            return Err(Refusal::Unwritable);
+        };
+        if fold_log {
+            eprintln!(
+                "fold: loudness {:?}\n      element_of {:?}\n      hosts {:?} scales {:?}\n      {} steps, amplification {:.2}x",
+                loudness
+                    .iter()
+                    .map(|l| (l * 10.0).round() / 10.0)
+                    .collect::<Vec<_>>(),
+                element_of,
+                cascade.hosts,
+                cascade
+                    .scales
+                    .iter()
+                    .map(|s| (s * 1000.0).round() / 1000.0)
+                    .collect::<Vec<_>>(),
+                cascade.steps.len(),
+                cascade.amplification()
+            );
+        }
+        // 🔴 And whether the coded domain can hold it, which is **run** rather
+        // than reasoned about. A cascade stores more than it was given — see
+        // [`crate::arrange::Arrangement::amplification`] — and a decoder
+        // enforces twenty-four bits by refusing the stream outright.
+        //
+        // The dead bits are the headroom and each channel has its own, so what
+        // a channel really stores is what the arithmetic makes of this
+        // interval's own samples. Bounding it instead means bounding a sum of
+        // magnitudes, which assumes every element peaks at once and in step:
+        // measured at 3.16x full scale on a programme whose cascade fits with
+        // room to spare. The encoder is holding the samples; it can just look.
+        if !self.the_cascade_fits(units, shifts, &element_of, &cascade.steps) {
+            if fold_log {
+                eprintln!("fold: the cascade does not fit the codec's domain");
+            }
+            return Err(Refusal::OverTheDomain);
+        }
+
+        // How loud each early presentation's fold gets over the interval, in
+        // the samples a decoder hands back — what a presentation's shifts
+        // have to leave room for.
+        let early = &self.wants[..self.wants.len().saturating_sub(1)];
+        let rows: Vec<&Vec<f64>> = early.iter().flat_map(|p| p.rows.iter()).collect();
+        let mut loudest = self
+            .threads
+            .map(&rows, |row| {
+                let mut peak = 0.0f64;
+                for unit in units {
+                    for frame in unit.samples.chunks_exact(elements).take(unit.frames) {
+                        let value: f64 = row
+                            .iter()
+                            .zip(frame)
+                            .map(|(gain, sample)| gain * f64::from(*sample))
+                            .sum();
+                        peak = peak.max(value.abs());
+                    }
+                }
+                peak
+            })
+            .into_iter();
+        let peaks: Vec<Vec<f64>> = early
+            .iter()
+            .map(|presentation| loudest.by_ref().take(presentation.rows.len()).collect())
+            .collect();
+        let Some(written) = Encoder::presentation_rows(
+            &self.threads,
+            &cascade.held,
+            &internal,
+            elements,
+            fold_log,
+            false,
+            &peaks,
+        ) else {
+            return Err(Refusal::Unwritable);
+        };
+        let (steps, (rows, assignment, stated)) = self.decorrelate(
+            units,
+            shifts,
+            &element_of,
+            cascade.steps,
+            cascade.held,
+            &internal,
+            written,
+            &peaks,
+            fold_log,
+        );
+        Ok(Built {
+            steps,
+            rows,
+            assignment,
+            stated,
+            element_of,
+        })
+    }
+
+    /// Does everything this interval stores stay inside the codec's domain?
+    ///
+    /// The samples as they will really be written: shifted down by what the
+    /// interval settled on, then with the cascade taken off. Anything outside
+    /// twenty-four bits is a stream a decoder refuses, so the arrangement is
+    /// dropped and the interval written without folds.
+    fn the_cascade_fits(
+        &self,
+        units: &[Held],
+        shifts: &[u8],
+        element_of: &[usize],
+        steps: &[Primitive],
+    ) -> bool {
+        let width = self.coded.frame_size;
+        // Each unit on its own: nothing carries from one to the next, and the
+        // answer is whether every one of them fits, which no order changes.
+        let fits = |unit: &Held| {
+            let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
+            for (channel, plane) in scratch.iter_mut().enumerate() {
+                let element = element_of.get(channel).copied().unwrap_or(channel);
+                let shift = shifts.get(element).copied().unwrap_or(0);
+                for (frame, slot) in plane.iter_mut().enumerate().take(width) {
+                    let sample = if frame < unit.frames {
+                        unit.samples[frame * self.channels + element]
+                    } else {
+                        0
+                    };
+                    *slot = sample >> shift;
+                }
+            }
+            for step in steps.iter().rev() {
+                crate::arrange::unapply_within(step, &mut scratch, width);
+            }
+            !scratch.iter().any(|plane| {
+                plane
+                    .iter()
+                    .any(|sample| !(-DOMAIN..DOMAIN).contains(sample))
+            })
+        };
+        self.threads.map(units, fits).into_iter().all(|fit| fit)
+    }
+
+    /// Take out of each early channel what the channels below it predict of
+    /// it, where the presentations can still be written over what is left.
+    ///
+    /// # Why
+    ///
+    /// The hierarchy's channels overlap: the 5.1's centre is also in the
+    /// stereo pair, the 7.1's backs are in the 5.1's surrounds, and every one
+    /// of them is a mix of the same elements. Stored as they are, the codec
+    /// pays for the shared part twice. Coding matrices used to take it out —
+    /// until FFmpeg's limit of eight matrices a substream under restart sync
+    /// words A and B, which the 7.1's eight rows already fill, left them no
+    /// room in channels 0 to 7. That cost folded streams five per cent.
+    ///
+    /// The reference pays nothing for it, because its channels are stored
+    /// already decorrelated and the correction lives in rows it declares
+    /// anyway. This does the same: a lifting step per channel, in the last
+    /// substream's cascade, which has room, and the early substreams' rows
+    /// rewritten over the decorrelated channels, at no extra rows.
+    ///
+    /// # How
+    ///
+    /// Channel `k`, from one up to the widest early presentation, is fitted by
+    /// least squares over the interval to channels `0..k` as the cascade
+    /// stores them, and a step `x[k] += Σ w·x[j]` goes in front of the cascade
+    /// where the fit takes out more than [`DECORRELATION_BITS`]. A decoder
+    /// runs these steps first and in rising `k`, each reading channels already
+    /// restored; the encoder undoes them last and in falling `k`, each reading
+    /// channels it has not touched yet — the same sums either way, so the
+    /// round trip is exact.
+    ///
+    /// # Why one at a time
+    ///
+    /// A channel with its prediction taken out holds a small remainder, and
+    /// the rows that rebuild a presentation from it then ask for coefficients
+    /// far past the field's two: measured at 30 to 130, mostly in the 5.1, and
+    /// the 7.1 has no spare row to scale one up with. Taken all at once, the
+    /// steps left the rows writable in one interval in seven, for 0.5 % of the
+    /// stream. So each step is kept only if every presentation can still be
+    /// written after it, and the rest are skipped.
+    ///
+    /// What made most of them writable is a shift per presentation channel —
+    /// see [`crate::hierarchy::rows_over_choosing_shifts`] — which says a row
+    /// asking for a hundred at a hundred-and-twenty-eighth of its size. With a
+    /// shift for every channel alike this came to 1.56 % of the programme
+    /// slice; with one per channel, and held to the precision and the room
+    /// at full scale a fold needs, 2.7 %, against 5.5 % had every step been
+    /// writable.
+    ///
+    /// # Measured and put down
+    ///
+    /// - **Only from the channel's own substream**, which keeps the rows
+    ///   simpler: +0.88 %, worse than nothing.
+    /// - **A prediction kept orthogonal, over the elements, to what the
+    ///   channel holds**, so that it keeps its size and the rows stay small:
+    ///   no gain at all. The saving *is* the shared elements, which is what
+    ///   makes the remainder small; the two cannot be had apart.
+    /// - **The threshold** is not the modelled gain it looks like: the raw
+    ///   energy predicts the coded cost badly, and a step it rates at a few
+    ///   hundred bits can cost more than it saves. On the slice, with a shift
+    ///   per channel and before the precision was held: 500 bits 1.6 %, 2 000
+    ///   3.0 %, **5 000 4.0 %**, 10 000 3.7 %, 20 000 2.8 %.
+    #[allow(clippy::too_many_arguments)]
+    fn decorrelate(
+        &self,
+        units: &[Held],
+        shifts: &[u8],
+        element_of: &[usize],
+        steps: Vec<Primitive>,
+        held: Vec<Vec<f64>>,
+        internal: &[crate::hierarchy::Presentation],
+        written: PresentationRows,
+        peaks: &[Vec<f64>],
+        fold_log: bool,
+    ) -> (Vec<Primitive>, PresentationRows) {
+        let upto = internal
+            .len()
+            .checked_sub(2)
+            .map_or(0, |widest| internal[widest].channels.min(self.channels));
+        let room = DECORRELATING_STEPS_AT_MOST.saturating_sub(steps.len());
+        if !self.decorrelation || upto < 2 || room == 0 {
+            return (steps, written);
+        }
+
+        // The Gram matrix of the stored channels over the interval.
+        let width = self.coded.frame_size;
+        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
+        let mut gram = vec![vec![0.0f64; upto]; upto];
+        let mut samples = 0usize;
+        for unit in units {
+            for (channel, plane) in scratch.iter_mut().enumerate() {
+                let element = element_of.get(channel).copied().unwrap_or(channel);
+                let shift = shifts.get(element).copied().unwrap_or(0);
+                for (frame, slot) in plane.iter_mut().enumerate() {
+                    *slot = if frame < unit.frames {
+                        unit.samples[frame * self.channels + element] >> shift
+                    } else {
+                        0
+                    };
+                }
+            }
+            for step in steps.iter().rev() {
+                crate::arrange::unapply_within(step, &mut scratch, width);
+            }
+            for frame in 0..unit.frames {
+                for i in 0..upto {
+                    let a = f64::from(scratch[i][frame]);
+                    for j in 0..=i {
+                        gram[i][j] += a * f64::from(scratch[j][frame]);
+                    }
+                }
+            }
+            samples += unit.frames;
+        }
+        for i in 0..upto {
+            for j in 0..i {
+                gram[j][i] = gram[i][j];
+            }
+        }
+
+        let mut decorrelating = Vec::new();
+        let mut holds = held.clone();
+        let mut best = None;
+        for k in 1..upto {
+            if decorrelating.len() >= room {
+                break;
+            }
+            let before = gram[k][k];
+            if before <= 0.0 {
+                continue;
+            }
+            let Some(weights) = least_squares(&gram, k) else {
+                continue;
+            };
+            let explained: f64 = weights.iter().zip(&gram[k][..k]).map(|(w, g)| w * g).sum();
+            let after = (before - explained).max(before * 1e-9);
+            if 0.5 * (before / after).log2() * (samples as f64) < DECORRELATION_BITS {
+                continue;
+            }
+            let mut gains = vec![0.0f64; self.channels];
+            gains[k] = 1.0;
+            gains[..k].copy_from_slice(&weights);
+            let Some(step) = Primitive::rounded(k, &gains, crate::matrix::FRACTION) else {
+                continue;
+            };
+            // What the channel holds once the step's prediction is taken out,
+            // at the coefficients the stream will carry — against what each
+            // source holds *before* any step, since the step reads it
+            // restored.
+            let mut remainder = holds[k].clone();
+            for (j, source) in held.iter().enumerate().take(k) {
+                let w = f64::from(step.coefficients[j]) / f64::from(crate::matrix::UNITY);
+                if w != 0.0 {
+                    for (into, from) in remainder.iter_mut().zip(source) {
+                        *into -= w * from;
+                    }
+                }
+            }
+            let kept = std::mem::replace(&mut holds[k], remainder);
+            match Encoder::presentation_rows(
+                &self.threads,
+                &holds,
+                internal,
+                self.channels,
+                false,
+                true,
+                peaks,
+            ) {
+                Some(rows) => {
+                    decorrelating.push(step);
+                    best = Some(rows);
+                }
+                None => holds[k] = kept,
+            }
+        }
+        let Some(rows) = best else {
+            return (steps, written);
+        };
+
+        // And whether the codec's domain holds what they leave, which is run
+        // rather than reasoned about for the same reason the cascade's is.
+        let count = decorrelating.len();
+        let mut candidate = decorrelating;
+        candidate.extend_from_slice(&steps);
+        if !self.the_cascade_fits(units, shifts, element_of, &candidate) {
+            if fold_log {
+                eprintln!("fold: decorrelating {count} channels leaves them over the domain");
+            }
+            return (steps, written);
+        }
+        if fold_log {
+            eprintln!("fold: {count} channels decorrelated");
+        }
+        (candidate, rows)
+    }
+}
+
 /// How far a presentation's rows, as written, land from what it asks for: the
 /// largest error over its outputs, each against the size of its own row, in
 /// the elements' coordinates.
@@ -3484,19 +3669,22 @@ mod tests {
                 .collect(),
         };
         let internal = [identity(2), identity(2)];
+        let threads = Threads::new(2);
 
         let quiet = [vec![0.0, 0.5 * FULL_SCALE]];
         let (_, _, stated) =
-            Encoder::presentation_rows(&held, &internal, 2, false, true, &quiet).expect("rows");
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, true, &quiet)
+                .expect("rows");
         assert_eq!(stated[0], [0, 6]);
 
         let loud = [vec![0.0, 0.9999 * FULL_SCALE]];
         assert!(
-            Encoder::presentation_rows(&held, &internal, 2, false, true, &loud).is_none(),
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, true, &loud).is_none(),
             "a step is refused rather than written to wrap"
         );
         let (_, _, stated) =
-            Encoder::presentation_rows(&held, &internal, 2, false, false, &loud).expect("rows");
+            Encoder::presentation_rows(&threads, &held, &internal, 2, false, false, &loud)
+                .expect("rows");
         assert!(
             stated[0].windows(2).all(|pair| pair[0] == pair[1]),
             "without the step, one shift for every channel as before: {:?}",
