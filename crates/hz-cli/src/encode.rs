@@ -1376,6 +1376,15 @@ pub fn run(config: Config) -> Result<()> {
         progress.at(0);
     }
 
+    // Without a fold the presentations follow the master's own elements, on
+    // the cadence a folding encode restates them at: once the elements have
+    // moved, and no more often than once a block. The encoder takes whichever
+    // it was last given at its next restart, so folds stated every unit would
+    // be thrown away all but once an interval.
+    let mut folds_due = carries_folds;
+    let mut fold_positions = Vec::with_capacity(parts.len());
+    let mut fold_stated = Vec::with_capacity(parts.len());
+
     match folded.as_mut() {
         // Folding, the span is read, mixed and turned into a payload on a
         // thread of its own, one span ahead of the writer.
@@ -1579,7 +1588,8 @@ pub fn run(config: Config) -> Result<()> {
                                 && carries_folds
                                 && let Some(positions) = fold.positions()
                             {
-                                presentations = presentations_of(positions, lfe_channel.is_some());
+                                presentations =
+                                    presentations_of(positions, None, lfe_channel.is_some());
                             }
 
                             Ok(spans
@@ -1796,6 +1806,15 @@ pub fn run(config: Config) -> Result<()> {
             // To the end of the unit, so that a keyframe inside it is stated
             // in it — at its own sample, below — and not a unit late.
             let moved = advance(&mut live, &parts, at + frames as u64 - 1);
+            folds_due |= carries_folds && moved;
+            if folds_due && units.is_multiple_of(BLOCK_UNITS as u64) {
+                if let Some(presentations) =
+                    plain_presentations(&live, &parts, &mut fold_positions, &mut fold_stated)
+                {
+                    encoder.set_presentations(&presentations);
+                }
+                folds_due = false;
+            }
             // Spread the master's channels across the elements the stream
             // carries, leaving the padding silent.
             for (index, part) in parts.iter().enumerate() {
@@ -2030,6 +2049,9 @@ pub fn run(config: Config) -> Result<()> {
             1u32 << DRC_REFRESH
         ),
         None => println!("  drc          none stated"),
+    }
+    if config.presentations {
+        presentations_summary(encoder.stats());
     }
     println!("  wrote        {}", config.out.display());
     // And what the guards make of it. Last, because it is a verdict on
@@ -3634,6 +3656,47 @@ fn overlay_summary(overlaid: &Overlaid, blocks: u64, config: &Config) {
     }
 }
 
+/// Whether the stream carries the folds `--presentations` asked for, and why
+/// the intervals that do not could not.
+///
+/// An interval whose folds are refused is written with the leading elements
+/// in its presentations instead, which is a stream that plays and is lossless
+/// and is not what was asked for — so it is said here rather than only under
+/// `HZ_FOLD`.
+fn presentations_summary(stats: &hz_mlp::encoder::Stats) {
+    let refused = stats.folds_asked - stats.folds_carried;
+    if stats.folds_asked == 0 {
+        println!(
+            "  presentations none: the programme is no wider than the widest fold, so the \
+             leading elements are its presentations"
+        );
+    } else if refused == 0 {
+        println!(
+            "  presentations the folds themselves, in every one of {} restart intervals",
+            stats.folds_asked
+        );
+    } else {
+        let over = stats.folds_over_the_domain;
+        let unwritable = refused - over;
+        let mut why = Vec::with_capacity(2);
+        if over > 0 {
+            why.push(format!(
+                "{over} would have left the codec's twenty-four bits"
+            ));
+        }
+        if unwritable > 0 {
+            why.push(format!("{unwritable} had rows no cascade could write"));
+        }
+        println!(
+            "  presentations the folds in {} of {} restart intervals; the other {refused} carry \
+             the leading elements — {} — see HZ_FOLD=1",
+            stats.folds_carried,
+            stats.folds_asked,
+            why.join(" and ")
+        );
+    }
+}
+
 /// What the stream's presentations are, over the elements it carries.
 ///
 /// A decoder may stop after any substream, and what it gets when it does is a
@@ -3646,7 +3709,17 @@ fn overlay_summary(overlaid: &Overlaid, blocks: u64, config: &Config) {
 /// frequency channel of any presentation that has one, at unity, and to nothing
 /// at all in a presentation that has none — a stereo fold discards it, which is
 /// what every stereo fold does.
-fn presentations_of(positions: &[[f64; 3]], lfe: bool) -> Option<Vec<Presentation>> {
+///
+/// `stated` is the gain a decoder gives each positioned element before it
+/// renders it, when that is not unity — the master's own, for a stream that
+/// carries the master's elements as they are. `None` is unity throughout,
+/// which is what an element whose audio a fold has already mixed at its
+/// objects' gains states.
+fn presentations_of(
+    positions: &[[f64; 3]],
+    stated: Option<&[f64]>,
+    lfe: bool,
+) -> Option<Vec<Presentation>> {
     let first = usize::from(lfe);
     let elements = first + positions.len();
     let mut out = Vec::with_capacity(4);
@@ -3663,20 +3736,27 @@ fn presentations_of(positions: &[[f64; 3]], lfe: bool) -> Option<Vec<Presentatio
         }
         let fold = ObjectFold::for_layout(&layout).ok()?;
         let low = layout.index_of("LFE1");
+        // An element's column at a time: the fold answers for every channel
+        // of the layout at once.
+        let mut rows = vec![vec![0.0f64; elements]; width];
         let mut gains = vec![0.0f64; width];
-        let rows = (0..width)
-            .map(|channel| {
-                (0..elements)
-                    .map(|element| {
-                        if lfe && element == 0 {
-                            return f64::from(u8::from(low == Some(channel)));
-                        }
-                        fold.gains(positions[element - first], &mut gains);
-                        gains[channel]
-                    })
-                    .collect()
-            })
-            .collect();
+        for element in 0..elements {
+            if lfe && element == 0 {
+                if let Some(low) = low {
+                    rows[low][element] = 1.0;
+                }
+                continue;
+            }
+            let index = element - first;
+            let stated = stated.map_or(1.0, |stated| stated[index]);
+            if stated == 0.0 {
+                continue;
+            }
+            fold.gains(positions[index], &mut gains);
+            for (row, gain) in rows.iter_mut().zip(&gains) {
+                row[element] = gain * stated;
+            }
+        }
         out.push(Presentation {
             channels: width,
             rows,
@@ -3693,6 +3773,40 @@ fn presentations_of(positions: &[[f64; 3]], lfe: bool) -> Option<Vec<Presentatio
             .collect(),
     });
     Some(out)
+}
+
+/// The presentations of a stream that carries the master's elements as they
+/// are: each folded from where the master puts it, at the gain the master
+/// states for it, which is what a decoder rendering the elements applies.
+///
+/// A padding element is silent and folds to nothing, and so does an element
+/// the master has switched off. `positions` and `stated` are the caller's, so
+/// that restating the folds as the elements move allocates nothing for them.
+fn plain_presentations(
+    live: &[Live],
+    parts: &[Part],
+    positions: &mut Vec<[f64; 3]>,
+    stated: &mut Vec<f64>,
+) -> Option<Vec<Presentation>> {
+    let lfe = matches!(parts.first(), Some(Part::Lfe { .. }));
+    positions.clear();
+    stated.clear();
+    for (part, entry) in parts.iter().zip(live).skip(usize::from(lfe)) {
+        debug_assert!(std::ptr::eq(part, &parts[entry.part_index]));
+        match part {
+            Part::Object { .. } => {
+                positions.push(entry.state.position);
+                stated.push(stated_gain(entry.state.gain));
+            }
+            Part::Absent => {
+                positions.push([0.0; 3]);
+                stated.push(0.0);
+            }
+            // Only ever the first part, which is skipped.
+            Part::Lfe { .. } => return None,
+        }
+    }
+    presentations_of(positions, Some(stated), lfe)
 }
 
 /// Full scale for the codec's twenty-four bit domain, and its two ends.
@@ -5465,6 +5579,93 @@ mod tests {
             "padding is inactive"
         );
         assert_eq!(programme.blocks[0].objects[2].gain, Gain::Silent);
+    }
+
+    /// Without a fold the presentations are the master's own elements folded
+    /// from where it puts them, at the gain it states for them: padding and an
+    /// element it switched off contribute nothing, and the low frequency
+    /// element goes to a presentation's own low frequency channel and nowhere
+    /// else.
+    #[test]
+    fn a_plain_programme_folds_each_element_where_the_master_puts_it() {
+        let object = |source_channel| Part::Object {
+            source_channel,
+            keyframes: Vec::new(),
+            bed: None,
+        };
+        let mut parts = vec![
+            Part::Lfe { source_channel: 0 },
+            object(1),
+            object(2),
+            object(3),
+        ];
+        parts.resize_with(MIN_ELEMENTS, || Part::Absent);
+        let placed = [
+            ([-1.0, 1.0, 0.0], 1.0),
+            ([1.0, 1.0, 0.0], 0.5),
+            ([0.0, -1.0, 0.0], 0.0),
+        ];
+        let live: Vec<Live> = (0..parts.len())
+            .map(|part_index| Live {
+                part_index,
+                next: 0,
+                state: match placed.get(part_index.wrapping_sub(1)) {
+                    Some((position, gain)) => Keyframe {
+                        position: *position,
+                        gain: *gain,
+                        ..Keyframe::default()
+                    },
+                    None => Keyframe::default(),
+                },
+            })
+            .collect();
+
+        let mut positions = Vec::new();
+        let mut stated = Vec::new();
+        let presentations = plain_presentations(&live, &parts, &mut positions, &mut stated)
+            .expect("nine elements are wider than every fold");
+        assert_eq!(
+            presentations.iter().map(|p| p.channels).collect::<Vec<_>>(),
+            [2, 6, 8, MIN_ELEMENTS]
+        );
+        for (presentation, layout) in presentations.iter().zip([
+            Layout::stereo(),
+            Layout::surround_5_1(),
+            Layout::surround_7_1(),
+        ]) {
+            let fold = ObjectFold::for_layout(&layout).expect("a fold");
+            let low = layout.index_of("LFE1");
+            let mut gains = vec![0.0; layout.channels()];
+            for (channel, row) in presentation.rows.iter().enumerate() {
+                let lfe = if low == Some(channel) { 1.0 } else { 0.0 };
+                assert_eq!(row[0], lfe, "{}: the LFE, channel {channel}", layout.name);
+                for (index, (position, gain)) in placed.iter().enumerate() {
+                    fold.gains(*position, &mut gains);
+                    let wanted = gains[channel] * stated_gain(*gain);
+                    assert!(
+                        (row[1 + index] - wanted).abs() < 1e-12,
+                        "{}: object {index}, channel {channel}: {} against {wanted}",
+                        layout.name,
+                        row[1 + index]
+                    );
+                }
+                assert!(
+                    row[1 + placed.len()..].iter().all(|gain| *gain == 0.0),
+                    "{}: padding folds to nothing",
+                    layout.name
+                );
+            }
+        }
+        // Not vacuously: the half-level object is folded at the six decibels
+        // the syntax says of it, and the switched-off one folds to nothing
+        // from a place the 7.1 does reach — so its gain is what silenced it.
+        assert!((stated_gain(0.5) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+        let seven = &presentations[2];
+        assert!(seven.rows.iter().all(|row| row[3] == 0.0));
+        let fold = ObjectFold::for_layout(&Layout::surround_7_1()).expect("a fold");
+        let mut gains = vec![0.0; 8];
+        fold.gains(placed[2].0, &mut gains);
+        assert!(gains.iter().any(|gain| *gain > 0.1), "{gains:?}");
     }
 }
 

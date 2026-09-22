@@ -777,6 +777,12 @@ fn a_hierarchy_of_presentations_round_trips() {
     let stream = encode(&mut encoder, &planes);
     let substreams = decoder::substreams(&stream).expect("a major sync");
     assert_eq!(substreams, 4);
+    let stats = encoder.stats();
+    assert_eq!(stats.folds_asked, 2, "two restart intervals, both asked");
+    assert_eq!(
+        stats.folds_carried, stats.folds_asked,
+        "every interval carries its folds"
+    );
 
     // The elements, exactly, and in order.
     let full = decoder::decode(&stream, 3).expect("the elements decode");
@@ -821,6 +827,66 @@ fn a_hierarchy_of_presentations_round_trips() {
             assert!(
                 level.abs() < 0.2,
                 "presentation {which}, channel {channel}: {level:+.2} dB off its fold"
+            );
+        }
+    }
+}
+
+/// A fold the codec's domain cannot hold is not written, and the encoder says
+/// so rather than leaving it to `HZ_FOLD`: the interval carries the leading
+/// elements instead, still lossless, and is counted as refused over the
+/// domain rather than carried.
+#[test]
+fn a_fold_the_domain_cannot_hold_is_counted_and_not_written() {
+    use hz_mlp::hierarchy::Presentation;
+    const ELEMENTS: usize = 12;
+    let frames = 40 * 130;
+    // Every element at the full twenty-four bits: no dead bits to lend the
+    // cascade the headroom it stores its sums in.
+    let planes: Vec<Vec<i32>> = (0..ELEMENTS)
+        .map(|element| noise(0xf011_5ca1 + element as u64, frames, 24))
+        .collect();
+    let row = |gains: &[(usize, f64)]| {
+        let mut out = vec![0.0; ELEMENTS];
+        for (element, gain) in gains {
+            out[*element] = *gain;
+        }
+        out
+    };
+    let seven: Vec<Vec<f64>> = (0..8)
+        .map(|channel| row(&[(channel, 1.0), (8 + channel % 4, 0.5)]))
+        .collect();
+    let five: Vec<Vec<f64>> = seven[..6].to_vec();
+    let two = vec![
+        row(&[(0, 0.7), (2, 0.5), (4, 0.7), (8, 0.35)]),
+        row(&[(1, 0.7), (2, 0.5), (5, 0.7), (9, 0.35)]),
+    ];
+    let elements: Vec<Vec<f64>> = (0..ELEMENTS)
+        .map(|element| row(&[(element, 1.0)]))
+        .collect();
+    let presentations: Vec<Presentation> = [(2usize, two), (6, five), (8, seven), (12, elements)]
+        .into_iter()
+        .map(|(channels, rows)| Presentation { channels, rows })
+        .collect();
+
+    let config = config(ELEMENTS, 48_000, SampleBits::TwentyFour);
+    let mut encoder = Encoder::new(config).expect("twelve elements");
+    encoder.set_presentations(&presentations);
+    let stream = encode(&mut encoder, &planes);
+
+    let stats = encoder.stats();
+    assert_eq!(stats.folds_asked, 2, "two restart intervals, both asked");
+    assert_eq!(stats.folds_carried, 0, "no interval carries a fold");
+    assert_eq!(
+        stats.folds_over_the_domain, stats.folds_asked,
+        "and each was refused for the domain"
+    );
+    let full = decoder::decode(&stream, 3).expect("the elements decode");
+    for (frame, got) in full.samples.chunks_exact(ELEMENTS).enumerate() {
+        for (element, sample) in got.iter().enumerate() {
+            assert_eq!(
+                *sample, planes[element][frame],
+                "frame {frame}, element {element}"
             );
         }
     }
