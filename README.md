@@ -45,9 +45,8 @@ object comes back where the master put it, at the sample the master named.
 - **Immersive streams** — nine to sixteen elements over four substreams, the
   object metadata read back by a real decoder as the programme it describes,
   and a real programme at about the size of its reference stream. With
-  `--presentations` the stream carries genuine folds, about 10 % larger than
-  without, most of it the eight-matrix limit of FFmpeg's decoder; see
-  [docs/mlp.md](docs/mlp.md).
+  `--presentations` the stream carries genuine folds, about 8 % larger than
+  without; see [docs/mlp.md](docs/mlp.md).
 - **Speed** — about 3 ms per channel-second of audio at full effort on a
   desktop machine: four minutes of a twelve-element programme in 17 s on
   sixteen cores.

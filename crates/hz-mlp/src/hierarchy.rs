@@ -366,7 +366,53 @@ pub fn rows_over(
     shifts: &[u8],
     frac_bits: u32,
 ) -> Option<(Vec<Primitive>, Vec<u8>)> {
+    rows_over_with(held, presentation, Some(shifts), frac_bits)
+        .map(|(rows, order, _)| (rows, order))
+}
+
+/// As [`rows_over`], with each channel's output shift chosen as its row is
+/// written rather than given: the smallest that lets the row be said in one
+/// matrix, or the largest there is where none does. Returns the shifts too,
+/// one per channel the presentation carries.
+///
+/// # Why a shift per channel
+///
+/// A shift says how much a decoder scales that channel of the presentation
+/// up by once the rows have run, so a row can be said at `2^-shift` of its
+/// size. One shift for every channel has to suit the row that needs the most,
+/// and the others then lose bits of precision they did not need to. Chosen
+/// per channel, each takes only what its own row asks for — which is what
+/// the reference does, its stereo saying `[3, 4]` where its 5.1 says `[3, 2]`.
+///
+/// The smallest is also the right one for the rows after it: a later row that
+/// reads this channel reads it at `2^-shift` of its size, and has to ask for
+/// `2^shift` times as much of it.
+///
+/// What it costs is precision and room: the output is rounded to
+/// `2^shift`, and a coefficient's rounding is scaled up with it. Whether a
+/// shift can be afforded is the encoder's to judge, since only it holds the
+/// samples — see `PRESENTATION_PRECISION` and `FOLD_MARGIN` there.
+pub fn rows_over_choosing_shifts(
+    held: &[Vec<f64>],
+    presentation: &Presentation,
+    frac_bits: u32,
+) -> Option<(Vec<Primitive>, Vec<u8>, Vec<u8>)> {
+    rows_over_with(held, presentation, None, frac_bits)
+}
+
+/// [`rows_over`] and [`rows_over_choosing_shifts`]: the shifts given, or
+/// `None` to choose them.
+fn rows_over_with(
+    held: &[Vec<f64>],
+    presentation: &Presentation,
+    given: Option<&[u8]>,
+    frac_bits: u32,
+) -> Option<(Vec<Primitive>, Vec<u8>, Vec<u8>)> {
+    let mut shifts: Vec<u8> = given.map_or_else(Vec::new, <[u8]>::to_vec);
     let n = presentation.channels.min(held.len());
+    if given.is_none() {
+        shifts = vec![0; n];
+    }
     if presentation.rows.len() < n {
         return None;
     }
@@ -468,6 +514,14 @@ pub fn rows_over(
             return None;
         };
 
+        // Where the shifts are chosen, this channel's is the smallest that
+        // says its row in one matrix.
+        if given.is_none() {
+            let widest = g.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+            shifts[channel] = (0..=crate::frame::MAX_OUTPUT_SHIFT)
+                .find(|shift| widest / f64::from(*shift).exp2() <= REACH)
+                .unwrap_or(crate::frame::MAX_OUTPUT_SHIFT);
+        }
         // What the channel has to end up holding: the row, made smaller by the
         // dead bits a decoder will shift it back up by.
         let back = f64::from(shifts.get(channel).copied().unwrap_or(0));
@@ -496,7 +550,7 @@ pub fn rows_over(
     if rows.len() > AT_MOST_ROWS {
         return None;
     }
-    Some((rows, assignment))
+    Some((rows, assignment, shifts))
 }
 
 /// One row of a triangle, said in as many matrices as the field needs.
@@ -629,6 +683,45 @@ pub fn as_decoded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel left holding a hundredth of its element — what a
+    /// decorrelated channel holds — needs a hundred of it back, which no
+    /// matrix can say at a shift of nought. Chosen per channel, that one takes
+    /// the smallest shift that says it in one matrix, six, and the channel
+    /// that needs nothing keeps nought; and scaled back up by their shifts,
+    /// the outputs are the presentation.
+    #[test]
+    fn a_small_channel_takes_the_shift_its_own_row_needs() {
+        let held = vec![vec![1.0, 0.0], vec![0.0, 0.01]];
+        let presentation = Presentation {
+            channels: 2,
+            rows: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        };
+        assert!(
+            rows_over(&held, &presentation, &[0, 0], PRESENTATION_BITS).is_none(),
+            "a hundred is past what a shift of nought can say"
+        );
+        let (rows, assignment, shifts) =
+            rows_over_choosing_shifts(&held, &presentation, PRESENTATION_BITS).expect("rows");
+        assert_eq!(shifts, [0, 6]);
+        assert_eq!(rows.len(), 1, "the channel that needs nothing gets no row");
+
+        let decoded = as_decoded(&held, &rows, &assignment, 2);
+        for (output, wanted) in presentation.rows.iter().enumerate() {
+            let channel = assignment
+                .iter()
+                .position(|o| usize::from(*o) == output)
+                .expect("every output has a channel");
+            let up = f64::from(shifts[channel]).exp2();
+            for (got, want) in decoded[output].iter().zip(wanted) {
+                assert!(
+                    (got * up - want).abs() < 1e-3,
+                    "output {output}: {got} at shift {}, against {want}",
+                    shifts[channel]
+                );
+            }
+        }
+    }
 
     /// A stereo, a 5.1 and the elements, over six elements.
     fn nested() -> Vec<Presentation> {
