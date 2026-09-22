@@ -743,17 +743,21 @@ impl Encoder {
             back: Some(IntervalDecider {
                 channels: config.channels,
                 coded,
-                // A pool of its own, of half as many threads as channels, and
-                // never fewer than four or than the channels there are: a
+                // A pool of its own, of two threads for every three channels,
+                // and never fewer than four or than the channels there are: a
                 // stereo on one thread decided its two channels one after the
                 // other. Sharing the encoder's, the blocks took threads the
                 // preparing of the next interval was waiting for, and that is
                 // the longer of the two: five minutes of an overlay at twelve
                 // channels took 11.3 s so, and on a pool of its own 13.5 s at
                 // three threads, 11.5 at four, 10.1 at six, 10.2 at eight
-                // and 10.7 at sixteen.
+                // and 10.7 at sixteen. With `--fast` the preparing is lighter
+                // and the blocks are the longer: 7.4 s at six, 7.2 at eight,
+                // 7.5 at twelve — and at full effort eight is as good as six.
                 threads: std::sync::Arc::new(Threads::exactly(
-                    config.channels.div_ceil(2).max(config.channels.min(4)),
+                    (2 * config.channels)
+                        .div_ceil(3)
+                        .max(config.channels.min(4)),
                 )),
                 interval_decided: vec![Vec::new(); config.channels],
                 interval_planes: vec![Vec::new(); config.channels],
@@ -3106,12 +3110,15 @@ impl Planning {
             return (steps, written);
         }
 
-        // The Gram matrix of the stored channels over the interval.
+        // The Gram matrix of the stored channels over the interval: what each
+        // unit stores worked out on its own, then each entry summed on its
+        // own, over the units and frames in order. Each entry is the same
+        // additions in the same order as one loop over all of them made, so
+        // the same to the bit — and there are thirty-six of them, where the
+        // loop was one thread and the longest thing a fold's building did.
         let width = self.coded.frame_size;
-        let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
-        let mut gram = vec![vec![0.0f64; upto]; upto];
-        let mut samples = 0usize;
-        for unit in units {
+        let stored: Vec<Vec<Vec<i32>>> = self.threads.map(units, |unit| {
+            let mut scratch: Vec<Vec<i32>> = vec![vec![0; width]; self.channels];
             for (channel, plane) in scratch.iter_mut().enumerate() {
                 let element = element_of.get(channel).copied().unwrap_or(channel);
                 let shift = shifts.get(element).copied().unwrap_or(0);
@@ -3126,15 +3133,28 @@ impl Planning {
             for step in steps.iter().rev() {
                 crate::arrange::unapply_within(step, &mut scratch, width);
             }
-            for frame in 0..unit.frames {
-                for i in 0..upto {
-                    let a = f64::from(scratch[i][frame]);
-                    for j in 0..=i {
-                        gram[i][j] += a * f64::from(scratch[j][frame]);
-                    }
+            scratch.truncate(upto);
+            for plane in &mut scratch {
+                plane.truncate(unit.frames);
+            }
+            scratch
+        });
+        let samples: usize = units.iter().map(|unit| unit.frames).sum();
+        let pairs: Vec<(usize, usize)> = (0..upto)
+            .flat_map(|i| (0..=i).map(move |j| (i, j)))
+            .collect();
+        let sums = self.threads.map(&pairs, |&(i, j)| {
+            let mut sum = 0.0f64;
+            for unit in &stored {
+                for (a, b) in unit[i].iter().zip(&unit[j]) {
+                    sum += f64::from(*a) * f64::from(*b);
                 }
             }
-            samples += unit.frames;
+            sum
+        });
+        let mut gram = vec![vec![0.0f64; upto]; upto];
+        for (&(i, j), sum) in pairs.iter().zip(sums) {
+            gram[i][j] = sum;
         }
         for i in 0..upto {
             for j in 0..i {
