@@ -160,11 +160,8 @@ impl DecoderModel {
         }
     }
 
-    /// One channel's held state, on its own.
-    ///
-    /// For [`crate::encoder::Encoder::decide_interval`], which walks a channel
-    /// through a whole interval on its own thread: what it needs of the model
-    /// is this, and the queries below on it.
+    /// One channel's held state, on its own, for the tests to query.
+    #[cfg(test)]
     pub(crate) fn channel(&self, channel: usize) -> Held {
         self.channels[channel]
     }
