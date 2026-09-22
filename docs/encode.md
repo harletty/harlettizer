@@ -61,6 +61,40 @@ It changes where the samples come from and nothing else. Twenty-two waveforms,
 encoded once from their CAF and once from the mono files that CAF was built
 from, gave the same stream byte for byte.
 
+## Carrying the folds
+
+```bash
+harlettizer encode programme.atmos --out programme.thd --presentations
+```
+
+With `--presentations` a decoder stopping after the first, second or third
+substream is handed a real 2.0, 5.1 or 7.1 rather than the leading elements —
+see [mlp.md](mlp.md#the-hierarchy-of-presentations) for how the channels become
+a hierarchy of presentations. Without a fold the elements are the master's own,
+so each is folded from where the master puts it and at the gain the master
+states for it, which is what a decoder rendering the elements applies; padding
+and an element the master switched off fold to nothing. The folds are restated
+as the elements move, no more often than once a block, and the encoder takes
+the latest at each restart.
+
+A cascade can be refused for an interval — its rows cannot all be written, or
+what it stores would leave the codec's twenty-four bits — and that interval is
+then written with the leading elements, still lossless. The summary says which:
+
+```
+  presentations the folds themselves, in every one of 283 restart intervals
+```
+
+On the slice above, the elements come back byte for byte through `harletty`,
+FFmpeg decodes the stream without a word, and the 2.0, 5.1 and 7.1 are those
+the same master gives through `--cluster 12` — a correlation of 1.00000 and
+0.00 dB on all sixteen channels. Carrying them costs 11.5 %: 14 811 256 bytes
+against 13 282 388.
+
+🔴 Until this was fixed the flag did nothing here: only `--cluster` and
+`--overlay` produced the positions the folds are made from, and a plain encode
+wrote the leading elements without saying so.
+
 ## Folding a scene into the elements a stream carries
 
 ```bash

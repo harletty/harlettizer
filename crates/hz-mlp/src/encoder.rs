@@ -332,6 +332,16 @@ fn presentation_check<P: AsRef<[i32]>>(
     check
 }
 
+/// Why an interval's folds could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// No cascade hosts the rows, or a presentation cannot be written over
+    /// what the channels would hold.
+    Unwritable,
+    /// The cascade would store more than the codec's domain holds.
+    OverTheDomain,
+}
+
 #[derive(Debug)]
 /// What a build produced, all of which takes effect together.
 struct Built {
@@ -592,6 +602,17 @@ pub struct Stats {
     /// and decided matrices dropped on what was really stored — see
     /// [`Encoder::judge_matrix`] and [`Encoder::prepare`].
     pub matrices_refused: u64,
+    /// Restart intervals that were asked for folds — see
+    /// [`Encoder::set_presentations`] — and how many of them carry them. The
+    /// rest were refused and carry the leading elements instead, so that the
+    /// stream is written without folds rather than written wrong.
+    pub folds_asked: u64,
+    pub folds_carried: u64,
+    /// Of the refused, those whose cascade would have left the codec's
+    /// twenty-four bits: the programme mixed too near full scale for what the
+    /// cascade stores. Every other refusal is a set of rows no cascade could
+    /// host or write.
+    pub folds_over_the_domain: u64,
     pub units: u64,
     /// Total residual bits, and how many residuals, so the mean is
     /// recoverable.
@@ -2033,6 +2054,7 @@ impl Encoder {
         if self.wants.is_empty() {
             return;
         }
+        self.stats.folds_asked += 1;
         let Some(shifts) = self.interval_shift.clone() else {
             return;
         };
@@ -2052,7 +2074,7 @@ impl Encoder {
         // channel — which costs the dead bits the others had, and is what a
         // programme with one unrounded channel among rounded ones ends up
         // paying until the shifts are stated per substream.
-        if let Some(built) = self.try_to_build(units, &shifts) {
+        if let Ok(built) = self.try_to_build(units, &shifts) {
             self.take_what_was_built(built);
             return;
         }
@@ -2063,14 +2085,19 @@ impl Encoder {
             .min()
             .unwrap_or(0);
         let common = vec![least; shifts.len()];
-        if let Some(built) = self.try_to_build(units, &common) {
-            self.interval_shift = Some(common);
-            self.take_what_was_built(built);
+        match self.try_to_build(units, &common) {
+            Ok(built) => {
+                self.interval_shift = Some(common);
+                self.take_what_was_built(built);
+            }
+            Err(Refusal::OverTheDomain) => self.stats.folds_over_the_domain += 1,
+            Err(Refusal::Unwritable) => {}
         }
     }
 
     /// Keep what a build produced.
     fn take_what_was_built(&mut self, built: Built) {
+        self.stats.folds_carried += 1;
         if std::env::var_os("HZ_FOLD").is_some() {
             eprintln!(
                 "fold: built, {} steps, presentations {:?} rows, stated shifts {:?}",
@@ -2117,7 +2144,7 @@ impl Encoder {
     /// destination's own shift is the other half of the ratio and belongs to
     /// whichever internal channel ends up computing the row, which the
     /// factorisation decides, so it goes in there.
-    fn try_to_build(&self, units: &[Held], shifts: &[u8]) -> Option<Built> {
+    fn try_to_build(&self, units: &[Held], shifts: &[u8]) -> Result<Built, Refusal> {
         let elements = self.channels;
         let scaled: Vec<crate::hierarchy::Presentation> = self
             .wants
@@ -2166,7 +2193,7 @@ impl Encoder {
         // channel's element at once, hosts and slots together; and the
         // hierarchy is built again with the slots' elements first, so that
         // is what fills them. Everything below is over internal channels.
-        let sketch = crate::hierarchy::build(&scaled, elements)?;
+        let sketch = crate::hierarchy::build(&scaled, elements).ok_or(Refusal::Unwritable)?;
         let channel_of = crate::arrange::place_elements(
             &sketch.rows,
             &sketch.within,
@@ -2177,7 +2204,7 @@ impl Encoder {
         let mut element_of = vec![usize::MAX; elements];
         for (element, channel) in channel_of.iter().enumerate() {
             if *channel >= elements || element_of[*channel] != usize::MAX {
-                return None;
+                return Err(Refusal::Unwritable);
             }
             element_of[*channel] = element;
         }
@@ -2189,9 +2216,10 @@ impl Encoder {
             .filter(|element| !prefer.contains(element))
             .collect();
         prefer.extend(rest);
-        let built = crate::hierarchy::build_preferring(&scaled, elements, &prefer)?;
+        let built = crate::hierarchy::build_preferring(&scaled, elements, &prefer)
+            .ok_or(Refusal::Unwritable)?;
         if built.within != sketch.within || built.filled != sketch.filled {
-            return None;
+            return Err(Refusal::Unwritable);
         }
         let rows: Vec<Vec<f64>> = built
             .rows
@@ -2215,7 +2243,7 @@ impl Encoder {
             if fold_log {
                 eprintln!("fold: no cascade hosts the rows, shifts {shifts:?}");
             }
-            return None;
+            return Err(Refusal::Unwritable);
         };
         if fold_log {
             eprintln!(
@@ -2250,7 +2278,7 @@ impl Encoder {
             if fold_log {
                 eprintln!("fold: the cascade does not fit the codec's domain");
             }
-            return None;
+            return Err(Refusal::OverTheDomain);
         }
 
         let mut rows = Vec::with_capacity(scaled.len() - 1);
@@ -2297,12 +2325,12 @@ impl Encoder {
                         presentation.channels
                     );
                 }
-                return None;
+                return Err(Refusal::Unwritable);
             };
             rows.push(row);
             assignment.push(order);
         }
-        Some(Built {
+        Ok(Built {
             steps: cascade.steps,
             rows,
             assignment,
