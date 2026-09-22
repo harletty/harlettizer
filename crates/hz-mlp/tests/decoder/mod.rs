@@ -64,11 +64,20 @@ const MAX_SOURCES: usize = MAX_CHANNELS + 2;
 /// The most matrices one access unit may carry.
 ///
 /// The count is a four-bit field, and the two matrix syntaxes read it
-/// differently: the first writes it as itself, so it stops at fifteen, and the
-/// immersive one writes it as one less than itself — which is why that syntax
-/// cannot say "no matrices" that way and can say sixteen, one per channel of
-/// the widest programme there is.
-const MAX_MATRICES: usize = 15;
+/// differently: the first writes it as itself, so it could say fifteen, and
+/// the immersive one writes it as one less than itself — which is why that
+/// syntax cannot say "no matrices" that way and can say sixteen, one per
+/// channel of the widest programme there is.
+///
+/// Under restart sync words A and B this reads eight, not fifteen, because
+/// eight is what FFmpeg reads (`MAX_MATRICES_TRUEHD`), and FFmpeg is the
+/// decoder in every player that is not Dolby's own. This decoder once took
+/// the fifteen the field can say, and a stream whose 7.1 substream declared
+/// up to fourteen went through every test here while no player outside
+/// Dolby's could open it. A decoder in the test tree that is more lenient
+/// than the one the world embeds is a test that passes streams nobody can
+/// play.
+const MAX_MATRICES: usize = 8;
 const MAX_MATRICES_IMMERSIVE: usize = 16;
 /// The most samples an access unit holds, at four times the base rate.
 const MAX_BLOCK: usize = 160;
@@ -600,7 +609,9 @@ impl Decoder {
 
         let count = bits.get(4).map_err(text)? as usize;
         if count > MAX_MATRICES {
-            return Err(format!("{count} matrices is more than the format has"));
+            return Err(format!(
+                "{count} matrices is more than FFmpeg reads under restart sync A or B"
+            ));
         }
         for _ in 0..count {
             let dest = bits.get(4).map_err(text)? as usize;

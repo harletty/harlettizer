@@ -274,12 +274,13 @@ pub fn run(options: Options) -> Result<()> {
     // FFmpeg is the one with a limit: its TrueHD decoder refuses the restart
     // sync word an immersive presentation's last substream carries, and stops
     // at eight channels. Above that the harness says so rather than reporting
-    // a comparison it did not make.
+    // a comparison it did not make — and still has FFmpeg decode what it can,
+    // below, because the substreams it does read are the ones a player plays.
     let mut exact = !over_peak;
     if channels <= 8 {
         exact &= verify_with_ffmpeg(&path, samples, channels, bits)?;
     } else {
-        println!("  ffmpeg       skipped: its decoder stops at eight channels");
+        println!("  ffmpeg       samples not compared: its decoder stops at eight channels");
     }
     // Every presentation the stream declares, not only the widest: a decoder
     // may stop after any of them, and that is what the substream split is for.
@@ -301,6 +302,9 @@ pub fn run(options: Options) -> Result<()> {
         exact &= verify_objects(&path, channels)?;
     }
     verify_with_harletty(&path);
+    // Whatever the channel count: a stream every decoder here gets back
+    // exactly can still be one no player outside Dolby's can open.
+    let playable = super::ffmpeg_check::check(&path)?;
     if over_peak {
         // A stream that overruns the peak it declares is not a stream: a
         // decoder sizes its input buffer from that figure and reports the
@@ -317,6 +321,13 @@ pub fn run(options: Options) -> Result<()> {
                 declared as f64 / 1e6,
                 declared as f64 / 1e6,
             ),
+        ));
+    }
+    if !playable {
+        return Err(Error::malformed(
+            &options.input,
+            "FFmpeg, the decoder in every player that is not Dolby's, refuses the stream; \
+             see above",
         ));
     }
     if !exact {
