@@ -215,6 +215,78 @@ pub fn code(codebook: u8, symbol: usize) -> Code {
     table(codebook).expect("codebook 0 has no symbols")[symbol]
 }
 
+/// A table's code lengths, padded to a power of two so that a symbol masked
+/// to five bits indexes it without a bounds check.
+const fn lengths(table: &[Code]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < table.len() {
+        out[i] = table[i].1 as u8;
+        i += 1;
+    }
+    out
+}
+
+/// A table's shortest code.
+const fn shortest(table: &[Code]) -> usize {
+    let mut out = table[0].1;
+    let mut i = 1;
+    while i < table.len() {
+        if table[i].1 < out {
+            out = table[i].1;
+        }
+        i += 1;
+    }
+    out as usize
+}
+
+/// Every codebook's code lengths, by codebook number; none for codebook zero.
+const LENGTHS: [[u8; 32]; 4] = [
+    [0; 32],
+    lengths(&TABLE_0),
+    lengths(&TABLE_1),
+    lengths(&TABLE_2),
+];
+
+/// Every codebook's shortest code, by codebook number; zero for codebook
+/// zero, which writes nothing but the raw bits.
+///
+/// What makes it useful is that it bounds a block's cost from below without
+/// looking at the block: at least `width + SHORTEST[codebook]` bits a sample.
+pub const SHORTEST: [usize; 4] = [
+    0,
+    shortest(&TABLE_0),
+    shortest(&TABLE_1),
+    shortest(&TABLE_2),
+];
+
+/// As [`cost`] with no offset, for a coding already known to hold every
+/// residual — the width at or above the narrowest one [`range`] allows.
+///
+/// The same sum without the per-sample checks that [`cost`] needs to say
+/// `None`, and without the early return that keeps a loop from vectorising.
+/// It is the inner loop of the whole filter search, which is why it earns a
+/// second copy.
+#[inline]
+pub fn cost_fitting(codebook: u8, lsb_bits: u32, residuals: &[i32]) -> usize {
+    let raw = residuals.len() * lsb_bits as usize;
+    if codebook == NONE {
+        return raw;
+    }
+    let offset = sign_offset(codebook, lsb_bits, 0);
+    let table = &LENGTHS[codebook as usize];
+    let mut bits = 0u32;
+    for residual in residuals {
+        let value = i64::from(*residual) - offset;
+        debug_assert!(
+            value >= 0 && ((value >> lsb_bits) as usize) < symbols(codebook),
+            "a residual the coding does not hold"
+        );
+        bits += u32::from(table[(value >> lsb_bits) as usize & 31]);
+    }
+    raw + bits as usize
+}
+
 /// What a block of residuals costs in this coding, or `None` if it does not
 /// fit.
 pub fn cost(codebook: u8, lsb_bits: u32, huff_offset: i32, residuals: &[i32]) -> Option<usize> {

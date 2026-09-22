@@ -713,13 +713,17 @@ fn consider(
     first: usize,
     second: usize,
 ) {
-    let Some((codebook, huff_lsbs, bits)) = best_entropy(candidate_residuals) else {
-        return;
-    };
     // A share of each description rather than the whole of it, because a
     // filter is described once and kept until it stops paying — see
     // [`crate::rate`], which holds the shares and what measured them.
-    let cost = bits + crate::rate::filters(first, second);
+    let description = crate::rate::filters(first, second);
+    // Only a coding under what is left of the best cost once the description
+    // is paid can win, so the search need not price anything at or above it.
+    let budget = best_cost.saturating_sub(description);
+    let Some((codebook, huff_lsbs, bits)) = best_entropy_within(candidate_residuals, budget) else {
+        return;
+    };
+    let cost = bits + description;
     if cost < *best_cost {
         *best_cost = cost;
         *best = Coding {
@@ -757,6 +761,22 @@ fn consider(
 /// format's definition of where a coding's range sits, and a later tool whose
 /// residuals *are* biased may want it.
 fn best_entropy(residuals: &[i32]) -> Option<(u8, u32, usize)> {
+    best_entropy_within(residuals, usize::MAX)
+}
+
+/// As [`best_entropy`], among the codings that cost less than `budget`; `None`
+/// if none does.
+///
+/// # It returns what the full search would, and why
+///
+/// The codings are tried in the same order, and one is kept only if it is
+/// *strictly* cheaper than everything before it, so the first of equals wins
+/// as before. What is new is only what is skipped: a block costs at least
+/// `width + SHORTEST[codebook]` bits a sample, and that bound grows with the
+/// width, so once it reaches the cheapest cost so far — or the budget — no
+/// wider field in this codebook can be kept, and the sweep moves on to the
+/// next. Nothing skipped could have been kept, so what is kept is the same.
+fn best_entropy_within(residuals: &[i32], budget: usize) -> Option<(u8, u32, usize)> {
     /// How far above the narrowest usable width to look. Beyond this the
     /// symbols have all collapsed onto the middle of the table and the raw
     /// bits are pure loss.
@@ -766,6 +786,9 @@ fn best_entropy(residuals: &[i32]) -> Option<(u8, u32, usize)> {
     let highest = i64::from(*residuals.iter().max()?);
 
     let mut best: Option<(u8, u32, usize)> = None;
+    // What a coding has to cost less than to be kept: the budget, then the
+    // cheapest found.
+    let mut bound = budget;
     for codebook in huffman::NONE..=huffman::MAX_CODEBOOK {
         // A coding's range only ever widens with the width, so the widths that
         // hold this block are everything from the narrowest one upwards, and
@@ -779,10 +802,15 @@ fn best_entropy(residuals: &[i32]) -> Option<(u8, u32, usize)> {
             continue;
         };
         for width in narrowest..=(narrowest + SWEEP).min(MAX_HUFF_LSBS) {
-            let Some(bits) = huffman::cost(codebook, width, 0, residuals) else {
-                continue;
-            };
-            if best.is_none_or(|(_, _, previous)| bits < previous) {
+            let floor = residuals.len() * (width as usize + huffman::SHORTEST[codebook as usize]);
+            if floor >= bound {
+                break;
+            }
+            // Every width from the narrowest up holds the block, so the
+            // checks `huffman::cost` makes per sample would all pass.
+            let bits = huffman::cost_fitting(codebook, width, residuals);
+            if bits < bound {
+                bound = bits;
                 best = Some((codebook, width, bits));
             }
         }
@@ -968,6 +996,122 @@ fn magnitude_width(value: i32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The search as it was before it was bounded, kept verbatim as what the
+    /// bounded one has to agree with.
+    fn best_entropy_unbounded(residuals: &[i32]) -> Option<(u8, u32, usize)> {
+        const SWEEP: u32 = 4;
+        let lowest = i64::from(*residuals.iter().min()?);
+        let highest = i64::from(*residuals.iter().max()?);
+        let mut best: Option<(u8, u32, usize)> = None;
+        for codebook in huffman::NONE..=huffman::MAX_CODEBOOK {
+            let holds = |width: u32| {
+                let (low, high) = huffman::range(codebook, width, 0);
+                lowest >= low && highest <= high
+            };
+            let Some(narrowest) = narrowest_width(holds) else {
+                continue;
+            };
+            for width in narrowest..=(narrowest + SWEEP).min(MAX_HUFF_LSBS) {
+                let Some(bits) = huffman::cost(codebook, width, 0, residuals) else {
+                    continue;
+                };
+                if best.is_none_or(|(_, _, previous)| bits < previous) {
+                    best = Some((codebook, width, bits));
+                }
+            }
+        }
+        best
+    }
+
+    /// Blocks of every shape the search meets: silence, a constant, small and
+    /// large residuals, lopsided ones, the codec's extremes, one sample to a
+    /// whole unit's worth.
+    fn blocks() -> Vec<Vec<i32>> {
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut out = vec![
+            vec![0; 40],
+            vec![7; 40],
+            vec![-1],
+            vec![(1 << 23) - 1, -(1 << 23)],
+        ];
+        for _ in 0..4000 {
+            let len = 1 + next() as usize % 160;
+            // How many bits a draw has, up to the codec's twenty-three.
+            let scale = next() % 24;
+            let bias = (next() % 5) as i32 - 2;
+            let mut draw = || {
+                if scale == 0 {
+                    0
+                } else {
+                    (next() >> (32 - scale)) as i32
+                }
+            };
+            out.push(
+                (0..len)
+                    .map(|_| {
+                        // Two draws subtracted, so the block leans to the
+                        // middle the way prediction residuals do, and some
+                        // blocks lean off it.
+                        let a = draw();
+                        let b = draw();
+                        (a - b + bias * (a >> 2)).clamp(-(1 << 23), (1 << 23) - 1)
+                    })
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    /// The unchecked cost is the checked one wherever the search calls it:
+    /// every codebook, every width from the narrowest that holds the block.
+    #[test]
+    fn the_cost_of_a_fitting_coding_is_the_checked_cost() {
+        for block in blocks() {
+            let lowest = i64::from(*block.iter().min().unwrap());
+            let highest = i64::from(*block.iter().max().unwrap());
+            for codebook in huffman::NONE..=huffman::MAX_CODEBOOK {
+                let holds = |width: u32| {
+                    let (low, high) = huffman::range(codebook, width, 0);
+                    lowest >= low && highest <= high
+                };
+                let Some(narrowest) = narrowest_width(holds) else {
+                    continue;
+                };
+                for width in narrowest..=MAX_HUFF_LSBS {
+                    assert_eq!(
+                        Some(huffman::cost_fitting(codebook, width, &block)),
+                        huffman::cost(codebook, width, 0, &block),
+                        "codebook {codebook}, width {width}, {block:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bounded search keeps exactly what the full one kept, ties included,
+    /// and under a budget keeps it only when it is under the budget.
+    #[test]
+    fn the_bounded_search_keeps_what_the_full_one_kept() {
+        for block in blocks() {
+            let full = best_entropy_unbounded(&block);
+            assert_eq!(best_entropy(&block), full, "{block:?}");
+            let cost = full.map_or(0, |(_, _, bits)| bits);
+            for budget in [0, cost.saturating_sub(1), cost, cost + 1, usize::MAX] {
+                assert_eq!(
+                    best_entropy_within(&block, budget),
+                    full.filter(|(_, _, bits)| *bits < budget),
+                    "budget {budget}, {block:?}"
+                );
+            }
+        }
+    }
 
     /// The first block of a restarting unit must not predict, because a
     /// decoder joining the stream there has nothing to predict from — and the
