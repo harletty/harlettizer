@@ -1,0 +1,109 @@
+# The `harlettizer` binary for Linux, Windows and macOS, attached to a draft
+# release when a `v*` tag is pushed.
+#
+# Each archive holds the binary and the licences it is shipped under:
+# `LICENSE` for the program, and `LICENSES/` for the code ported into it under
+# other terms, whose notices have to travel with a binary as much as with the
+# source.
+#
+# A pull request that touches this file builds all three archives without
+# releasing anything, so a change to the release is seen working before a tag
+# depends on it. `workflow_dispatch` does the same by hand.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    strategy:
+      # One platform failing says nothing about the others; see them all.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary: harlettizer
+          - os: windows-latest
+            platform: windows-x86_64
+            binary: harlettizer.exe
+          - os: macos-14
+            platform: macos-arm64
+            binary: harlettizer
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release --locked -p hz-cli
+        env:
+          RUSTFLAGS: -D warnings
+
+      # The tag when there is one; the commit otherwise, since a branch name
+      # can hold a slash and a file name cannot.
+      - name: Name
+        id: name
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          echo "archive=harlettizer-${version}-${{ matrix.platform }}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Package (zip)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir staging
+          cp "target/release/${{ matrix.binary }}" LICENSE staging/
+          cp -R LICENSES staging/
+          cd staging && zip -r "../${{ steps.name.outputs.archive }}" .
+
+      - name: Package (zip, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory staging | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}", LICENSE staging/
+          Copy-Item -Recurse LICENSES staging/
+          Compress-Archive -Path staging/* -DestinationPath "${{ steps.name.outputs.archive }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harlettizer-${{ matrix.platform }}
+          path: ${{ steps.name.outputs.archive }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: harlettizer-*
+          merge-multiple: true
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: harlettizer-*.zip

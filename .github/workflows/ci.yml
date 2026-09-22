@@ -73,3 +73,43 @@ jobs:
       - name: Clippy (advisory)
         run: cargo clippy --all-targets -- -W clippy::all
         continue-on-error: true
+
+  # The release ships a Windows binary, so Windows is built on every change.
+  #
+  # The build is a gate. The tests are advisory for now, for one of them:
+  # `hz_cluster`'s `an_object_between_elements_stops_trading_channels` counts
+  # how often a slowly turning ring of 37 objects trades channels, and that
+  # count moves with the last bits of `sin` and `cos`. It is 72 on Linux and
+  # 132 run as Windows code under Wine, against a bound of 110. The streams do
+  # not move with it: ten seconds of a real programme, encoded plainly and
+  # folded to ten elements, come out byte for byte the same from the Linux and
+  # the Windows build. Once this job shows what a real Windows runner counts,
+  # the test step can become a gate.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Test (advisory)
+        run: cargo test --all --no-fail-fast
+        continue-on-error: true
