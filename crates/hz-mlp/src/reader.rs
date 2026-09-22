@@ -946,6 +946,10 @@ mod tests {
             }
             encoder.push(&samples);
         }
+        // What was written is counted once it is written, and the encoder
+        // holds intervals back while it works on them: finished, it has
+        // written them all.
+        encoder.finish(&[]);
 
         let stats = encoder.stats();
         assert!(

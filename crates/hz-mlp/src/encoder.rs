@@ -384,18 +384,10 @@ pub struct Encoder {
     sample_rate: u32,
     channels: usize,
     shift: u32,
-    /// Channel-major planes of residuals, allocated once and reused.
-    planes: Vec<Vec<i32>>,
-    /// The samples of the unit being encoded, before prediction.
-    samples: Vec<Vec<i32>>,
     /// What has already been encoded, per channel, most recent last. Its tail
     /// is the filter state a decoder carries across access units; the rest is
     /// context for choosing the next filter.
     past: Vec<History>,
-    /// Per channel, how this unit's last block is coded.
-    codings: Vec<Coding>,
-    /// And how the unprediced first block of a restarting unit is.
-    restart_codings: Vec<Coding>,
     /// The matrices this unit carries, in the order a decoder applies them.
     ///
     /// One list, not one per substream, because a full decode applies only the
@@ -461,38 +453,14 @@ pub struct Encoder {
     /// puts the elements back in order on the way out, so nothing outside the
     /// codec — the object metadata in particular — knows.
     permutation: Vec<usize>,
-    /// The second filter the decoder currently holds, per channel. A restart
-    /// header clears it, and it is almost always empty — so saying
-    /// "unchanged" rather than "order zero" saves four bits a channel an
-    /// access unit, which is more than the filter itself was winning.
-    ///
-    /// The whole taps, not just the order: two filters of the same order with
-    /// different coefficients are different filters, and saying "unchanged"
-    /// there leaves a decoder predicting with the previous ones. That produced
-    /// a stream that decoded to the wrong samples with every checksum intact,
-    /// and only the round trip caught it.
-    /// The high-resolution output timing field, one bit per restart header —
-    /// see [`crate::hires`], where the run-length code and why it is written
-    /// at all are set out.
-    hires: crate::hires::Timing,
     /// Per channel, the dead low bits taken off this unit, which the decoder
     /// puts back after everything else.
     output_shift: Vec<u8>,
-    /// What the decoder holds, as the writer left it: both filters, the
-    /// coding, the shifts, the block size and the dynamic range gain. Queried
-    /// for every "does this have to be said again?" decision and updated by
-    /// the writer as it emits — see [`crate::model`].
-    model: crate::model::DecoderModel,
     /// The last residuals each channel was coded with, most recent last. A
     /// decoder carries them as the second filter's state, so this encoder has
     /// to as well — and they are the residuals of whatever filter was actually
     /// chosen, not of any candidate.
     past_residuals: Vec<Vec<i32>>,
-    /// Whether each channel's second filter has to be described, per block.
-    write_fir: Vec<bool>,
-    restart_write_fir: Vec<bool>,
-    write_iir: Vec<bool>,
-    restart_write_iir: Vec<bool>,
     /// The second filter each channel carries through the current restart
     /// interval, decided at its start on the interval it is about to meet — an
     /// index into the designs, or none. See [`crate::filter::pick_second`].
@@ -506,12 +474,6 @@ pub struct Encoder {
     interval_restart: Vec<Decided>,
     /// And its residuals, `[channel]` by unit, laid out like `prepared`.
     interval_planes: Vec<Vec<i32>>,
-    /// Whether each channel's parameters are said at all in the unit's
-    /// blocks, and in the unpredicted first block of a restarting unit. A
-    /// channel says nothing when its filters, codebook and width are all what
-    /// the decoder already holds, which costs one bit rather than eleven.
-    write_params: Vec<bool>,
-    restart_write_params: Vec<bool>,
     /// What each channel's search decided, this unit and in the unpredicted
     /// block of a restarting one. Held rather than returned so that spreading
     /// Where the per-channel search runs.
@@ -519,6 +481,21 @@ pub struct Encoder {
     /// The interval that is complete and not yet written — see
     /// [`Encoder::advance`].
     deferred: Option<Deferred>,
+    /// What writes the stream: everything that changes as units are written,
+    /// and the interval being written. Out of the encoder while it writes an
+    /// interval beside the deciding of the next — see [`Encoder::advance`].
+    writer: Option<Writer>,
+    /// The Evolution payload the next unit pushed is given, and where in the
+    /// unit it takes effect; [`Encoder::hold`] keeps it with the unit.
+    evolution: Vec<u8>,
+    evolution_id: u32,
+    evolution_offset: u32,
+    evolution_pending: bool,
+    /// The interval that is decided and not yet written.
+    decided: Option<Record>,
+    /// How many intervals have been decided, which is what a second filter
+    /// decided every other restart counts.
+    intervals_decided: u64,
     /// The interval prepared for coding: per channel, every unit's samples
     /// with the dead bits off and the matrices applied, one after another.
     prepared: Vec<Vec<i32>>,
@@ -540,16 +517,6 @@ pub struct Encoder {
     /// increasing size, with the weights that fit them. Decided once an
     /// interval; costed by the unit that opens it.
     candidates: Vec<Vec<Candidate>>,
-    /// Scratch for costing a rematrixed channel before committing to it.
-    input_timing: u16,
-    output_timing: u16,
-    /// The lossless check accumulated since the last restart header, per
-    /// substream, which is what the *next* one certifies.
-    ///
-    /// Per substream because each covers every channel up to *its* last one:
-    /// the stereo presentation certifies two channels, the one behind it
-    /// certifies all of them.
-    pending_check: [u32; MAX_SUBSTREAMS],
     /// The dynamic range each substream currently asks for, and what was last
     /// written for it. A substream that has never been given one carries no
     /// second directory word at all, which is two bytes an access unit saved
@@ -558,33 +525,8 @@ pub struct Encoder {
     /// Whether a hierarchy's early channels are decorrelated — see
     /// [`Encoder::decorrelate`]. On unless turned off.
     decorrelation: bool,
-    /// What to carry in the next access unit's extra data, and under which
-    /// Evolution identifier. Held in one buffer that is refilled rather than
-    /// reallocated, and emptied once written: object metadata belongs to the
-    /// unit it describes.
-    evolution: Vec<u8>,
-    evolution_id: u32,
-    /// The sample of the next unit the payload takes effect at — see
-    /// [`Encoder::set_evolution_at`].
-    evolution_offset: u32,
-    /// Whether there is one to write. Not "is the buffer empty": a payload of
-    /// no bytes is a payload, and it is not the same as carrying none.
-    evolution_pending: bool,
-    /// The key each Evolution frame's protection field is signed with, when
-    /// there is one. See [`crate::protection`].
-    protection: Option<hz_core::hmac::HmacSha256>,
-    /// The decoder's input buffer, in samples: how far the arrival clock is
-    /// behind the presentation clock. It starts full, a large unit spends from
-    /// it, and the units after one refill it. Never negative in a stream a
-    /// decoder will accept — see [`Stats::starved`].
-    advance: i64,
-    /// Access units since each substream last stated one. The value stands for
-    /// `2^refresh` of them and no longer, so this is a deadline and not a
-    /// preference.
-    since_range: [u64; MAX_SUBSTREAMS],
     /// Access units written since the last restart.
     since_restart: u64,
-    frames_written: u64,
     stats: Stats,
     /// Wall time spent in each phase of an interval, kept only when
     /// `HZ_TIME` is set and printed when the stream is finished.
@@ -705,37 +647,11 @@ impl Encoder {
             sample_rate: config.sample_rate,
             channels: config.channels,
             shift: config.bits.shift_into_codec(),
-            planes: vec![vec![0; coded.frame_size]; config.channels],
-            samples: vec![vec![0; coded.frame_size]; config.channels],
             past: (0..config.channels)
                 .map(|_| History::new(filter::SECOND_CONTEXT, coded.frame_size))
                 .collect(),
-            codings: vec![
-                Coding {
-                    filter: crate::filter::Filter::default(),
-                    codebook: crate::huffman::NONE,
-                    huff_lsbs: 24,
-                };
-                config.channels
-            ],
-            restart_codings: vec![
-                Coding {
-                    filter: crate::filter::Filter::default(),
-                    codebook: crate::huffman::NONE,
-                    huff_lsbs: 24,
-                };
-                config.channels
-            ],
-            write_fir: vec![true; config.channels],
-            restart_write_fir: vec![true; config.channels],
-            restart_write_iir: vec![false; config.channels],
-            write_params: vec![true; config.channels],
-            restart_write_params: vec![true; config.channels],
-            hires: crate::hires::Timing::default(),
             output_shift: vec![0; config.channels],
-            model: crate::model::DecoderModel::default(),
             past_residuals: vec![Vec::new(); config.channels],
-            write_iir: vec![false; config.channels],
             second_mode: vec![None; config.channels],
             interval_decided: vec![Vec::new(); config.channels],
             interval_restart: vec![Decided::default(); config.channels],
@@ -754,6 +670,74 @@ impl Encoder {
             timed: std::env::var_os("HZ_TIME").is_some(),
             threads: std::sync::Arc::new(Threads::new(config.channels)),
             deferred: None,
+            writer: Some(Writer {
+                coded,
+                channels: config.channels,
+                hires: crate::hires::Timing::default(),
+                model: crate::model::DecoderModel::default(),
+                input_timing: ((coded.frame_size * (1 + INPUT_RESERVE)) as u16).wrapping_neg(),
+                output_timing: 0,
+                advance: (coded.frame_size * INPUT_RESERVE) as i64,
+                pending_check: [0; MAX_SUBSTREAMS],
+                evolution: Vec::new(),
+                evolution_id: 0,
+                evolution_offset: 0,
+                evolution_pending: false,
+                protection: None,
+                since_range: [0; MAX_SUBSTREAMS],
+                frames_written: 0,
+                codings: vec![
+                    Coding {
+                        filter: crate::filter::Filter::default(),
+                        codebook: crate::huffman::NONE,
+                        huff_lsbs: 24,
+                    };
+                    config.channels
+                ],
+                restart_codings: vec![
+                    Coding {
+                        filter: crate::filter::Filter::default(),
+                        codebook: crate::huffman::NONE,
+                        huff_lsbs: 24,
+                    };
+                    config.channels
+                ],
+                write_fir: vec![true; config.channels],
+                restart_write_fir: vec![true; config.channels],
+                write_iir: vec![false; config.channels],
+                restart_write_iir: vec![false; config.channels],
+                write_params: vec![true; config.channels],
+                restart_write_params: vec![true; config.channels],
+                samples: vec![vec![0; coded.frame_size]; config.channels],
+                planes: vec![vec![0; coded.frame_size]; config.channels],
+                output_shift: vec![0; config.channels],
+                dynamic_range: [None; MAX_SUBSTREAMS],
+                since_restart: 0,
+                stats: Stats {
+                    // It starts full, so anything lower is something spent.
+                    lowest_advance: (coded.frame_size * INPUT_RESERVE) as i64,
+                    ..Stats::default()
+                },
+                prepared: Vec::new(),
+                prepared_shifts: Vec::new(),
+                prepared_checks: Vec::new(),
+                interval_decided: Vec::new(),
+                interval_planes: Vec::new(),
+                interval_restart: Vec::new(),
+                matrices: Vec::new(),
+                presentations: Vec::new(),
+                arrangement: Vec::new(),
+                assignment: Vec::new(),
+                presentation_shift: Vec::new(),
+                max_shift: crate::frame::MAX_OUTPUT_SHIFT,
+                max_output_bits: crate::frame::CODEC_BITS as u8,
+            }),
+            decided: None,
+            intervals_decided: 0,
+            evolution: Vec::new(),
+            evolution_id: 0,
+            evolution_offset: 0,
+            evolution_pending: false,
             prepared: vec![Vec::new(); config.channels],
             prepared_shifts: Vec::new(),
             prepared_checks: Vec::new(),
@@ -763,24 +747,9 @@ impl Encoder {
             spare: Vec::new(),
             unit_scratch: Vec::new(),
             candidates: vec![Vec::new(); config.channels],
-            // The first unit arrives a frame before zero, which is what a
-            // decoder expects of a stream that starts at zero — and a reserve
-            // earlier still, so that the first large unit has something to
-            // spend.
-            input_timing: ((coded.frame_size * (1 + INPUT_RESERVE)) as u16).wrapping_neg(),
-            output_timing: 0,
-            advance: (coded.frame_size * INPUT_RESERVE) as i64,
-            pending_check: [0; MAX_SUBSTREAMS],
-            evolution: Vec::new(),
-            evolution_id: 0,
-            evolution_offset: 0,
-            evolution_pending: false,
-            protection: None,
             dynamic_range: [None; MAX_SUBSTREAMS],
             decorrelation: true,
-            since_range: [0; MAX_SUBSTREAMS],
             since_restart: 0,
-            frames_written: 0,
             stats: Stats {
                 // It starts full, so anything lower is something spent.
                 lowest_advance: (coded.frame_size * INPUT_RESERVE) as i64,
@@ -800,12 +769,45 @@ impl Encoder {
 
     /// Frames encoded so far.
     pub fn frames_written(&self) -> u64 {
-        self.frames_written
+        self.writer().frames_written
+    }
+
+    /// The writer, which is only ever out of the encoder inside
+    /// [`Encoder::advance`].
+    fn writer(&self) -> &Writer {
+        self.writer
+            .as_ref()
+            .expect("the writer is in the encoder between calls")
+    }
+
+    fn writer_mut(&mut self) -> &mut Writer {
+        self.writer
+            .as_mut()
+            .expect("the writer is in the encoder between calls")
     }
 
     /// What the encoder has been choosing.
-    pub fn stats(&self) -> &Stats {
-        &self.stats
+    pub fn stats(&self) -> Stats {
+        // What deciding counts and what writing counts are different fields
+        // of the same record, kept apart while the two run side by side.
+        let written = &self.writer().stats;
+        Stats {
+            orders: written.orders,
+            iir_orders: written.iir_orders,
+            filter_blocks: written.filter_blocks,
+            params_restated: written.params_restated,
+            codebooks: written.codebooks,
+            matrixed_units: written.matrixed_units,
+            units: written.units,
+            residual_bits: written.residual_bits,
+            residuals: written.residuals,
+            framing_bytes: written.framing_bytes,
+            total_bytes: written.total_bytes,
+            starved: written.starved,
+            lowest_advance: written.lowest_advance,
+            peak_unit_bytes: written.peak_unit_bytes,
+            ..self.stats.clone()
+        }
     }
 
     /// Carry a payload in the next access unit's extra data.
@@ -860,7 +862,7 @@ impl Encoder {
     /// verifies against nothing. What the digest covers, and why the key is
     /// not this project's to provide, is in [`crate::protection`].
     pub fn set_evolution_key(&mut self, key: &[u8]) {
-        self.protection = Some(hz_core::hmac::HmacSha256::new(key));
+        self.writer_mut().protection = Some(hz_core::hmac::HmacSha256::new(key));
     }
 
     /// Ask a presentation for a dynamic range gain, from the next access unit
@@ -995,14 +997,15 @@ impl Encoder {
     /// The encoder holds an interval before it writes one, because the
     /// decisions that stand for an interval — the matrices, the second filter
     /// each channel carries — are better made on the interval they will be
-    /// applied to than on the one before it. And it writes an interval only
-    /// once the next one is complete too, so that the next one's folds are
-    /// worked out while this one is written — see [`Encoder::advance`]. So all
-    /// but one push in [`RESTART_INTERVAL`] hands back nothing and the last
-    /// hands back the lot *of the interval before*; the first interval's
-    /// bytes come with the second's last push, and [`Encoder::finish`] hands
-    /// back what is left. A caller appends what it is given either way, which
-    /// is what every caller already did.
+    /// applied to than on the one before it. And it works on three intervals
+    /// at once — one's folds, the one before it decided, the one before that
+    /// written — see [`Encoder::advance`]. So all but one push in
+    /// [`RESTART_INTERVAL`] hands back nothing and the last hands back the lot
+    /// *of the interval two before*; the first interval's bytes come with the
+    /// third's last push, and [`Encoder::finish`] hands back what is left. A
+    /// caller appends what it is given either way, which is what every caller
+    /// already did; what it reads of [`Encoder::stats`] is what has been
+    /// written, which is everything once it has finished.
     pub fn push(&mut self, interleaved: &[i32]) -> Vec<u8> {
         assert_eq!(
             interleaved.len(),
@@ -1063,9 +1066,7 @@ impl Encoder {
             self.hold(interleaved, frames, self.coded.frame_size - frames);
         }
         let mut out = self.advance();
-        if let Some(last) = self.deferred.take() {
-            out.extend_from_slice(&self.write_interval(last));
-        }
+        out.extend_from_slice(&self.drain());
         if self.timed {
             let names = [
                 "build", "copy", "suggest", "prepare", "matrices", "second", "interval", "write",
@@ -1096,20 +1097,24 @@ impl Encoder {
         out
     }
 
-    /// An interval is complete: decide what it will be while the one before
-    /// it is written, and hand that one back.
+    /// An interval is complete: work out its folds while the one before it
+    /// is decided and the one before that is written, and hand that one back.
     ///
-    /// # Why an interval late
+    /// # Why two intervals late
     ///
-    /// Deciding an interval's folds is a search over its own samples and
+    /// Working out an interval's folds is a search over its own samples and
     /// nothing else, and with folds it was a quarter of an encode, on one
-    /// thread, between writing one interval and deciding the next. Done beside
-    /// the writing of the interval before, it costs no time at all; the price
-    /// is that [`Encoder::push`] hands back each interval when the one after
-    /// it is complete rather than when it is, and [`Encoder::finish`] hands
-    /// back the last two. The stream is byte for byte the same: every interval
-    /// is decided from the same samples and the same request, and written with
-    /// the dynamic range the caller had asked for when it was complete.
+    /// thread. Writing an interval is on one thread too, and reads nothing the
+    /// deciding of the next one changes — every interval opens with a restart
+    /// header, so what the decoder held before it is nothing either way. So the
+    /// three run side by side, each on its own interval, the writing with the
+    /// [`Writer`] taken out of the encoder and the deciding with the rest. The
+    /// price is that [`Encoder::push`] hands back each interval two intervals
+    /// after it is complete, and [`Encoder::finish`] hands back the last
+    /// three. The stream is byte for byte the same: every interval is worked
+    /// out and decided from the same samples, the same request and the same
+    /// decisions before it, and written with the dynamic range the caller had
+    /// asked for when it was complete.
     fn advance(&mut self) -> Vec<u8> {
         let held = std::mem::take(&mut self.pending);
         if held.is_empty() {
@@ -1127,22 +1132,67 @@ impl Encoder {
         }
         let planning = self.planning();
         let dynamic_range = self.dynamic_range;
-        let (planning, out) = match self.deferred.take() {
-            None => (planning.plan(&held), Vec::new()),
-            Some(previous) => std::thread::scope(|scope| {
-                let next = scope.spawn(|| planning.plan(&held));
-                let out = self.write_interval(previous);
-                (
-                    next.join().expect("deciding an interval does not panic"),
-                    out,
-                )
-            }),
-        };
+        let planned = self.deferred.take();
+        let decided = self.decided.take();
+        let mut writer = self.writer.take().expect("the writer is in the encoder");
+        // Three intervals at once: this one's folds worked out, the one before
+        // it decided, and the one before that written. None reads what
+        // another changes — see [`Planning`] and [`Writer`].
+        let (planning, record, written, writer) = std::thread::scope(|scope| {
+            let plan = scope.spawn(|| planning.plan(&held));
+            let write = scope.spawn(move || {
+                let written = decided.map(|record| writer.write(record));
+                (written, writer)
+            });
+            let record = planned.map(|planned| self.decide(planned));
+            let (written, writer) = write.join().expect("writing an interval does not panic");
+            (
+                plan.join().expect("deciding an interval does not panic"),
+                record,
+                written,
+                writer,
+            )
+        });
+        self.writer = Some(writer);
+        self.decided = record;
         self.deferred = Some(Deferred {
             held,
             planning,
             dynamic_range,
         });
+        self.take_what_was_written(written)
+    }
+
+    /// The bytes of an interval just written, with its units' buffers put
+    /// back rather than dropped: an interval is a megabyte or so at sixteen
+    /// channels and there is one of them a third of a second.
+    fn take_what_was_written(
+        &mut self,
+        written: Option<(Vec<u8>, Vec<Held>, std::time::Duration)>,
+    ) -> Vec<u8> {
+        let Some((out, held, took)) = written else {
+            return Vec::new();
+        };
+        if self.timed {
+            self.phase_times[7] += took;
+        }
+        self.spare.extend(held);
+        out
+    }
+
+    /// Everything not yet written, written: the interval decided, then the
+    /// one worked out and not yet decided.
+    fn drain(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(record) = self.decided.take() {
+            let written = self.writer_mut().write(record);
+            out.extend_from_slice(&self.take_what_was_written(Some(written)));
+        }
+        if let Some(planned) = self.deferred.take() {
+            let record = self.decide(planned);
+            let written = self.writer_mut().write(record);
+            out.extend_from_slice(&self.take_what_was_written(Some(written)));
+        }
         out
     }
 
@@ -1183,8 +1233,9 @@ impl Encoder {
         }
     }
 
-    /// Write an interval that is complete and decided.
-    fn write_interval(&mut self, deferred: Deferred) -> Vec<u8> {
+    /// Decide an interval that is complete and worked out, and hand over
+    /// what the writing needs.
+    fn decide(&mut self, deferred: Deferred) -> Record {
         let Deferred {
             held,
             planning,
@@ -1193,33 +1244,36 @@ impl Encoder {
         if self.since_restart == 0 {
             self.take_the_plan(planning);
         }
-        // The dynamic range as it stood when the interval was complete, which
-        // is what writing it then would have stated; what the caller has asked
-        // for since is the next interval's, and goes back after.
-        let live = std::mem::replace(&mut self.dynamic_range, dynamic_range);
         self.timed_phase(3, |encoder| encoder.prepare(&held));
         self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
         self.timed_phase(6, |encoder| encoder.decide_interval(held.len()));
-
-        let mut out = Vec::with_capacity(held.len() * 4096);
-        let start = std::time::Instant::now();
-        for (index, unit) in held.iter().enumerate() {
-            self.evolution_pending = unit.evolution.is_some();
-            self.evolution_id = unit.evolution.unwrap_or(0);
-            self.evolution_offset = unit.evolution_offset;
-            self.evolution.clear();
-            self.evolution.extend_from_slice(&unit.payload);
-            out.extend_from_slice(&self.encode(index, unit.frames, unit.padding));
+        self.intervals_decided += 1;
+        let channels = self.channels;
+        // The buffers the deciding filled go with the interval; the next one
+        // starts from empty ones of the same shape, which it sizes itself.
+        Record {
+            held,
+            dynamic_range,
+            prepared: std::mem::replace(&mut self.prepared, vec![Vec::new(); channels]),
+            prepared_shifts: std::mem::take(&mut self.prepared_shifts),
+            prepared_checks: std::mem::take(&mut self.prepared_checks),
+            interval_decided: std::mem::replace(
+                &mut self.interval_decided,
+                vec![Vec::new(); channels],
+            ),
+            interval_planes: std::mem::replace(
+                &mut self.interval_planes,
+                vec![Vec::new(); channels],
+            ),
+            interval_restart: self.interval_restart.clone(),
+            matrices: self.matrices.clone(),
+            presentations: self.presentations.clone(),
+            arrangement: self.arrangement.clone(),
+            assignment: self.assignment.clone(),
+            presentation_shift: self.presentation_shift.clone(),
+            max_shift: self.max_shift,
+            max_output_bits: self.max_output_bits,
         }
-        if self.timed {
-            self.phase_times[7] += start.elapsed();
-        }
-        // The buffers go back rather than being dropped: an interval is a
-        // megabyte or so at sixteen channels and there is one of them a third
-        // of a second.
-        self.dynamic_range = live;
-        self.spare.extend(held);
-        out
     }
 
     /// Which channels each destination might be coded against, over the
@@ -1437,7 +1491,6 @@ impl Encoder {
         let past = &self.past;
         let past_residuals = &self.past_residuals;
         let modes = &self.second_mode;
-        let model = &self.model;
         let split_at = RESTART_BLOCK;
 
         let body = |channel: usize,
@@ -1448,7 +1501,10 @@ impl Encoder {
             // The three things that cross units, this channel's own.
             let mut history = past[channel].clone();
             let mut residuals = past_residuals[channel].clone();
-            let mut held = model.channel(channel);
+            // What the decoder holds for this channel when the interval
+            // starts, which is nothing: every interval opens with a restart
+            // header, and a restart header throws away what it held.
+            let mut held = crate::model::Held::default();
 
             for index in 0..units {
                 let samples = &prepared[channel][index * width..(index + 1) * width];
@@ -1556,92 +1612,6 @@ impl Encoder {
             self.past_residuals[channel] = residuals;
         }
         self.stats.filters_restated += restated.iter().sum::<u64>();
-    }
-
-    /// One access unit, from samples to bytes.
-    ///
-    /// The steps are named rather than inlined because each of them is a
-    /// decision with its own reasons, and the reasons are what the next change
-    /// needs. `padding` is how many of `frames` are not real samples, which
-    /// only a final short unit has.
-    fn encode(&mut self, index: usize, frames: usize, padding: usize) -> Vec<u8> {
-        let _ = frames;
-        let width = self.coded.frame_size;
-        for (channel, plane) in self.samples.iter_mut().enumerate() {
-            plane.copy_from_slice(&self.prepared[channel][index * width..(index + 1) * width]);
-            self.output_shift[channel] = self.prepared_shifts[index * self.channels + channel];
-        }
-        let check = self.prepared_checks[index];
-
-        let restart = self.since_restart == 0;
-        // A restart header throws away everything the blocks before it left
-        // standing: both filters, the coding, the block size and the shifts.
-        // The writer does this again where the header is actually written; it
-        // is done here too because the decisions below are made against what
-        // the decoder will be holding, not against what it holds now.
-        if restart {
-            for substream in 0..self.coded.substreams {
-                self.model.restart(substream, &self.coded.ranges[substream]);
-            }
-        }
-        // A stream whose content fills its container never says anything about
-        // shifts at all.
-        let write_shift = self
-            .model
-            .restates_shifts(&self.output_shift, self.channels - 1);
-
-        // A restart header clears the decoder's matrices, so they are said
-        // there and nowhere else.
-        // A restart header clears the decoder's matrices, so they are said
-        // again on every restart — and a presentation is a matrix like any
-        // other, so a stream that states one has to say so even when it
-        // rematrixes nothing for compression.
-        let write_matrix = restart
-            && (!self.matrices.is_empty()
-                || !self.arrangement.is_empty()
-                || self.presentations.iter().any(|rows| !rows.is_empty()));
-
-        // A restarting unit is two blocks: an unpredicted one that refills
-        // the decoder's filter state, and the rest of the unit coded from it.
-        // See [`RESTART_BLOCK`].
-        let split = if restart { RESTART_BLOCK } else { 0 };
-        // Already decided, for the whole interval — see `decide_interval`.
-        // What is left here is to put this unit's share where the writer looks
-        // for it, which is a copy of forty samples a channel.
-        for channel in 0..self.channels {
-            let decided = &self.interval_decided[channel][index];
-            self.codings[channel] = decided.coding;
-            self.write_fir[channel] = decided.write_fir;
-            self.write_iir[channel] = decided.write_iir;
-            self.write_params[channel] = decided.write_params;
-            self.planes[channel].copy_from_slice(
-                &self.interval_planes[channel][index * width..(index + 1) * width],
-            );
-            if restart {
-                let first = &self.interval_restart[channel];
-                self.restart_codings[channel] = first.coding;
-                self.restart_write_fir[channel] = first.write_fir;
-                self.restart_write_iir[channel] = first.write_iir;
-                self.restart_write_params[channel] = first.write_params;
-            }
-        }
-
-        let certified = self.certify(restart);
-        let bytes = self.write_unit(Written {
-            restart,
-            split,
-            write_shift,
-            write_matrix,
-            certified,
-            padding,
-        });
-
-        for (accumulated, unit_check) in self.pending_check.iter_mut().zip(&check) {
-            *accumulated ^= unit_check;
-        }
-        self.schedule_arrival(bytes.len());
-        self.frames_written += self.coded.frame_size as u64;
-        bytes
     }
 
     /// Prepare every unit of the held interval: de-interleave it through the
@@ -2030,7 +2000,7 @@ impl Encoder {
         let width = self.coded.frame_size;
         let block = crate::format::MAX_BLOCK.min(40);
         let ahead = (units * width).min(filter::TRIAL_BLOCKS * block);
-        let restart = self.stats.units / RESTART_INTERVAL;
+        let restart = self.intervals_decided;
         let effort = self.effort;
 
         let past = &self.past;
@@ -2268,229 +2238,6 @@ impl Encoder {
             return pool.install(|| (0..self.channels).into_par_iter().map(judge).collect());
         }
         (0..self.channels).map(judge).collect()
-    }
-    /// Read and clear the check a restart header certifies.
-    ///
-    /// A restart header certifies everything since the previous one, so the
-    /// accumulator is read and cleared here and this unit's own check goes
-    /// into the next interval.
-    fn certify(&mut self, restart: bool) -> [u8; MAX_SUBSTREAMS] {
-        let mut certified = [0u8; MAX_SUBSTREAMS];
-        if restart {
-            for (slot, accumulated) in certified.iter_mut().zip(&mut self.pending_check) {
-                *slot = xor_to_byte(*accumulated);
-                *accumulated = 0;
-            }
-        }
-        certified
-    }
-
-    /// Build this unit's blocks, write it, and account for what it chose.
-    ///
-    /// The accounting is here rather than in a function of its own because the
-    /// blocks borrow the codings and the statistics are a field beside them;
-    /// splitting them would mean either copying the blocks or handing out a
-    /// borrow the counter cannot hold.
-    fn write_unit(&mut self, written: Written) -> Vec<u8> {
-        let Written {
-            restart,
-            split,
-            write_shift,
-            write_matrix,
-            certified,
-            padding,
-        } = written;
-
-        // Decided before the blocks, which borrow the codings for as long as
-        // they exist.
-        let dynamic_range = self.due_dynamic_range();
-        // What a decoder that never left is running, per substream: the word
-        // it read last, which is what it holds the start-up gain against.
-        let running: Vec<Option<DynamicRange>> = (0..self.coded.substreams)
-            .map(|index| self.model.range(index))
-            .collect();
-
-        // A restart header sets the decoder's block size back to eight, so
-        // that is what it holds coming into a restarting unit whatever the
-        // last block said.
-        let mut held = self.model.blocksize(0);
-        let first_frames = if restart {
-            split
-        } else {
-            self.coded.frame_size
-        };
-        let tail_frames = self.coded.frame_size - split;
-        let all = [
-            Block {
-                first: 0,
-                frames: first_frames,
-                write_frames: {
-                    let differs = first_frames != held;
-                    held = first_frames;
-                    differs
-                },
-                codings: if restart {
-                    &self.restart_codings
-                } else {
-                    &self.codings
-                },
-                write_fir: if restart {
-                    &self.restart_write_fir
-                } else {
-                    &self.write_fir
-                },
-                write_iir: if restart {
-                    &self.restart_write_iir
-                } else {
-                    &self.write_iir
-                },
-                write_params: if restart {
-                    &self.restart_write_params
-                } else {
-                    &self.write_params
-                },
-                output_shift: &self.output_shift,
-                write_shift,
-            },
-            Block {
-                first: split,
-                frames: tail_frames,
-                write_frames: tail_frames != held,
-                codings: &self.codings,
-                write_fir: &self.write_fir,
-                write_iir: &self.write_iir,
-                write_params: &self.write_params,
-                output_shift: &self.output_shift,
-                // A restarting unit says them in its first block; the second
-                // has nothing to add.
-                write_shift: false,
-            },
-        ];
-        let blocks = &all[..if restart { 2 } else { 1 }];
-
-        let unit = Unit {
-            samples: &self.planes,
-            blocks,
-            matrices: &self.matrices,
-            arrangement: &self.arrangement,
-            presentation_shift: &self.presentation_shift,
-            assignment: &self.assignment,
-            presentations: &self.presentations,
-            write_matrix,
-            input_timing: self.input_timing,
-            output_timing: self.output_timing,
-            lossless_check: certified,
-            // Only a restart header carries one, so only a restarting unit
-            // takes a bit off the serialiser.
-            hires_timing: restart && self.hires.next(self.frames_written),
-            max_shift: self.max_shift,
-            max_output_bits: self.max_output_bits,
-            shorten_by: padding as u16,
-            restart,
-            evolution: self.evolution_pending.then_some(frame::Evolution {
-                id: self.evolution_id,
-                bytes: self.evolution.as_slice(),
-                sample_offset: self.evolution_offset,
-            }),
-            protection: self.protection.as_ref(),
-            dynamic_range,
-            // A decoder joining at this unit may not be told to start louder
-            // than the gain the stream is already running at, so this follows
-            // the gains rather than being chosen.
-            start_up_gain: crate::format::start_up_gain(&self.dynamic_range, &running),
-        };
-        let bytes = frame::access_unit(&self.coded, &unit, &mut self.model);
-        self.evolution.clear();
-        self.evolution_offset = 0;
-        self.evolution_pending = false;
-        self.since_restart = (self.since_restart + 1) % RESTART_INTERVAL;
-
-        // The real cost, code lengths included — counting the raw tails alone
-        // made the codebooks look free and their gain look like nothing.
-        let mut residual_bits = 0u64;
-        for block in blocks {
-            for (channel, coding) in block.codings.iter().enumerate() {
-                self.stats.orders[coding.filter.fir.order] += 1;
-                self.stats.filter_blocks += 1;
-                if block.write_params[channel] {
-                    self.stats.params_restated += 1;
-                }
-                self.stats.iir_orders[coding.filter.iir.order] += 1;
-                self.stats.codebooks[coding.codebook as usize] += 1;
-                let residuals = &self.planes[channel][block.first..block.first + block.frames];
-                residual_bits +=
-                    crate::huffman::cost(coding.codebook, coding.huff_lsbs, 0, residuals)
-                        .unwrap_or(0) as u64;
-            }
-        }
-        self.stats.units += 1;
-        if !self.matrices.is_empty() {
-            self.stats.matrixed_units += 1;
-        }
-        self.stats.residual_bits += residual_bits;
-        self.stats.residuals += self.channels as u64 * self.coded.frame_size as u64;
-        self.stats.total_bytes += bytes.len() as u64;
-        self.stats.peak_unit_bytes = self.stats.peak_unit_bytes.max(bytes.len() as u64);
-        self.stats.framing_bytes += bytes.len() as u64 - residual_bits.div_ceil(8);
-        bytes
-    }
-
-    /// The directory's second word, per substream: said when the value
-    /// changes, and again whenever the last one is about to lapse.
-    fn due_dynamic_range(&mut self) -> [Option<DynamicRange>; MAX_SUBSTREAMS] {
-        let mut dynamic_range = [None; MAX_SUBSTREAMS];
-        for (index, slot) in dynamic_range
-            .iter_mut()
-            .enumerate()
-            .take(self.coded.substreams)
-        {
-            let Some(wanted) = self.dynamic_range[index] else {
-                continue;
-            };
-            // Counted first and tested after, because a decoder counts this
-            // access unit before it looks at the word in it: the value has to
-            // arrive on the `2^refresh`-th unit, not the one after. Testing
-            // before incrementing puts every word one unit late and a decoder
-            // says so, once per substream per interval.
-            self.since_range[index] += 1;
-            let due = self.model.range(index) != Some(wanted)
-                || self.since_range[index] >= wanted.deadline();
-            if due {
-                *slot = Some(wanted);
-                self.since_range[index] = 0;
-            }
-        }
-        dynamic_range
-    }
-
-    /// When the next access unit is declared to arrive.
-    ///
-    /// Long enough for the one just written to have got there at the declared
-    /// peak, and otherwise whatever steers the buffer back to full — which is
-    /// one frame exactly once nothing has been borrowed.
-    fn schedule_arrival(&mut self, bytes: usize) {
-        let frames = self.coded.frame_size as i64;
-        let reserve = (self.coded.frame_size * INPUT_RESERVE) as i64;
-        let peak = u64::from(self.coded.peak_bitrate).max(1);
-        // From the unit just written, which is the one whose bytes have to
-        // reach a decoder before the next one is due — not the one before it.
-        let words = (bytes / 2) as u64;
-        let needed = (words << 8).div_ceil(peak);
-        let interval = (needed as i64).max(self.advance + frames - reserve).max(1);
-
-        self.advance += frames - interval;
-        if self.advance < 0 {
-            // The content needs more than the stream declared, on average and
-            // not merely in one unit — no schedule fixes that, and a decoder
-            // will report the units as arriving faster than it can take them.
-            self.stats.starved += 1;
-        }
-        self.stats.lowest_advance = self.stats.lowest_advance.min(self.advance);
-
-        self.input_timing = self.input_timing.wrapping_add(interval as u16);
-        self.output_timing = self
-            .output_timing
-            .wrapping_add(self.coded.frame_size as u16);
     }
 }
 
@@ -3533,6 +3280,496 @@ impl Planning {
             eprintln!("fold: {count} channels decorrelated");
         }
         (candidate, rows)
+    }
+}
+
+/// What writes the stream.
+///
+/// Everything that changes as units are written — what the decoder is
+/// holding, when each unit arrives, what is due to be restated, what is
+/// signed — and the interval being written, under the names the encoder uses
+/// for the same things while deciding them. Taken out of the encoder to write
+/// one interval while the next is decided: nothing here is read by a
+/// decision, and nothing a decision changes is read here except through the
+/// [`Record`] it hands over.
+#[derive(Debug)]
+struct Writer {
+    coded: Coded,
+    channels: usize,
+    /// The second filter the decoder currently holds, per channel. A restart
+    /// header clears it, and it is almost always empty — so saying
+    /// "unchanged" rather than "order zero" saves four bits a channel an
+    /// access unit, which is more than the filter itself was winning.
+    ///
+    /// The whole taps, not just the order: two filters of the same order with
+    /// different coefficients are different filters, and saying "unchanged"
+    /// there leaves a decoder predicting with the previous ones. That produced
+    /// a stream that decoded to the wrong samples with every checksum intact,
+    /// and only the round trip caught it.
+    /// The high-resolution output timing field, one bit per restart header —
+    /// see [`crate::hires`], where the run-length code and why it is written
+    /// at all are set out.
+    hires: crate::hires::Timing,
+    /// What the decoder holds, as the writer left it: both filters, the
+    /// coding, the shifts, the block size and the dynamic range gain. Queried
+    /// for every "does this have to be said again?" decision and updated by
+    /// the writer as it emits — see [`crate::model`].
+    model: crate::model::DecoderModel,
+    /// Scratch for costing a rematrixed channel before committing to it.
+    input_timing: u16,
+    output_timing: u16,
+    /// The decoder's input buffer, in samples: how far the arrival clock is
+    /// behind the presentation clock. It starts full, a large unit spends from
+    /// it, and the units after one refill it. Never negative in a stream a
+    /// decoder will accept — see [`Stats::starved`].
+    advance: i64,
+    /// The lossless check accumulated since the last restart header, per
+    /// substream, which is what the *next* one certifies.
+    ///
+    /// Per substream because each covers every channel up to *its* last one:
+    /// the stereo presentation certifies two channels, the one behind it
+    /// certifies all of them.
+    pending_check: [u32; MAX_SUBSTREAMS],
+    /// What to carry in the next access unit's extra data, and under which
+    /// Evolution identifier. Held in one buffer that is refilled rather than
+    /// reallocated, and emptied once written: object metadata belongs to the
+    /// unit it describes.
+    evolution: Vec<u8>,
+    evolution_id: u32,
+    /// The sample of the next unit the payload takes effect at — see
+    /// [`Encoder::set_evolution_at`].
+    evolution_offset: u32,
+    /// Whether there is one to write. Not "is the buffer empty": a payload of
+    /// no bytes is a payload, and it is not the same as carrying none.
+    evolution_pending: bool,
+    /// The key each Evolution frame's protection field is signed with, when
+    /// there is one. See [`crate::protection`].
+    protection: Option<hz_core::hmac::HmacSha256>,
+    /// Access units since each substream last stated one. The value stands for
+    /// `2^refresh` of them and no longer, so this is a deadline and not a
+    /// preference.
+    since_range: [u64; MAX_SUBSTREAMS],
+    frames_written: u64,
+    /// Per channel, how this unit's last block is coded.
+    codings: Vec<Coding>,
+    /// And how the unprediced first block of a restarting unit is.
+    restart_codings: Vec<Coding>,
+    /// Whether each channel's second filter has to be described, per block.
+    write_fir: Vec<bool>,
+    restart_write_fir: Vec<bool>,
+    write_iir: Vec<bool>,
+    restart_write_iir: Vec<bool>,
+    /// Whether each channel's parameters are said at all in the unit's
+    /// blocks, and in the unpredicted first block of a restarting unit. A
+    /// channel says nothing when its filters, codebook and width are all what
+    /// the decoder already holds, which costs one bit rather than eleven.
+    write_params: Vec<bool>,
+    restart_write_params: Vec<bool>,
+    /// The samples of the unit being encoded, before prediction.
+    samples: Vec<Vec<i32>>,
+    /// Channel-major planes of residuals, allocated once and reused.
+    planes: Vec<Vec<i32>>,
+    /// The dead-bit shift in force, per channel, as the units are written.
+    output_shift: Vec<u8>,
+    /// What the interval being written states for its dynamic range.
+    dynamic_range: [Option<DynamicRange>; MAX_SUBSTREAMS],
+    /// Units into the restart interval being written.
+    since_restart: u64,
+    /// What writing counts; see [`Encoder::stats`].
+    stats: Stats,
+    prepared: Vec<Vec<i32>>,
+    prepared_shifts: Vec<u8>,
+    prepared_checks: Vec<[u32; MAX_SUBSTREAMS]>,
+    interval_decided: Vec<Vec<Decided>>,
+    interval_planes: Vec<Vec<i32>>,
+    interval_restart: Vec<Decided>,
+    matrices: Vec<Primitive>,
+    presentations: Vec<Vec<Primitive>>,
+    arrangement: Vec<Primitive>,
+    assignment: Vec<Vec<u8>>,
+    presentation_shift: Vec<Vec<u8>>,
+    max_shift: u8,
+    max_output_bits: u8,
+}
+
+/// An interval decided and not yet written: its units, and everything the
+/// deciding left for the writing.
+#[derive(Debug)]
+struct Record {
+    held: Vec<Held>,
+    dynamic_range: [Option<DynamicRange>; MAX_SUBSTREAMS],
+    prepared: Vec<Vec<i32>>,
+    prepared_shifts: Vec<u8>,
+    prepared_checks: Vec<[u32; MAX_SUBSTREAMS]>,
+    interval_decided: Vec<Vec<Decided>>,
+    interval_planes: Vec<Vec<i32>>,
+    interval_restart: Vec<Decided>,
+    matrices: Vec<Primitive>,
+    presentations: Vec<Vec<Primitive>>,
+    arrangement: Vec<Primitive>,
+    assignment: Vec<Vec<u8>>,
+    presentation_shift: Vec<Vec<u8>>,
+    max_shift: u8,
+    max_output_bits: u8,
+}
+
+impl Writer {
+    /// Write an interval, and hand back its bytes, its units' buffers and
+    /// how long the writing took.
+    fn write(&mut self, record: Record) -> (Vec<u8>, Vec<Held>, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let Record {
+            held,
+            dynamic_range,
+            prepared,
+            prepared_shifts,
+            prepared_checks,
+            interval_decided,
+            interval_planes,
+            interval_restart,
+            matrices,
+            presentations,
+            arrangement,
+            assignment,
+            presentation_shift,
+            max_shift,
+            max_output_bits,
+        } = record;
+        self.dynamic_range = dynamic_range;
+        self.prepared = prepared;
+        self.prepared_shifts = prepared_shifts;
+        self.prepared_checks = prepared_checks;
+        self.interval_decided = interval_decided;
+        self.interval_planes = interval_planes;
+        self.interval_restart = interval_restart;
+        self.matrices = matrices;
+        self.presentations = presentations;
+        self.arrangement = arrangement;
+        self.assignment = assignment;
+        self.presentation_shift = presentation_shift;
+        self.max_shift = max_shift;
+        self.max_output_bits = max_output_bits;
+
+        let mut out = Vec::with_capacity(held.len() * 4096);
+        for (index, unit) in held.iter().enumerate() {
+            self.evolution_pending = unit.evolution.is_some();
+            self.evolution_id = unit.evolution.unwrap_or(0);
+            self.evolution_offset = unit.evolution_offset;
+            self.evolution.clear();
+            self.evolution.extend_from_slice(&unit.payload);
+            out.extend_from_slice(&self.encode(index, unit.frames, unit.padding));
+        }
+        (out, held, start.elapsed())
+    }
+
+    /// One access unit, from samples to bytes.
+    ///
+    /// The steps are named rather than inlined because each of them is a
+    /// decision with its own reasons, and the reasons are what the next change
+    /// needs. `padding` is how many of `frames` are not real samples, which
+    /// only a final short unit has.
+    fn encode(&mut self, index: usize, frames: usize, padding: usize) -> Vec<u8> {
+        let _ = frames;
+        let width = self.coded.frame_size;
+        for (channel, plane) in self.samples.iter_mut().enumerate() {
+            plane.copy_from_slice(&self.prepared[channel][index * width..(index + 1) * width]);
+            self.output_shift[channel] = self.prepared_shifts[index * self.channels + channel];
+        }
+        let check = self.prepared_checks[index];
+
+        let restart = self.since_restart == 0;
+        // A restart header throws away everything the blocks before it left
+        // standing: both filters, the coding, the block size and the shifts.
+        // The writer does this again where the header is actually written; it
+        // is done here too because the decisions below are made against what
+        // the decoder will be holding, not against what it holds now.
+        if restart {
+            for substream in 0..self.coded.substreams {
+                self.model.restart(substream, &self.coded.ranges[substream]);
+            }
+        }
+        // A stream whose content fills its container never says anything about
+        // shifts at all.
+        let write_shift = self
+            .model
+            .restates_shifts(&self.output_shift, self.channels - 1);
+
+        // A restart header clears the decoder's matrices, so they are said
+        // there and nowhere else.
+        // A restart header clears the decoder's matrices, so they are said
+        // again on every restart — and a presentation is a matrix like any
+        // other, so a stream that states one has to say so even when it
+        // rematrixes nothing for compression.
+        let write_matrix = restart
+            && (!self.matrices.is_empty()
+                || !self.arrangement.is_empty()
+                || self.presentations.iter().any(|rows| !rows.is_empty()));
+
+        // A restarting unit is two blocks: an unpredicted one that refills
+        // the decoder's filter state, and the rest of the unit coded from it.
+        // See [`RESTART_BLOCK`].
+        let split = if restart { RESTART_BLOCK } else { 0 };
+        // Already decided, for the whole interval — see `decide_interval`.
+        // What is left here is to put this unit's share where the writer looks
+        // for it, which is a copy of forty samples a channel.
+        for channel in 0..self.channels {
+            let decided = &self.interval_decided[channel][index];
+            self.codings[channel] = decided.coding;
+            self.write_fir[channel] = decided.write_fir;
+            self.write_iir[channel] = decided.write_iir;
+            self.write_params[channel] = decided.write_params;
+            self.planes[channel].copy_from_slice(
+                &self.interval_planes[channel][index * width..(index + 1) * width],
+            );
+            if restart {
+                let first = &self.interval_restart[channel];
+                self.restart_codings[channel] = first.coding;
+                self.restart_write_fir[channel] = first.write_fir;
+                self.restart_write_iir[channel] = first.write_iir;
+                self.restart_write_params[channel] = first.write_params;
+            }
+        }
+
+        let certified = self.certify(restart);
+        let bytes = self.write_unit(Written {
+            restart,
+            split,
+            write_shift,
+            write_matrix,
+            certified,
+            padding,
+        });
+
+        for (accumulated, unit_check) in self.pending_check.iter_mut().zip(&check) {
+            *accumulated ^= unit_check;
+        }
+        self.schedule_arrival(bytes.len());
+        self.frames_written += self.coded.frame_size as u64;
+        bytes
+    }
+
+    /// Build this unit's blocks, write it, and account for what it chose.
+    ///
+    /// The accounting is here rather than in a function of its own because the
+    /// blocks borrow the codings and the statistics are a field beside them;
+    /// splitting them would mean either copying the blocks or handing out a
+    /// borrow the counter cannot hold.
+    fn write_unit(&mut self, written: Written) -> Vec<u8> {
+        let Written {
+            restart,
+            split,
+            write_shift,
+            write_matrix,
+            certified,
+            padding,
+        } = written;
+
+        // Decided before the blocks, which borrow the codings for as long as
+        // they exist.
+        let dynamic_range = self.due_dynamic_range();
+        // What a decoder that never left is running, per substream: the word
+        // it read last, which is what it holds the start-up gain against.
+        let running: Vec<Option<DynamicRange>> = (0..self.coded.substreams)
+            .map(|index| self.model.range(index))
+            .collect();
+
+        // A restart header sets the decoder's block size back to eight, so
+        // that is what it holds coming into a restarting unit whatever the
+        // last block said.
+        let mut held = self.model.blocksize(0);
+        let first_frames = if restart {
+            split
+        } else {
+            self.coded.frame_size
+        };
+        let tail_frames = self.coded.frame_size - split;
+        let all = [
+            Block {
+                first: 0,
+                frames: first_frames,
+                write_frames: {
+                    let differs = first_frames != held;
+                    held = first_frames;
+                    differs
+                },
+                codings: if restart {
+                    &self.restart_codings
+                } else {
+                    &self.codings
+                },
+                write_fir: if restart {
+                    &self.restart_write_fir
+                } else {
+                    &self.write_fir
+                },
+                write_iir: if restart {
+                    &self.restart_write_iir
+                } else {
+                    &self.write_iir
+                },
+                write_params: if restart {
+                    &self.restart_write_params
+                } else {
+                    &self.write_params
+                },
+                output_shift: &self.output_shift,
+                write_shift,
+            },
+            Block {
+                first: split,
+                frames: tail_frames,
+                write_frames: tail_frames != held,
+                codings: &self.codings,
+                write_fir: &self.write_fir,
+                write_iir: &self.write_iir,
+                write_params: &self.write_params,
+                output_shift: &self.output_shift,
+                // A restarting unit says them in its first block; the second
+                // has nothing to add.
+                write_shift: false,
+            },
+        ];
+        let blocks = &all[..if restart { 2 } else { 1 }];
+
+        let unit = Unit {
+            samples: &self.planes,
+            blocks,
+            matrices: &self.matrices,
+            arrangement: &self.arrangement,
+            presentation_shift: &self.presentation_shift,
+            assignment: &self.assignment,
+            presentations: &self.presentations,
+            write_matrix,
+            input_timing: self.input_timing,
+            output_timing: self.output_timing,
+            lossless_check: certified,
+            // Only a restart header carries one, so only a restarting unit
+            // takes a bit off the serialiser.
+            hires_timing: restart && self.hires.next(self.frames_written),
+            max_shift: self.max_shift,
+            max_output_bits: self.max_output_bits,
+            shorten_by: padding as u16,
+            restart,
+            evolution: self.evolution_pending.then_some(frame::Evolution {
+                id: self.evolution_id,
+                bytes: self.evolution.as_slice(),
+                sample_offset: self.evolution_offset,
+            }),
+            protection: self.protection.as_ref(),
+            dynamic_range,
+            // A decoder joining at this unit may not be told to start louder
+            // than the gain the stream is already running at, so this follows
+            // the gains rather than being chosen.
+            start_up_gain: crate::format::start_up_gain(&self.dynamic_range, &running),
+        };
+        let bytes = frame::access_unit(&self.coded, &unit, &mut self.model);
+        self.evolution.clear();
+        self.evolution_offset = 0;
+        self.evolution_pending = false;
+        self.since_restart = (self.since_restart + 1) % RESTART_INTERVAL;
+
+        // The real cost, code lengths included — counting the raw tails alone
+        // made the codebooks look free and their gain look like nothing.
+        let mut residual_bits = 0u64;
+        for block in blocks {
+            for (channel, coding) in block.codings.iter().enumerate() {
+                self.stats.orders[coding.filter.fir.order] += 1;
+                self.stats.filter_blocks += 1;
+                if block.write_params[channel] {
+                    self.stats.params_restated += 1;
+                }
+                self.stats.iir_orders[coding.filter.iir.order] += 1;
+                self.stats.codebooks[coding.codebook as usize] += 1;
+                let residuals = &self.planes[channel][block.first..block.first + block.frames];
+                residual_bits +=
+                    crate::huffman::cost(coding.codebook, coding.huff_lsbs, 0, residuals)
+                        .unwrap_or(0) as u64;
+            }
+        }
+        self.stats.units += 1;
+        if !self.matrices.is_empty() {
+            self.stats.matrixed_units += 1;
+        }
+        self.stats.residual_bits += residual_bits;
+        self.stats.residuals += self.channels as u64 * self.coded.frame_size as u64;
+        self.stats.total_bytes += bytes.len() as u64;
+        self.stats.peak_unit_bytes = self.stats.peak_unit_bytes.max(bytes.len() as u64);
+        self.stats.framing_bytes += bytes.len() as u64 - residual_bits.div_ceil(8);
+        bytes
+    }
+
+    /// Read and clear the check a restart header certifies.
+    ///
+    /// A restart header certifies everything since the previous one, so the
+    /// accumulator is read and cleared here and this unit's own check goes
+    /// into the next interval.
+    fn certify(&mut self, restart: bool) -> [u8; MAX_SUBSTREAMS] {
+        let mut certified = [0u8; MAX_SUBSTREAMS];
+        if restart {
+            for (slot, accumulated) in certified.iter_mut().zip(&mut self.pending_check) {
+                *slot = xor_to_byte(*accumulated);
+                *accumulated = 0;
+            }
+        }
+        certified
+    }
+
+    /// When the next access unit is declared to arrive.
+    ///
+    /// Long enough for the one just written to have got there at the declared
+    /// peak, and otherwise whatever steers the buffer back to full — which is
+    /// one frame exactly once nothing has been borrowed.
+    fn schedule_arrival(&mut self, bytes: usize) {
+        let frames = self.coded.frame_size as i64;
+        let reserve = (self.coded.frame_size * INPUT_RESERVE) as i64;
+        let peak = u64::from(self.coded.peak_bitrate).max(1);
+        // From the unit just written, which is the one whose bytes have to
+        // reach a decoder before the next one is due — not the one before it.
+        let words = (bytes / 2) as u64;
+        let needed = (words << 8).div_ceil(peak);
+        let interval = (needed as i64).max(self.advance + frames - reserve).max(1);
+
+        self.advance += frames - interval;
+        if self.advance < 0 {
+            // The content needs more than the stream declared, on average and
+            // not merely in one unit — no schedule fixes that, and a decoder
+            // will report the units as arriving faster than it can take them.
+            self.stats.starved += 1;
+        }
+        self.stats.lowest_advance = self.stats.lowest_advance.min(self.advance);
+
+        self.input_timing = self.input_timing.wrapping_add(interval as u16);
+        self.output_timing = self
+            .output_timing
+            .wrapping_add(self.coded.frame_size as u16);
+    }
+
+    /// The directory's second word, per substream: said when the value
+    /// changes, and again whenever the last one is about to lapse.
+    fn due_dynamic_range(&mut self) -> [Option<DynamicRange>; MAX_SUBSTREAMS] {
+        let mut dynamic_range = [None; MAX_SUBSTREAMS];
+        for (index, slot) in dynamic_range
+            .iter_mut()
+            .enumerate()
+            .take(self.coded.substreams)
+        {
+            let Some(wanted) = self.dynamic_range[index] else {
+                continue;
+            };
+            // Counted first and tested after, because a decoder counts this
+            // access unit before it looks at the word in it: the value has to
+            // arrive on the `2^refresh`-th unit, not the one after. Testing
+            // before incrementing puts every word one unit late and a decoder
+            // says so, once per substream per interval.
+            self.since_range[index] += 1;
+            let due = self.model.range(index) != Some(wanted)
+                || self.since_range[index] >= wanted.deadline();
+            if due {
+                *slot = Some(wanted);
+                self.since_range[index] = 0;
+            }
+        }
+        dynamic_range
     }
 }
 

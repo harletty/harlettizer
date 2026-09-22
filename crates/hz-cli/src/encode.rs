@@ -2072,7 +2072,7 @@ pub fn run(config: Config) -> Result<()> {
         None => println!("  drc          none stated"),
     }
     if config.presentations {
-        presentations_summary(encoder.stats());
+        presentations_summary(&encoder.stats());
     }
     println!("  wrote        {}", config.out.display());
     // And what the guards make of it. Last, because it is a verdict on
