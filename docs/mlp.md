@@ -1867,10 +1867,53 @@ energy, which predicts the coded cost badly; one step at a time, 500 bits and
 Validated on the slice and on five minutes of an overlay: the elements byte
 for byte, every narrow presentation matching the one written without it to a
 correlation of 1.000000 and within 0.0004 dB, FFmpeg silent. With it, the
-slice folded with `--cluster 12` is 14 358 334 bytes: 1.068 of the reference,
-and folds cost 9.8 % over the fold-free stream. The rest, up to the 3.7 %,
-needs rows that can reach a small channel — a presentation's shifts per
-channel, which the reference states, are the next thing to try.
+slice folded with `--cluster 12` was 14 358 334 bytes: 1.068 of the
+reference.
+
+### A shift per presentation channel
+
+What stopped most steps was a row asking for a hundred of a small channel.
+A presentation's output shift says how much a decoder scales each of its
+channels up by after the rows, so a row can be said at `2^-shift` of its size
+— and the shift is stated per channel, which the reference uses (its stereo
+says `[3, 4]` where its 5.1 says `[3, 2]`). This encoder stated one for every
+channel alike. Chosen per channel, as each row is written, as the smallest
+that says it in one matrix, more than twice as many decorrelating steps can
+be written (1 326 against 591 on the slice), and the threshold that pays
+moves with it: 500 bits −1.6 %, 2 000 −3.0 %, **5 000 −4.0 %**, 10 000
+−3.7 %, 20 000 −2.8 %, against −5.5 % had every step been writable.
+
+Two things a shift costs, and both are now checked before one is taken:
+
+- **Precision.** A row's coefficients are rounded to the field's step and
+  the output is then scaled up by the shift, so a coefficient's rounding on a
+  source channel at full size comes out `2^shift` times larger. Each
+  candidate's rows are decoded over the elements and held to
+  `PRESENTATION_PRECISION`, three in ten thousand of each output's row: about
+  −108 dBFS on the slice, which is where the reference's shifts of three to
+  five sit. A thousandth would give −3.4 % at −101 dBFS, a ten-thousandth
+  −0.6 % at −115.
+- **Room at full scale.** The output is rounded to `2^shift`, and a fold
+  within that of full scale is rounded past it and **wraps**: one interval of
+  a film's 5.1 came back sign-flipped at full scale before this was checked,
+  which no correlation over five minutes shows (it read 0.999975) and a
+  listener would. Each fold output's peak over the interval is measured, and
+  a shift has to leave it room.
+
+A decorrelating step whose rows fail either is not taken. Rows written without
+one fall back, if nothing better passes, to what one shift for every channel
+wrote before — so no interval loses the folds it had.
+
+| | before decorrelation | one shift for every channel | a shift per channel |
+|---|---|---|---|
+| slice, `--cluster 12` | 14 586 432 | 14 358 334 (−1.56 %) | **14 186 704 (−2.74 %)** |
+| 5 min of an overlay | 128 540 840 | 127 439 576 (−0.86 %) | **126 063 228 (−1.93 %)** |
+| 31 min of the same | 870 870 022 | 858 287 774 (−1.44 %) | **850 921 378 (−2.29 %)** |
+
+On the five minutes: elements byte for byte, every narrow presentation within
+−99 dBFS of the stream without decorrelation and 2 784 samples at its worst,
+correlation 1.000000, level within 0.0002 dB; FFmpeg silent. The folded slice
+is 1.055 of the reference, and folds cost 8.5 % over the fold-free stream.
 
 ## The search that ran for minutes, and the reservation that ends it
 

@@ -2294,7 +2294,34 @@ impl Encoder {
             return Err(Refusal::OverTheDomain);
         }
 
-        let Some(written) = Self::presentation_rows(&cascade.held, &internal, elements, fold_log)
+        // How loud each early presentation's fold gets over the interval, in
+        // the samples a decoder hands back — what a presentation's shifts
+        // have to leave room for.
+        let peaks: Vec<Vec<f64>> = self.wants[..self.wants.len().saturating_sub(1)]
+            .iter()
+            .map(|presentation| {
+                presentation
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let mut peak = 0.0f64;
+                        for unit in units {
+                            for frame in unit.samples.chunks_exact(elements).take(unit.frames) {
+                                let value: f64 = row
+                                    .iter()
+                                    .zip(frame)
+                                    .map(|(gain, sample)| gain * f64::from(*sample))
+                                    .sum();
+                                peak = peak.max(value.abs());
+                            }
+                        }
+                        peak
+                    })
+                    .collect()
+            })
+            .collect();
+        let Some(written) =
+            Self::presentation_rows(&cascade.held, &internal, elements, fold_log, false, &peaks)
         else {
             return Err(Refusal::Unwritable);
         };
@@ -2306,6 +2333,7 @@ impl Encoder {
             cascade.held,
             &internal,
             written,
+            &peaks,
             fold_log,
         );
         Ok(Built {
@@ -2325,11 +2353,13 @@ impl Encoder {
         internal: &[crate::hierarchy::Presentation],
         elements: usize,
         fold_log: bool,
+        strict: bool,
+        peaks: &[Vec<f64>],
     ) -> Option<PresentationRows> {
         let mut rows = Vec::with_capacity(internal.len() - 1);
         let mut assignment = Vec::with_capacity(internal.len() - 1);
         let mut stated: Vec<Vec<u8>> = Vec::with_capacity(internal.len() - 1);
-        for presentation in &internal[..internal.len() - 1] {
+        for (which, presentation) in internal[..internal.len() - 1].iter().enumerate() {
             // 🔴 A presentation's own shifts are **free**, and this is what the
             // reference's restating of them per substream is for. The encoder's
             // own shifting is the elements' — that is what makes the full
@@ -2347,20 +2377,85 @@ impl Encoder {
             // four-bit count with the coding matrices, which on the 7.1's
             // substream were found stopped at fifteen. Ties go to the lower
             // shift.
-            let Some((row, order)) = (0..=crate::frame::MAX_OUTPUT_SHIFT)
-                .filter_map(|state| {
-                    let uniform = vec![state; elements];
-                    crate::hierarchy::rows_over(
-                        held,
-                        presentation,
-                        &uniform,
-                        crate::hierarchy::PRESENTATION_BITS,
-                    )
-                    .map(|written| (written, state))
+            //
+            // And a shift per channel, each the smallest its own row needs,
+            // which is kept where it takes no more rows — see
+            // [`crate::hierarchy::rows_over_choosing_shifts`]. The two are
+            // weighed on the rows first and then on the largest shift, the
+            // precision the presentation gives up.
+            let uniform = (0..=crate::frame::MAX_OUTPUT_SHIFT).filter_map(|state| {
+                crate::hierarchy::rows_over(
+                    held,
+                    presentation,
+                    &vec![state; elements],
+                    crate::hierarchy::PRESENTATION_BITS,
+                )
+                .map(|(rows, order)| (rows, order, vec![state; presentation.channels]))
+            });
+            let chosen = crate::hierarchy::rows_over_choosing_shifts(
+                held,
+                presentation,
+                crate::hierarchy::PRESENTATION_BITS,
+            )
+            .map(|(rows, order, mut shifts)| {
+                shifts.resize(presentation.channels, 0);
+                (rows, order, shifts)
+            });
+            //
+            // 🔴 And only as precise as a fold has to be: a coefficient's
+            // rounding comes out scaled up by its channel's shift, so a large
+            // shift on a row that also reads a channel at full size lands the
+            // presentation tens of decibels off — measured at −66 dBFS on a
+            // film's 5.1 before this. Candidates past
+            // [`PRESENTATION_PRECISION`] give way to those within it; where
+            // none is, the rows are what one shift for every channel wrote
+            // before, unless `strict`, which is how a decorrelating step asks
+            // whether it can be afforded.
+            let candidates: Vec<_> = chosen.into_iter().chain(uniform).collect();
+            //
+            // 🔴 And the shift has to leave the fold room at its loudest. A
+            // channel's output is its row's result shifted up, so it is
+            // rounded to `2^shift`, and a fold within that of full scale is
+            // rounded past it and wraps — measured as one interval of a
+            // film's 5.1 coming back sign-flipped at full scale, from a
+            // shift of seven on a fold that peaked there.
+            let peaks = peaks.get(which);
+            let fits = |order: &[u8], shifts: &[u8]| {
+                let Some(peaks) = peaks else {
+                    return true;
+                };
+                shifts.iter().enumerate().all(|(channel, shift)| {
+                    let output = order.get(channel).map_or(channel, |o| usize::from(*o));
+                    let peak = peaks.get(output).copied().unwrap_or(0.0);
+                    peak + f64::from(*shift + 1).exp2() + FOLD_MARGIN < FULL_SCALE
                 })
-                .min_by_key(|((rows, _), state)| (rows.len(), *state))
-                .map(|((row, order), state)| {
-                    stated.push(vec![state; presentation.channels]);
+            };
+            let precise: Vec<_> = candidates
+                .iter()
+                .filter(|(rows, order, shifts)| {
+                    fits(order, shifts)
+                        && presentation_error(held, presentation, rows, order, shifts)
+                            <= PRESENTATION_PRECISION
+                })
+                .cloned()
+                .collect();
+            let pool = if !precise.is_empty() {
+                precise
+            } else if strict {
+                Vec::new()
+            } else {
+                candidates
+                    .into_iter()
+                    .filter(|(_, _, shifts)| shifts.windows(2).all(|pair| pair[0] == pair[1]))
+                    .collect()
+            };
+            let Some((row, order)) = pool
+                .into_iter()
+                .min_by_key(|(rows, _, shifts)| {
+                    (rows.len(), shifts.iter().copied().max().unwrap_or(0))
+                })
+                .map(|(row, order, shifts)| {
+                    stated.push(shifts);
                     (row, order)
                 })
             else {
@@ -2416,9 +2511,15 @@ impl Encoder {
     /// the 7.1 has no spare row to scale one up with. Taken all at once, the
     /// steps left the rows writable in one interval in seven, for 0.5 % of the
     /// stream. So each step is kept only if every presentation can still be
-    /// written after it, and the rest are skipped: 1.56 % on the programme
-    /// slice and 1.44 % on thirty-one minutes of an overlay, against 5.5 % and
-    /// 3.7 % had every step been writable.
+    /// written after it, and the rest are skipped.
+    ///
+    /// What made most of them writable is a shift per presentation channel —
+    /// see [`crate::hierarchy::rows_over_choosing_shifts`] — which says a row
+    /// asking for a hundred at a hundred-and-twenty-eighth of its size. With a
+    /// shift for every channel alike this came to 1.56 % of the programme
+    /// slice; with one per channel, and held to the precision and the room
+    /// at full scale a fold needs, 2.7 %, against 5.5 % had every step been
+    /// writable.
     ///
     /// # Measured and put down
     ///
@@ -2429,9 +2530,10 @@ impl Encoder {
     ///   no gain at all. The saving *is* the shared elements, which is what
     ///   makes the remainder small; the two cannot be had apart.
     /// - **The threshold** is not the modelled gain it looks like: the raw
-    ///   energy predicts the coded cost badly, and taken all at once the
-    ///   steps above 400 bits saved 2.0 % where those above 5 000 saved 5.5 %.
-    ///   One at a time, 500 and 2 000 come to within 0.04 % of each other.
+    ///   energy predicts the coded cost badly, and a step it rates at a few
+    ///   hundred bits can cost more than it saves. On the slice, with a shift
+    ///   per channel and before the precision was held: 500 bits 1.6 %, 2 000
+    ///   3.0 %, **5 000 4.0 %**, 10 000 3.7 %, 20 000 2.8 %.
     #[allow(clippy::too_many_arguments)]
     fn decorrelate(
         &self,
@@ -2442,6 +2544,7 @@ impl Encoder {
         held: Vec<Vec<f64>>,
         internal: &[crate::hierarchy::Presentation],
         written: PresentationRows,
+        peaks: &[Vec<f64>],
         fold_log: bool,
     ) -> (Vec<Primitive>, PresentationRows) {
         let upto = internal
@@ -2528,7 +2631,7 @@ impl Encoder {
                 }
             }
             let kept = std::mem::replace(&mut holds[k], remainder);
-            match Self::presentation_rows(&holds, internal, self.channels, false) {
+            match Self::presentation_rows(&holds, internal, self.channels, false, true, peaks) {
                 Some(rows) => {
                     decorrelating.push(step);
                     best = Some(rows);
@@ -3248,6 +3351,64 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
     [END_OF_STREAM, u32::from(shorten_by & 0x1fff) | 0xe000]
 }
 
+/// How far a presentation's rows, as written, land from what it asks for: the
+/// largest error over its outputs, each against the size of its own row, in
+/// the elements' coordinates.
+///
+/// The rows are rounded to the field's step and each output is scaled up by
+/// its channel's shift afterwards, so a coefficient's rounding comes out
+/// `2^shift` times larger — on a source channel at full size, a large error
+/// from a small step.
+fn presentation_error(
+    held: &[Vec<f64>],
+    presentation: &crate::hierarchy::Presentation,
+    rows: &[Primitive],
+    order: &[u8],
+    shifts: &[u8],
+) -> f64 {
+    let n = presentation.channels.min(held.len());
+    let decoded = crate::hierarchy::as_decoded(held, rows, order, n);
+    let mut worst = 0.0f64;
+    for (output, wanted) in presentation.rows.iter().enumerate().take(n) {
+        let Some(channel) = order.iter().position(|o| usize::from(*o) == output) else {
+            return f64::INFINITY;
+        };
+        let up = f64::from(shifts.get(channel).copied().unwrap_or(0)).exp2();
+        let size = wanted.iter().map(|w| w * w).sum::<f64>().sqrt();
+        if size == 0.0 {
+            continue;
+        }
+        let error = decoded[output]
+            .iter()
+            .zip(wanted)
+            .map(|(got, want)| (got * up - want).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        worst = worst.max(error / size);
+    }
+    worst
+}
+
+/// How far a presentation's rows may land from its fold, as a fraction of
+/// each output's own row — see [`presentation_error`].
+///
+/// Three in ten thousand. On the programme slice it puts the 5.1 and 7.1
+/// within about −108 dBFS of the fold, which is what the reference's shifts of
+/// three to five give, for 2.7 % of the stream from the decorrelation it
+/// allows. A thousandth gives 3.4 % at −101 dBFS; a ten-thousandth, 0.6 % at
+/// −115; three in a hundred thousand is tighter than the rows one shift for
+/// every channel writes, and no interval keeps its folds.
+const PRESENTATION_PRECISION: f64 = 3e-4;
+
+/// Full scale in the samples a decoder hands back.
+const FULL_SCALE: f64 = 8_388_608.0;
+
+/// What a presentation's rows may land off its fold by, in samples, as the
+/// room a shift has to leave under full scale on top of its own rounding:
+/// [`PRESENTATION_PRECISION`] of full scale, eight times over for a bound
+/// that holds at a peak rather than on average.
+const FOLD_MARGIN: f64 = 8.0 * PRESENTATION_PRECISION * FULL_SCALE;
+
 /// Rows, output order and stated shifts of every early presentation.
 type PresentationRows = (Vec<Vec<Primitive>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
@@ -3258,7 +3419,7 @@ const DECORRELATING_STEPS_AT_MOST: usize = 12;
 /// What a decorrelating step has to take out of its channel over an interval,
 /// as the fit models it, in bits. See [`Encoder::decorrelate`] for what it is
 /// and is not.
-const DECORRELATION_BITS: f64 = 500.0;
+const DECORRELATION_BITS: f64 = 5_000.0;
 
 /// The weights that predict channel `k` from channels `0..k` by least squares,
 /// from their Gram matrix; `None` if the channels are too nearly dependent to
@@ -3302,6 +3463,46 @@ fn least_squares(gram: &[Vec<f64>], k: usize) -> Option<Vec<f64>> {
 mod tests {
     use super::*;
     use crate::format::SampleBits;
+
+    /// A channel holding a hundredth of its element can only be written at a
+    /// shift of six, which rounds its output to sixty-four samples. Where its
+    /// fold peaks at half of full scale that is taken; where it peaks at full
+    /// scale it would round past it and wrap, so a decorrelating step asking
+    /// for it is refused, and the rows the stream would otherwise write fall
+    /// back to one shift for every channel.
+    #[test]
+    fn a_shift_leaves_a_loud_fold_room_to_round() {
+        let held = vec![vec![1.0, 0.0], vec![0.0, 0.01]];
+        let identity = |channels: usize| crate::hierarchy::Presentation {
+            channels,
+            rows: (0..channels)
+                .map(|channel| {
+                    let mut row = vec![0.0; 2];
+                    row[channel] = 1.0;
+                    row
+                })
+                .collect(),
+        };
+        let internal = [identity(2), identity(2)];
+
+        let quiet = [vec![0.0, 0.5 * FULL_SCALE]];
+        let (_, _, stated) =
+            Encoder::presentation_rows(&held, &internal, 2, false, true, &quiet).expect("rows");
+        assert_eq!(stated[0], [0, 6]);
+
+        let loud = [vec![0.0, 0.9999 * FULL_SCALE]];
+        assert!(
+            Encoder::presentation_rows(&held, &internal, 2, false, true, &loud).is_none(),
+            "a step is refused rather than written to wrap"
+        );
+        let (_, _, stated) =
+            Encoder::presentation_rows(&held, &internal, 2, false, false, &loud).expect("rows");
+        assert!(
+            stated[0].windows(2).all(|pair| pair[0] == pair[1]),
+            "without the step, one shift for every channel as before: {:?}",
+            stated[0]
+        );
+    }
 
     #[test]
     fn the_check_folds_a_word_into_a_byte() {
