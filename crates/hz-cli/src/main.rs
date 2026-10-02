@@ -3,6 +3,7 @@
 mod convert;
 mod encode;
 mod iamf;
+mod iamf_objects;
 mod source;
 
 use clap::{Parser, Subcommand};
@@ -466,6 +467,30 @@ enum Command {
         #[arg(long, default_value = "stereo")]
         headphones: String,
 
+        /// Carry the master's objects as IAMF v2.0 objects — each its own
+        /// element, its path as position parameter blocks — rather than
+        /// rendering them to a 7.1.4 bed. The LFE travels in an element of its
+        /// own and other bed channels as objects that stand at their speakers.
+        /// At most twenty-eight channels in all. Few decoders read v2.0 yet.
+        #[arg(long)]
+        objects: bool,
+
+        /// With `--objects`: how positions are coded. `cart16`, the master's
+        /// cube coordinates to a sixty-five-thousandth; `cart8`, to a
+        /// hundred-and-twenty-seventh, for a third of the metadata; or
+        /// `polar`, the cube put onto the sphere by BS.2127's conversion.
+        #[arg(long, value_name = "CODING", default_value = "cart16")]
+        positions: String,
+
+        /// With `--objects`: the most object elements to carry — twenty-seven
+        /// beside an LFE unless asked, seventeen to stay within advanced-1. A
+        /// master with more objects and bed channels than this has its objects
+        /// folded into this many elements, block by block, by the same
+        /// clustering `encode --cluster` uses; its bed channels keep elements
+        /// of their own.
+        #[arg(long, value_name = "N")]
+        elements: Option<usize>,
+
         /// Report how far along the encode is, on standard error.
         #[arg(long)]
         progress: bool,
@@ -604,6 +629,9 @@ fn main() -> ExitCode {
             bitrate,
             frame_size,
             headphones,
+            objects,
+            positions,
+            elements,
             progress,
         } => {
             let codec = match (codec.as_str(), bitrate) {
@@ -631,6 +659,19 @@ fn main() -> ExitCode {
             };
             let frame_size =
                 frame_size.unwrap_or(if lossy { iamf::OPUS_FRAME } else { iamf::FRAME });
+            let objects = if objects {
+                match positions.as_str() {
+                    "cart16" => Ok(Some(hz_iamf::PositionKind::Cart16)),
+                    "cart8" => Ok(Some(hz_iamf::PositionKind::Cart8)),
+                    "polar" => Ok(Some(hz_iamf::PositionKind::Polar)),
+                    other => Err(hz_core::Error::unsupported(
+                        &input,
+                        format!("`{other}` for the positions; cart16, cart8 or polar"),
+                    )),
+                }
+            } else {
+                Ok(None)
+            };
             let headphones = match headphones.as_str() {
                 "stereo" => Ok(hz_iamf::Headphones::Stereo),
                 "binaural" => Ok(hz_iamf::Headphones::Binaural),
@@ -650,6 +691,8 @@ fn main() -> ExitCode {
                     frame: frame_size,
                     headphones: headphones?,
                     progress,
+                    objects: objects?,
+                    elements,
                 })
             })
         }

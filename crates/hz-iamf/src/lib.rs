@@ -10,10 +10,10 @@
 //! today.
 //!
 //! ```no_run
-//! use hz_iamf::{Codec, Config, Headphones, Loudness, Writer, layout};
+//! use hz_iamf::{Codec, Config, Element, Headphones, Loudness, Writer, layout};
 //!
 //! let config = Config {
-//!     layout: layout::SEVEN_ONE_FOUR,
+//!     elements: vec![Element::Channels(layout::SEVEN_ONE_FOUR)],
 //!     codec: Codec::Flac,
 //!     sample_rate: 48_000,
 //!     bits: 24,
@@ -21,7 +21,7 @@
 //!     headphones: Headphones::Stereo,
 //! };
 //! let mut writer = Writer::new(std::fs::File::create("programme.iamf")?, config)?;
-//! writer.push(&vec![0i32; 4096 * 12])?;
+//! writer.push(&vec![0i32; 4096 * 12], &[])?;
 //! let silence = Loudness { integrated: f64::NEG_INFINITY, digital_peak: f64::NEG_INFINITY, true_peak: f64::NEG_INFINITY };
 //! writer.finish([silence; 2])?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -32,7 +32,9 @@ pub mod layout;
 pub mod obu;
 #[cfg(feature = "opus")]
 pub mod opus;
+pub mod position;
 pub mod stream;
 
 pub use layout::Layout;
-pub use stream::{Codec, Config, Error, Headphones, Loudness, Writer};
+pub use position::{Animation, PositionKind, Subblock};
+pub use stream::{Codec, Config, Element, Error, Headphones, Loudness, PositionBlock, Writer};

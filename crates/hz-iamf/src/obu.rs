@@ -11,7 +11,10 @@ pub enum ObuType {
     CodecConfig,
     AudioElement,
     MixPresentation,
+    ParameterBlock,
     TemporalDelimiter,
+    /// An audio frame whose payload leads with its substream's id.
+    AudioFrame,
     /// An audio frame of substream `0..=17`, whose id the type itself
     /// carries.
     AudioFrameId(u8),
@@ -24,7 +27,9 @@ impl ObuType {
             Self::CodecConfig => 0,
             Self::AudioElement => 1,
             Self::MixPresentation => 2,
+            Self::ParameterBlock => 3,
             Self::TemporalDelimiter => 4,
+            Self::AudioFrame => 5,
             Self::AudioFrameId(id) => {
                 assert!(id <= 17, "substream {id} has no implicit frame type");
                 6 + id
@@ -64,7 +69,7 @@ pub fn leb128_len(value: u64) -> usize {
 /// of what `obu_size` counts.
 pub fn put_obu(out: &mut Vec<u8>, kind: ObuType, trim: Option<(u32, u32)>, payload: &[u8]) {
     assert!(
-        trim.is_none() || matches!(kind, ObuType::AudioFrameId(_)),
+        trim.is_none() || matches!(kind, ObuType::AudioFrameId(_) | ObuType::AudioFrame),
         "only an audio frame carries a trim"
     );
     // obu_type (5) | obu_redundant_copy (1) | obu_trimming_status_flag (1) |
