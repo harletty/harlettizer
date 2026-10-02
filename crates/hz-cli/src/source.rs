@@ -124,6 +124,12 @@ impl Source {
         self.format.channels as usize
     }
 
+    /// How the input's samples are laid out: what scales the integers
+    /// [`Source::read`] hands back.
+    pub(crate) fn pcm_format(&self) -> &PcmFormat {
+        &self.format
+    }
+
     pub(crate) fn sample_rate(&self) -> u32 {
         self.format.sample_rate_hz()
     }

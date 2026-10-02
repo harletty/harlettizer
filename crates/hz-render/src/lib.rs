@@ -11,11 +11,15 @@
 pub mod fold;
 pub mod keyframe;
 pub mod layout;
+pub mod mixdown;
 pub mod panner;
 pub mod render;
+pub mod room;
 
 pub use fold::{FoldMode, ObjectFold, elevation_scale};
 pub use keyframe::{Keyframe, Mode};
 pub use layout::Layout;
+pub use mixdown::Mixdown;
 pub use panner::{Panner, PointPanner, speakers_of};
 pub use render::Renderer;
+pub use room::Room;

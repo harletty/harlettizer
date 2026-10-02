@@ -165,6 +165,14 @@ impl BitWriter {
         self.bytes.len() * 8 + self.filled as usize
     }
 
+    /// Empty the writer and keep its buffer, so that a frame written every few
+    /// milliseconds reuses one allocation rather than making its own.
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.partial = 0;
+        self.filled = 0;
+    }
+
     /// Whole bytes written so far. A partial byte is not one.
     pub fn byte_position(&self) -> usize {
         self.bytes.len()

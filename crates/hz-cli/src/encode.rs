@@ -228,7 +228,7 @@ pub struct Config {
 /// in their header. So this is a real fraction of the work and not an estimate
 /// from how much has been written, which would depend on how well the material
 /// compresses.
-struct Progress {
+pub(crate) struct Progress {
     total: u64,
     last: u64,
 }
@@ -236,7 +236,7 @@ struct Progress {
 impl Progress {
     /// `None` when the flag is off, or when the input does not say how long it
     /// is — a percentage of an unknown total is a number made up.
-    fn new(wanted: bool, total: u64) -> Option<Self> {
+    pub(crate) fn new(wanted: bool, total: u64) -> Option<Self> {
         (wanted && total > 0).then_some(Self {
             total,
             last: u64::MAX,
@@ -259,7 +259,7 @@ impl Progress {
     }
 
     /// Report `at` frames of `total` done, if that has moved the whole percent.
-    fn at(&mut self, at: u64) {
+    pub(crate) fn at(&mut self, at: u64) {
         if let Some(percent) = self.stepped(at) {
             eprintln!("progress {percent}%");
         }

@@ -1,7 +1,7 @@
 # harlettizer — the encoder counterpart to harletty.
 #
 # Crates are added phase by phase (see PLAN.md). The dependency rule is that
-# the codec crates (hz-ac3, hz-mlp, hz-ac4) never depend on each other; they
+# the codec crates (hz-ac3, hz-mlp, hz-ac4, hz-iamf) never depend on each other; they
 # all sit on hz-core / hz-analysis / hz-render, and only hz-cli knows all of
 # them.
 [workspace]
@@ -11,6 +11,7 @@ members = [
     "crates/hz-cli",
     "crates/hz-cluster",
     "crates/hz-core",
+    "crates/hz-iamf",
     "crates/hz-io",
     "crates/hz-meta",
     "crates/hz-mlp",
@@ -29,6 +30,7 @@ authors = ["harletty"]
 [workspace.dependencies]
 hz-cluster = { path = "crates/hz-cluster" }
 hz-core = { path = "crates/hz-core" }
+hz-iamf = { path = "crates/hz-iamf" }
 hz-analysis = { path = "crates/hz-analysis" }
 hz-io = { path = "crates/hz-io" }
 hz-meta = { path = "crates/hz-meta" }

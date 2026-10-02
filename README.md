@@ -5,24 +5,28 @@ An open encoding engine for immersive audio, and the encoder counterpart to
 *decodes* immersive bitstreams into masters, harlettizer *encodes* masters into
 bitstreams — today a **lossless TrueHD/MLP stream carrying object audio
 metadata**, written from an object master and checked bit for bit through
-decoders that share no code with it.
+decoders that share no code with it — and an **IAMF** 7.1.4 bed, rendered from
+the same master and coded losslessly, for the players that read the open
+format.
 
 Pure Rust, headless, GPL-3.0-or-later.
 
 ```bash
 harlettizer convert programme.atmos programme_adm.wav                  # master set -> ADM BW64
 harlettizer encode  programme.atmos --out programme.thd --cluster 12   # the immersive bitstream
+harlettizer iamf    programme.atmos --out programme.iamf               # a 7.1.4 bed as IAMF
 ```
 
 ## What it does
 
-Two commands, each taking a master file set (`.atmos` + `.atmos.audio` +
+Three commands, each taking a master file set (`.atmos` + `.atmos.audio` +
 `.atmos.metadata`) or an ADM BW64 file.
 
 | | |
 |---|---|
 | `convert` | One container to the other, either direction |
 | `encode` | The programme as a TrueHD stream: its elements coded losslessly, its object metadata carried in the access units, its objects clustered into the twelve to sixteen elements a delivery stream holds, and — on request — real 2.0, 5.1 and 7.1 folds inside the stream for decoders that stop early |
+| `iamf` | The programme rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence, FLAC or LPCM, with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; see [docs/iamf.md](docs/iamf.md) |
 
 **Everything an encode writes is decoded back and compared, not inspected.**
 The test suite decodes every presentation of every stream it writes through a
@@ -225,6 +229,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | | |
 |---|---|
 | [docs/encode.md](docs/encode.md) | The `encode` command: what a real programme did, the progress protocol, what `--fast` costs |
+| [docs/iamf.md](docs/iamf.md) | The `iamf` command: the sequence it writes, the render, the loudness, the FLAC encoder, and what checked them |
 | [docs/mlp-state.md](docs/mlp-state.md) | What the MLP encoder writes today — every constant and decision in force |
 | [docs/mlp.md](docs/mlp.md) | The lossless encoder's notebook: what was tried, what it measured, what was put down |
 | [docs/clustering.md](docs/clustering.md) | Clustering objects into elements, and the metric that judges a clustering |
