@@ -26,7 +26,7 @@ Three commands, each taking a master file set (`.atmos` + `.atmos.audio` +
 |---|---|
 | `convert` | One container to the other, either direction |
 | `encode` | The programme as a TrueHD stream: its elements coded losslessly, its object metadata carried in the access units, its objects clustered into the twelve to sixteen elements a delivery stream holds, and — on request — real 2.0, 5.1 and 7.1 folds inside the stream for decoders that stop early |
-| `iamf` | The programme rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence, FLAC or LPCM, with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; see [docs/iamf.md](docs/iamf.md) |
+| `iamf` | The programme rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence — FLAC or LPCM, or Opus in a build with the `opus` feature — with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; see [docs/iamf.md](docs/iamf.md) |
 
 **Everything an encode writes is decoded back and compared, not inspected.**
 The test suite decodes every presentation of every stream it writes through a
@@ -66,10 +66,13 @@ cargo build --release -p hz-cli
 ```
 
 Rust 1.87 or later. Pure Rust: no C toolchain, no vendor SDK, no git
-dependency.
+dependency. The one exception is opt-in: `--features opus` links the system's
+libopus for `iamf --codec opus`; see [docs/iamf.md](docs/iamf.md#opus).
 
 Each release also carries the built binary for Linux (x86-64), Windows
 (x86-64) and macOS (Apple silicon), zipped with the licences it ships under.
+Those binaries have Opus, with libopus linked statically: nothing to install
+beside them.
 
 ## Usage
 

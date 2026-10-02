@@ -13,6 +13,15 @@ authors.workspace = true
 [dependencies]
 hz-core.workspace = true
 
+[build-dependencies]
+pkg-config = { version = "0.3", optional = true }
+
+[features]
+# Opus substreams, through the system's libopus — found by pkg-config, linked
+# dynamically. Off by default: everything else here is pure Rust and builds
+# without a C library anywhere. See src/opus.rs for why it is not a port.
+opus = ["dep:pkg-config"]
+
 [dev-dependencies]
 # An independent FLAC decoder, for the round trips in the tests and nothing
 # else. Nothing shipped links it.

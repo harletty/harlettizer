@@ -70,6 +70,18 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      # IAMF's Opus substreams are coded by the system's libopus, behind a
+      # feature the default build leaves off; this is the one job that has
+      # the library and so the one place that code is built and tested.
+      - name: Opus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev
+          cargo test -p hz-iamf --features opus
+          cargo build -p hz-cli --features opus
+        env:
+          RUSTFLAGS: -D warnings
+
       - name: Clippy (advisory)
         run: cargo clippy --all-targets -- -W clippy::all
         continue-on-error: true

@@ -6,6 +6,14 @@
 # other terms, whose notices have to travel with a binary as much as with the
 # source.
 #
+# The binary is built with the `opus` feature and libopus linked statically,
+# so `iamf --codec opus` works with nothing installed beside it: the library
+# comes from apt on Linux, Homebrew on macOS and vcpkg on Windows, each one's
+# static build, and the binary is checked to depend on no libopus before it
+# is packaged — the pkg-config crate links the shared library without a word
+# when it will not link the static one. libopus's notice travels in
+# `LICENSES/`.
+#
 # A pull request that touches this file builds all three archives without
 # releasing anything, so a change to the release is seen working before a tag
 # depends on it. `workflow_dispatch` does the same by hand.
@@ -48,10 +56,63 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Through OPUS_LIB_DIR rather than pkg-config: the pkg-config crate will
+      # not link a library from a system directory statically, whatever
+      # OPUS_STATIC says, and links the shared one instead.
+      - name: libopus (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev
+          echo "OPUS_LIB_DIR=$(pkg-config --variable=libdir opus)" >> "$GITHUB_ENV"
+          echo "OPUS_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: libopus (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install opus pkgconf
+          echo "OPUS_STATIC=1" >> "$GITHUB_ENV"
+
+      # The static build against the dynamic C runtime, which is the one
+      # Rust's MSVC target links.
+      - name: libopus (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opus:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "OPUS_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib" >> $env:GITHUB_ENV
+          "OPUS_STATIC=1" >> $env:GITHUB_ENV
+
       - name: Build (release)
-        run: cargo build --release --locked -p hz-cli
+        run: cargo build --release --locked -p hz-cli --features opus
         env:
           RUSTFLAGS: -D warnings
+
+      # Windows has no ldd to ask, and needs none: vcpkg's directory is not
+      # on the PATH, so a binary wanting opus.dll would not start in the
+      # encode below.
+      - name: No libopus to install beside it
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          binary="target/release/${{ matrix.binary }}"
+          if [ "$RUNNER_OS" = Linux ]; then deps="$(ldd "$binary")"; else deps="$(otool -L "$binary")"; fi
+          echo "$deps"
+          if echo "$deps" | grep -qi opus; then
+            echo "::error::the binary links libopus dynamically"
+            exit 1
+          fi
+
+      # Not a test of the codec — CI does that — but of the binary that ships:
+      # that the Opus it was built with is there and encodes.
+      - name: Encode Opus with the shipped binary
+        shell: bash
+        run: |
+          mkdir -p smoke
+          cargo run --locked -q -p xtask -- make-master smoke/smoke.atmos --objects 3 --seconds 2
+          "target/release/${{ matrix.binary }}" iamf smoke/smoke.atmos --out smoke/smoke.iamf --codec opus
+          test -s smoke/smoke.iamf
 
       # The tag when there is one; the commit otherwise, since a branch name
       # can hold a slash and a file name cannot.
