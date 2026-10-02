@@ -129,7 +129,21 @@ the pure-Rust ports on crates.io are young, and one that sounds worse is no
 trade for a toolchain. So Opus is behind the `opus` feature, links the system's
 libopus through `pkg-config`, and is the only `unsafe` in `hz-iamf` — five
 functions of its C API in [`opus.rs`](../crates/hz-iamf/src/opus.rs). The
-default build stays pure Rust, and the released binaries are built without it.
+default build stays pure Rust.
+
+**The released binaries have it**, with libopus linked statically — apt's
+build on Linux, Homebrew's on macOS, vcpkg's on Windows — so nothing has to
+be installed beside them; the release job checks the binary depends on no
+libopus and encodes a few seconds of Opus with it before packaging, and
+libopus's notice ships in `LICENSES/`. To build the same:
+
+```bash
+OPUS_STATIC=1 cargo build --release -p hz-cli --features opus         # pkg-config, static
+OPUS_LIB_DIR=/path/to/lib OPUS_STATIC=1 cargo build ... --features opus # no pkg-config
+```
+
+`pkg-config` falls back to the shared library without saying so when there
+is no static one (Arch ships none), so check with `ldd`.
 
 What IAMF fixes (§3.11.1), and what is chosen:
 
@@ -224,9 +238,6 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 
 ## Not done
 
-- **Opus in the released binaries.** They are built without the feature:
-  Linux would need libopus at run time, Windows and macOS a libopus built and
-  linked statically in the release job.
 - **AAC.** Its free encoder, FDK, is not GPL-compatible.
 - **Objects.** IAMF v2.0's object elements would carry the master's objects
   through `hz-cluster` to at most 18 or 28 channels; the encode pipeline would

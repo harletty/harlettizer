@@ -49,12 +49,14 @@ specifications.
 | `oxideav-ac4` | MIT | AC-4 framing and channel-based encoding |
 | `damf` crate (harletty-bridge) | Apache-2.0 | Master-file metadata model and writers |
 | EBU ADM Renderer (`ear`) | BSD-3-Clause | The BS.2094 common-definition speaker positions, and the reference implementation both directions of the ADM support are checked against |
+| libopus (Xiph.Org) | BSD-3-Clause, with royalty-free patent licences | **Linked**, not ported: the Opus encoder behind `hz-iamf`'s `opus` feature, statically in the released binaries |
 
 Ported code must carry the original copyright line and license notice in
 the file header, and the port must be recorded in `docs/provenance.md`
 (file, upstream revision, what was changed). Licences that require their
 text to travel with the source — the EBU ADM Renderer's BSD 3-Clause, the
-`truehd` crate's Apache-2.0 — are reproduced in `LICENSES/`.
+`truehd` crate's Apache-2.0 — are reproduced in `LICENSES/`, as is libopus's,
+whose notice has to travel with the binaries it is linked into.
 
 ## 3. Forbidden sources
 

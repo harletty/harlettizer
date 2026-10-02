@@ -66,10 +66,13 @@ cargo build --release -p hz-cli
 ```
 
 Rust 1.87 or later. Pure Rust: no C toolchain, no vendor SDK, no git
-dependency.
+dependency. The one exception is opt-in: `--features opus` links the system's
+libopus for `iamf --codec opus`; see [docs/iamf.md](docs/iamf.md#opus).
 
 Each release also carries the built binary for Linux (x86-64), Windows
 (x86-64) and macOS (Apple silicon), zipped with the licences it ships under.
+Those binaries have Opus, with libopus linked statically: nothing to install
+beside them.
 
 ## Usage
 
