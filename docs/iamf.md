@@ -3,6 +3,7 @@
 ```bash
 harlettizer iamf programme.atmos --out programme.iamf                # FLAC, lossless
 harlettizer iamf programme.atmos --out programme.iamf --codec opus   # Opus, for distribution
+harlettizer iamf programme.atmos --out programme.iamf --objects      # IAMF v2.0 objects
 ```
 
 Takes a master set or an ADM BW64 file, renders it to a 7.1.4 bed, and writes
@@ -16,8 +17,9 @@ IAMF had no objects until v2.0 (September 2026), and v2.0 is not what a browser
 or a television decodes yet: Chrome, YouTube's players and libiamf before 2.0
 read v1.1. In v1.1 an element is either channels — up to 7.1.4, or 9.1.6 in the
 base-enhanced profile's expanded layouts — or a scene in ambisonics. A bed is
-the one that plays everywhere, so the objects do not survive as objects: they
-are rendered.
+the one that plays everywhere, so by default the objects do not survive as
+objects: they are rendered. `--objects` carries them as v2.0 objects instead —
+see [Objects](#objects-iamf-v20).
 
 What is written is the smallest sequence that carries one:
 
@@ -177,6 +179,103 @@ under 120 Hz says); iamf-rs renders it, and FFmpeg's `ebur128` reads its
 stereo at −23.2 LUFS and −2.0 dBTP against the stated −23.1 and −2.1. How it
 *sounds* is not something any of that checks.
 
+## Objects (IAMF v2.0)
+
+```bash
+harlettizer iamf programme.atmos --out programme.iamf --objects [--positions cart16|cart8|polar] [--elements N]
+```
+
+Each object of the master becomes an audio element of its own: one mono
+substream, positioned by a parameter its mix presentation declares in the
+rendering config — where v2.0 put it so that a v1.1 parser steps over it —
+and animated by parameter blocks. Beside the objects:
+
+- the **LFE**, which has no direction and so cannot be an object, travels in a
+  channel-based element of its own, expanded layout 0 (the LFE subset of
+  7.1.4, one substream);
+- a **bed channel** — a speaker feed — becomes an object that stands at its
+  speaker's place in the cube and never moves, which costs no parameter block
+  at all: its definition's default is where it is.
+
+An IA sequence carries at most twenty-eight channels. The header says which
+profile the sequence needs: base-advanced for objects alone, advanced-1 up to
+eighteen elements and channels, advanced-2 up to twenty-eight.
+
+### Positions
+
+A master moves an object by updates — be here, this loud, take this long — so
+its path through the room is piecewise linear, and IAMF's position blocks are
+exactly that: runs of subblocks, each a step or a line. The path is computed
+once from the updates (a ramp an update cuts short is left from where it had
+got to), and every block is cut from it: a unit's subblocks break where the
+path does, so a move that starts mid-unit starts on its sample; an object
+standing still costs one block for as long as it stands; and the codec's
+delay is carried, the blocks counting on the sequence's timeline while the
+audio is trimmed by the pre-skip. Coded as the master's cube coordinates —
+`cart16` (default) or `cart8` — or as `polar`, the cube put on the sphere by
+BS.2127's conversion. On a 71 s programme of eleven objects, positions cost
+about 7 kbit/s in `cart16`.
+
+An object element has a mix gain and nothing finer, so an object's **gain**
+— ramps included — is applied to its samples, sample by sample. Its **size**
+and **rendering mode** (snap, zones, screen) have nowhere to go and are
+dropped.
+
+### More objects than elements
+
+When the master's objects and bed channels outnumber the elements —
+twenty-seven beside an LFE unless `--elements` says fewer; seventeen keeps a
+sequence within advanced-1 — the objects are folded into the elements block
+by block with `hz-cluster`, the fold `encode --cluster` makes: where each
+element goes, and how much of each object it carries, the weights ramping
+across each block and each element's position ramping with them to where the
+block put it. Bed channels keep elements of their own. Blocks are the largest
+divisor of the unit no longer than 1280 samples (1024 for a 4096 unit, 960 for
+Opus), so that one never straddles two units. Unlike `encode`, there is no
+look-ahead: a block's elements are placed on that block's own energies. The
+summary reports what the fold cost on the metric of `docs/clustering.md`; a
+synthetic 40-object scene with a 7.1.2 bed into 27 elements: 0.0085 mean,
+0.43 at its worst — and into 17, with nine of them pinned to the bed, 0.049
+and 0.84.
+
+### Loudness
+
+The mix presentation states the loudness on stereo and 7.1.4, measured on what
+a decoder is handed rendered the way the bed mode renders — every object on the
+room's cube along the path the blocks give it, the LFE to its speaker. How a
+v2.0 decoder renders objects is the Open Audio Renderer's business, not the
+stream's, so this is the measurement of one rendering, not of every one.
+
+### Checked against
+
+Nothing decodes IAMF v2.0 objects here except the iamf-rs fork's object
+passthrough (`harletty/iamf-rs`, the v2.0 parser and position animation),
+which hands out each object's samples and its position every 256 samples.
+It had no expanded layouts, so the LFE element was checked with a local
+patch to it — expanded layout 0 rendered as 7.1.4 with every other channel
+empty, as IAMF §7.3.2.1 says. `HZ_IAMF_TRACE=<dir>` makes the encode write what
+it meant — every element's samples, every object's position at the same
+offsets — and the decoder's output is compared with it:
+
+| | |
+|---|---|
+| LPCM and FLAC, the real programme (11 objects + LFE) | every object's samples exact, to the length; the LFE exact in the 7.1.4 render and nothing else in it; 20 625 positions to half an LSB of `cart16` |
+| Opus, the same | every object to the programme's length and aligned to the sample; 22 011 positions on the master's timeline, the pre-skip accounted, to 1e-5 |
+| 40 objects + 7.1.2 bed folded into 27 + LFE (advanced-2, substream ids past 17 stated in the frames) | all 27 elements exact; LFE exact; 101 250 positions to half an LSB |
+| advanced-1 (`--elements 17`) Opus `cart8`, and `polar` FLAC | decoded |
+
+The syntax — parameter definition types, coordinate widths, the animation
+codes and their bit packing, `ObjectsConfig` — was read from libiamf's v2.0
+test vectors and their iamf-tools descriptions and from the fork's parser;
+`hz_iamf::position` reproduces a vector's bytes in its tests. The IAMF v2.0
+text itself was not to hand.
+
+**Not checked**: libiamf 2.0 or any player. A v1.1 reader refuses the
+sequence: FFmpeg 9 skips the object elements as a type it does not know, then
+stops at the mix presentation that names them (`Invalid Audio Element with id
+2 referenced by Mix Parameters 2`), and a decoder that honours the header's
+profile stops sooner.
+
 ## Checked against
 
 Nothing here is checked against itself:
@@ -238,14 +337,20 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--headphones <MODE>` | `stereo` | What a decoder playing to headphones does: `stereo`, the loudspeaker fold, or `binaural`, its own binaural renderer |
 | `--frames <N>` | | Stop after this many frames of audio |
 | `--mono-prefix <PREFIX>` | | As for `encode` |
+| `--objects` | off | Carry the objects as IAMF v2.0 objects rather than rendering a bed |
+| `--positions <CODING>` | `cart16` | With `--objects`: `cart16`, `cart8` or `polar` |
+| `--elements <N>` | 27 beside an LFE, else 28 | With `--objects`: the most object elements; more objects than that are folded into them |
 | `--progress` | off | As for `encode` |
 
 ## Not done
 
 - **AAC.** Its free encoder, FDK, is not GPL-compatible.
-- **Objects.** IAMF v2.0's object elements would carry the master's objects
-  through `hz-cluster` to at most 18 or 28 channels; the encode pipeline would
-  have to be separated from MLP first.
+- **A v1.1 fallback** beside the objects — a second mix presentation over a
+  rendered bed, for decoders that do not read v2.0 — which would cost the bed's
+  channels on top of the objects'.
+- **Look-ahead in the objects fold**, which `encode --cluster` has.
+- **Two objects to a substream**, which v2.0 allows and Opus would code
+  jointly.
 - **Scalable layers** (a stereo or 5.1 core with 7.1.4 on top), which need
   demixing parameters and, for lossy codecs, recon gains.
 - **Anchored loudness** (dialogue), which `hz-analysis`'s speech gate could

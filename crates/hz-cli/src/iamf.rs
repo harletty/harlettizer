@@ -1,19 +1,22 @@
-//! `harlettizer iamf`: a programme rendered to a 7.1.4 bed and written as an
-//! IAMF sequence.
+//! `harlettizer iamf`: a programme written as an IAMF sequence.
 //!
-//! The objects do not survive as objects: IAMF before v2.0 has none, and v2.0
-//! is not what a browser or a television decodes. So the master is rendered —
-//! its bed channels routed to their speakers, its objects panned on the room's
-//! cube ([`hz_render::room`]) — and the bed is what is coded, losslessly, with
-//! the loudness a decoder normalises by measured on the two layouts it has to
-//! state: the bed's own, and the stereo pair a decoder folds it to.
+//! Two ways. By default the objects do not survive as objects: IAMF before
+//! v2.0 has none, and v2.0 is not yet what a browser or a television decodes.
+//! So the master is rendered — its bed channels routed to their speakers, its
+//! objects panned on the room's cube ([`hz_render::room`]) — and the 7.1.4 bed
+//! is what is coded. With `--objects` the objects are carried as IAMF v2.0
+//! objects instead; see [`crate::iamf_objects`].
+//!
+//! Either way the loudness a decoder normalises by is measured on the two
+//! layouts the mix presentation states: 7.1.4, and the stereo pair a decoder
+//! folds it to.
 
 use crate::encode::Progress;
 use crate::source::{Source, keyframes_of, tracks};
 use hz_analysis::loudness::{ChannelWeight, Meter};
 use hz_analysis::truepeak::TruePeak;
 use hz_core::{Error, Result, speakers};
-use hz_iamf::{Codec, Headphones, Loudness, Writer};
+use hz_iamf::{Codec, Element, Headphones, Loudness, PositionKind, Writer};
 use hz_io::adm::model::TypeDefinition;
 use hz_io::container::SampleFormat;
 use hz_render::{Keyframe, Layout, Mixdown};
@@ -32,6 +35,12 @@ pub struct Config {
     pub frame: usize,
     pub headphones: Headphones,
     pub progress: bool,
+    /// Carry the objects as IAMF v2.0 objects, positions coded this way,
+    /// rather than rendering them to a bed.
+    pub objects: Option<PositionKind>,
+    /// With `objects`: the most object elements to use, folding the master's
+    /// objects into them when it has more.
+    pub elements: Option<usize>,
 }
 
 /// Samples a channel per temporal unit, unless asked otherwise: a FLAC block
@@ -59,7 +68,156 @@ struct Moving {
     next: usize,
 }
 
+/// The output, open, with its descriptors written.
+pub(crate) type Output = Writer<BufWriter<File>>;
+
+/// Open `config.out` and start a sequence of these elements there.
+pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
+    let out_file = File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
+    let iamf_config = hz_iamf::Config {
+        elements,
+        codec: config.codec,
+        sample_rate,
+        bits: config.bits,
+        frame: config.frame,
+        headphones: config.headphones,
+    };
+    Writer::new(BufWriter::new(out_file), iamf_config).map_err(|e| match e {
+        hz_iamf::Error::Io(e) => Error::io(&config.out, e),
+        hz_iamf::Error::Unsupported(what) => Error::unsupported(&config.out, what),
+    })
+}
+
+/// Read up to `want` frames into `raw`, as many reads as it takes: how many
+/// landed, fewer only at the end of the input.
+pub(crate) fn fill(
+    source: &mut Source,
+    raw: &mut [i32],
+    want: usize,
+    stride: usize,
+) -> Result<usize> {
+    let mut got = 0;
+    while got < want {
+        let landed = source.read(&mut raw[got * stride..want * stride])?;
+        if landed == 0 {
+            break;
+        }
+        got += landed;
+    }
+    Ok(got)
+}
+
+/// The loudness of what a decoder hands back, measured as it goes: a 7.1.4
+/// bed, and the stereo pair it folds to the decoder's way.
+pub(crate) struct Measure {
+    meter: Meter,
+    stereo_meter: Meter,
+    true_peak: TruePeak,
+    stereo_true_peak: TruePeak,
+    peak: f64,
+    stereo_peak: f64,
+    stereo: Vec<f32>,
+}
+
+impl Measure {
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        let weights: Vec<ChannelWeight> = Layout::surround_7_1_4()
+            .speakers
+            .iter()
+            .map(|label| ChannelWeight::for_speaker_label(label))
+            .collect();
+        Self {
+            meter: Meter::new(sample_rate, &weights),
+            stereo_meter: Meter::new(sample_rate, &[ChannelWeight::Unity; 2]),
+            true_peak: TruePeak::new(weights.len()),
+            stereo_true_peak: TruePeak::new(2),
+            peak: 0.0,
+            stereo_peak: 0.0,
+            stereo: Vec::new(),
+        }
+    }
+
+    /// Interleaved 7.1.4 frames, full scale ±1.
+    pub(crate) fn push(&mut self, bed: &[f32]) {
+        let coded = hz_iamf::layout::SEVEN_ONE_FOUR;
+        let width = coded.channels();
+        self.stereo.clear();
+        for frame in bed.chunks_exact(width) {
+            let (mut left, mut right) = (0.0f64, 0.0f64);
+            for (&x, gains) in frame.iter().zip(coded.stereo) {
+                self.peak = self.peak.max(f64::from(x).abs());
+                left += f64::from(x) * gains[0];
+                right += f64::from(x) * gains[1];
+            }
+            self.stereo_peak = self.stereo_peak.max(left.abs()).max(right.abs());
+            self.stereo.push(left as f32);
+            self.stereo.push(right as f32);
+        }
+        self.meter.push(bed);
+        self.true_peak.push(bed);
+        self.stereo_meter.push(&self.stereo);
+        self.stereo_true_peak.push(&self.stereo);
+    }
+
+    /// Stereo, then 7.1.4: the order the mix presentation states them in.
+    pub(crate) fn finish(mut self) -> [Loudness; 2] {
+        self.meter.flush();
+        self.stereo_meter.flush();
+        [
+            Loudness {
+                integrated: self.stereo_meter.integrated(),
+                digital_peak: decibels(self.stereo_peak),
+                true_peak: self.stereo_true_peak.peak_db(),
+            },
+            Loudness {
+                integrated: self.meter.integrated(),
+                digital_peak: decibels(self.peak),
+                true_peak: self.true_peak.peak_db(),
+            },
+        ]
+    }
+}
+
+/// How the summary names the coding.
+pub(crate) fn coding(config: &Config) -> String {
+    match config.codec {
+        Codec::Flac => format!("FLAC {}-bit", config.bits),
+        Codec::Lpcm => format!("LPCM {}-bit", config.bits),
+        Codec::Opus { bitrate } => format!("Opus at {} kbit/s a channel", bitrate / 1000),
+    }
+}
+
+/// The summary's loudness and peak lines.
+pub(crate) fn report_loudness([folded, native]: [Loudness; 2]) {
+    println!(
+        "  loudness     {} on 7.1.4, {} on stereo",
+        lkfs(native.integrated),
+        lkfs(folded.integrated)
+    );
+    println!(
+        "  peaks        {:.1} dBFS sampled, {:.1} dBTP on 7.1.4; {:.1} dBFS, {:.1} dBTP on stereo",
+        native.digital_peak, native.true_peak, folded.digital_peak, folded.true_peak
+    );
+}
+
+/// The summary's last line, and the number of bytes it names.
+pub(crate) fn report_written(config: &Config, samples: u64, sample_rate: u32) -> Result<()> {
+    let bytes = std::fs::metadata(&config.out)
+        .map_err(|e| Error::io(&config.out, e))?
+        .len();
+    let seconds = samples as f64 / f64::from(sample_rate);
+    println!(
+        "  wrote        {}, {bytes} bytes, {:.0} kbit/s",
+        config.out.display(),
+        bytes as f64 * 8.0 / seconds / 1000.0
+    );
+    Ok(())
+}
+
 pub fn run(config: Config) -> Result<()> {
+    if config.objects.is_some() {
+        return crate::iamf_objects::run(config);
+    }
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
     let format = *source.pcm_format();
@@ -139,19 +297,7 @@ pub fn run(config: Config) -> Result<()> {
         return Err(Error::unsupported(path, "nothing in it to render"));
     }
 
-    let out_file = File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
-    let iamf_config = hz_iamf::Config {
-        layout: coded,
-        codec: config.codec,
-        sample_rate,
-        bits: config.bits,
-        frame: config.frame,
-        headphones: config.headphones,
-    };
-    let mut writer = Writer::new(BufWriter::new(out_file), iamf_config).map_err(|e| match e {
-        hz_iamf::Error::Io(e) => Error::io(&config.out, e),
-        hz_iamf::Error::Unsupported(what) => Error::unsupported(&config.out, what),
-    })?;
+    let mut writer = open(&config, sample_rate, vec![Element::Channels(coded)])?;
 
     let frame = config.frame;
     let total = config
@@ -164,18 +310,7 @@ pub fn run(config: Config) -> Result<()> {
     let mut mixed = vec![0f64; frame * width];
     let mut quantised = vec![0i32; frame * width];
     let mut measured = vec![0f32; frame * width];
-    let mut stereo = vec![0f32; frame * 2];
-
-    let weights: Vec<ChannelWeight> = layout
-        .speakers
-        .iter()
-        .map(|label| ChannelWeight::for_speaker_label(label))
-        .collect();
-    let mut meter = Meter::new(sample_rate, &weights);
-    let mut stereo_meter = Meter::new(sample_rate, &[ChannelWeight::Unity; 2]);
-    let mut true_peak = TruePeak::new(width);
-    let mut stereo_true_peak = TruePeak::new(2);
-    let (mut peak, mut stereo_peak) = (0.0f64, 0.0f64);
+    let mut measure = Measure::new(sample_rate);
 
     let full_scale = f64::from(1u32 << (config.bits - 1));
     let (low, high) = (-full_scale, full_scale - 1.0);
@@ -185,14 +320,7 @@ pub fn run(config: Config) -> Result<()> {
     let mut at = 0u64;
     while at < total {
         let want = (total - at).min(frame as u64) as usize;
-        let mut got = 0;
-        while got < want {
-            let landed = source.read(&mut raw[got * stride..want * stride])?;
-            if landed == 0 {
-                break;
-            }
-            got += landed;
-        }
+        let got = fill(&mut source, &mut raw, want, stride)?;
         if got == 0 {
             break;
         }
@@ -244,30 +372,12 @@ pub fn run(config: Config) -> Result<()> {
             .iter_mut()
             .zip(&quantised[..got * width])
         {
-            let x = f64::from(q) / full_scale;
-            peak = peak.max(x.abs());
-            *f = x as f32;
+            *f = (f64::from(q) / full_scale) as f32;
         }
-        for (pair, bed) in stereo[..got * 2]
-            .chunks_exact_mut(2)
-            .zip(measured[..got * width].chunks_exact(width))
-        {
-            let (mut left, mut right) = (0.0f64, 0.0f64);
-            for (&x, gains) in bed.iter().zip(coded.stereo) {
-                left += f64::from(x) * gains[0];
-                right += f64::from(x) * gains[1];
-            }
-            stereo_peak = stereo_peak.max(left.abs()).max(right.abs());
-            pair[0] = left as f32;
-            pair[1] = right as f32;
-        }
-        meter.push(&measured[..got * width]);
-        true_peak.push(&measured[..got * width]);
-        stereo_meter.push(&stereo[..got * 2]);
-        stereo_true_peak.push(&stereo[..got * 2]);
+        measure.push(&measured[..got * width]);
 
         writer
-            .push(&quantised[..got * width])
+            .push(&quantised[..got * width], &[])
             .map_err(|e| Error::io(&config.out, e))?;
         at += got as u64;
         if let Some(progress) = progress.as_mut() {
@@ -281,27 +391,12 @@ pub fn run(config: Config) -> Result<()> {
         return Err(Error::unsupported(path, "no audio to encode"));
     }
 
-    meter.flush();
-    stereo_meter.flush();
-    let native = Loudness {
-        integrated: meter.integrated(),
-        digital_peak: decibels(peak),
-        true_peak: true_peak.peak_db(),
-    };
-    let folded = Loudness {
-        integrated: stereo_meter.integrated(),
-        digital_peak: decibels(stereo_peak),
-        true_peak: stereo_true_peak.peak_db(),
-    };
+    let loudness = measure.finish();
     let units = writer.units();
     writer
-        .finish([folded, native])
+        .finish(loudness)
         .map_err(|e| Error::io(&config.out, e))?;
 
-    let bytes = std::fs::metadata(&config.out)
-        .map_err(|e| Error::io(&config.out, e))?
-        .len();
-    let seconds = at as f64 / f64::from(sample_rate);
     let mut parts = Vec::new();
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
@@ -329,24 +424,12 @@ pub fn run(config: Config) -> Result<()> {
         "  programme    {}, rendered to 7.1.4 on the room's cube",
         parts.join(", ")
     );
-    let coding = match config.codec {
-        Codec::Flac => format!("FLAC {}-bit", config.bits),
-        Codec::Lpcm => format!("LPCM {}-bit", config.bits),
-        Codec::Opus { bitrate } => format!("Opus at {} kbit/s a channel", bitrate / 1000),
-    };
     println!(
-        "  encoded      {units} temporal units of {frame}, {at} samples, {coding}, {} substreams",
+        "  encoded      {units} temporal units of {frame}, {at} samples, {}, {} substreams",
+        coding(&config),
         coded.substreams()
     );
-    println!(
-        "  loudness     {} on 7.1.4, {} on stereo",
-        lkfs(native.integrated),
-        lkfs(folded.integrated)
-    );
-    println!(
-        "  peaks        {:.1} dBFS sampled, {:.1} dBTP on 7.1.4; {:.1} dBFS, {:.1} dBTP on stereo",
-        native.digital_peak, native.true_peak, folded.digital_peak, folded.true_peak
-    );
+    report_loudness(loudness);
     println!(
         "  headroom     {clipped} samples clipped, the bed peaking at {mix_peak:.2} of full scale \
          before the codec's integers"
@@ -357,12 +440,7 @@ pub fn run(config: Config) -> Result<()> {
              scale on 7.1.4"
         );
     }
-    println!(
-        "  wrote        {}, {bytes} bytes, {:.0} kbit/s",
-        config.out.display(),
-        bytes as f64 * 8.0 / seconds / 1000.0
-    );
-    Ok(())
+    report_written(&config, at, sample_rate)
 }
 
 fn decibels(linear: f64) -> f64 {

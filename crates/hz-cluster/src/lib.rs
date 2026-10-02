@@ -244,9 +244,15 @@ impl Clustering {
     }
 }
 
-/// The fewest elements a bitstream carries, and the most.
+/// The fewest elements a bitstream carries, and the most a TrueHD stream
+/// does.
 pub const MIN_ELEMENTS: usize = 3;
 pub const MAX_ELEMENTS: usize = 16;
+
+/// The most elements any format here carries, and so the most the
+/// clustering folds into: an IA sequence's twenty-eight. Nothing in the fold
+/// is sized to the TrueHD bound; a caller checks its own format's.
+pub const MOST_ELEMENTS: usize = 28;
 
 /// How an object's energy is shared out between the elements.
 ///
@@ -1354,10 +1360,10 @@ pub fn partition_with(
     settling: &Settling<'_>,
 ) -> Result<Partition> {
     let path = std::path::Path::new("object scene");
-    if !(MIN_ELEMENTS..=MAX_ELEMENTS).contains(&elements) {
+    if !(MIN_ELEMENTS..=MOST_ELEMENTS).contains(&elements) {
         return Err(hz_core::Error::unsupported(
             path,
-            format!("{elements} elements; a bitstream carries {MIN_ELEMENTS} to {MAX_ELEMENTS}"),
+            format!("{elements} elements; a bitstream carries {MIN_ELEMENTS} to {MOST_ELEMENTS}"),
         ));
     }
 

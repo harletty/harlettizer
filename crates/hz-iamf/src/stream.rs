@@ -1,12 +1,18 @@
 //! A standalone IA sequence (IAMF §5): the descriptors, then one temporal
 //! unit per frame.
 //!
-//! What is written is the simplest sequence that carries a channel bed: one
-//! codec config, one channel-based audio element of a single layer, and one
-//! mix presentation that plays it as it is, with the loudness measured on
-//! the element's own layout and on the stereo pair every sub-mix has to
-//! state. Simple profile throughout — one element, at most sixteen channels
-//! — which is the profile every decoder reads.
+//! What is written is one codec config, the audio elements asked for, and
+//! one mix presentation that plays them all at unity, with the loudness
+//! measured on 7.1.4 and on the stereo pair every sub-mix has to state.
+//!
+//! A single channel-based element — a bed — is the simple profile, which
+//! every decoder reads. Objects are IAMF v2.0: each one an element of its
+//! own, one mono substream, positioned by a parameter the mix presentation
+//! declares and parameter blocks animate (see [`crate::position`]); beside
+//! them, a channel-based element for what cannot be an object, the LFE.
+//! Those sequences are base-advanced (objects only), advanced-1 (up to
+//! eighteen channels in all) or advanced-2 (up to twenty-eight), and the
+//! sequence header says which.
 //!
 //! The loudness is a property of the whole programme and sits in a
 //! descriptor at the head of the file, so it is written as a placeholder and
@@ -28,6 +34,7 @@ use crate::layout::{Layout, STEREO_SOUND_SYSTEM};
 use crate::obu::{ObuType, put_leb128, put_obu, q7_8};
 #[cfg(feature = "opus")]
 use crate::opus;
+use crate::position::{self, PositionKind, Subblock};
 use std::fmt;
 use std::io::{self, Seek, SeekFrom, Write};
 
@@ -73,10 +80,62 @@ pub enum Headphones {
     Binaural,
 }
 
-/// What the sequence is.
+/// One audio element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Element {
+    /// Channels on a loudspeaker layout, one layer.
+    Channels(Layout),
+    /// One object: a mono substream, positioned by a parameter coded as
+    /// `kind`, at `default` — ADM Cartesian — wherever no parameter block
+    /// says otherwise.
+    Object {
+        kind: PositionKind,
+        default: [f64; 3],
+    },
+}
+
+impl Element {
+    pub fn channels(&self) -> usize {
+        match self {
+            Self::Channels(layout) => layout.channels(),
+            Self::Object { .. } => 1,
+        }
+    }
+
+    fn substreams(&self) -> usize {
+        match self {
+            Self::Channels(layout) => layout.substreams(),
+            Self::Object { .. } => 1,
+        }
+    }
+}
+
+/// A run of an object's positions: what one parameter block states.
 #[derive(Debug, Clone, Copy)]
+pub struct PositionBlock<'a> {
+    /// Which element, an object, in the order of [`Config::elements`].
+    pub element: usize,
+    /// Its subblocks, in order: the block starts with the unit it is pushed
+    /// with and lasts as long as they do — past the unit, if they say so.
+    pub subblocks: &'a [Subblock],
+}
+
+/// One substream, as the writer codes it.
+#[derive(Debug, Clone)]
+struct Substream {
+    /// Channels it carries, as indices into a pushed frame.
+    channels: Vec<usize>,
+    /// Coded narrowband by a lossy codec.
+    #[cfg_attr(not(feature = "opus"), allow(dead_code))]
+    lfe: bool,
+}
+
+/// What the sequence is.
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub layout: Layout,
+    /// The audio elements, in the order a pushed frame's channels follow
+    /// them: each element's channels in its own order.
+    pub elements: Vec<Element>,
     pub codec: Codec,
     pub sample_rate: u32,
     /// Bits a sample, which the samples pushed are already at.
@@ -150,10 +209,20 @@ enum Coder {
 /// Identifiers. One of each, so any distinct values would do; these are
 /// kept apart from each other so that a dump reads unambiguously.
 const CODEC_CONFIG_ID: u64 = 0;
+/// The first element's; the rest follow it.
 const AUDIO_ELEMENT_ID: u64 = 1;
 const MIX_PRESENTATION_ID: u64 = 2;
-const ELEMENT_MIX_GAIN_ID: u64 = 100;
 const OUTPUT_MIX_GAIN_ID: u64 = 101;
+/// The first element's mix gain parameter. Each element has its own, above
+/// the output's, so that no two parameter substreams share an id.
+const ELEMENT_MIX_GAIN_ID: u64 = 1000;
+/// The first object's position parameter, likewise.
+const POSITION_ID: u64 = 2000;
+
+/// The most elements and channels a v2.0 profile carries: advanced-1, then
+/// advanced-2.
+const ADVANCED_1: usize = 18;
+const ADVANCED_2: usize = 28;
 
 /// A `LoudnessInfo` with a true peak and nothing anchored: the type byte,
 /// then three Q7.8 fields.
@@ -163,6 +232,8 @@ const LOUDNESS_FIELDS: usize = 6;
 pub struct Writer<W: Write + Seek> {
     out: W,
     config: Config,
+    substreams: Vec<Substream>,
+    width: usize,
     coder: Coder,
     /// Samples a channel the codec's output lags its input by.
     delay: usize,
@@ -182,11 +253,10 @@ pub struct Writer<W: Write + Seek> {
 impl<W: Write + Seek> Writer<W> {
     /// Check `config` and write the descriptors.
     pub fn new(mut out: W, config: Config) -> Result<Self, Error> {
-        if config.layout.channels() > 16 {
-            return Err(Error::Unsupported(format!(
-                "{} channels in one element; the simple profile carries sixteen",
-                config.layout.channels()
-            )));
+        let profile = profile(&config.elements)?;
+        let substreams = substreams(&config.elements);
+        if substreams.len() > 1 << 16 {
+            return Err(Error::Unsupported("that many substreams".into()));
         }
         if config.frame == 0 {
             return Err(Error::Unsupported("an empty frame".into()));
@@ -212,7 +282,7 @@ impl<W: Write + Seek> Writer<W> {
                 config.bits,
                 config.frame,
             )?),
-            Codec::Opus { bitrate } => opus_coder(&config, bitrate)?,
+            Codec::Opus { bitrate } => opus_coder(&config, &substreams, bitrate)?,
         };
         let delay = match &coder {
             #[cfg(feature = "opus")]
@@ -228,15 +298,18 @@ impl<W: Write + Seek> Writer<W> {
         }
 
         let start = out.stream_position()?;
-        let (descriptors, offsets) = descriptors(&config, &coder, delay);
+        let (descriptors, offsets) = descriptors(&config, profile, &coder, delay);
         out.write_all(&descriptors)?;
+        let width = config.elements.iter().map(Element::channels).sum();
         Ok(Self {
+            channels: vec![vec![0; config.frame]; width],
             out,
             config,
+            substreams,
+            width,
             coder,
             delay,
             loudness_at: offsets.map(|at| start + at as u64),
-            channels: vec![vec![0; config.frame]; config.layout.channels()],
             unit: Vec::new(),
             payload: Vec::new(),
             units: 0,
@@ -254,14 +327,32 @@ impl<W: Write + Seek> Writer<W> {
         self.units
     }
 
-    /// Write one temporal unit from `interleaved` frames in the layout's
-    /// channel order, each sample already at the configured depth.
+    /// Samples a channel the codec's output lags what was pushed: the
+    /// pre-skip. A sample pushed at `t` is at `t + delay` on the sequence's
+    /// timeline, which is the timeline parameter blocks count on.
+    pub fn delay(&self) -> usize {
+        self.delay
+    }
+
+    /// Write one temporal unit from `interleaved` frames — the elements'
+    /// channels in order, each sample already at the configured depth — with
+    /// the position blocks that start in it.
     ///
     /// A full frame unless it is the last: a short one is padded with
     /// silence and the padding trimmed at the end, which closes the
     /// substreams — nothing may follow it.
-    pub fn push(&mut self, interleaved: &[i32]) -> io::Result<()> {
-        let width = self.config.layout.channels();
+    pub fn push(&mut self, interleaved: &[i32], blocks: &[PositionBlock]) -> io::Result<()> {
+        let width = self.width;
+        for block in blocks {
+            assert!(
+                matches!(
+                    self.config.elements.get(block.element),
+                    Some(Element::Object { .. })
+                ),
+                "element {} has no position to animate",
+                block.element
+            );
+        }
         let frame = self.config.frame;
         assert!(
             !self.ended,
@@ -283,14 +374,14 @@ impl<W: Write + Seek> Writer<W> {
         let start = if self.units == 0 { self.delay } else { 0 };
         let pad = frame - frames;
         if pad == 0 {
-            return self.write_unit(start, 0);
+            return self.write_unit(start, 0, blocks);
         }
         // The programme ends here. What is still inside the codec has to
         // come out too, in this unit if the padding has room for it.
         if pad >= self.delay {
-            self.write_unit(start, pad - self.delay)?;
+            self.write_unit(start, pad - self.delay, blocks)?;
         } else {
-            self.write_unit(start, 0)?;
+            self.write_unit(start, 0, blocks)?;
             self.write_silent_unit(frame - (self.delay - pad))?;
         }
         self.ended = true;
@@ -303,22 +394,41 @@ impl<W: Write + Seek> Writer<W> {
         for channel in &mut self.channels {
             channel.fill(0);
         }
-        self.write_unit(0, end)
+        self.write_unit(0, end, &[])
     }
 
     /// Code the channels as one unit, trimming `start` samples off its start
     /// and `end` off its end.
-    fn write_unit(&mut self, start: usize, end: usize) -> io::Result<()> {
+    fn write_unit(&mut self, start: usize, end: usize, blocks: &[PositionBlock]) -> io::Result<()> {
         let frame = self.config.frame;
         let trim = (start > 0 || end > 0).then_some((end as u32, start as u32));
         self.unit.clear();
         // A temporal delimiter opens every unit, which lets a reader find the
         // unit boundaries without knowing how many substreams there are.
         put_obu(&mut self.unit, ObuType::TemporalDelimiter, None, &[]);
-        let layout = self.config.layout;
-        for substream in 0..layout.substreams() {
-            let carried = layout.substream_channels(substream);
+        // The parameter blocks start where the unit does, and come before
+        // its audio (IAMF §5.1.2: in order of their implied timestamps).
+        for block in blocks {
+            let Element::Object { kind, .. } = self.config.elements[block.element] else {
+                unreachable!("checked in push");
+            };
             self.payload.clear();
+            position::put_block(
+                &mut self.payload,
+                kind,
+                POSITION_ID + block.element as u64,
+                block.subblocks,
+            );
+            put_obu(&mut self.unit, ObuType::ParameterBlock, None, &self.payload);
+        }
+        for (substream, coded) in self.substreams.iter().enumerate() {
+            let carried = coded.channels.as_slice();
+            self.payload.clear();
+            // Past the eighteen ids a frame's type can carry, the id leads
+            // the payload.
+            if substream > 17 {
+                put_leb128(&mut self.payload, substream as u64);
+            }
             match &mut self.coder {
                 Coder::Lpcm => {
                     let width = self.config.bits as usize / 8;
@@ -356,12 +466,12 @@ impl<W: Write + Seek> Writer<W> {
                     self.payload.extend_from_slice(packet);
                 }
             }
-            put_obu(
-                &mut self.unit,
-                ObuType::AudioFrameId(substream as u8),
-                trim,
-                &self.payload,
-            );
+            let kind = if substream > 17 {
+                ObuType::AudioFrame
+            } else {
+                ObuType::AudioFrameId(substream as u8)
+            };
+            put_obu(&mut self.unit, kind, trim, &self.payload);
         }
         self.out.write_all(&self.unit)?;
         self.units += 1;
@@ -400,7 +510,7 @@ impl<W: Write + Seek> Writer<W> {
 
 /// An encoder per substream, at the rate each one's channels earn.
 #[cfg(feature = "opus")]
-fn opus_coder(config: &Config, bitrate: u32) -> Result<Coder, Error> {
+fn opus_coder(config: &Config, substreams: &[Substream], bitrate: u32) -> Result<Coder, Error> {
     if config.sample_rate != opus::SAMPLE_RATE {
         return Err(Error::Unsupported(format!(
             "{} Hz into Opus; IAMF runs Opus at 48 kHz and this does not resample",
@@ -419,18 +529,16 @@ fn opus_coder(config: &Config, bitrate: u32) -> Result<Coder, Error> {
             config.bits
         )));
     }
-    let layout = config.layout;
-    let mut encoders = Vec::with_capacity(layout.substreams());
-    for substream in 0..layout.substreams() {
-        let carried = layout.substream_channels(substream);
-        let lfe = carried.len() == 1 && layout.labels[carried[0]].starts_with("LFE");
+    let mut encoders = Vec::with_capacity(substreams.len());
+    for substream in substreams {
+        let lfe = substream.lfe;
         let rate = if lfe {
             bitrate / LFE_SHARE
         } else {
-            bitrate * carried.len() as u32
+            bitrate * substream.channels.len() as u32
         };
         encoders.push(opus::Encoder::new(opus::Settings {
-            channels: carried.len(),
+            channels: substream.channels.len(),
             bitrate: rate.max(MIN_SUBSTREAM_BITRATE),
             lfe,
         })?);
@@ -450,7 +558,7 @@ fn opus_coder(config: &Config, bitrate: u32) -> Result<Coder, Error> {
 }
 
 #[cfg(not(feature = "opus"))]
-fn opus_coder(_: &Config, _: u32) -> Result<Coder, Error> {
+fn opus_coder(_: &Config, _: &[Substream], _: u32) -> Result<Coder, Error> {
     Err(Error::Unsupported(
         "Opus; this build has no Opus encoder — build with the `opus` feature, which links \
          libopus"
@@ -458,16 +566,81 @@ fn opus_coder(_: &Config, _: u32) -> Result<Coder, Error> {
     ))
 }
 
+/// The sequence header's profile for these elements, or why there is none.
+///
+/// A bed alone is the simple profile. With objects it is v2.0: base-advanced
+/// when everything is an object, advanced-1 up to eighteen elements and
+/// channels, advanced-2 up to twenty-eight.
+fn profile(elements: &[Element]) -> Result<u8, Error> {
+    let channels: usize = elements.iter().map(Element::channels).sum();
+    let objects = elements
+        .iter()
+        .filter(|e| matches!(e, Element::Object { .. }))
+        .count();
+    if elements.is_empty() {
+        return Err(Error::Unsupported("a sequence with nothing in it".into()));
+    }
+    if objects == 0 {
+        if elements.len() == 1 && channels <= 16 {
+            return Ok(0);
+        }
+        return Err(Error::Unsupported(format!(
+            "{} channel elements and {channels} channels; a bed is one element of at most sixteen",
+            elements.len()
+        )));
+    }
+    let size = elements.len().max(channels);
+    if size <= ADVANCED_1 {
+        Ok(if objects == elements.len() { 3 } else { 4 })
+    } else if size <= ADVANCED_2 {
+        Ok(5)
+    } else {
+        Err(Error::Unsupported(format!(
+            "{} elements and {channels} channels; IAMF's largest profile, advanced-2, carries \
+             {ADVANCED_2}",
+            elements.len()
+        )))
+    }
+}
+
+/// Every element's substreams, in order, with the channels each carries.
+fn substreams(elements: &[Element]) -> Vec<Substream> {
+    let mut out = Vec::new();
+    let mut first = 0;
+    for element in elements {
+        match element {
+            Element::Channels(layout) => {
+                for substream in 0..layout.substreams() {
+                    out.push(Substream {
+                        channels: layout
+                            .substream_channels(substream)
+                            .iter()
+                            .map(|c| first + c)
+                            .collect(),
+                        lfe: layout.is_lfe(substream),
+                    });
+                }
+            }
+            Element::Object { .. } => out.push(Substream {
+                channels: vec![first],
+                lfe: false,
+            }),
+        }
+        first += element.channels();
+    }
+    out
+}
+
 /// The descriptors, and where in them each layout's loudness fields start.
 /// `delay` is the pre-skip, which only Opus states.
 #[cfg_attr(not(feature = "opus"), allow(unused_variables))]
-fn descriptors(config: &Config, coder: &Coder, delay: usize) -> (Vec<u8>, [usize; 2]) {
+fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Vec<u8>, [usize; 2]) {
     let mut out = Vec::with_capacity(256);
     let mut payload = Vec::with_capacity(128);
 
-    // IA sequence header: simple profile, and nothing more.
+    // IA sequence header: the one profile it complies with, twice.
     payload.extend_from_slice(b"iamf");
-    payload.extend_from_slice(&[0, 0]);
+    payload.extend_from_slice(&[profile, profile]);
     put_obu(&mut out, ObuType::SequenceHeader, None, &payload);
 
     // Codec config.
@@ -496,47 +669,94 @@ fn descriptors(config: &Config, coder: &Coder, delay: usize) -> (Vec<u8>, [usize
     }
     put_obu(&mut out, ObuType::CodecConfig, None, &payload);
 
-    // Audio element: channel-based, one layer, no parameters — a single
-    // layer has nothing to demix and nothing to recon.
-    let layout = config.layout;
-    payload.clear();
-    put_leb128(&mut payload, AUDIO_ELEMENT_ID);
-    payload.push(0); // audio_element_type CHANNEL_BASED, reserved
-    put_leb128(&mut payload, CODEC_CONFIG_ID);
-    put_leb128(&mut payload, layout.substreams() as u64);
-    for substream in 0..layout.substreams() {
-        put_leb128(&mut payload, substream as u64);
+    // The audio elements, their substreams numbered in order across them.
+    let mut substream_id = 0u64;
+    for (index, element) in config.elements.iter().enumerate() {
+        payload.clear();
+        put_leb128(&mut payload, AUDIO_ELEMENT_ID + index as u64);
+        let element_type = match element {
+            Element::Channels(_) => 0,
+            Element::Object { .. } => 2,
+        };
+        payload.push(element_type << 5);
+        put_leb128(&mut payload, CODEC_CONFIG_ID);
+        put_leb128(&mut payload, element.substreams() as u64);
+        for _ in 0..element.substreams() {
+            put_leb128(&mut payload, substream_id);
+            substream_id += 1;
+        }
+        // No parameters: a single layer has nothing to demix and nothing to
+        // recon, and an object's position belongs to the mix presentation.
+        put_leb128(&mut payload, 0);
+        match element {
+            Element::Channels(layout) => {
+                payload.push(1 << 5); // num_layers
+                // loudspeaker_layout, no output gain, no recon gain.
+                payload.push(layout.loudspeaker_layout << 4);
+                payload.push(layout.substreams() as u8);
+                payload.push(layout.coupled as u8);
+                if let Some(expanded) = layout.expanded {
+                    payload.push(expanded);
+                }
+            }
+            Element::Object { .. } => {
+                // ObjectsConfig: its size, then one object.
+                put_leb128(&mut payload, 1);
+                payload.push(1);
+            }
+        }
+        put_obu(&mut out, ObuType::AudioElement, None, &payload);
     }
-    put_leb128(&mut payload, 0); // num_parameters
-    payload.push(1 << 5); // num_layers
-    // loudspeaker_layout, no output gain, no recon gain, reserved.
-    payload.push(layout.loudspeaker_layout << 4);
-    payload.push(layout.substreams() as u8);
-    payload.push(layout.coupled as u8);
-    put_obu(&mut out, ObuType::AudioElement, None, &payload);
 
-    // Mix presentation: the one element, at unity, measured on stereo and on
-    // its own layout.
+    // Mix presentation: every element at unity, measured on stereo and on
+    // the layout the programme was rendered to for it.
     payload.clear();
     put_leb128(&mut payload, MIX_PRESENTATION_ID);
     put_leb128(&mut payload, 0); // count_label: no annotations
     put_leb128(&mut payload, 1); // num_sub_mixes
-    put_leb128(&mut payload, 1); // num_audio_elements
-    put_leb128(&mut payload, AUDIO_ELEMENT_ID);
+    put_leb128(&mut payload, config.elements.len() as u64);
     let headphones = match config.headphones {
         Headphones::Stereo => 0u8,
         Headphones::Binaural => 1,
     };
-    payload.push(headphones << 6);
-    put_leb128(&mut payload, 0); // rendering_config_extension_size
-    put_mix_gain(&mut payload, ELEMENT_MIX_GAIN_ID, config.sample_rate);
+    let mut extension = Vec::with_capacity(16);
+    for (index, element) in config.elements.iter().enumerate() {
+        put_leb128(&mut payload, AUDIO_ELEMENT_ID + index as u64);
+        // headphones_rendering_mode; no element gain offset; the ambient
+        // binaural filter profile; reserved.
+        payload.push(headphones << 6);
+        // The rendering config's extension, which is where v2.0 put an
+        // object's position so that a v1.1 parser steps over it.
+        extension.clear();
+        if let Element::Object { kind, default } = element {
+            put_leb128(&mut extension, 1); // num_parameters
+            put_leb128(&mut extension, kind.param_definition_type());
+            position::put_definition(
+                &mut extension,
+                *kind,
+                POSITION_ID + index as u64,
+                config.sample_rate,
+                *default,
+            );
+        }
+        put_leb128(&mut payload, extension.len() as u64);
+        payload.extend_from_slice(&extension);
+        put_mix_gain(
+            &mut payload,
+            ELEMENT_MIX_GAIN_ID + index as u64,
+            config.sample_rate,
+        );
+    }
     put_mix_gain(&mut payload, OUTPUT_MIX_GAIN_ID, config.sample_rate);
     put_leb128(&mut payload, 2); // num_layouts
+    // A bed is measured on its own layout; anything with objects on the
+    // 7.1.4 it was rendered to for the measurement.
+    let measured = match config.elements.as_slice() {
+        [Element::Channels(layout)] => layout.sound_system,
+        _ => crate::layout::SEVEN_ONE_FOUR.sound_system,
+    };
     let mut offsets = [0usize; 2];
-    for (offset, sound_system) in offsets
-        .iter_mut()
-        .zip([STEREO_SOUND_SYSTEM, layout.sound_system])
-    {
+    for (offset, sound_system) in offsets.iter_mut().zip([STEREO_SOUND_SYSTEM, measured]) {
         // layout_type LOUDSPEAKERS_SS_CONVENTION, the sound system, reserved.
         payload.push((2 << 6) | (sound_system << 2));
         payload.push(1); // info_type: a true peak, nothing anchored
@@ -572,7 +792,7 @@ mod tests {
 
     fn config(codec: Codec) -> Config {
         Config {
-            layout: SEVEN_ONE_FOUR,
+            elements: vec![Element::Channels(SEVEN_ONE_FOUR)],
             codec,
             sample_rate: 48_000,
             bits: 24,
@@ -622,11 +842,11 @@ mod tests {
     #[test]
     fn the_sequence_has_the_shape_the_spec_requires() {
         let config = config(Codec::Lpcm);
-        let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
-        let channels = config.layout.channels();
+        let channels = 12;
+        let mut writer = Writer::new(Cursor::new(Vec::new()), config.clone()).unwrap();
         let full: Vec<i32> = (0..256 * channels as i32).collect();
-        writer.push(&full).unwrap();
-        writer.push(&full[..100 * channels]).unwrap();
+        writer.push(&full, &[]).unwrap();
+        writer.push(&full[..100 * channels], &[]).unwrap();
         let loudness = Loudness {
             integrated: -23.0,
             digital_peak: -1.0,
@@ -661,8 +881,8 @@ mod tests {
     #[test]
     fn the_loudness_is_patched_into_the_mix_presentation() {
         let config = config(Codec::Flac);
-        let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
-        writer.push(&vec![0; 256 * 12]).unwrap();
+        let mut writer = Writer::new(Cursor::new(Vec::new()), config.clone()).unwrap();
+        writer.push(&vec![0; 256 * 12], &[]).unwrap();
         let stereo = Loudness {
             integrated: -24.5,
             digital_peak: -2.0,
@@ -698,14 +918,14 @@ mod tests {
             frame: 960,
             ..config(Codec::Lpcm)
         };
-        let width = config.layout.channels();
+        let width = 12;
         for length in [960 * 3 + 100, 960 * 3 + 900, 960 * 3, 500] {
-            let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
+            let mut writer = Writer::new(Cursor::new(Vec::new()), config.clone()).unwrap();
             let delay = writer.delay;
             let mut left = length;
             while left > 0 {
                 let n = left.min(960);
-                writer.push(&vec![1000; n * width]).unwrap();
+                writer.push(&vec![1000; n * width], &[]).unwrap();
                 left -= n;
             }
             let silence = Loudness {
@@ -730,5 +950,106 @@ mod tests {
                 assert_eq!(end > 0, i + 1 == frames.len(), "{length}: unit {i}");
             }
         }
+    }
+
+    fn object(kind: PositionKind) -> Element {
+        Element::Object {
+            kind,
+            default: [0.0, 1.0, 0.0],
+        }
+    }
+
+    /// The header names the profile the elements need: a bed alone is
+    /// simple, objects alone base-advanced, objects beside a channel element
+    /// advanced-1 up to eighteen channels and advanced-2 up to twenty-eight,
+    /// and past that there is none.
+    #[test]
+    fn the_profile_follows_the_elements() {
+        use crate::layout::LFE;
+        let objects = |n: usize| vec![object(PositionKind::Cart8); n];
+        assert_eq!(profile(&[Element::Channels(SEVEN_ONE_FOUR)]).unwrap(), 0);
+        assert_eq!(profile(&objects(18)).unwrap(), 3);
+        let mut mixed = vec![Element::Channels(LFE)];
+        mixed.extend(objects(17));
+        assert_eq!(profile(&mixed).unwrap(), 4);
+        mixed.push(object(PositionKind::Cart8));
+        assert_eq!(profile(&mixed).unwrap(), 5);
+        mixed.extend(objects(9));
+        assert_eq!(mixed.len(), 28);
+        assert_eq!(profile(&mixed).unwrap(), 5);
+        mixed.push(object(PositionKind::Cart8));
+        assert!(profile(&mixed).is_err());
+        // A 7.1.4 bed counts its twelve channels: sixteen objects beside it
+        // fill advanced-2, a seventeenth does not fit.
+        let mut bed = vec![Element::Channels(SEVEN_ONE_FOUR)];
+        bed.extend(objects(16));
+        assert_eq!(profile(&bed).unwrap(), 5);
+        bed.push(object(PositionKind::Cart8));
+        assert!(profile(&bed).is_err());
+    }
+
+    /// An LFE and nineteen objects: twenty substreams, so the last two
+    /// state their ids; position blocks before the audio of the unit they
+    /// start in; the LFE element an expanded layout.
+    #[test]
+    fn objects_beside_an_lfe_are_written_as_v2_elements() {
+        use crate::layout::LFE;
+        let mut elements = vec![Element::Channels(LFE)];
+        elements.extend(vec![object(PositionKind::Cart16); 19]);
+        let config = Config {
+            elements,
+            ..config(Codec::Lpcm)
+        };
+        let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
+        let subblocks = [Subblock {
+            duration: 256,
+            animation: crate::position::Animation::Linear([-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]),
+        }];
+        writer
+            .push(
+                &vec![7; 256 * 20],
+                &[PositionBlock {
+                    element: 3,
+                    subblocks: &subblocks,
+                }],
+            )
+            .unwrap();
+        let bytes = writer
+            .finish(
+                [Loudness {
+                    integrated: -20.0,
+                    digital_peak: -1.0,
+                    true_peak: -1.0,
+                }; 2],
+            )
+            .unwrap()
+            .into_inner();
+        let obus = obus(&bytes);
+        // Header (profile advanced-2), codec, 20 elements, the mix.
+        assert_eq!(obus[0].0, 31);
+        assert_eq!(&obus[0].2[4..], &[5, 5]);
+        assert!(obus[2..22].iter().all(|o| o.0 == 1));
+        // The LFE element: channel-based, one layer, layout 15, one mono
+        // substream, expanded layout 0.
+        let lfe = &obus[2].2;
+        assert_eq!(&lfe[lfe.len() - 5..], &[1 << 5, 15 << 4, 1, 0, 0]);
+        // An object element: type 2, then ObjectsConfig of size 1 holding 1.
+        let first_object = &obus[3].2;
+        assert_eq!(first_object[1], 2 << 5);
+        assert_eq!(&first_object[first_object.len() - 2..], &[1, 1]);
+        // The unit: a delimiter, the block, then twenty frames, ids 0 to 17
+        // in the type and the last two in the payload.
+        let unit = &obus[23..];
+        assert_eq!(unit[0].0, 4);
+        assert_eq!(unit[1].0, 3);
+        let block = &unit[1].2;
+        // POSITION_ID + 3 = 2003, a two-byte LEB128.
+        assert_eq!(&block[..2], &[0xd3, 0x0f]);
+        let types: Vec<u8> = unit[2..].iter().map(|o| o.0).collect();
+        let mut expected: Vec<u8> = (6..24).collect();
+        expected.extend([5, 5]);
+        assert_eq!(types, expected);
+        assert_eq!(unit[20].2[0], 18);
+        assert_eq!(unit[21].2[0], 19);
     }
 }

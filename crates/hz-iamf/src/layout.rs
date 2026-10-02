@@ -11,8 +11,12 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
     pub name: &'static str,
-    /// `loudspeaker_layout`, as the audio element carries it.
+    /// `loudspeaker_layout`, as the audio element carries it: 15 for an
+    /// expanded layout, which `expanded` then names.
     pub loudspeaker_layout: u8,
+    /// `expanded_loudspeaker_layout`, for a layout that is a subset of a
+    /// larger one (IAMF v1.1 §3.6.2).
+    pub expanded: Option<u8>,
     /// `sound_system`, as a mix presentation names the same layout when it
     /// states the loudness measured on it.
     pub sound_system: u8,
@@ -51,6 +55,7 @@ const HALF: f64 = std::f64::consts::FRAC_1_SQRT_2;
 pub const SEVEN_ONE_FOUR: Layout = Layout {
     name: "7.1.4",
     loudspeaker_layout: 7,
+    expanded: None,
     sound_system: 9,
     labels: &[
         "M+030", "M-030", "M+000", "LFE1", "M+090", "M-090", "M+135", "M-135", "U+030", "U-030",
@@ -74,6 +79,24 @@ pub const SEVEN_ONE_FOUR: Layout = Layout {
     ],
 };
 
+/// The LFE alone: expanded layout 0, the low-frequency subset of 7.1.4.
+///
+/// What carries a programme's LFE beside objects, which cannot carry one: an
+/// object is panned, and a low-frequency channel has no direction to pan
+/// to. One mono substream. Outside the simple and base profiles, which
+/// every sequence with objects already is.
+pub const LFE: Layout = Layout {
+    name: "LFE",
+    loudspeaker_layout: 15,
+    expanded: Some(0),
+    // Not a layout a mix states a loudness on.
+    sound_system: 9,
+    labels: &["LFE1"],
+    decoding: &[0],
+    coupled: 0,
+    stereo: &[[0.0, 0.0]],
+};
+
 /// The `sound_system` of a stereo pair, sound system A (0+2+0), which every
 /// sub-mix has to state a loudness for (IAMF §3.7.4).
 pub const STEREO_SOUND_SYSTEM: u8 = 0;
@@ -86,6 +109,12 @@ impl Layout {
     /// How many substreams carry it.
     pub fn substreams(&self) -> usize {
         self.channels() - self.coupled
+    }
+
+    /// Whether substream `index` is a low-frequency channel.
+    pub fn is_lfe(&self, index: usize) -> bool {
+        let carried = self.substream_channels(index);
+        carried.len() == 1 && self.labels[carried[0]].starts_with("LFE")
     }
 
     /// The channels substream `index` carries, as indices into `labels`: two
