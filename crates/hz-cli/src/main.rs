@@ -2,6 +2,7 @@
 
 mod convert;
 mod encode;
+mod iamf;
 mod source;
 
 use clap::{Parser, Subcommand};
@@ -407,6 +408,59 @@ enum Command {
         #[arg(long)]
         progress: bool,
     },
+
+    /// Render a programme to a 7.1.4 bed and write it as an IAMF sequence.
+    ///
+    /// Takes a master set or an ADM BW64 file. Its bed channels are routed to
+    /// their speakers and its objects panned on the room's cube, and the bed is
+    /// coded losslessly as one channel-based audio element under the IAMF
+    /// v1.1 simple profile — what browsers and televisions decode. The mix
+    /// presentation states the loudness measured on 7.1.4 and on the stereo
+    /// pair a decoder folds it to. The output is a standalone `.iamf` stream;
+    /// `docs/iamf.md` has the FFmpeg line that puts it in MP4.
+    Iamf {
+        /// A master set's `.atmos` config, or an ADM BW64 file.
+        input: PathBuf,
+
+        /// Write the stream here.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Stop after this many frames of audio.
+        #[arg(long)]
+        frames: Option<u64>,
+
+        /// Read the master's audio from one mono WAV per waveform; see
+        /// `encode --mono-prefix`.
+        #[arg(long, value_name = "PREFIX")]
+        mono_prefix: Option<PathBuf>,
+
+        /// `flac`, lossless and about half the size, or `lpcm`, the samples
+        /// as they are.
+        #[arg(long, default_value = "flac")]
+        codec: String,
+
+        /// Bits a sample: 16 or 24, and 32 for LPCM. FLAC stops at 24
+        /// because the decoders in use do.
+        #[arg(long, default_value_t = 24)]
+        bits: u32,
+
+        /// Samples a channel per temporal unit. Every FLAC frame is this
+        /// long, so it is also the FLAC block size; 4608 is the most the
+        /// streamable subset allows.
+        #[arg(long, value_name = "SAMPLES", default_value_t = iamf::FRAME)]
+        frame_size: usize,
+
+        /// What a decoder playing to headphones does with the bed:
+        /// `stereo`, the same fold as for two loudspeakers, or `binaural`,
+        /// its own binaural renderer.
+        #[arg(long, default_value = "stereo")]
+        headphones: String,
+
+        /// Report how far along the encode is, on standard error.
+        #[arg(long)]
+        progress: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -528,6 +582,47 @@ fn main() -> ExitCode {
                     presentations,
                     progress,
                     settings: settings?,
+                })
+            })
+        }
+        Command::Iamf {
+            input,
+            out,
+            frames,
+            mono_prefix,
+            codec,
+            bits,
+            frame_size,
+            headphones,
+            progress,
+        } => {
+            let codec = match codec.as_str() {
+                "flac" => Ok(hz_iamf::Codec::Flac),
+                "lpcm" | "pcm" => Ok(hz_iamf::Codec::Lpcm),
+                other => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("`{other}` for the codec; flac or lpcm"),
+                )),
+            };
+            let headphones = match headphones.as_str() {
+                "stereo" => Ok(hz_iamf::Headphones::Stereo),
+                "binaural" => Ok(hz_iamf::Headphones::Binaural),
+                other => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("`{other}` for the headphones; stereo or binaural"),
+                )),
+            };
+            codec.and_then(|codec| {
+                iamf::run(iamf::Config {
+                    input,
+                    out,
+                    frames,
+                    mono_prefix,
+                    codec,
+                    bits,
+                    frame: frame_size,
+                    headphones: headphones?,
+                    progress,
                 })
             })
         }
