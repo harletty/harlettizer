@@ -138,12 +138,16 @@ libopus and encodes a few seconds of Opus with it before packaging, and
 libopus's notice ships in `LICENSES/`. To build the same:
 
 ```bash
-OPUS_STATIC=1 cargo build --release -p hz-cli --features opus         # pkg-config, static
-OPUS_LIB_DIR=/path/to/lib OPUS_STATIC=1 cargo build ... --features opus # no pkg-config
+OPUS_LIB_DIR=$(pkg-config --variable=libdir opus) OPUS_STATIC=1 \
+  cargo build --release -p hz-cli --features opus
 ```
 
-`pkg-config` falls back to the shared library without saying so when there
-is no static one (Arch ships none), so check with `ldd`.
+Through `OPUS_LIB_DIR`, because the `pkg-config` crate will not link a
+library in a system directory statically, whatever `OPUS_STATIC` says: it
+links the shared one and says nothing — the first release build did exactly
+that, and the `ldd` check caught it. Under `OPUS_LIB_DIR` a missing static
+library fails the build instead (Arch ships none; Debian's and Ubuntu's
+`libopus-dev` do).
 
 What IAMF fixes (§3.11.1), and what is chosen:
 

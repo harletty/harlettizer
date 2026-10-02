@@ -10,8 +10,9 @@
 # so `iamf --codec opus` works with nothing installed beside it: the library
 # comes from apt on Linux, Homebrew on macOS and vcpkg on Windows, each one's
 # static build, and the binary is checked to depend on no libopus before it
-# is packaged — pkg-config falls back to a shared library without a word when
-# the static one is missing. libopus's notice travels in `LICENSES/`.
+# is packaged — the pkg-config crate links the shared library without a word
+# when it will not link the static one. libopus's notice travels in
+# `LICENSES/`.
 #
 # A pull request that touches this file builds all three archives without
 # releasing anything, so a change to the release is seen working before a tag
@@ -55,11 +56,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Through OPUS_LIB_DIR rather than pkg-config: the pkg-config crate will
+      # not link a library from a system directory statically, whatever
+      # OPUS_STATIC says, and links the shared one instead.
       - name: libopus (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libopus-dev
+          echo "OPUS_LIB_DIR=$(pkg-config --variable=libdir opus)" >> "$GITHUB_ENV"
           echo "OPUS_STATIC=1" >> "$GITHUB_ENV"
 
       - name: libopus (macOS)

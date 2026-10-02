@@ -2,11 +2,12 @@
 //! otherwise.
 //!
 //! Two ways to find it. `pkg-config`, the default, which is how Linux and
-//! macOS ship it — and which links it statically when `OPUS_STATIC` is set,
-//! as the release builds do so that the binary carries no dependency. Or
-//! `OPUS_LIB_DIR`, a directory holding the library, for a platform with no
-//! `pkg-config` — the Windows release takes vcpkg's static build this way —
-//! linked statically under `OPUS_STATIC` and dynamically otherwise.
+//! macOS ship it, and which links it statically under `OPUS_STATIC` — except
+//! from a system directory such as `/usr/lib`, where the `pkg-config` crate
+//! links the shared library instead and says nothing. Or `OPUS_LIB_DIR`, a
+//! directory holding the library, linked statically under `OPUS_STATIC` — or
+//! the build fails — and dynamically otherwise: what the Linux release does
+//! with apt's library and the Windows one with vcpkg's.
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
