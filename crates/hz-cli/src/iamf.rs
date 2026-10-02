@@ -39,6 +39,18 @@ pub struct Config {
 /// 85 ms at 48 kHz.
 pub const FRAME: usize = 4096;
 
+/// An Opus packet's samples unless asked otherwise: 20 ms, what libopus is
+/// tuned at and what YouTube's IAMF streams use.
+pub const OPUS_FRAME: usize = 960;
+
+/// Opus kilobits a second for each channel unless asked otherwise.
+///
+/// YouTube's IAMF streams carry about 46 a channel. This is a step above,
+/// for a programme that is an encode's output rather than a stream's: a
+/// 7.1.4 at about 720 kbit/s, between a streaming service's immersive tier
+/// and a disc's.
+pub const OPUS_BITRATE: u32 = 64;
+
 /// An object of the master: its input channel, its updates, and the next one
 /// to act on.
 struct Moving {
@@ -317,14 +329,13 @@ pub fn run(config: Config) -> Result<()> {
         "  programme    {}, rendered to 7.1.4 on the room's cube",
         parts.join(", ")
     );
+    let coding = match config.codec {
+        Codec::Flac => format!("FLAC {}-bit", config.bits),
+        Codec::Lpcm => format!("LPCM {}-bit", config.bits),
+        Codec::Opus { bitrate } => format!("Opus at {} kbit/s a channel", bitrate / 1000),
+    };
     println!(
-        "  encoded      {units} temporal units of {frame}, {at} samples, {} {}-bit, \
-         {} substreams",
-        match config.codec {
-            Codec::Flac => "FLAC",
-            Codec::Lpcm => "LPCM",
-        },
-        config.bits,
+        "  encoded      {units} temporal units of {frame}, {at} samples, {coding}, {} substreams",
         coded.substreams()
     );
     println!(

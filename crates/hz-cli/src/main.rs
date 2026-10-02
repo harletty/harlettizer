@@ -435,21 +435,30 @@ enum Command {
         #[arg(long, value_name = "PREFIX")]
         mono_prefix: Option<PathBuf>,
 
-        /// `flac`, lossless and about half the size, or `lpcm`, the samples
-        /// as they are.
+        /// `flac`, lossless and about half the size; `lpcm`, the samples as
+        /// they are; or `opus`, lossy, what a browser or YouTube is sent —
+        /// only in a build with the `opus` feature, which links libopus.
         #[arg(long, default_value = "flac")]
         codec: String,
 
-        /// Bits a sample: 16 or 24, and 32 for LPCM. FLAC stops at 24
-        /// because the decoders in use do.
-        #[arg(long, default_value_t = 24)]
-        bits: u32,
+        /// Bits a sample for the lossless codecs: 16 or 24, and 32 for
+        /// LPCM. FLAC stops at 24 because the decoders in use do. Opus has
+        /// no depth, and takes the bed at 24.
+        #[arg(long)]
+        bits: Option<u32>,
+
+        /// Opus only: kilobits a second for each channel. A coupled pair is
+        /// coded at twice it and the LFE at a quarter, so 64 puts a 7.1.4 at
+        /// about 720 kbit/s. YouTube's IAMF streams run at about 46.
+        #[arg(long, value_name = "KBPS")]
+        bitrate: Option<u32>,
 
         /// Samples a channel per temporal unit. Every FLAC frame is this
-        /// long, so it is also the FLAC block size; 4608 is the most the
-        /// streamable subset allows.
-        #[arg(long, value_name = "SAMPLES", default_value_t = iamf::FRAME)]
-        frame_size: usize,
+        /// long, so it is also the FLAC block size, 4096 unless asked and
+        /// 4608 at most; an Opus packet is 960 unless asked — 20 ms — and
+        /// 480, 1920 or 2880 otherwise.
+        #[arg(long, value_name = "SAMPLES")]
+        frame_size: Option<usize>,
 
         /// What a decoder playing to headphones does with the bed:
         /// `stereo`, the same fold as for two loudspeakers, or `binaural`,
@@ -592,18 +601,36 @@ fn main() -> ExitCode {
             mono_prefix,
             codec,
             bits,
+            bitrate,
             frame_size,
             headphones,
             progress,
         } => {
-            let codec = match codec.as_str() {
-                "flac" => Ok(hz_iamf::Codec::Flac),
-                "lpcm" | "pcm" => Ok(hz_iamf::Codec::Lpcm),
-                other => Err(hz_core::Error::unsupported(
+            let codec = match (codec.as_str(), bitrate) {
+                ("opus", rate) => Ok(hz_iamf::Codec::Opus {
+                    bitrate: rate.unwrap_or(iamf::OPUS_BITRATE) * 1000,
+                }),
+                (_, Some(_)) => Err(hz_core::Error::unsupported(
                     &input,
-                    format!("`{other}` for the codec; flac or lpcm"),
+                    "--bitrate with a lossless codec; it is for opus",
+                )),
+                ("flac", None) => Ok(hz_iamf::Codec::Flac),
+                ("lpcm" | "pcm", None) => Ok(hz_iamf::Codec::Lpcm),
+                (other, None) => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("`{other}` for the codec; flac, lpcm or opus"),
                 )),
             };
+            let lossy = matches!(codec, Ok(hz_iamf::Codec::Opus { .. }));
+            let bits = match (lossy, bits) {
+                (true, Some(_)) => Err(hz_core::Error::unsupported(
+                    &input,
+                    "--bits with opus, which has no depth",
+                )),
+                (_, bits) => Ok(bits.unwrap_or(24)),
+            };
+            let frame_size =
+                frame_size.unwrap_or(if lossy { iamf::OPUS_FRAME } else { iamf::FRAME });
             let headphones = match headphones.as_str() {
                 "stereo" => Ok(hz_iamf::Headphones::Stereo),
                 "binaural" => Ok(hz_iamf::Headphones::Binaural),
@@ -619,7 +646,7 @@ fn main() -> ExitCode {
                     frames,
                     mono_prefix,
                     codec,
-                    bits,
+                    bits: bits?,
                     frame: frame_size,
                     headphones: headphones?,
                     progress,

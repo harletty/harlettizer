@@ -22,3 +22,7 @@ hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
 hz-render.workspace = true
 clap.workspace = true
+
+[features]
+# `iamf --codec opus`, through the system's libopus; see hz-iamf.
+opus = ["hz-iamf/opus"]

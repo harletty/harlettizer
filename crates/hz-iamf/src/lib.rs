@@ -4,9 +4,10 @@
 //! IAMF is the Alliance for Open Media's immersive container: a bed, a scene
 //! or (from v2.0) objects, coded by an ordinary codec one or two channels at
 //! a time and described by a handful of small descriptors. What this crate
-//! writes is a channel bed, losslessly — LPCM, or FLAC through an encoder of
-//! its own — under the v1.1 simple profile, which is what browsers and
-//! televisions decode today.
+//! writes is a channel bed — losslessly as LPCM or as FLAC through an encoder
+//! of its own, or as Opus through libopus behind the `opus` feature — under
+//! the v1.1 simple profile, which is what browsers and televisions decode
+//! today.
 //!
 //! ```no_run
 //! use hz_iamf::{Codec, Config, Headphones, Loudness, Writer, layout};
@@ -29,6 +30,8 @@
 pub mod flac;
 pub mod layout;
 pub mod obu;
+#[cfg(feature = "opus")]
+pub mod opus;
 pub mod stream;
 
 pub use layout::Layout;

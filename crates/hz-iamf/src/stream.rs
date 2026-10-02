@@ -12,10 +12,22 @@
 //! descriptor at the head of the file, so it is written as a placeholder and
 //! patched when the programme ends. The fields are fixed-width, so the patch
 //! changes no length and nothing after it moves.
+//!
+//! # A codec with a delay
+//!
+//! Opus hands each sample back a lookahead late, so its timeline is shifted:
+//! the first unit trims that many samples off its start (the pre-skip), and
+//! the programme's last samples come out only once the encoder has been fed
+//! that much more — silence, in a unit of its own if the last one has no room
+//! — trimmed off the end. The lossless codecs have no delay and the same
+//! arithmetic gives them a trim at the end of a short last unit and nothing
+//! else.
 
 use crate::flac;
 use crate::layout::{Layout, STEREO_SOUND_SYSTEM};
 use crate::obu::{ObuType, put_leb128, put_obu, q7_8};
+#[cfg(feature = "opus")]
+use crate::opus;
 use std::fmt;
 use std::io::{self, Seek, SeekFrom, Write};
 
@@ -26,6 +38,10 @@ pub enum Codec {
     Lpcm,
     /// FLAC, lossless.
     Flac,
+    /// Opus, lossy, at `bitrate` bits a second for each channel: a coupled
+    /// pair is coded at twice it, the LFE at a quarter. Needs the `opus`
+    /// feature; without it [`Writer::new`] refuses it.
+    Opus { bitrate: u32 },
 }
 
 impl Codec {
@@ -33,9 +49,20 @@ impl Codec {
         match self {
             Self::Lpcm => b"ipcm",
             Self::Flac => b"fLaC",
+            Self::Opus { .. } => b"Opus",
         }
     }
 }
+
+/// The LFE's share of a channel's bitrate. It carries a band a few hundred
+/// hertz wide; coded narrowband, a quarter is generous.
+#[cfg(feature = "opus")]
+const LFE_SHARE: u32 = 4;
+
+/// The fewest bits a second an Opus substream is given, however low the
+/// rate asked: below this libopus stops being music-grade.
+#[cfg(feature = "opus")]
+const MIN_SUBSTREAM_BITRATE: u32 = 12_000;
 
 /// How a decoder playing to headphones renders the bed (IAMF §3.7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +127,26 @@ impl From<flac::Unsupported> for Error {
     }
 }
 
+#[cfg(feature = "opus")]
+impl From<opus::OpusError> for Error {
+    fn from(e: opus::OpusError) -> Self {
+        Self::Unsupported(e.to_string())
+    }
+}
+
+/// The coder behind each codec, with whatever state it keeps.
+enum Coder {
+    Lpcm,
+    Flac(flac::Encoder),
+    #[cfg(feature = "opus")]
+    Opus {
+        /// One per substream: Opus is stateful.
+        encoders: Vec<opus::Encoder>,
+        /// One substream's samples, interleaved and scaled to ±1.
+        scratch: Vec<f32>,
+    },
+}
+
 /// Identifiers. One of each, so any distinct values would do; these are
 /// kept apart from each other so that a dump reads unambiguously.
 const CODEC_CONFIG_ID: u64 = 0;
@@ -116,7 +163,9 @@ const LOUDNESS_FIELDS: usize = 6;
 pub struct Writer<W: Write + Seek> {
     out: W,
     config: Config,
-    flac: Option<flac::Encoder>,
+    coder: Coder,
+    /// Samples a channel the codec's output lags its input by.
+    delay: usize,
     /// Where, in `out`, each layout's loudness fields start: stereo, then
     /// the element's own layout.
     loudness_at: [u64; 2],
@@ -125,8 +174,9 @@ pub struct Writer<W: Write + Seek> {
     unit: Vec<u8>,
     payload: Vec<u8>,
     units: u64,
-    /// Samples a channel the last unit was padded with, once there is one.
-    ended: Option<usize>,
+    /// Whether the substreams are closed: a unit trimmed at its end has
+    /// been written, and nothing may follow it.
+    ended: bool,
 }
 
 impl<W: Write + Seek> Writer<W> {
@@ -141,7 +191,7 @@ impl<W: Write + Seek> Writer<W> {
         if config.frame == 0 {
             return Err(Error::Unsupported("an empty frame".into()));
         }
-        let flac = match config.codec {
+        let coder = match config.codec {
             Codec::Lpcm => {
                 if ![16, 24, 32].contains(&config.bits) {
                     return Err(Error::Unsupported(format!(
@@ -155,28 +205,42 @@ impl<W: Write + Seek> Writer<W> {
                         config.sample_rate
                     )));
                 }
-                None
+                Coder::Lpcm
             }
-            Codec::Flac => Some(flac::Encoder::new(
+            Codec::Flac => Coder::Flac(flac::Encoder::new(
                 config.sample_rate,
                 config.bits,
                 config.frame,
             )?),
+            Codec::Opus { bitrate } => opus_coder(&config, bitrate)?,
         };
+        let delay = match &coder {
+            #[cfg(feature = "opus")]
+            Coder::Opus { encoders, .. } => encoders[0].lookahead(),
+            _ => 0,
+        };
+        if delay >= config.frame {
+            return Err(Error::Unsupported(format!(
+                "{}-sample frames under a codec delay of {delay}; a frame has to be longer than \
+                 the samples its first one trims",
+                config.frame
+            )));
+        }
 
         let start = out.stream_position()?;
-        let (descriptors, offsets) = descriptors(&config, flac.as_ref());
+        let (descriptors, offsets) = descriptors(&config, &coder, delay);
         out.write_all(&descriptors)?;
         Ok(Self {
             out,
             config,
-            flac,
+            coder,
+            delay,
             loudness_at: offsets.map(|at| start + at as u64),
             channels: vec![vec![0; config.frame]; config.layout.channels()],
             unit: Vec::new(),
             payload: Vec::new(),
             units: 0,
-            ended: None,
+            ended: false,
         })
     }
 
@@ -200,7 +264,7 @@ impl<W: Write + Seek> Writer<W> {
         let width = self.config.layout.channels();
         let frame = self.config.frame;
         assert!(
-            self.ended.is_none(),
+            !self.ended,
             "a short frame ends the sequence; nothing follows it"
         );
         assert_eq!(interleaved.len() % width, 0, "whole frames only");
@@ -216,9 +280,37 @@ impl<W: Write + Seek> Writer<W> {
             }
             channel[frames..].fill(0);
         }
+        let start = if self.units == 0 { self.delay } else { 0 };
         let pad = frame - frames;
-        let trim = (pad > 0).then_some((pad as u32, 0));
+        if pad == 0 {
+            return self.write_unit(start, 0);
+        }
+        // The programme ends here. What is still inside the codec has to
+        // come out too, in this unit if the padding has room for it.
+        if pad >= self.delay {
+            self.write_unit(start, pad - self.delay)?;
+        } else {
+            self.write_unit(start, 0)?;
+            self.write_silent_unit(frame - (self.delay - pad))?;
+        }
+        self.ended = true;
+        Ok(())
+    }
 
+    /// A unit of silence, trimmed by `end` at its end: what flushes a
+    /// codec's delay out after the programme.
+    fn write_silent_unit(&mut self, end: usize) -> io::Result<()> {
+        for channel in &mut self.channels {
+            channel.fill(0);
+        }
+        self.write_unit(0, end)
+    }
+
+    /// Code the channels as one unit, trimming `start` samples off its start
+    /// and `end` off its end.
+    fn write_unit(&mut self, start: usize, end: usize) -> io::Result<()> {
+        let frame = self.config.frame;
+        let trim = (start > 0 || end > 0).then_some((end as u32, start as u32));
         self.unit.clear();
         // A temporal delimiter opens every unit, which lets a reader find the
         // unit boundaries without knowing how many substreams there are.
@@ -227,17 +319,17 @@ impl<W: Write + Seek> Writer<W> {
         for substream in 0..layout.substreams() {
             let carried = layout.substream_channels(substream);
             self.payload.clear();
-            match &mut self.flac {
-                None => {
+            match &mut self.coder {
+                Coder::Lpcm => {
+                    let width = self.config.bits as usize / 8;
                     for i in 0..frame {
                         for &c in carried {
                             let bytes = self.channels[c][i].to_le_bytes();
-                            let width = self.config.bits as usize / 8;
                             self.payload.extend_from_slice(&bytes[..width]);
                         }
                     }
                 }
-                Some(encoder) => {
+                Coder::Flac(encoder) => {
                     let slices: [&[i32]; 2];
                     let channels: &[&[i32]] = if carried.len() == 2 {
                         slices = [&self.channels[carried[0]], &self.channels[carried[1]]];
@@ -249,6 +341,20 @@ impl<W: Write + Seek> Writer<W> {
                     self.payload
                         .extend_from_slice(encoder.encode(self.units, channels));
                 }
+                #[cfg(feature = "opus")]
+                Coder::Opus { encoders, scratch } => {
+                    let scale = 1.0 / f64::from(1u32 << (self.config.bits - 1));
+                    scratch.clear();
+                    for i in 0..frame {
+                        for &c in carried {
+                            scratch.push((f64::from(self.channels[c][i]) * scale) as f32);
+                        }
+                    }
+                    let packet = encoders[substream]
+                        .encode(scratch)
+                        .map_err(io::Error::other)?;
+                    self.payload.extend_from_slice(packet);
+                }
             }
             put_obu(
                 &mut self.unit,
@@ -259,8 +365,8 @@ impl<W: Write + Seek> Writer<W> {
         }
         self.out.write_all(&self.unit)?;
         self.units += 1;
-        if pad > 0 {
-            self.ended = Some(pad);
+        if end > 0 {
+            self.ended = true;
         }
         Ok(())
     }
@@ -268,6 +374,11 @@ impl<W: Write + Seek> Writer<W> {
     /// State the programme's loudness — on the stereo pair, then on the
     /// element's own layout — and hand back the output.
     pub fn finish(mut self, loudness: [Loudness; 2]) -> io::Result<W> {
+        // A programme that ended on a whole unit still has the codec's delay
+        // to flush.
+        if !self.ended && self.units > 0 && self.delay > 0 {
+            self.write_silent_unit(self.config.frame - self.delay)?;
+        }
         let end = self.out.stream_position()?;
         for (at, loudness) in self.loudness_at.iter().zip(loudness) {
             let mut fields = [0u8; LOUDNESS_FIELDS];
@@ -287,8 +398,70 @@ impl<W: Write + Seek> Writer<W> {
     }
 }
 
+/// An encoder per substream, at the rate each one's channels earn.
+#[cfg(feature = "opus")]
+fn opus_coder(config: &Config, bitrate: u32) -> Result<Coder, Error> {
+    if config.sample_rate != opus::SAMPLE_RATE {
+        return Err(Error::Unsupported(format!(
+            "{} Hz into Opus; IAMF runs Opus at 48 kHz and this does not resample",
+            config.sample_rate
+        )));
+    }
+    if !opus::is_frame_size(config.frame) {
+        return Err(Error::Unsupported(format!(
+            "{}-sample Opus frames; a packet is 120, 240, 480, 960, 1920 or 2880 samples",
+            config.frame
+        )));
+    }
+    if ![16, 24, 32].contains(&config.bits) {
+        return Err(Error::Unsupported(format!(
+            "{}-bit samples into Opus; 16, 24 or 32",
+            config.bits
+        )));
+    }
+    let layout = config.layout;
+    let mut encoders = Vec::with_capacity(layout.substreams());
+    for substream in 0..layout.substreams() {
+        let carried = layout.substream_channels(substream);
+        let lfe = carried.len() == 1 && layout.labels[carried[0]].starts_with("LFE");
+        let rate = if lfe {
+            bitrate / LFE_SHARE
+        } else {
+            bitrate * carried.len() as u32
+        };
+        encoders.push(opus::Encoder::new(opus::Settings {
+            channels: carried.len(),
+            bitrate: rate.max(MIN_SUBSTREAM_BITRATE),
+            lfe,
+        })?);
+    }
+    // Every substream trims the same pre-skip, so every encoder has to have
+    // the same delay; libopus's depends only on the rate and application.
+    let delay = encoders[0].lookahead();
+    if encoders.iter().any(|e| e.lookahead() != delay) {
+        return Err(Error::Unsupported(
+            "Opus encoders with different delays in one element".into(),
+        ));
+    }
+    Ok(Coder::Opus {
+        encoders,
+        scratch: Vec::with_capacity(config.frame * 2),
+    })
+}
+
+#[cfg(not(feature = "opus"))]
+fn opus_coder(_: &Config, _: u32) -> Result<Coder, Error> {
+    Err(Error::Unsupported(
+        "Opus; this build has no Opus encoder — build with the `opus` feature, which links \
+         libopus"
+            .into(),
+    ))
+}
+
 /// The descriptors, and where in them each layout's loudness fields start.
-fn descriptors(config: &Config, flac: Option<&flac::Encoder>) -> (Vec<u8>, [usize; 2]) {
+/// `delay` is the pre-skip, which only Opus states.
+#[cfg_attr(not(feature = "opus"), allow(unused_variables))]
+fn descriptors(config: &Config, coder: &Coder, delay: usize) -> (Vec<u8>, [usize; 2]) {
     let mut out = Vec::with_capacity(256);
     let mut payload = Vec::with_capacity(128);
 
@@ -302,21 +475,29 @@ fn descriptors(config: &Config, flac: Option<&flac::Encoder>) -> (Vec<u8>, [usiz
     put_leb128(&mut payload, CODEC_CONFIG_ID);
     payload.extend_from_slice(config.codec.four_cc());
     put_leb128(&mut payload, config.frame as u64);
-    // audio_roll_distance: nought for both lossless codecs (IAMF §3.11).
-    payload.extend_from_slice(&0i16.to_be_bytes());
-    match flac {
-        None => {
+    match coder {
+        Coder::Lpcm => {
+            // audio_roll_distance: nought for a lossless codec (IAMF §3.11).
+            payload.extend_from_slice(&0i16.to_be_bytes());
             // Little-endian, the depth, the rate.
             payload.push(1);
             payload.push(config.bits as u8);
             payload.extend_from_slice(&config.sample_rate.to_be_bytes());
         }
-        Some(encoder) => payload.extend_from_slice(&encoder.decoder_config()),
+        Coder::Flac(encoder) => {
+            payload.extend_from_slice(&0i16.to_be_bytes());
+            payload.extend_from_slice(&encoder.decoder_config());
+        }
+        #[cfg(feature = "opus")]
+        Coder::Opus { .. } => {
+            payload.extend_from_slice(&opus::roll_distance(config.frame).to_be_bytes());
+            payload.extend_from_slice(&opus::decoder_config(delay as u16, config.sample_rate));
+        }
     }
     put_obu(&mut out, ObuType::CodecConfig, None, &payload);
 
     // Audio element: channel-based, one layer, no parameters — a single
-    // layer has nothing to demix, and a lossless codec nothing to recon.
+    // layer has nothing to demix and nothing to recon.
     let layout = config.layout;
     payload.clear();
     put_leb128(&mut payload, AUDIO_ELEMENT_ID);
@@ -503,5 +684,51 @@ mod tests {
         assert_eq!(q(&tail[6..]), -448);
         assert_eq!(tail[8], (2 << 6) | (9 << 2));
         assert_eq!(q(&tail[10..]), -23 * 256);
+    }
+
+    /// Opus's timeline: the first unit trims the pre-skip off its start, the
+    /// last trims whatever overhangs the programme off its end, and what is
+    /// left is exactly the programme — whether it ends with room in its last
+    /// unit for the delay, without room, or on a whole unit.
+    #[cfg(feature = "opus")]
+    #[test]
+    fn opus_trims_its_delay_at_both_ends() {
+        let config = Config {
+            codec: Codec::Opus { bitrate: 64_000 },
+            frame: 960,
+            ..config(Codec::Lpcm)
+        };
+        let width = config.layout.channels();
+        for length in [960 * 3 + 100, 960 * 3 + 900, 960 * 3, 500] {
+            let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
+            let delay = writer.delay;
+            let mut left = length;
+            while left > 0 {
+                let n = left.min(960);
+                writer.push(&vec![1000; n * width]).unwrap();
+                left -= n;
+            }
+            let silence = Loudness {
+                integrated: -70.0,
+                digital_peak: -70.0,
+                true_peak: -70.0,
+            };
+            let bytes = writer.finish([silence; 2]).unwrap().into_inner();
+            let frames: Vec<_> = obus(&bytes).into_iter().filter(|o| o.0 == 6).collect();
+            let kept: u64 = frames
+                .iter()
+                .map(|(_, trim, _)| {
+                    let (end, start) = trim.unwrap_or((0, 0));
+                    960 - end - start
+                })
+                .sum();
+            assert_eq!(kept, length as u64, "{length}");
+            assert_eq!(frames[0].1.map(|t| t.1), Some(delay as u64), "{length}");
+            // Only the last unit trims its end.
+            for (i, (_, trim, _)) in frames.iter().enumerate() {
+                let end = trim.map_or(0, |t| t.0);
+                assert_eq!(end > 0, i + 1 == frames.len(), "{length}: unit {i}");
+            }
+        }
     }
 }

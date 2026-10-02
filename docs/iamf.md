@@ -1,7 +1,8 @@
 # IAMF output
 
 ```bash
-harlettizer iamf programme.atmos --out programme.iamf
+harlettizer iamf programme.atmos --out programme.iamf                # FLAC, lossless
+harlettizer iamf programme.atmos --out programme.iamf --codec opus   # Opus, for distribution
 ```
 
 Takes a master set or an ADM BW64 file, renders it to a 7.1.4 bed, and writes
@@ -21,7 +22,7 @@ are rendered.
 What is written is the smallest sequence that carries one:
 
 - **simple profile** — one audio element, at most sixteen channels;
-- **one codec config** — FLAC (default) or LPCM, both lossless;
+- **one codec config** — FLAC (default) or LPCM, both lossless, or Opus;
 - **one channel-based element**, `loudspeaker_layout` 7 (7.1.4), a single
   layer, no demixing or recon parameters — seven substreams, the front, side,
   rear, top-front and top-back pairs, then centre, then LFE (§3.6.3.3);
@@ -65,7 +66,9 @@ there are any.
 
 A decoder normalises by the mix presentation's loudness, so it has to describe
 what the decoder plays. Both figures are measured on the bed **after** it is
-rounded, which is what a decoder hands back:
+rounded, which is what a lossless decoder hands back — and what an Opus
+decoder hands back to within what the codec changes, a tenth of a LU on the
+programme below:
 
 - **7.1.4** — BS.1770-4 through `hz-analysis`, the surrounds weighted, the LFE
   left out.
@@ -113,6 +116,49 @@ same block size:
 
 About 1.5 s for the 71 s programme on one core, render included.
 
+## Opus
+
+```bash
+cargo build --release -p hz-cli --features opus
+harlettizer iamf programme.atmos --out programme.iamf --codec opus [--bitrate 64]
+```
+
+The one codec here that is not written here. A lossy coder is judged by ear
+and by years of tuning, and libopus is the encoder the format was tuned with;
+the pure-Rust ports on crates.io are young, and one that sounds worse is no
+trade for a toolchain. So Opus is behind the `opus` feature, links the system's
+libopus through `pkg-config`, and is the only `unsafe` in `hz-iamf` — five
+functions of its C API in [`opus.rs`](../crates/hz-iamf/src/opus.rs). The
+default build stays pure Rust, and the released binaries are built without it.
+
+What IAMF fixes (§3.11.1), and what is chosen:
+
+- One packet per frame per substream, mono or stereo, at **48 kHz** — a
+  programme at another rate is refused rather than resampled. 20 ms packets
+  (960) unless asked; `audio_roll_distance` is −⌈3840 / frame⌉, −4 at 20 ms.
+- The codec config is RFC 7845's identification header without its magic,
+  big-endian, two channels, no output gain, mapping family 0 — the same
+  eleven bytes YouTube's own IAMF streams carry.
+- **The pre-skip is the encoder's lookahead** (312 samples), and every
+  substream trims exactly that off its first frame. The programme's last
+  samples leave the encoder that much late, so the sequence is fed that much
+  more silence — in the last unit if it has room, in one more otherwise — and
+  the overhang trimmed off the end. What a decoder keeps is the programme,
+  sample for sample in length and in time.
+- **Bitrate** is per channel, 64 kbit/s unless asked: a coupled pair at twice
+  it, the LFE at a quarter and band-limited to narrowband, which is all it
+  carries — about 720 kbit/s for a 7.1.4. YouTube's IAMF streams carry about
+  46 a channel (sixteen mono substreams of third-order ambisonics, in a
+  capture of one). Unconstrained VBR, complexity 10, music.
+
+On the same 71 s programme: 6.5 MB at 732 kbit/s against 70 MB of FLAC, in
+2.4 s. FFmpeg's native Opus decoder and libopus both decode every substream
+to exactly the programme's length and aligned with the bed to the sample
+(the LFE's cross-correlation peaks within ten samples, as close as a signal
+under 120 Hz says); iamf-rs renders it, and FFmpeg's `ebur128` reads its
+stereo at −23.2 LUFS and −2.0 dBTP against the stated −23.1 and −2.1. How it
+*sounds* is not something any of that checks.
+
 ## Checked against
 
 Nothing here is checked against itself:
@@ -134,7 +180,14 @@ Nothing here is checked against itself:
 
 Not checked: a browser. Chrome decodes IAMF from 153 and the one to hand was
 152; and whether Chromium's IAMF path takes FLAC substreams at all, rather
-than only Opus and AAC, is untested.
+than only Opus and AAC, is untested. The Opus sequence is the one to try
+first.
+
+Found on the way: the pure-Rust `opus-decoder` crate (0.1.1), which iamf-rs
+uses when it is built without libopus, overflows a shift building its
+anti-collapse mask (`1u8 << i` with `i` past seven) on packets libopus writes
+for an ordinary tone — a panic in a debug build and the wrong mask bit in a
+release one. The tests here decode with libopus instead.
 
 ## Into MP4
 
@@ -151,17 +204,19 @@ ffmpeg -i programme.iamf -map 0 -c:a copy \
   programme.mp4
 ```
 
-Without the stream groups it writes seven unrelated FLAC tracks, which no IAMF
-player will recognise.
+Without the stream groups it writes seven unrelated tracks, which no IAMF
+player will recognise. For Opus the MP4 carries the `roll` sample groups the
+encapsulation requires (§6.2.2), from the codec config's roll distance.
 
 ## Options
 
 | Option | Default | What it does |
 |---|---|---|
 | `--out <FILE>` | required | Write the sequence here |
-| `--codec <CODEC>` | `flac` | `flac` or `lpcm` |
-| `--bits <BITS>` | `24` | 16 or 24; 32 for LPCM |
-| `--frame-size <SAMPLES>` | `4096` | Samples a channel per temporal unit, and so the FLAC block size; at most 4608 for FLAC |
+| `--codec <CODEC>` | `flac` | `flac`, `lpcm`, or `opus` in a build with the `opus` feature |
+| `--bits <BITS>` | `24` | 16 or 24; 32 for LPCM; none for Opus |
+| `--bitrate <KBPS>` | `64` | Opus only: kilobits a second for each channel |
+| `--frame-size <SAMPLES>` | `4096`, Opus `960` | Samples a channel per temporal unit: the FLAC block size, at most 4608; an Opus packet's length, 480, 960, 1920 or 2880 |
 | `--headphones <MODE>` | `stereo` | What a decoder playing to headphones does: `stereo`, the loudspeaker fold, or `binaural`, its own binaural renderer |
 | `--frames <N>` | | Stop after this many frames of audio |
 | `--mono-prefix <PREFIX>` | | As for `encode` |
@@ -169,9 +224,10 @@ player will recognise.
 
 ## Not done
 
-- **Lossy codecs.** Distribution — YouTube, a browser — is Opus or AAC. Opus
-  means libopus behind a cargo feature: there is no pure-Rust Opus encoder
-  worth shipping, and AAC's free encoder is not GPL-compatible.
+- **Opus in the released binaries.** They are built without the feature:
+  Linux would need libopus at run time, Windows and macOS a libopus built and
+  linked statically in the release job.
+- **AAC.** Its free encoder, FDK, is not GPL-compatible.
 - **Objects.** IAMF v2.0's object elements would carry the master's objects
   through `hz-cluster` to at most 18 or 28 channels; the encode pipeline would
   have to be separated from MLP first.
