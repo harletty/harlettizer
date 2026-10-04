@@ -122,16 +122,27 @@ struct Path {
 impl Path {
     /// The updates as a path: each one moves the object from wherever it is
     /// when the update arrives — part way along a ramp the update cuts short,
-    /// if it does — to where it asks, over the samples it asks for. Silent and
-    /// at its first position until its first update.
+    /// if it does — to where it asks, over the samples it asks for.
+    ///
+    /// Before its first update it is where and as loud as that update says,
+    /// which is what `encode` seeds an element with: a master whose first
+    /// update comes a few samples in still has audio before it, and a path
+    /// that was silent until then dropped those samples from every object —
+    /// near-silence on the masters seen, 171 samples of it, but not the
+    /// master's.
     fn new(keyframes: &[Keyframe]) -> Self {
         let mut keyframes = keyframes.to_vec();
         keyframes.sort_by_key(|k| k.sample_pos);
-        let first = keyframes.first().map_or([0.0, 1.0, 0.0], |k| k.position);
-        let mut from = State {
-            position: first,
-            gain: 0.0,
-        };
+        let mut from = keyframes.first().map_or(
+            State {
+                position: [0.0, 1.0, 0.0],
+                gain: 0.0,
+            },
+            |k| State {
+                position: k.position,
+                gain: k.gain,
+            },
+        );
         let mut to = from;
         let (mut ramp_start, mut ramp_end) = (0u64, 0u64);
         let mut last = 0u64;
@@ -903,15 +914,18 @@ fn bed_names(parts: &[Part]) -> Vec<&'static str> {
 
 fn bed_said(bed: &BedPlan, parts: &[Part]) -> String {
     let master = bed_names(parts).len();
+    let routed = bed.routes.len();
+    let channels = bed.layout.channels();
     format!(
-        "a {} bed element ({} of its {} channels the master's{})",
+        "the bed as a {} element{}",
         bed.layout.name,
-        bed.routes.len(),
-        bed.layout.channels(),
-        if master > bed.routes.len() {
-            format!(", {} not", master - bed.routes.len())
-        } else {
-            String::new()
+        match (routed == channels, master > routed) {
+            (true, false) => String::new(),
+            (_, false) => format!(" ({routed} of its {channels} channels the master's)"),
+            (_, true) => format!(
+                " ({routed} of its {channels} channels the master's, {} not in it)",
+                master - routed
+            ),
         }
     )
 }
@@ -1263,6 +1277,17 @@ impl Voices {
                 };
                 let mut keyframes = keyframes.clone();
                 keyframes.sort_by_key(|k| k.sample_pos);
+                // Heard from the first sample, at its first update — see
+                // [`Path::new`].
+                if let Some(first) = keyframes.first() {
+                    mixdown.update(
+                        index,
+                        &Keyframe {
+                            ramp_samples: 0,
+                            ..*first
+                        },
+                    );
+                }
                 VoiceTrack {
                     channel: *channel,
                     keyframes,
@@ -2535,13 +2560,18 @@ mod tests {
         assert!((gain(250) - 0.75).abs() < 1e-12);
     }
 
-    /// An object is silent before its first update.
+    /// Before its first update an object is where and as loud as that update
+    /// says — its audio from the first sample, as `encode` carries it — and
+    /// a ramp the first update asks for has nothing to ramp from.
     #[test]
-    fn an_object_is_silent_until_it_starts() {
-        let path = Path::new(&[keyframe(480, 0.3, 1.0, 0)]);
-        assert_eq!(path.segment(0, &mut 0).at(0).gain, 0.0);
-        assert_eq!(path.segment(480, &mut 0).at(480).gain, 1.0);
+    fn an_object_plays_from_the_first_sample() {
+        let path = Path::new(&[keyframe(171, 0.3, 0.5, 0)]);
+        assert_eq!(path.segment(0, &mut 0).at(0).gain, 0.5);
+        assert_eq!(path.segment(171, &mut 0).at(171).gain, 0.5);
         assert_eq!(path.origin(), [0.3, 1.0, 0.0]);
+        let ramped = Path::new(&[keyframe(171, 0.3, 0.5, 1000)]);
+        assert_eq!(ramped.segment(500, &mut 0).at(500).gain, 0.5);
+        assert_eq!(ramped.still_until(0, [0.3, 1.0, 0.0], &mut 0), None);
     }
 
     /// A unit's subblocks break where the path does, a standstill is one

@@ -327,9 +327,22 @@ pub fn run(config: Config) -> Result<()> {
             }
             TypeDefinition::Objects => {
                 let index = mixdown.object(track.source_channel);
+                let keyframes = keyframes_of(track.format, described.sample_rate);
+                // Where and as loud as its first update says from the first
+                // sample, as `encode` and `--objects` carry it, rather than
+                // silent until that update arrives.
+                if let Some(first) = keyframes.iter().min_by_key(|k| k.sample_pos) {
+                    mixdown.update(
+                        index,
+                        &Keyframe {
+                            ramp_samples: 0,
+                            ..*first
+                        },
+                    );
+                }
                 moving.push(Moving {
                     source: index,
-                    keyframes: keyframes_of(track.format, described.sample_rate),
+                    keyframes,
                     next: 0,
                 });
                 objects += 1;
