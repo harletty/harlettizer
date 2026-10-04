@@ -223,8 +223,12 @@ The workspace is `hz-core` (formats and geometry), `hz-io` (the two
 containers), `hz-analysis` (loudness, speech, dynamic range), `hz-render`
 (layouts, the measured fold model, and the panner the clustering metric judges
 the immersive presentation on), `hz-cluster` (objects into elements), `hz-meta`
-(object audio metadata), `hz-mlp` (the lossless encoder) and `hz-cli`.
-The codec crates never depend on each other; only `hz-cli` knows all of them.
+(object audio metadata), `hz-mlp` (the lossless encoder), `hz-iamf` (IAMF
+sequences), `hz-programme` (what every writer does before its own format:
+reading a master, its tracks and object paths, rendering, mixing a fold or an
+overlay, coding samples) and `hz-cli`. The codec crates never depend on each
+other, and `hz-programme` depends on none of them; only `hz-cli` knows all of
+them.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation

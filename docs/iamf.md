@@ -244,7 +244,7 @@ It is the same computation and not a second one. The overlay's arithmetic —
 the carriers, the beds-first fit, the fallback, every guard, which elements
 are copied and which mixed, the ramps, the limiter, the account
 `--overlay-report` writes and the verdict — lives in one module,
-`crates/hz-cli/src/overlay.rs`, and both writers call it: on the same
+`crates/hz-programme/src/overlay.rs`, and both writers call it: on the same
 1280-sample blocks (26.7 ms at 48 kHz), with the elements numbered the same
 way (the LFE first, then every other track in the master's order) and each
 block placed on the same state — every element at the update in force at the

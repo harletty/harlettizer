@@ -1,6 +1,6 @@
-//! What `encode` is given, and how it reads it.
+//! What a run is given, and how it reads it.
 //!
-//! It takes a master set or a BW64 file and wants the same three things out
+//! Every writer takes a master set or a BW64 file and wants the same three things out
 //! of either — an ADM description, a sample format, and interleaved frames —
 //! before walking the description's tracks. That half lives here, apart from
 //! what is built from each track, so the container is decided once.
@@ -20,10 +20,10 @@ use hz_render::{Keyframe, Mode};
 use std::path::Path;
 
 /// What both kinds of input boil down to: an ADM description and a reader.
-pub(crate) struct Described {
-    pub(crate) chna: Chna,
-    pub(crate) adm: AudioFormatExtended,
-    pub(crate) sample_rate: u32,
+pub struct Described {
+    pub chna: Chna,
+    pub adm: AudioFormatExtended,
+    pub sample_rate: u32,
 }
 
 /// An opened input: its description, its sample layout, and its frames.
@@ -31,7 +31,7 @@ pub(crate) struct Described {
 /// Not an enum over the two containers. Everything below the header is the
 /// same for both — see [`FrameSource`] — so the container is decided once, in
 /// [`Source::open`], and nothing after it asks again.
-pub(crate) struct Source {
+pub struct Source {
     reader: Box<dyn FrameSource>,
     described: Described,
     format: PcmFormat,
@@ -41,7 +41,7 @@ impl Source {
     /// Open `path`; `mono_prefix`, for a master set, reads its waveforms from
     /// their own files instead of from the interleaved audio its header
     /// names.
-    pub(crate) fn open(path: &Path, mono_prefix: Option<&Path>) -> Result<Self> {
+    pub fn open(path: &Path, mono_prefix: Option<&Path>) -> Result<Self> {
         if path.extension().and_then(|e| e.to_str()) == Some("atmos") {
             let set = MasterSet::open(path)?;
             let events = set.read_events(0)?;
@@ -116,50 +116,65 @@ impl Source {
         }
     }
 
-    pub(crate) fn adm(&self) -> &Described {
+    pub fn adm(&self) -> &Described {
         &self.described
     }
 
-    pub(crate) fn channels(&self) -> usize {
+    pub fn channels(&self) -> usize {
         self.format.channels as usize
     }
 
     /// How the input's samples are laid out: what scales the integers
     /// [`Source::read`] hands back.
-    pub(crate) fn pcm_format(&self) -> &PcmFormat {
+    pub fn pcm_format(&self) -> &PcmFormat {
         &self.format
     }
 
-    pub(crate) fn sample_rate(&self) -> u32 {
+    pub fn sample_rate(&self) -> u32 {
         self.format.sample_rate_hz()
     }
 
     /// Frames the input holds, which is what a percentage needs a denominator
     /// for. Both containers state it in their header, so it is known before a
     /// sample is read rather than discovered at the end.
-    pub(crate) fn frames(&self) -> u64 {
+    pub fn frames(&self) -> u64 {
         self.reader.frame_count()
     }
 
-    pub(crate) fn read(&mut self, into: &mut [i32]) -> Result<usize> {
+    pub fn read(&mut self, into: &mut [i32]) -> Result<usize> {
         self.reader.read_frames(into)
+    }
+
+    /// Read up to `want` frames into `into`, as many reads as it takes: how
+    /// many landed, fewer only at the end of the input.
+    pub fn fill(&mut self, into: &mut [i32], want: usize) -> Result<usize> {
+        let stride = self.channels();
+        let mut got = 0;
+        while got < want {
+            let landed = self.read(&mut into[got * stride..want * stride])?;
+            if landed == 0 {
+                break;
+            }
+            got += landed;
+        }
+        Ok(got)
     }
 }
 
 /// One track of a description, resolved to the channel format that describes
 /// it.
-pub(crate) struct Track<'a> {
-    pub(crate) number: u16,
+pub struct Track<'a> {
+    pub number: u16,
     /// Where its audio is in an interleaved frame.
-    pub(crate) source_channel: usize,
-    pub(crate) format: &'a AudioChannelFormat,
+    pub source_channel: usize,
+    pub format: &'a AudioChannelFormat,
 }
 
 impl Track<'_> {
     /// The speaker this track names, for a `DirectSpeakers` format. Empty
     /// where the format states none, which is a label to refuse rather than to
     /// guess at.
-    pub(crate) fn speaker_label(&self) -> &str {
+    pub fn speaker_label(&self) -> &str {
         self.format
             .blocks
             .first()
@@ -175,7 +190,7 @@ impl Track<'_> {
 /// audio and there is nothing to describe. A track whose entry names a uid
 /// that resolves to nothing is an error rather than a gap — the description is
 /// internally inconsistent and any element built from it would be a guess.
-pub(crate) fn tracks<'a>(
+pub fn tracks<'a>(
     path: &Path,
     described: &'a Described,
     channels: usize,
@@ -226,7 +241,7 @@ pub(crate) fn tracks<'a>(
 /// domain rather than converted — which bounds a 30° object to the widest
 /// spread there is instead of handing the panner a 30 it has no meaning for —
 /// and the case is named here rather than silently rendered.
-pub(crate) fn keyframes_of(
+pub fn keyframes_of(
     channel_format: &hz_io::adm::model::AudioChannelFormat,
     sample_rate: u32,
 ) -> Vec<Keyframe> {

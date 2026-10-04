@@ -71,13 +71,18 @@ crates/
   hz-joc        joint object coding analysis + payload (TS 103 420)
   hz-mlp        MLP / TrueHD lossless encoder + immersive extension
   hz-ac4        AC-4, built on oxideav-ac4
-  hz-job        job model: TOML, progress reporting
+  hz-iamf       IAMF sequences: OBUs, layouts, FLAC / LPCM / Opus, Matroska
+  hz-programme  what every writer does before its own format: the master's
+                tracks and object paths, renders, fold / overlay mixing,
+                sample coding, progress — no codec crate
+  hz-job        job model: TOML
   hz-cli        the binary
 xtask/          development harness, differential runs, report generation
 ```
 
 Dependency rule: `hz-ac3`, `hz-mlp`, `hz-ac4` never depend on each other;
-they all depend on `hz-core`, `hz-analysis`, `hz-render`. `hz-cli` is the
+they all depend on `hz-core`, `hz-analysis`, `hz-render`. `hz-programme`
+holds what the writers share and depends on no codec crate. `hz-cli` is the
 only crate allowed to know about all of them.
 
 ---

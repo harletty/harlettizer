@@ -20,6 +20,7 @@ hz-iamf.workspace = true
 hz-io.workspace = true
 hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
+hz-programme.workspace = true
 hz-render.workspace = true
 clap.workspace = true
 
