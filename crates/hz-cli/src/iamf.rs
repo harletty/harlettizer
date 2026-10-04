@@ -41,6 +41,39 @@ pub struct Config {
     /// With `objects`: the most object elements to use, folding the master's
     /// objects into them when it has more.
     pub elements: Option<usize>,
+    /// With `objects`: keep the master's elements and pan its last this-many
+    /// objects onto them — `encode --overlay`, written as IAMF. See
+    /// [`crate::overlay`].
+    pub overlay: Option<usize>,
+    /// With `objects`: render the master's last this-many objects into the
+    /// bed element, and carry the rest as objects.
+    pub voices_to_bed: Option<usize>,
+    /// What shapes an overlay: the same options, with the same defaults, as
+    /// `encode --overlay`.
+    pub overlaying: Overlaying,
+}
+
+/// What shapes `--overlay` beyond its sources, as `encode` takes it.
+pub struct Overlaying {
+    /// How far a bed-only fit may land from a source before the moving
+    /// elements are let in; `None` declines the preference.
+    pub beds_first: Option<f64>,
+    /// What was typed for it, so that a negative reach is refused rather than
+    /// read as the preference declined.
+    pub beds_asked: f64,
+    pub bounds: crate::overlay::Bounds,
+    /// Whether a source may take a spare element of its own.
+    pub spare: bool,
+    /// Where the block-by-block account goes.
+    pub report: Option<PathBuf>,
+    /// What the mixed elements are rounded to, in bits.
+    pub fold_depth: u32,
+    /// What sets the audibility floor: see `hz_cluster::floor`.
+    pub dialnorm: f64,
+    /// Whether a limiter keeps the mixed elements inside the codec's domain.
+    pub limit: bool,
+    /// How a block's power is weighed.
+    pub weighing: hz_cluster::scene::Loudness,
 }
 
 /// Samples a channel per temporal unit, unless asked otherwise: a FLAC block

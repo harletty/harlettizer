@@ -66,11 +66,15 @@ pub const SPEAKERS: [Speaker; 17] = [
 ///
 /// BS.775 puts the 5.1 surrounds at ±110°; the label set the rest of this
 /// engine uses has them at ±90°, under the names a 7.1 bed gives its side
-/// surrounds. Both spellings occur, and they are the same channel.
+/// surrounds. Both spellings occur, and they are the same channel. The same
+/// goes one tier up: BS.2051's 4+5+0 (5.1.4) puts its top back pair at
+/// ±110°, where a 7.1.4 has its top rear pair at ±135°.
 #[rustfmt::skip]
-const ALIASES: [(&str, &str, f64, f64); 2] = [
+const ALIASES: [(&str, &str, f64, f64); 4] = [
     ("M+110", "Lss",  110.0, 0.0),
     ("M-110", "Rss", -110.0, 0.0),
+    ("U+110", "Lrh",  110.0, 30.0),
+    ("U-110", "Rrh", -110.0, 30.0),
 ];
 
 /// The speaker a master-format channel name refers to.
@@ -160,6 +164,8 @@ mod tests {
         assert_eq!(master_name_for_label("M-110"), Some("Rss"));
         assert_eq!(master_name_for_label("M+090"), Some("Lss"));
         assert_eq!(master_name_for_label("nonsense"), None);
+        assert_eq!(master_name_for_label("U+110"), Some("Lrh"));
+        assert_eq!(master_name_for_label("U-110"), Some("Rrh"));
     }
 
     /// An alias points where it says, not where the channel it aliases to

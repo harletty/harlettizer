@@ -321,7 +321,7 @@ impl Headroom {
         matches!(self, Self::Both | Self::Bound)
     }
 
-    fn limits(self) -> bool {
+    pub(crate) fn limits(self) -> bool {
         matches!(self, Self::Both | Self::Limit)
     }
 }

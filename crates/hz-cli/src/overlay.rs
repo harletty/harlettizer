@@ -660,9 +660,8 @@ impl Overlaid {
         // Fit the sources onto them.
         let scene_objects = scene.objects();
         self.fitting.clear();
-        for index in 0..sources {
+        for (index, voice) in voices.iter().enumerate().take(sources) {
             let object = carried + index;
-            let voice = &voices[index];
             self.fitting.push(hz_cluster::Object {
                 position: voice.position,
                 energy: scene_objects.get(object).map_or(0.0, |o| o.energy),
@@ -975,15 +974,16 @@ impl Overlaid {
             row.clear();
             row.resize(elements, 0.0);
         }
-        for object in 0..carried {
+        for (object, gain) in gains.iter_mut().enumerate().take(carried) {
             let element = object + first;
             if self.copy_from[element].is_none() {
                 self.mix[object][element] = 1.0;
             }
             // An element's own audio goes through as it is: the level a decoder
-            // applies is in the metadata, which is the master's, so applying it
-            // here as well would apply it twice.
-            gains[object] = 1.0;
+            // applies is the writer's to state — in a TrueHD stream's metadata,
+            // in an IAMF object's samples — so applying it here as well would
+            // apply it twice.
+            *gain = 1.0;
         }
         for index in 0..sources {
             if self.slotted[index] {
