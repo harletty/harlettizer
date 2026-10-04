@@ -357,14 +357,15 @@ enum Command {
         overlay: Option<usize>,
 
         /// With `--objects`: render the master's last this-many objects — the
-        /// dubbed voices — into the bed element, on the room's cube as the
-        /// bed mode renders, summed with the master's own bed channels, and
-        /// carry the other objects as objects.
+        /// dubbed voices — into a dialogue element of their own, on the room's
+        /// cube as the bed mode renders, and carry the rest — the M&E — as
+        /// `--objects` alone does, its bed as its bed element.
         ///
-        /// The bed element's layout is the master's bed's, unless that bed
-        /// has no front left, right and centre to put a voice on — an LFE
-        /// alone, which is what a decoded master brings — when it is 7.1.4.
-        /// See `docs/iamf.md`.
+        /// The dialogue element's layout is the smallest that holds where the
+        /// voices go. The mix presentation labels it `Dialogue`, lets a
+        /// listener move it 12 dB either way (an IAMF v2.0 element gain
+        /// offset), and states the loudness anchored on dialogue — the element
+        /// alone, measured as the mix is. See `docs/iamf.md`.
         #[arg(long, value_name = "VOICES", requires = "objects")]
         voices_to_bed: Option<usize>,
 

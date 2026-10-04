@@ -136,6 +136,64 @@ struct Substream {
     lfe: bool,
 }
 
+/// What the mix presentation says beyond which elements it plays: labels, a
+/// gain a listener may move, and a loudness anchored on part of the mix.
+/// The default says none of it, which is what every sequence said before.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Presentation {
+    /// Labels in one language — the mix's and every element's, since a mix
+    /// presentation states as many for each element as for itself (IAMF
+    /// §3.7, `count_label`). `None` writes no annotations at all.
+    pub labels: Option<Labels>,
+    /// Element gain offsets (IAMF v2.0, in the rendering config): the
+    /// element, by its index in [`Config::elements`], and its offset.
+    pub gain_offsets: Vec<(usize, GainOffset)>,
+    /// What the loudness is anchored on beside the whole mix — see
+    /// [`Writer::finish_anchored`]. `None` anchors nothing.
+    pub anchor: Option<Anchor>,
+}
+
+/// One language's labels for a mix presentation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Labels {
+    /// The language they are in, as a BCP 47 tag: `en-us`.
+    pub language: String,
+    /// The mix presentation's own.
+    pub mix: String,
+    /// One per element, in the order of [`Config::elements`].
+    pub elements: Vec<String>,
+}
+
+/// An element gain offset (IAMF v2.0 `ElementGainOffsetConfig`), in
+/// decibels, coded Q7.8.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GainOffset {
+    /// `value_type`: one offset, applied.
+    Value(f64),
+    /// `range_type`: an offset applied by default, and the range a player
+    /// may let a listener move it in. `min` and `max` are stated as they
+    /// are given; libiamf's vector `test_000854` states −3 dB within −6 and
+    /// 0 and reads them as the bounds themselves.
+    Range { default: f64, min: f64, max: f64 },
+}
+
+/// What a loudness is anchored on (IAMF §3.7.7 `anchor_element`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// The dialogue, coded 1. (iamf-tools' proto numbers it 2, its own
+    /// enumeration starting at an invalid 0; libiamf's vector `test_000062`
+    /// carries the byte 1 for its `ANCHOR_TYPE_DIALOGUE`.)
+    Dialogue,
+}
+
+impl Anchor {
+    fn code(self) -> u8 {
+        match self {
+            Self::Dialogue => 1,
+        }
+    }
+}
+
 /// What the sequence is.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -149,6 +207,9 @@ pub struct Config {
     /// `num_samples_per_frame`: samples a channel per temporal unit.
     pub frame: usize,
     pub headphones: Headphones,
+    /// Labels, gain offsets and an anchored loudness, when the mix states
+    /// any.
+    pub presentation: Presentation,
 }
 
 /// The loudness of the programme on one layout, as the mix presentation
@@ -230,9 +291,13 @@ const POSITION_ID: u64 = 2000;
 const ADVANCED_1: usize = 18;
 const ADVANCED_2: usize = 28;
 
-/// A `LoudnessInfo` with a true peak and nothing anchored: the type byte,
-/// then three Q7.8 fields.
+/// A `LoudnessInfo`'s three Q7.8 fields: integrated loudness, digital peak,
+/// true peak.
 const LOUDNESS_FIELDS: usize = 6;
+
+/// `info_type` bits: a true peak, and an anchored loudness.
+const TRUE_PEAK: u8 = 1;
+const ANCHORED: u8 = 2;
 
 /// How the sequence is laid out in the output.
 enum Framing {
@@ -281,7 +346,10 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     fn open(mut out: W, config: Config, matroska: Option<&str>) -> Result<Self, Error> {
-        let profile = profile(&config.elements)?;
+        let profile = profile(
+            &config.elements,
+            !config.presentation.gain_offsets.is_empty(),
+        )?;
         let substreams = substreams(&config.elements);
         if substreams.len() > 1 << 16 {
             return Err(Error::Unsupported("that many substreams".into()));
@@ -538,7 +606,19 @@ impl<W: Write + Seek> Writer<W> {
 
     /// State the programme's loudness — on the stereo pair, then on the
     /// element's own layout — and hand back the output.
-    pub fn finish(mut self, loudness: [Loudness; 2]) -> io::Result<W> {
+    pub fn finish(self, loudness: [Loudness; 2]) -> io::Result<W> {
+        self.finish_anchored(loudness, None)
+    }
+
+    /// As [`Writer::finish`], with the integrated loudness of what the
+    /// presentation's [`Anchor`] names, on the stereo pair and on the
+    /// element's own layout, in LKFS. A sequence configured with an anchor
+    /// and finished without one states the lowest loudness the field holds.
+    pub fn finish_anchored(
+        mut self,
+        loudness: [Loudness; 2],
+        anchored: Option<[f64; 2]>,
+    ) -> io::Result<W> {
         // A programme that ended on a whole unit still has the codec's delay
         // to flush.
         if !self.ended && self.units > 0 && self.delay > 0 {
@@ -550,7 +630,8 @@ impl<W: Write + Seek> Writer<W> {
             muxer.finish(&mut self.out, presented)?;
         }
         let end = self.out.stream_position()?;
-        for (at, loudness) in self.loudness_at.iter().zip(loudness) {
+        let anchor = self.config.presentation.anchor;
+        for (index, (at, loudness)) in self.loudness_at.iter().zip(loudness).enumerate() {
             let mut fields = [0u8; LOUDNESS_FIELDS];
             for (slot, db) in fields.chunks_exact_mut(2).zip([
                 loudness.integrated,
@@ -561,6 +642,14 @@ impl<W: Write + Seek> Writer<W> {
             }
             self.out.seek(SeekFrom::Start(*at))?;
             self.out.write_all(&fields)?;
+            if let Some(anchor) = anchor {
+                // num_anchored_loudness and the anchor are stated already;
+                // after them, the loudness.
+                let db = anchored.map_or(f64::NEG_INFINITY, |both| both[index]);
+                let mut tail = [1u8, anchor.code(), 0, 0];
+                tail[2..].copy_from_slice(&q7_8(db).to_be_bytes());
+                self.out.write_all(&tail)?;
+            }
         }
         self.out.seek(SeekFrom::Start(end))?;
         self.out.flush()?;
@@ -639,10 +728,14 @@ fn opus_coder(_: &Config, _: &[Substream], _: u32) -> Result<Coder, Error> {
 
 /// The sequence header's profile for these elements, or why there is none.
 ///
-/// A bed alone is the simple profile. With objects it is v2.0: base-advanced
-/// when everything is an object, advanced-1 up to eighteen elements and
-/// channels, advanced-2 up to twenty-eight.
-fn profile(elements: &[Element]) -> Result<u8, Error> {
+/// A bed alone is the simple profile. With objects — or with what only v2.0
+/// states, an element gain offset — it is v2.0: base-advanced when
+/// everything is an object, advanced-1 up to eighteen elements and channels,
+/// advanced-2 up to twenty-eight. Channel elements alone, more than one, are
+/// v1.1's base profile up to two elements and eighteen channels, base-enhanced
+/// up to twenty-eight — and base-enhanced in any case for an expanded layout,
+/// which the base profile does not take.
+fn profile(elements: &[Element], v2: bool) -> Result<u8, Error> {
     let channels: usize = elements.iter().map(Element::channels).sum();
     let objects = elements
         .iter()
@@ -651,16 +744,26 @@ fn profile(elements: &[Element]) -> Result<u8, Error> {
     if elements.is_empty() {
         return Err(Error::Unsupported("a sequence with nothing in it".into()));
     }
-    if objects == 0 {
-        if elements.len() == 1 && channels <= 16 {
+    let size = elements.len().max(channels);
+    if objects == 0 && !v2 {
+        let expanded = elements
+            .iter()
+            .any(|e| matches!(e, Element::Channels(layout) if layout.expanded.is_some()));
+        if elements.len() == 1 && channels <= 16 && !expanded {
             return Ok(0);
         }
+        if elements.len() <= 2 && channels <= ADVANCED_1 && !expanded {
+            return Ok(1);
+        }
+        if size <= ADVANCED_2 {
+            return Ok(2);
+        }
         return Err(Error::Unsupported(format!(
-            "{} channel elements and {channels} channels; a bed is one element of at most sixteen",
+            "{} channel elements and {channels} channels; IAMF v1.1's largest profile, \
+             base-enhanced, carries {ADVANCED_2}",
             elements.len()
         )));
     }
-    let size = elements.len().max(channels);
     if size <= ADVANCED_1 {
         Ok(if objects == elements.len() { 3 } else { 4 })
     } else if size <= ADVANCED_2 {
@@ -783,7 +886,16 @@ fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Ve
     // the layout the programme was rendered to for it.
     payload.clear();
     put_leb128(&mut payload, MIX_PRESENTATION_ID);
-    put_leb128(&mut payload, 0); // count_label: no annotations
+    let labels = config.presentation.labels.as_ref();
+    match labels {
+        // count_label, the languages, then the mix's own annotations.
+        Some(labels) => {
+            put_leb128(&mut payload, 1);
+            put_string(&mut payload, &labels.language);
+            put_string(&mut payload, &labels.mix);
+        }
+        None => put_leb128(&mut payload, 0),
+    }
     put_leb128(&mut payload, 1); // num_sub_mixes
     put_leb128(&mut payload, config.elements.len() as u64);
     let headphones = match config.headphones {
@@ -793,11 +905,25 @@ fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Ve
     let mut extension = Vec::with_capacity(16);
     for (index, element) in config.elements.iter().enumerate() {
         put_leb128(&mut payload, AUDIO_ELEMENT_ID + index as u64);
-        // headphones_rendering_mode; no element gain offset; the ambient
-        // binaural filter profile; reserved.
-        payload.push(headphones << 6);
+        if let Some(labels) = labels {
+            put_string(
+                &mut payload,
+                labels.elements.get(index).map_or("", String::as_str),
+            );
+        }
+        let offset = config
+            .presentation
+            .gain_offsets
+            .iter()
+            .find(|(element, _)| *element == index)
+            .map(|(_, offset)| *offset);
+        // headphones_rendering_mode; element_gain_offset_flag (v2.0, a
+        // reserved bit to v1.1); the ambient binaural filter profile;
+        // reserved.
+        payload.push(headphones << 6 | u8::from(offset.is_some()) << 5);
         // The rendering config's extension, which is where v2.0 put an
-        // object's position so that a v1.1 parser steps over it.
+        // object's position and an element's gain offset, so that a v1.1
+        // parser steps over them.
         extension.clear();
         if let Element::Object { kind, default } = element {
             put_leb128(&mut extension, 1); // num_parameters
@@ -809,6 +935,21 @@ fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Ve
                 config.sample_rate,
                 *default,
             );
+        } else if offset.is_some() {
+            put_leb128(&mut extension, 0); // num_parameters
+        }
+        match offset {
+            Some(GainOffset::Value(db)) => {
+                extension.push(0); // element_gain_offset_type: value
+                extension.extend_from_slice(&q7_8(db).to_be_bytes());
+            }
+            Some(GainOffset::Range { default, min, max }) => {
+                extension.push(1); // element_gain_offset_type: range
+                for db in [default, min, max] {
+                    extension.extend_from_slice(&q7_8(db).to_be_bytes());
+                }
+            }
+            None => {}
         }
         put_leb128(&mut payload, extension.len() as u64);
         payload.extend_from_slice(&extension);
@@ -830,9 +971,14 @@ fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Ve
     for (offset, sound_system) in offsets.iter_mut().zip([STEREO_SOUND_SYSTEM, measured]) {
         // layout_type LOUDSPEAKERS_SS_CONVENTION, the sound system, reserved.
         payload.push((2 << 6) | (sound_system << 2));
-        payload.push(1); // info_type: a true peak, nothing anchored
+        let anchor = config.presentation.anchor;
+        payload.push(TRUE_PEAK | if anchor.is_some() { ANCHORED } else { 0 });
         *offset = payload.len();
         payload.extend_from_slice(&[0; LOUDNESS_FIELDS]);
+        if let Some(anchor) = anchor {
+            // One anchored loudness, patched with the rest.
+            payload.extend_from_slice(&[1, anchor.code(), 0, 0]);
+        }
     }
     // No mix presentation tags. v1.1 added them at the end of the OBU, a
     // v1.0 parser — FFmpeg's, among others — reports the byte it did not
@@ -843,6 +989,12 @@ fn descriptors(config: &Config, profile: u8, coder: &Coder, delay: usize) -> (Ve
     // The payload sits after the header byte and its size.
     let payload_start = before + (out.len() - before - payload.len());
     (out, offsets.map(|at| payload_start + at))
+}
+
+/// A null-terminated string, as IAMF's `string` type is.
+fn put_string(out: &mut Vec<u8>, text: &str) {
+    out.extend(text.bytes().filter(|b| *b != 0));
+    out.push(0);
 }
 
 /// A mix gain that never changes: its parameter blocks are never sent, so
@@ -869,6 +1021,7 @@ mod tests {
             bits: 24,
             frame: 256,
             headphones: Headphones::Stereo,
+            presentation: Presentation::default(),
         }
     }
 
@@ -1023,6 +1176,78 @@ mod tests {
         }
     }
 
+    /// Labels for the mix and every element, a ranged gain offset on a
+    /// channel element in its rendering config's extension, and a loudness
+    /// anchored on the dialogue patched beside the rest — laid out as
+    /// libiamf's vectors lay them out (`test_000062`, `test_000854`).
+    #[test]
+    fn a_presentation_states_labels_an_offset_and_an_anchored_loudness() {
+        use crate::layout::{LFE, SEVEN_ONE};
+        let config = Config {
+            elements: vec![Element::Channels(LFE), Element::Channels(SEVEN_ONE)],
+            presentation: Presentation {
+                labels: Some(Labels {
+                    language: "en-us".into(),
+                    mix: "Main".into(),
+                    elements: vec!["M&E".into(), "Dialogue".into()],
+                }),
+                gain_offsets: vec![(
+                    1,
+                    GainOffset::Range {
+                        default: 0.0,
+                        min: -12.0,
+                        max: 12.0,
+                    },
+                )],
+                anchor: Some(Anchor::Dialogue),
+            },
+            ..config(Codec::Lpcm)
+        };
+        let mut writer = Writer::new(Cursor::new(Vec::new()), config).unwrap();
+        writer.push(&vec![0; 256 * 9], &[]).unwrap();
+        let loudness = Loudness {
+            integrated: -20.0,
+            digital_peak: -1.0,
+            true_peak: -0.5,
+        };
+        let bytes = writer
+            .finish_anchored([loudness; 2], Some([-27.0, -26.5]))
+            .unwrap()
+            .into_inner();
+        let mix = obus(&bytes)
+            .into_iter()
+            .find(|o| o.0 == 2)
+            .expect("a mix presentation")
+            .2;
+        // The id, count_label 1, the language and the mix's label.
+        assert_eq!(&mix[..15], b"\x02\x01en-us\x00Main\x00\x01\x02");
+        let at = |needle: &[u8]| {
+            mix.windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {mix:?}"))
+        };
+        // The first element: its label, no offset flag, no extension.
+        let first = at(b"M&E\x00");
+        assert_eq!(&mix[first + 4..first + 6], &[0, 0]);
+        // The dialogue: the flag, then an extension of no parameters and a
+        // range of 0, -12 and +12 dB in Q7.8.
+        let dialogue = at(b"Dialogue\x00") + 9;
+        assert_eq!(mix[dialogue], 1 << 5);
+        assert_eq!(
+            &mix[dialogue + 1..dialogue + 10],
+            &[8, 0, 1, 0, 0, 0xf4, 0x00, 0x0c, 0x00]
+        );
+        // Each layout: true peak and anchored, three fields, then one
+        // anchored loudness on the dialogue.
+        let tail = &mix[mix.len() - 2 * 12..];
+        for (layout, anchored) in tail.chunks_exact(12).zip([-27.0f64, -26.5]) {
+            assert_eq!(layout[1], TRUE_PEAK | ANCHORED);
+            assert_eq!(&layout[2..4], &q7_8(-20.0).to_be_bytes());
+            assert_eq!(&layout[8..10], &[1, 1]);
+            assert_eq!(&layout[10..12], &q7_8(anchored).to_be_bytes());
+        }
+    }
+
     fn object(kind: PositionKind) -> Element {
         Element::Object {
             kind,
@@ -1038,25 +1263,28 @@ mod tests {
     fn the_profile_follows_the_elements() {
         use crate::layout::LFE;
         let objects = |n: usize| vec![object(PositionKind::Cart8); n];
-        assert_eq!(profile(&[Element::Channels(SEVEN_ONE_FOUR)]).unwrap(), 0);
-        assert_eq!(profile(&objects(18)).unwrap(), 3);
+        assert_eq!(
+            profile(&[Element::Channels(SEVEN_ONE_FOUR)], false).unwrap(),
+            0
+        );
+        assert_eq!(profile(&objects(18), false).unwrap(), 3);
         let mut mixed = vec![Element::Channels(LFE)];
         mixed.extend(objects(17));
-        assert_eq!(profile(&mixed).unwrap(), 4);
+        assert_eq!(profile(&mixed, false).unwrap(), 4);
         mixed.push(object(PositionKind::Cart8));
-        assert_eq!(profile(&mixed).unwrap(), 5);
+        assert_eq!(profile(&mixed, false).unwrap(), 5);
         mixed.extend(objects(9));
         assert_eq!(mixed.len(), 28);
-        assert_eq!(profile(&mixed).unwrap(), 5);
+        assert_eq!(profile(&mixed, false).unwrap(), 5);
         mixed.push(object(PositionKind::Cart8));
-        assert!(profile(&mixed).is_err());
+        assert!(profile(&mixed, false).is_err());
         // A 7.1.4 bed counts its twelve channels: sixteen objects beside it
         // fill advanced-2, a seventeenth does not fit.
         let mut bed = vec![Element::Channels(SEVEN_ONE_FOUR)];
         bed.extend(objects(16));
-        assert_eq!(profile(&bed).unwrap(), 5);
+        assert_eq!(profile(&bed, false).unwrap(), 5);
         bed.push(object(PositionKind::Cart8));
-        assert!(profile(&bed).is_err());
+        assert!(profile(&bed, false).is_err());
     }
 
     /// An LFE and nineteen objects: twenty substreams, so the last two

@@ -114,6 +114,21 @@ fn is_matroska(out: &std::path::Path) -> bool {
 
 /// Open `config.out` and start a sequence of these elements there.
 pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
+    open_presenting(
+        config,
+        sample_rate,
+        elements,
+        hz_iamf::Presentation::default(),
+    )
+}
+
+/// [`open`], the mix presentation stating `presentation` as well.
+pub(crate) fn open_presenting(
+    config: &Config,
+    sample_rate: u32,
+    elements: Vec<Element>,
+    presentation: hz_iamf::Presentation,
+) -> Result<Output> {
     let out_file = File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
     let iamf_config = hz_iamf::Config {
         elements,
@@ -122,6 +137,7 @@ pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) ->
         bits: config.bits,
         frame: config.frame,
         headphones: config.headphones,
+        presentation,
     };
     let out = BufWriter::new(out_file);
     let writer = if is_matroska(&config.out) {
@@ -507,7 +523,7 @@ fn decibels(linear: f64) -> f64 {
     20.0 * linear.log10()
 }
 
-fn lkfs(value: f64) -> String {
+pub(crate) fn lkfs(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.1} LKFS")
     } else {

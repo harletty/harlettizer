@@ -16,8 +16,10 @@
 //! - **`--overlay K`**: the master's elements kept and its last K objects
 //!   panned onto them — the computation of [`crate::overlay`], the one
 //!   `encode --overlay` writes into a TrueHD stream;
-//! - **`--voices-to-bed K`**: the master's last K objects rendered into the
-//!   bed element on the room's cube, the rest carried as objects.
+//! - **`--voices-to-bed K`**: the master's last K objects rendered on the
+//!   room's cube into a dialogue element of their own, which the mix
+//!   presentation labels, lets a listener turn up or down and anchors its
+//!   loudness on; the rest carried as objects.
 //!
 //! # A master's path, and the format's
 //!
@@ -67,6 +69,10 @@ const TRACE_INTERVAL: usize = 256;
 
 /// The most channels an IA sequence carries: IAMF v2.0's advanced-2.
 const BUDGET: usize = 28;
+
+/// How far either way a listener may move the dialogue element, in decibels:
+/// its gain offset's range, about 0 dB.
+const DIALOGUE_RANGE: f64 = 12.0;
 
 /// Under this an element's gain is silence — a hundred decibels down — and
 /// a decoder playing it plays nothing a source could be heard through.
@@ -512,19 +518,9 @@ fn layout_for(names: &[&str]) -> Option<hz_iamf::Layout> {
         .copied()
 }
 
-/// Whether a layout can take a voice: it has the front three a dialogue is
-/// put on.
-fn takes_voices(layout: &hz_iamf::Layout) -> bool {
-    ["L", "R", "C"]
-        .iter()
-        .all(|name| slot_of(layout, name).is_some())
-}
-
 /// The bed element for `parts`, and the bed channels it has no channel for
-/// (as indices into `parts`). `voices` asks for a layout that can take the
-/// voices rendered into it: the master's own when it has a front left,
-/// right and centre, 7.1.4 otherwise.
-fn plan_bed(parts: &[Part], voices: bool) -> (Option<BedPlan>, Vec<usize>) {
+/// (as indices into `parts`).
+fn plan_bed(parts: &[Part]) -> (Option<BedPlan>, Vec<usize>) {
     let names: Vec<(usize, &'static str)> = parts
         .iter()
         .enumerate()
@@ -534,10 +530,7 @@ fn plan_bed(parts: &[Part], voices: bool) -> (Option<BedPlan>, Vec<usize>) {
             Part::Object { .. } => None,
         })
         .collect();
-    let mut layout = layout_for(&names.iter().map(|(_, name)| *name).collect::<Vec<_>>());
-    if voices && !layout.as_ref().is_some_and(takes_voices) {
-        layout = Some(hz_iamf::layout::SEVEN_ONE_FOUR);
-    }
+    let layout = layout_for(&names.iter().map(|(_, name)| *name).collect::<Vec<_>>());
     let Some(layout) = layout else {
         return (None, names.iter().map(|(index, _)| *index).collect());
     };
@@ -550,6 +543,72 @@ fn plan_bed(parts: &[Part], voices: bool) -> (Option<BedPlan>, Vec<usize>) {
         }
     }
     (Some(BedPlan { layout, routes }), left)
+}
+
+/// Points a move between two of a voice's updates is looked at, beside its
+/// ends: where the panning between two places reaches a speaker neither end
+/// does.
+const ALONG_A_MOVE: usize = 8;
+
+/// The dialogue element's layout: the smallest of IAMF's loudspeaker layouts
+/// that **holds** every place the voices go.
+///
+/// # What holds a place
+///
+/// A layout holds a position when every speaker the room's cube pans it onto
+/// on 7.1.4 — the layout this workspace renders on and measures on — is a
+/// speaker of that layout, at the same label: then the voice rendered into the
+/// layout and the layout played on 7.1.4 is the voice rendered on 7.1.4, and
+/// nothing is lost to the smaller layout. A voice at the centre is held by
+/// mono; hard left, hard right and the centre by 5.1 — IAMF's 3.0 would hold
+/// them in three channels, and is an expanded layout no decoder to hand
+/// renders; the side and rear surrounds by 7.1 (not by 5.1, whose surrounds are
+/// at ±110°, between 7.1.4's); a height by 7.1.2 or 7.1.4. 7.1.4 holds
+/// everything, and is what is left when nothing smaller does.
+///
+/// # Which places
+///
+/// Every place the voices' updates put them, and the places between two
+/// updates in a row — a voice that moves passes through them — at
+/// [`ALONG_A_MOVE`] points a move. A dub's voices are placed once, at the
+/// original's dialogue, so this is usually a handful of points.
+fn dialogue_layout(parts: &[Part], voices: &[usize]) -> hz_iamf::Layout {
+    let room_714 = Layout::surround_7_1_4();
+    let room = hz_render::Room::new(&room_714).expect("7.1.4 is in the room");
+    let mut gains = vec![0.0; room_714.channels()];
+    let mut used = vec![false; room_714.channels()];
+    for &voice in voices {
+        let Part::Object { keyframes, .. } = &parts[voice] else {
+            continue;
+        };
+        let mut keyframes = keyframes.clone();
+        keyframes.sort_by_key(|k| k.sample_pos);
+        let mut last: Option<[f64; 3]> = None;
+        for keyframe in &keyframes {
+            let to = keyframe.position;
+            let from = last.unwrap_or(to);
+            for step in 0..=ALONG_A_MOVE {
+                let a = step as f64 / ALONG_A_MOVE as f64;
+                let at = [0, 1, 2].map(|i| from[i] + (to[i] - from[i]) * a);
+                room.gains(at, &mut gains);
+                for (used, gain) in used.iter_mut().zip(&gains) {
+                    *used |= gain.abs() > 1e-9;
+                }
+            }
+            last = Some(to);
+        }
+    }
+    hz_iamf::layout::LOUDSPEAKER_LAYOUTS
+        .iter()
+        .find(|layout| {
+            room_714
+                .speakers
+                .iter()
+                .zip(&used)
+                .all(|(label, used)| !used || layout.index_of(label).is_some())
+        })
+        .copied()
+        .unwrap_or(hz_iamf::layout::SEVEN_ONE_FOUR)
 }
 
 /// How an object element's position is stated.
@@ -705,16 +764,16 @@ pub fn run(config: Config) -> Result<()> {
     match (config.overlay, config.voices_to_bed) {
         (Some(_), Some(_)) => Err(Error::unsupported(
             path,
-            "`--overlay` and `--voices-to-bed` at once; one keeps the voices out of the bed and \
-             the other renders them into it",
+            "`--overlay` and `--voices-to-bed` at once; one pans the voices onto the master's \
+             elements and the other gives them an element of their own",
         )),
         (Some(sources), None) => run_overlay(&config, kind, source, parts, sources),
         (None, voices) => run_plain(&config, kind, source, parts, voices.unwrap_or(0)),
     }
 }
 
-/// The master as it is, or with its last `voices` objects rendered into the
-/// bed element.
+/// The master as it is, or with its last `voices` objects rendered into a
+/// dialogue element of their own beside it.
 fn run_plain(
     config: &Config,
     kind: PositionKind,
@@ -745,12 +804,14 @@ fn run_plain(
     }
     let (rendered, carried_objects) = objects.split_at(objects.len() - voices);
     let (rendered, carried_objects) = (carried_objects.to_vec(), rendered.to_vec());
-    let (bed, left) = plan_bed(&parts, voices > 0);
+    let (bed, left) = plan_bed(&parts);
     let bed_width = bed.as_ref().map_or(0, |bed| bed.layout.channels());
+    let dialogue = (!rendered.is_empty()).then(|| dialogue_layout(&parts, &rendered));
+    let dialogue_width = dialogue.as_ref().map_or(0, hz_iamf::Layout::channels);
 
     // How many object elements there may be: what is asked, or what is left
-    // of the budget beside the bed element.
-    let room = BUDGET - bed_width;
+    // of the budget beside the bed and dialogue elements.
+    let room = BUDGET - bed_width - dialogue_width;
     let allowed = config.elements.unwrap_or(room);
     if allowed > room || allowed < hz_cluster::MIN_ELEMENTS {
         return Err(Error::unsupported(
@@ -758,9 +819,15 @@ fn run_plain(
             format!(
                 "{allowed} object elements; an IA sequence carries {} to {room}{}",
                 hz_cluster::MIN_ELEMENTS,
-                match &bed {
-                    Some(bed) => format!(" beside a {} bed element", bed.layout.name),
-                    None => String::new(),
+                match (&bed, &dialogue) {
+                    (Some(bed), Some(dialogue)) => format!(
+                        " beside a {} bed element and a {} dialogue element",
+                        bed.layout.name, dialogue.name
+                    ),
+                    (Some(bed), None) => format!(" beside a {} bed element", bed.layout.name),
+                    (None, Some(dialogue)) =>
+                        format!(" beside a {} dialogue element", dialogue.name),
+                    (None, None) => String::new(),
                 }
             ),
         ));
@@ -814,18 +881,19 @@ fn run_plain(
             default: element.default,
         });
     }
+    // The dialogue last: its channels after every object element's.
+    let dialogue_first = bed_width + carried.len();
+    if let Some(layout) = dialogue {
+        elements.push(Element::Channels(layout));
+    }
 
-    let voices_feed = if rendered.is_empty() {
-        None
-    } else {
-        let layout = &bed.as_ref().expect("a bed takes the voices").layout;
-        Some(Voices::new(layout, &parts, &rendered)?)
-    };
     let fill = BedFill {
         routes: bed.as_ref().map_or_else(Vec::new, |bed| bed.routes.clone()),
         width: bed_width,
-        voices: voices_feed,
-        mixed: Vec::new(),
+        dialogue: match dialogue {
+            Some(layout) => Some((dialogue_first, Voices::new(&layout, &parts, &rendered)?)),
+            None => None,
+        },
     };
     let feed = if folding {
         let sources: Vec<(usize, Pooled)> = left
@@ -873,16 +941,22 @@ fn run_plain(
     if let Some(bed) = &bed {
         parts_said.push(bed_said(bed, &parts));
     }
-    if voices > 0 {
-        lines.push(format!(
-            "  voices       the last {} rendered into the {} bed element on the room's cube{}",
-            plural(voices, "object", "objects"),
-            bed.as_ref().expect("a bed").layout.name,
-            if layout_for(&bed_names(&parts)).is_some_and(|layout| takes_voices(&layout)) {
-                ", the master's own bed layout"
+    if let Some(layout) = &dialogue {
+        parts_said.push(format!(
+            "{} {} dialogue element",
+            if layout.name.starts_with(['1', '3', '5', '7', '8']) {
+                "an"
             } else {
-                ", 7.1.4 because the master's bed has no front three to put a voice on"
-            }
+                "a"
+            },
+            layout.name
+        ));
+        lines.push(format!(
+            "  dialogue     the last {} rendered into a {} element of their own on the room's \
+             cube, the smallest layout that holds where they go; a listener may move it \
+             {DIALOGUE_RANGE} dB either way",
+            plural(voices, "object", "objects"),
+            layout.name,
         ));
     }
     drive(Drive {
@@ -897,6 +971,7 @@ fn run_plain(
         programme: parts_said.join(", "),
         lines,
         overlay: None,
+        dialogue: dialogue.map(|layout| (dialogue_first, layout)),
     })
 }
 
@@ -917,7 +992,12 @@ fn bed_said(bed: &BedPlan, parts: &[Part]) -> String {
     let routed = bed.routes.len();
     let channels = bed.layout.channels();
     format!(
-        "the bed as a {} element{}",
+        "the bed as {} {} element{}",
+        if bed.layout.name.starts_with(['1', '3', '5', '7', '8', 'L']) {
+            "an"
+        } else {
+            "a"
+        },
         bed.layout.name,
         match (routed == channels, master > routed) {
             (true, false) => String::new(),
@@ -1015,7 +1095,7 @@ fn run_overlay(
     }
 
     // The bed element, from the kept bed channels; a source is never a bed.
-    let (bed, left) = plan_bed(&parts[..kept], false);
+    let (bed, left) = plan_bed(&parts[..kept]);
     let bed_width = bed.as_ref().map_or(0, |bed| bed.layout.channels());
     // Each kept element's channel in a pushed frame: the bed element's, or an
     // object element's after it, in the master's order.
@@ -1232,6 +1312,7 @@ fn run_overlay(
         feed,
         programme: said.join(", "),
         lines: Vec::new(),
+        dialogue: None,
         overlay: Some(OverlaySummary {
             sources,
             beds_first: options.beds_first,
@@ -1249,8 +1330,8 @@ struct Live {
     state: Keyframe,
 }
 
-/// The voices `--voices-to-bed` renders into the bed element: panned on the
-/// room's cube onto the bed's own layout, each moved at its own updates and
+/// The voices `--voices-to-bed` renders into the dialogue element: panned on
+/// the room's cube onto its layout, each moved at its own updates and
 /// ramping its gains over the samples each asks for — the render the bed mode
 /// makes, onto a different layout.
 struct Voices {
@@ -1353,17 +1434,16 @@ impl Voices {
     }
 }
 
-/// The bed element's channels: the master's bed channels where the layout
-/// has them, silence where it does not, and the voices rendered in when
-/// there are any.
+/// The channel elements: the bed's — the master's bed channels where its
+/// layout has them, silence where it does not — and the dialogue's, the
+/// voices rendered, when there is one.
 struct BedFill {
     /// `(master channel, layout channel)`.
     routes: Vec<(usize, usize)>,
     width: usize,
-    voices: Option<Voices>,
-    /// One block of the bed before it is rounded, when voices are added to
-    /// it.
-    mixed: Vec<f64>,
+    /// The dialogue element's first channel in a pushed frame, and the
+    /// voices it renders.
+    dialogue: Option<(usize, Voices)>,
 }
 
 /// How samples are scaled in and out: the master's integers to ±1, and ±1
@@ -1391,9 +1471,9 @@ impl Scale {
 }
 
 impl BedFill {
-    /// `got` frames of the bed into the first `self.width` channels of `q`,
-    /// `width` channels a frame. A bed channel nothing is added to is the
-    /// master's sample as it is.
+    /// `got` frames of the bed into its channels of `q`, `width` channels a
+    /// frame — the master's samples as they are — and of the dialogue into
+    /// its own.
     #[allow(clippy::too_many_arguments)]
     fn fill(
         &mut self,
@@ -1406,36 +1486,21 @@ impl BedFill {
         width: usize,
         account: &mut Account,
     ) {
-        if self.width == 0 {
-            return;
-        }
         for frame in q[..got * width].chunks_exact_mut(width) {
             frame[..self.width].fill(0);
         }
-        match &mut self.voices {
-            None => {
-                for &(channel, slot) in &self.routes {
-                    for n in 0..got {
-                        let x = f64::from(raw[n * stride + channel]) * scale.input;
-                        q[n * width + slot] = scale.code(x, account);
-                    }
-                }
+        for &(channel, slot) in &self.routes {
+            for n in 0..got {
+                let x = f64::from(raw[n * stride + channel]) * scale.input;
+                q[n * width + slot] = scale.code(x, account);
             }
-            Some(voices) => {
-                voices.render(raw, stride, got, at, scale.input);
-                self.mixed.clear();
-                self.mixed.extend_from_slice(&voices.rendered);
-                for &(channel, slot) in &self.routes {
-                    for n in 0..got {
-                        self.mixed[n * self.width + slot] +=
-                            f64::from(raw[n * stride + channel]) * scale.input;
-                    }
-                }
-                for n in 0..got {
-                    for slot in 0..self.width {
-                        q[n * width + slot] =
-                            scale.code(self.mixed[n * self.width + slot], account);
-                    }
+        }
+        if let Some((first, voices)) = &mut self.dialogue {
+            voices.render(raw, stride, got, at, scale.input);
+            let channels = voices.mixdown.channels();
+            for (n, frame) in voices.rendered.chunks_exact(channels).take(got).enumerate() {
+                for (c, &x) in frame.iter().enumerate() {
+                    q[n * width + *first + c] = scale.code(x, account);
                 }
             }
         }
@@ -1968,6 +2033,40 @@ struct Drive<'a> {
     /// More of the summary, the mode's own.
     lines: Vec<String>,
     overlay: Option<OverlaySummary>,
+    /// The dialogue element's first channel in a pushed frame and its layout,
+    /// when the voices have one: labelled, given a gain a listener may move,
+    /// and the loudness anchored on it.
+    dialogue: Option<(usize, hz_iamf::Layout)>,
+}
+
+/// Route a channel element's channels, from `first` in a pushed frame, onto
+/// 7.1.4 as the measurement renders them: each to its speaker, or placed at
+/// its speaker's place where 7.1.4 has none.
+fn route_channels(
+    mixdown: &mut Mixdown,
+    layout: &Layout,
+    channels: &hz_iamf::Layout,
+    first: usize,
+) {
+    for (slot, label) in channels.labels.iter().enumerate() {
+        let label = canonical(label);
+        match layout.index_of(label) {
+            Some(channel) => {
+                mixdown.speaker(first + slot, channel);
+            }
+            None => {
+                let index = mixdown.object(first + slot);
+                mixdown.update(
+                    index,
+                    &Keyframe {
+                        position: hz_render::fold::bed_position(label)
+                            .expect("a layout's channel has a place"),
+                        ..Keyframe::default()
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// One temporal unit on its way to the writer, and back to be refilled.
@@ -2013,6 +2112,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
         programme,
         lines,
         overlay: overlay_summary,
+        dialogue,
     } = job;
     let path = config.input.as_path();
     let format = *source.pcm_format();
@@ -2025,9 +2125,42 @@ fn drive(job: Drive<'_>) -> Result<()> {
         high: full - 1.0,
     };
     let width: usize = elements.iter().map(Element::channels).sum();
-    debug_assert_eq!(width, bed_width + carried.len());
+    debug_assert_eq!(
+        width,
+        bed_width + carried.len() + dialogue.as_ref().map_or(0, |(_, l)| l.channels())
+    );
     let first_object = usize::from(bed.is_some());
-    let writer = iamf::open(config, sample_rate, elements.clone())?;
+    // With a dialogue element the mix says which element is which, gives the
+    // dialogue a gain a listener may move, and anchors its loudness on it.
+    let presentation = match &dialogue {
+        None => hz_iamf::Presentation::default(),
+        Some(_) => hz_iamf::Presentation {
+            labels: Some(hz_iamf::Labels {
+                language: "en-us".into(),
+                mix: "Main".into(),
+                elements: (0..elements.len())
+                    .map(|index| {
+                        if index + 1 == elements.len() {
+                            "Dialogue"
+                        } else {
+                            "M&E"
+                        }
+                        .to_string()
+                    })
+                    .collect(),
+            }),
+            gain_offsets: vec![(
+                elements.len() - 1,
+                hz_iamf::GainOffset::Range {
+                    default: 0.0,
+                    min: -DIALOGUE_RANGE,
+                    max: DIALOGUE_RANGE,
+                },
+            )],
+            anchor: Some(hz_iamf::Anchor::Dialogue),
+        },
+    };
+    let writer = iamf::open_presenting(config, sample_rate, elements.clone(), presentation)?;
     let delay = writer.delay() as i64;
 
     // The measurement renders what a decoder is handed, on 7.1.4: the bed
@@ -2035,26 +2168,19 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let layout = Layout::surround_7_1_4();
     let mut mixdown = Mixdown::new(&layout)?;
     if let Some(bed) = &bed {
-        for (slot, label) in bed.labels.iter().enumerate() {
-            let label = canonical(label);
-            match layout.index_of(label) {
-                Some(channel) => {
-                    mixdown.speaker(slot, channel);
-                }
-                None => {
-                    let index = mixdown.object(slot);
-                    mixdown.update(
-                        index,
-                        &Keyframe {
-                            position: hz_render::fold::bed_position(label)
-                                .expect("a layout's channel has a place"),
-                            ..Keyframe::default()
-                        },
-                    );
-                }
-            }
-        }
+        route_channels(&mut mixdown, &layout, bed, 0);
     }
+    // The dialogue alone, rendered the same way, for the loudness anchored
+    // on it; and within the whole mix, beside everything else.
+    let mut dialogue_measure = match &dialogue {
+        Some((first, channels)) => {
+            route_channels(&mut mixdown, &layout, channels, *first);
+            let mut alone = Mixdown::new(&layout)?;
+            route_channels(&mut alone, &layout, channels, *first);
+            Some((alone, Measure::new(sample_rate)))
+        }
+        None => None,
+    };
     let measured_as: Vec<usize> = carried
         .iter()
         .map(|element| {
@@ -2312,6 +2438,22 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     *m = r as f32;
                 }
                 measure.push(&measured[..got * layout.channels()]);
+                if let Some((alone, dialogue)) = dialogue_measure.as_mut() {
+                    rendered[..got * layout.channels()].fill(0.0);
+                    alone.render(
+                        &input[..got * width],
+                        width,
+                        got,
+                        &mut rendered[..got * layout.channels()],
+                    );
+                    for (m, &r) in measured
+                        .iter_mut()
+                        .zip(&rendered[..got * layout.channels()])
+                    {
+                        *m = r as f32;
+                    }
+                    dialogue.push(&measured[..got * layout.channels()]);
+                }
 
                 // A fold's history is only looked at a unit or two back.
                 let next_a = (unit_index as i64 + 1) * frame as i64 - delay;
@@ -2344,9 +2486,13 @@ fn drive(job: Drive<'_>) -> Result<()> {
     }
 
     let loudness = measure.finish();
+    let anchored = dialogue_measure.map(|(_, dialogue)| {
+        let [stereo, native] = dialogue.finish();
+        [stereo.integrated, native.integrated]
+    });
     let units = writer.units();
     writer
-        .finish(loudness)
+        .finish_anchored(loudness, anchored)
         .map_err(|e| Error::io(&config.out, e))?;
 
     let channels: usize = elements.iter().map(Element::channels).sum();
@@ -2444,6 +2590,14 @@ fn drive(job: Drive<'_>) -> Result<()> {
         }
     }
     iamf::report_loudness(loudness);
+    if let Some([stereo, native]) = anchored {
+        println!(
+            "  anchored     the dialogue element alone at {} on 7.1.4, {} on stereo, stated as \
+             the loudness anchored on dialogue",
+            iamf::lkfs(native),
+            iamf::lkfs(stereo)
+        );
+    }
     println!(
         "  levels       {} samples clipped, the loudest element at {:.2} of full scale with its \
          gain",
@@ -2725,7 +2879,7 @@ mod tests {
     /// to stand at its speaker as an object, the rest still a 7.1.
     #[test]
     fn the_bed_element_is_the_smallest_layout_holding_the_bed() {
-        let (plan, left) = plan_bed(&[Part::Lfe { channel: 0 }, object(1)], false);
+        let (plan, left) = plan_bed(&[Part::Lfe { channel: 0 }, object(1)]);
         assert_eq!(plan.expect("a bed").layout.name, "LFE");
         assert!(left.is_empty());
 
@@ -2736,7 +2890,7 @@ mod tests {
         {
             seven_one.push(bed(if channel < 3 { channel } else { channel + 1 }, name));
         }
-        let (plan, left) = plan_bed(&seven_one, false);
+        let (plan, left) = plan_bed(&seven_one);
         let plan = plan.expect("a bed");
         assert_eq!(plan.layout.name, "7.1");
         assert!(left.is_empty());
@@ -2757,7 +2911,7 @@ mod tests {
         let mut seven_one_two = seven_one;
         seven_one_two.push(bed(8, "Lts"));
         seven_one_two.push(bed(9, "Rts"));
-        let (plan, left) = plan_bed(&seven_one_two, false);
+        let (plan, left) = plan_bed(&seven_one_two);
         assert_eq!(plan.expect("a bed").layout.name, "7.1");
         assert_eq!(left, vec![8, 9]);
 
@@ -2771,40 +2925,93 @@ mod tests {
             bed(4, "Lss"),
             bed(5, "Rss"),
         ];
-        assert_eq!(
-            plan_bed(&five_one, false).0.expect("a bed").layout.name,
-            "5.1"
-        );
+        assert_eq!(plan_bed(&five_one).0.expect("a bed").layout.name, "5.1");
         // No bed at all, and nothing to plan.
-        assert!(plan_bed(&[object(0)], false).0.is_none());
+        assert!(plan_bed(&[object(0)]).0.is_none());
     }
 
-    /// Voices need a front to land on: an LFE-only bed becomes 7.1.4, the
-    /// LFE routed into it; a bed with the front three keeps its layout.
+    fn voice(channel: usize, positions: &[[f64; 3]]) -> Part {
+        Part::Object {
+            channel,
+            keyframes: positions
+                .iter()
+                .enumerate()
+                .map(|(n, &position)| Keyframe {
+                    sample_pos: n as u64 * 48_000,
+                    position,
+                    ..Keyframe::default()
+                })
+                .collect(),
+        }
+    }
+
+    /// The dialogue element is the smallest layout that holds where the
+    /// voices go: the centre alone is mono, the front three 5.1 (3.0 is an
+    /// expanded layout no decoder to hand renders), a 7.1's places 7.1 —
+    /// not 5.1, whose surrounds are not 7.1.4's — a front height 3.1.2, or 7.1.2
+    /// beside the side surrounds, a top rear
+    /// 7.1.4, and a voice moving from the left front to the left rear passes
+    /// the side surround on the way.
     #[test]
-    fn voices_go_into_the_masters_bed_or_a_seven_one_four() {
-        let (plan, _) = plan_bed(&[Part::Lfe { channel: 0 }, object(1)], true);
-        let plan = plan.expect("a bed");
-        assert_eq!(plan.layout.name, "7.1.4");
-        assert_eq!(plan.routes, vec![(0, 3)]);
-        let (plan, _) = plan_bed(&[object(0)], true);
-        assert_eq!(plan.expect("a bed").layout.name, "7.1.4");
-        let front = [
-            Part::Lfe { channel: 3 },
-            bed(0, "L"),
-            bed(1, "R"),
-            bed(2, "C"),
-        ];
-        assert_eq!(plan_bed(&front, true).0.expect("a bed").layout.name, "5.1");
-        let stereo = [bed(0, "L"), bed(1, "R")];
-        assert_eq!(
-            plan_bed(&stereo, false).0.expect("a bed").layout.name,
-            "2.0"
-        );
-        assert_eq!(
-            plan_bed(&stereo, true).0.expect("a bed").layout.name,
-            "7.1.4"
-        );
+    fn the_dialogue_element_is_the_smallest_layout_holding_the_voices() {
+        let name = |voices: &[&[[f64; 3]]]| {
+            let parts: Vec<Part> = voices
+                .iter()
+                .enumerate()
+                .map(|(channel, positions)| voice(channel, positions))
+                .collect();
+            dialogue_layout(&parts, &(0..parts.len()).collect::<Vec<_>>()).name
+        };
+        let at = |label: &str| hz_render::fold::bed_position(label).expect("a speaker");
+        assert_eq!(name(&[&[at("C")]]), "1.0");
+        assert_eq!(name(&[&[at("L")], &[at("R")]]), "2.0");
+        assert_eq!(name(&[&[at("L")], &[at("C")], &[at("R")]]), "5.1");
+        let seven_one: Vec<[[f64; 3]; 1]> = ["L", "C", "R", "Rss", "Rrs", "Lrs", "Lss"]
+            .iter()
+            .map(|label| [at(label)])
+            .collect();
+        let refs: Vec<&[[f64; 3]]> = seven_one.iter().map(|p| &p[..]).collect();
+        assert_eq!(name(&refs), "7.1");
+        assert_eq!(name(&[&[at("L")], &[at("Lfh")]]), "3.1.2");
+        assert_eq!(name(&[&[at("Lss")], &[at("Lfh")]]), "7.1.2");
+        assert_eq!(name(&[&[at("C")], &[at("Lrh")]]), "7.1.4");
+        // Between two front speakers is still the front.
+        assert_eq!(name(&[&[[-0.4, 1.0, 0.0]]]), "5.1");
+        // Front left to rear left: the side surround on the way.
+        assert_eq!(name(&[&[at("L"), at("Lrs")]]), "7.1");
+    }
+
+    /// Rendered into the layout that holds it, a voice lands where the room
+    /// puts it on 7.1.4: the same gains on the same speakers.
+    #[test]
+    fn a_held_voice_renders_as_it_would_on_seven_one_four() {
+        let full = Layout::surround_7_1_4();
+        let room = hz_render::Room::new(&full).expect("7.1.4");
+        for (position, layout) in [
+            ([0.0, 1.0, 0.0], hz_iamf::layout::MONO),
+            ([-0.4, 1.0, 0.0], hz_iamf::layout::FIVE_ONE),
+            ([1.0, -0.3, 0.0], hz_iamf::layout::SEVEN_ONE),
+            ([-1.0, 1.0, 0.6], hz_iamf::layout::SEVEN_ONE_TWO),
+        ] {
+            let small = Layout {
+                name: layout.name,
+                speakers: layout.labels.iter().map(|label| canonical(label)).collect(),
+            };
+            let mut want = vec![0.0; full.channels()];
+            room.gains(position, &mut want);
+            let mut got = vec![0.0; small.channels()];
+            hz_render::Room::new(&small)
+                .expect("in the room")
+                .gains(position, &mut got);
+            for (label, gain) in full.speakers.iter().zip(&want) {
+                let there = small.index_of(label).map_or(0.0, |c| got[c]);
+                assert!(
+                    (there - gain).abs() < 1e-12,
+                    "{} {label}: {there} {gain}",
+                    layout.name
+                );
+            }
+        }
     }
 
     /// Every layout's channels have a place in the room under the label the

@@ -546,6 +546,7 @@ mod tests {
             bits: 16,
             frame: 4096,
             headphones: Headphones::Stereo,
+            presentation: Default::default(),
         };
         // Fifty units, three clusters of five seconds; the last short.
         let mut lengths = vec![4096; 49];
@@ -667,6 +668,7 @@ mod tests {
             bits: 24,
             frame: 960,
             headphones: Headphones::Stereo,
+            presentation: Default::default(),
         };
         let file = sequence(Some("test"), &config, &[960; 10]);
         let top = children(&file, 0, file.len());

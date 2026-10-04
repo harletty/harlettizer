@@ -185,7 +185,7 @@ stereo at −23.2 LUFS and −2.0 dBTP against the stated −23.1 and −2.1. Ho
 ```bash
 harlettizer iamf programme.atmos --out programme.iamf --objects [--positions cart16|cart8|polar] [--elements N]
 harlettizer iamf vf.atmos --out vf.iamf --objects --overlay 7          # a re-voiced programme, encode --overlay's way
-harlettizer iamf vf.atmos --out vf.iamf --objects --voices-to-bed 7    # the voices rendered into the bed
+harlettizer iamf vf.atmos --out vf.iamf --objects --voices-to-bed 7    # the voices as a dialogue element
 ```
 
 Each object of the master becomes an audio element of its own: one mono
@@ -298,20 +298,67 @@ element states another, the TrueHD stream carries its samples and the gain
 apart and the IAMF sequence carries their product, so the two agree as
 rendered and not sample for sample.
 
-### `--voices-to-bed`: the voices in the bed
+### `--voices-to-bed`: a dialogue element
 
-`--voices-to-bed K` renders the master's last K objects into the bed element
-on the room's cube — `hz_render::Room`, the panner the bed mode renders with:
-each voice panned where its updates put it, its gains ramping over the samples
-each asks for — and sums them with the master's own bed channels; a bed
-channel nothing lands on is the master's samples as they are. The other
-objects are carried as objects, folded only past what IAMF carries.
+`--voices-to-bed K` gives the master's last K objects — a dub's voices — an
+element of their own. The rest is the M&E and is carried exactly as
+`--objects` carries a master: its objects as object elements (folded only past
+what IAMF carries), its bed as its bed element — an LFE alone stays an LFE
+element. The voices are rendered on the room's cube — `hz_render::Room`, the
+panner the bed mode renders with: each voice panned where its updates put it,
+its gains ramping over the samples each asks for — into **one channel-based
+element**, the last of the sequence.
 
-**The bed layout** is the master's own (as above) when it has a front left,
-right and centre to put a voice on; otherwise — an LFE alone, which is what a
-decoded master brings, a stereo, no bed at all — it is 7.1.4, the master's
-bed channels routed into it. A voice above a layout with no height lands on
-its floor.
+**Its layout** is the smallest of the loudspeaker layouts above that *holds*
+every place the voices go: every place their updates put them and, between
+two updates in a row, eight points along the way. A layout holds a place when
+every speaker the room pans it onto on 7.1.4 — what this workspace renders and
+measures on — is one of its own, under the same label; then the voices
+rendered into it and played on 7.1.4 are the voices rendered on 7.1.4, and the
+smaller layout loses nothing. A voice at the centre is mono; the front three
+are 5.1 (IAMF's 3.0 would hold them in three channels, and is an expanded
+layout no decoder to hand renders); the seven places of a 7.1 are 7.1 — not
+5.1, whose surrounds stand at ±110°, between 7.1.4's; a front height is 3.1.2,
+or 7.1.2 beside the side surrounds; anything else is 7.1.4. A dub's voices are
+the channels of the track they came from, placed once at the original's
+speaker places, so the rule is decided by a handful of points, and a voice at
+a speaker's place lands on that channel alone — its samples, unchanged.
+
+**The mix presentation says what it is.** With a dialogue element:
+
+- **labels**, one language (`en-us`) for the mix (`Main`) and every element
+  — `M&E` for the bed and the objects, `Dialogue` for the voices — since a mix
+  presentation states as many labels for each element as for itself;
+- an **element gain offset** on the dialogue (IAMF v2.0, in the rendering
+  config's extension, flagged in a bit a v1.1 parser reads as reserved): the
+  range type, 0 dB by default and −12 to +12 dB for a player to let a listener
+  move it. libiamf's vector `test_000854` (−3 dB within −6 and 0) reads the
+  bounds as absolute; the iamf-rs fork's parser comments them as relative to
+  the default. With a default of 0 dB the two readings agree;
+- a **loudness anchored on dialogue** on both layouts (`info_type` bit 1,
+  `anchor_element` 1 — the byte libiamf's vector `test_000062` carries for its
+  `ANCHOR_TYPE_DIALOGUE`, which iamf-tools' enumeration numbers 2): the
+  BS.1770 integrated loudness of the dialogue element alone, rendered and
+  folded exactly as the mix is measured, gated as BS.1770 gates and with no
+  speech gate — the element carries nothing but the voices.
+
+Checked on the first five minutes of Tron: Ares (`--voices-to-bed 7`): the
+voices at the seven places of a 7.1 make a 7.1 dialogue element — beside the
+LFE element and 13 object elements, 15 elements and 22 channels, advanced-2.
+Decoded by the IAMF fork, the dialogue's channels are the trace's bit for bit
+and each the master's voice of that place, unchanged; the 13 objects and the
+LFE are the master's; and the fork's own descriptor parser reads back the
+labels, the range (0, −3072, +3072 in Q7.8) and the anchored loudness
+(−24.2 LKFS on 7.1.4, −23.8 on stereo, against the mix's −17.1 and −16.5). On a
+synthetic 7.1.2 bed with voices moving overhead, the dialogue is a 7.1.4
+element, and the decoder's System J bed is the bed element plus the dialogue
+element to the sample. FFmpeg 9 lists the labels; it stops with `Invalid data`
+on any sequence of two elements, labels or not, so that says nothing about
+these.
+
+The flag keeps its name, from when the voices went into the bed; front ends
+pass it as before. The summary's `voices` line is now a `dialogue` line, and an
+`anchored` line follows the loudness.
 
 ### Positions
 ### Positions
@@ -519,7 +566,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--positions <CODING>` | `cart16` | With `--objects`: `cart16`, `cart8` or `polar` |
 | `--elements <N>` | what the bed element leaves of 28 | With `--objects`: the most object elements; more objects than that are folded into them |
 | `--overlay <K>` | | With `--objects`: keep the master's elements and pan its last K objects onto them, as `encode --overlay` |
-| `--voices-to-bed <K>` | | With `--objects`: render the last K objects into the bed element, carry the rest as objects |
+| `--voices-to-bed <K>` | | With `--objects`: render the last K objects into a dialogue element of their own — labelled, ±12 dB for a listener, the loudness anchored on it — and carry the rest as `--objects` does |
 | `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | as `encode` | With `--overlay`: as for `encode` |
 | `--fold-depth`, `--dialnorm`, `--headroom`, `--loudness` | `20`, `-31`, `limit`, `flat` | With `--overlay`: as for `encode`; the depth 16 to 24 |
 | `--progress` | off | As for `encode` |
