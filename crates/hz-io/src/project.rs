@@ -446,6 +446,9 @@ fn object_blocks(
     let mut active = true;
     let mut width = None;
     let mut importance = None;
+    // The ramp too: a master states `rampLength` when it changes, and every
+    // move after that takes as long until it says otherwise.
+    let mut ramp = 0u32;
     let mut hints = RenderHints::default();
     let mut blocks = Vec::with_capacity(mine.len().max(1));
 
@@ -481,6 +484,9 @@ fn object_blocks(
         let gain = if active { stated } else { Some(0.0) };
         if let Some(value) = event.size {
             width = Some(value.0);
+        }
+        if let Some(value) = event.ramp_length {
+            ramp = value;
         }
         if let Some(value) = event.importance {
             // The master carries importance as a fraction; ADM as 0..10.
@@ -519,10 +525,8 @@ fn object_blocks(
             importance,
             jump_position: Some(JumpPosition {
                 flag: true,
-                interpolation_length: event
-                    .ramp_length
-                    .filter(|&length| length > 0)
-                    .map(|length| Time::at_sample(length as u64, sample_rate)),
+                interpolation_length: (ramp > 0)
+                    .then(|| Time::at_sample(u64::from(ramp), sample_rate)),
             }),
             hints: Some(hints),
             ..Default::default()
@@ -747,10 +751,12 @@ fn object_events(
             size: block.width.map(Real),
             importance: block.importance.map(|i| Real(i as f64 / 10.0)),
             gain: block.gain.map(|g| Num(linear_to_decibels(g))),
-            ramp_length: block
-                .jump_position
-                .and_then(|jump| jump.interpolation_length)
-                .map(|length| length.to_samples(sample_rate) as u32),
+            // Stated on every event, a jump as 0: an event that leaves the
+            // ramp out keeps the one before it in force.
+            ramp_length: block.jump_position.map(|jump| {
+                jump.interpolation_length
+                    .map_or(0, |length| length.to_samples(sample_rate) as u32)
+            }),
             ..Event::default()
         });
     }
@@ -934,6 +940,57 @@ mod tests {
                 z: 0.5
             })
         );
+    }
+
+    /// The ramp is state like the rest. A master states `rampLength` once
+    /// and moves by it for the rest of the programme: Tron's states it 49
+    /// times in 95 148 events. Read per event, every move after the first
+    /// was a jump.
+    #[test]
+    fn the_ramp_carries_forward_until_the_master_changes_it() {
+        let (config, _) = master();
+        let events = EventStream::parse(
+            "sampleRate: 48000\n\
+             events:\n\
+             \x20 - ID: 10\n\
+             \x20   samplePos: 0\n\
+             \x20   pos: [-1, 1, 0]\n\
+             \x20   rampLength: 1536\n\
+             \x20 - ID: 10\n\
+             \x20   samplePos: 4800\n\
+             \x20   pos: [1, 1, 0]\n\
+             \x20 - ID: 10\n\
+             \x20   samplePos: 9600\n\
+             \x20   pos: [0, 1, 0]\n\
+             \x20   rampLength: 0\n\
+             \x20 - ID: 10\n\
+             \x20   samplePos: 14400\n\
+             \x20   pos: [0, -1, 0]\n",
+        )
+        .unwrap();
+        let projected = to_adm(path(), &config, 0, &events, 3, 48_000, 48_000).unwrap();
+        let ramps: Vec<Option<u64>> = projected.adm.channel_formats[2]
+            .blocks
+            .iter()
+            .map(|block| {
+                block
+                    .jump_position
+                    .and_then(|jump| jump.interpolation_length)
+                    .map(|length| length.to_samples(48_000))
+            })
+            .collect();
+        assert_eq!(ramps, [Some(1536), Some(1536), None, None]);
+
+        // And back: every event states its ramp, so none leans on another.
+        let recovered = to_master(path(), &projected.chna, &projected.adm, 48_000, 3).unwrap();
+        let ramps: Vec<Option<u32>> = recovered
+            .events
+            .events
+            .iter()
+            .filter(|e| e.id == Some(10))
+            .map(|e| e.ramp_length)
+            .collect();
+        assert_eq!(ramps, [Some(1536), Some(1536), Some(0), Some(0)]);
     }
 
     #[test]
