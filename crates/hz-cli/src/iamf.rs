@@ -71,6 +71,14 @@ struct Moving {
 /// The output, open, with its descriptors written.
 pub(crate) type Output = Writer<BufWriter<File>>;
 
+/// Whether `out` names a Matroska file, which the sequence is then the one
+/// track of.
+fn is_matroska(out: &std::path::Path) -> bool {
+    out.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mka") || e.eq_ignore_ascii_case("mkv"))
+}
+
 /// Open `config.out` and start a sequence of these elements there.
 pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
     let out_file = File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
@@ -82,7 +90,13 @@ pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) ->
         frame: config.frame,
         headphones: config.headphones,
     };
-    Writer::new(BufWriter::new(out_file), iamf_config).map_err(|e| match e {
+    let out = BufWriter::new(out_file);
+    let writer = if is_matroska(&config.out) {
+        Writer::matroska(out, iamf_config, "harlettizer")
+    } else {
+        Writer::new(out, iamf_config)
+    };
+    writer.map_err(|e| match e {
         hz_iamf::Error::Io(e) => Error::io(&config.out, e),
         hz_iamf::Error::Unsupported(what) => Error::unsupported(&config.out, what),
     })

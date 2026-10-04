@@ -417,13 +417,16 @@ enum Command {
     /// coded losslessly as one channel-based audio element under the IAMF
     /// v1.1 simple profile — what browsers and televisions decode. The mix
     /// presentation states the loudness measured on 7.1.4 and on the stereo
-    /// pair a decoder folds it to. The output is a standalone `.iamf` stream;
-    /// `docs/iamf.md` has the FFmpeg line that puts it in MP4.
+    /// pair a decoder folds it to. The output is a standalone `.iamf` stream,
+    /// or a Matroska file whose one track is the sequence (`A_IAMF`) when
+    /// `--out` ends in `.mka` or `.mkv`; `docs/iamf.md` has the FFmpeg line
+    /// that puts the standalone stream in MP4.
     Iamf {
         /// A master set's `.atmos` config, or an ADM BW64 file.
         input: PathBuf,
 
-        /// Write the stream here.
+        /// Write the stream here: into Matroska if it ends in `.mka` or
+        /// `.mkv`, as a standalone IAMF stream otherwise.
         #[arg(long)]
         out: PathBuf,
 

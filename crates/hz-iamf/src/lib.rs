@@ -1,5 +1,5 @@
 //! IAMF — Immersive Audio Model and Formats — written as a standalone IA
-//! sequence.
+//! sequence, or as the one track of a Matroska file.
 //!
 //! IAMF is the Alliance for Open Media's immersive container: a bed, a scene
 //! or (from v2.0) objects, coded by an ordinary codec one or two channels at
@@ -29,6 +29,7 @@
 
 pub mod flac;
 pub mod layout;
+pub mod matroska;
 pub mod obu;
 #[cfg(feature = "opus")]
 pub mod opus;
