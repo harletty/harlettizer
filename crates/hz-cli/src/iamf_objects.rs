@@ -944,7 +944,8 @@ fn run_plain(
     if let Some(layout) = &dialogue {
         parts_said.push(format!(
             "{} {} dialogue element",
-            if layout.name.starts_with(['1', '3', '5', '7', '8']) {
+            // Read aloud, only an eight (or an L-F-E) takes "an".
+            if layout.name.starts_with('8') {
                 "an"
             } else {
                 "a"
@@ -993,7 +994,7 @@ fn bed_said(bed: &BedPlan, parts: &[Part]) -> String {
     let channels = bed.layout.channels();
     format!(
         "the bed as {} {} element{}",
-        if bed.layout.name.starts_with(['1', '3', '5', '7', '8', 'L']) {
+        if bed.layout.name.starts_with(['8', 'L']) {
             "an"
         } else {
             "a"
