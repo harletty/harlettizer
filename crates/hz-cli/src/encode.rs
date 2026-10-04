@@ -40,12 +40,13 @@
 //! the flag for.
 
 use hz_cluster::scene::{Loudness as Weighing, Scene, Source as SceneSource};
-use hz_cluster::smooth::{SMOOTHING, Smoother, Smoothing};
-use hz_cluster::{Clusterer, Clustering, Weighting};
+use hz_cluster::smooth::{SMOOTHING, Smoothing};
+use hz_cluster::{Clusterer, Weighting};
 use hz_core::{Error, Result};
 use hz_meta::oamd::{Block, Gain, Object, ObjectAudioMetadata, Position, Ramp, Render, Size};
 use hz_mlp::hierarchy::Presentation;
 use hz_mlp::{Config as StreamConfig, Encoder, SampleBits};
+use hz_programme::fold::Placer;
 use hz_programme::mix::{Mixer, Mixing};
 use hz_programme::overlay::{self, Overlaid};
 use hz_programme::path;
@@ -229,19 +230,12 @@ enum Shape {
 
 /// Folding the master's objects into fewer elements — `--cluster`.
 struct Clustered {
-    clusterer: Clusterer,
+    /// The clusterer, steered by the energies of the window around each
+    /// block, and the block it placed last — see [`Placer`].
+    placer: Placer,
     /// Elements the objects are folded into, which is the stream's elements
     /// less the low frequency channel when there is one.
     clustered: usize,
-    /// The previous block's clustering: what the weights ramp *from*, and what
-    /// the next one warm-starts from.
-    previous: Option<Clustering>,
-    /// The scene as the *placement* sees it — this block's geometry carrying
-    /// the energies of the window around it. See [`hz_cluster::smooth`].
-    placing: Vec<hz_cluster::Object>,
-    /// The energies of the blocks around the one being folded, and the rule
-    /// that reads them.
-    smoother: Smoother,
     /// Whether the bed channels take elements of their own — see [`Beds`] —
     /// and how many there are.
     pin_beds: bool,
@@ -255,8 +249,6 @@ struct Clustered {
     /// What each element carries, for the ruler above. Refilled rather than
     /// rebuilt: it was an allocation a block.
     carried: Vec<f64>,
-    /// How many blocks the fit bounded an element's coherent peak in.
-    bounded: u64,
 }
 
 /// What a folding encode carries between blocks.
@@ -286,7 +278,7 @@ impl Fold {
     /// depends on what a later block does.
     fn look_ahead(&self) -> usize {
         match &self.shape {
-            Shape::Clustered(clustered) => clustered.smoother.smoothing().ahead,
+            Shape::Clustered(clustered) => clustered.placer.look_ahead(),
             Shape::Overlaid(_) => 0,
         }
     }
@@ -302,7 +294,7 @@ impl Fold {
     /// What the span just read does, for the window the placement looks over.
     fn record(&mut self, energies: &[f64]) {
         if let Shape::Clustered(clustered) = &mut self.shape {
-            clustered.smoother.record(energies);
+            clustered.placer.record(energies);
         }
     }
 
@@ -311,7 +303,7 @@ impl Fold {
     /// [`presentations_of`] reads them in.
     fn positions(&self) -> Option<&[[f64; 3]]> {
         match &self.shape {
-            Shape::Clustered(clustered) => clustered.previous.as_ref().map(|at| &at.positions[..]),
+            Shape::Clustered(clustered) => clustered.placer.previous().map(|at| &at.positions[..]),
             Shape::Overlaid(overlaid) => Some(&overlaid.positions[..]),
         }
     }
@@ -417,11 +409,11 @@ fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
     Ok(Fold {
         // Replaced by the caller; a shape is the one thing this cannot guess.
         shape: Shape::Clustered(Box::new(Clustered {
-            clusterer: Clusterer::new(hz_cluster::MIN_ELEMENTS, Weighting::Fitted).map_err(fail)?,
+            placer: Placer::new(
+                Clusterer::new(hz_cluster::MIN_ELEMENTS, Weighting::Fitted).map_err(fail)?,
+                SMOOTHING,
+            ),
             clustered: 0,
-            previous: None,
-            placing: Vec::new(),
-            smoother: Smoother::new(SMOOTHING),
             pin_beds: false,
             beds: 0,
             motion: hz_cluster::motion::Motion::new(
@@ -430,7 +422,6 @@ fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
             ),
             written: Vec::new(),
             carried: Vec::new(),
-            bounded: 0,
         })),
         mixer: Mixer::new(
             sample_rate,
@@ -591,24 +582,24 @@ pub fn run(config: Config) -> Result<()> {
             }
             Some(Fold {
                 shape: Shape::Clustered(Box::new(Clustered {
-                    clusterer: Clusterer::new(clustered, Weighting::Fitted)
-                        .map_err(|why| Error::unsupported(&config.input, why.to_string()))?
-                        .searching(hz_cluster::place::Search {
-                            passes: config.fold_search,
-                            holding: config.fold_hold,
-                            ..hz_cluster::place::Search::default()
-                        })
-                        .flooring(hz_cluster::floor::Floor::for_dialnorm(
-                            config.mixing.dialnorm,
-                        ))
-                        .bounding(config.mixing.headroom.bounds()),
+                    placer: Placer::new(
+                        Clusterer::new(clustered, Weighting::Fitted)
+                            .map_err(|why| Error::unsupported(&config.input, why.to_string()))?
+                            .searching(hz_cluster::place::Search {
+                                passes: config.fold_search,
+                                holding: config.fold_hold,
+                                ..hz_cluster::place::Search::default()
+                            })
+                            .flooring(hz_cluster::floor::Floor::for_dialnorm(
+                                config.mixing.dialnorm,
+                            ))
+                            .bounding(config.mixing.headroom.bounds()),
+                        Smoothing {
+                            behind: config.smooth_behind,
+                            ..SMOOTHING
+                        },
+                    ),
                     clustered,
-                    previous: None,
-                    placing: Vec::new(),
-                    smoother: Smoother::new(Smoothing {
-                        behind: config.smooth_behind,
-                        ..SMOOTHING
-                    }),
                     pin_beds,
                     beds,
                     motion: hz_cluster::motion::Motion::new(
@@ -617,7 +608,6 @@ pub fn run(config: Config) -> Result<()> {
                     ),
                     written: Vec::new(),
                     carried: Vec::new(),
-                    bounded: 0,
                 })),
                 ..blank_fold(&config, f64::from(source.sample_rate()), clustered)?
             })
@@ -1385,7 +1375,7 @@ pub fn run(config: Config) -> Result<()> {
                     "nothing: an element moves for any gain the metric sees".to_string()
                 }
             );
-            let smoothing = clustered.smoother.smoothing();
+            let smoothing = clustered.placer.smoothing();
             println!(
                 "  steadied by  a hold over {} block{} behind and {} ahead",
                 smoothing.behind,
@@ -1451,7 +1441,7 @@ pub fn run(config: Config) -> Result<()> {
         println!(
             "  headroom     {} blocks where an element's coherent peak was bounded in the fit, {}",
             match &fold.shape {
-                Shape::Clustered(clustered) => clustered.bounded,
+                Shape::Clustered(clustered) => clustered.placer.bounded(),
                 Shape::Overlaid(_) => 0,
             },
             match &fold.mixer.limiter {
@@ -2070,12 +2060,9 @@ fn cluster_span(
     // recorded as it was read, ahead of the fold, so the window is already
     // in; the last blocks of a stream have less after them, and are placed
     // for what there is.
-    clustered
-        .smoother
-        .place(mixer.scene.objects(), &mut clustered.placing);
     let clustering = clustered
-        .clusterer
-        .cluster(&clustered.placing, clustered.previous.as_ref())
+        .placer
+        .place(mixer.scene.objects())
         .map_err(|why| Error::unsupported(path, why.to_string()))?;
 
     // What of the elements' movement a listener would notice, on the
@@ -2111,13 +2098,10 @@ fn cluster_span(
     // `hz_cluster::headroom`. The limiter counts its own blocks.
     mixer.fold(
         &clustering,
-        clustered.previous.as_ref(),
+        clustered.placer.previous(),
         frames,
         CEILING / FULL_SCALE,
     );
-    if clustering.bounded > 0 {
-        clustered.bounded += 1;
-    }
 
     // The low frequency channel is *copied*, not mixed, so it is not rounded:
     // the fold is the lossy step and a pass-through is not part of it.
@@ -2143,7 +2127,7 @@ fn cluster_span(
         .to_metadata(lfe_channel.is_some(), 0, ramp)
         .write()
         .map_err(|why| Error::unsupported(path, format!("metadata: {why}")))?;
-    clustered.previous = Some(clustering);
+    clustered.placer.keep(clustering);
     Ok(payload)
 }
 
