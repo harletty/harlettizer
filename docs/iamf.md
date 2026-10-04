@@ -405,12 +405,35 @@ across each block and each element's position ramping with them to where the
 block put it. Bed channels outside the bed element keep elements of their
 own. Blocks are the largest
 divisor of the unit no longer than 1280 samples (1024 for a 4096 unit, 960 for
-Opus), so that one never straddles two units. Unlike `encode`, there is no
-look-ahead: a block's elements are placed on that block's own energies. The
-summary reports what the fold cost on the metric of `docs/clustering.md`; a
-synthetic 40-object scene with a 7.1.2 bed into 27 elements: 0.0085 mean,
-0.43 at its worst — and into 17, with nine of them pinned to the bed, 0.049
-and 0.84.
+Opus), so that one never straddles two units.
+
+It is placed as `encode --cluster` places it, by the same code
+(`hz_programme::fold::Placer`): each block steered by the energies of the
+window around it — `hz_cluster::smooth::SMOOTHING`, two blocks ahead, so that
+an element is where a sound arrives when it does (see `docs/clustering.md`).
+So the fold reads its own blocks two ahead of what it folds and hands the
+folded frames out a unit at a time; a block is read whole whatever `--frames`
+says, as an overlay's is. The mix takes the command's `--dialnorm` (the floor
+under what an object has to carry to be heard), `--loudness` (how a block's
+power is weighed), `--headroom` (the fit's bound on an element's coherent
+peak, the limiter, both or neither) and `--fold-depth` (the mixed elements
+rounded to it, 16 to 24 and never finer than `--bits`: twenty unless asked,
+whose zeroed low bits FLAC drops as wasted bits). The summary reports what the
+fold cost on the metric of `docs/clustering.md`, the floor, the bound and the
+limiter. Synthetic 40-object scenes over a 7.1.2 bed (`cargo xtask
+make-master --objects 40 --bed 7.1.2`, ten seconds) into 17 elements, FLAC,
+before the look-ahead and the options reached this fold and after:
+
+| scene | mean / worst, before | mean / worst, after | bytes, before → after |
+|---|---|---|---|
+| `tones` | 0.0289 / 0.260 | 0.0289 / 0.260 | 16.6 M → 11.6 M |
+| `broadband` | 0.0175 / 0.431 | 0.0176 / 0.435 | 23.9 M → 19.8 M |
+| `bursts` | 0.0099 / 0.580 | 0.0104 / 0.664 | 22.6 M → 18.7 M |
+
+The per-block metric does not see what the look-ahead is for — an element
+arriving with the sound rather than a block after it, and fewer flips — and
+on the scene with onsets it pays a few per cent of it, as `docs/clustering.md`
+measured at sixteen elements; the bytes are the twenty-bit rounding.
 
 ### Loudness
 
@@ -568,7 +591,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--overlay <K>` | | With `--objects`: keep the master's elements and pan its last K objects onto them, as `encode --overlay` |
 | `--voices-to-bed <K>` | | With `--objects`: render the last K objects into a dialogue element of their own — labelled, ±12 dB for a listener, the loudness anchored on it — and carry the rest as `--objects` does |
 | `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | as `encode` | With `--overlay`: as for `encode` |
-| `--fold-depth`, `--dialnorm`, `--headroom`, `--loudness` | `20`, `-31`, `limit`, `flat` | With `--overlay`: as for `encode`; the depth 16 to 24 |
+| `--fold-depth`, `--dialnorm`, `--headroom`, `--loudness` | `20`, `-31`, `limit`, `flat` | With `--overlay`, or `--objects` folding: as for `encode`; the depth 16 to 24 |
 | `--progress` | off | As for `encode` |
 
 ## Not done
@@ -577,7 +600,6 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 - **A v1.1 fallback** beside the objects — a second mix presentation over a
   rendered bed, for decoders that do not read v2.0 — which would cost the bed's
   channels on top of the objects'.
-- **Look-ahead in the objects fold**, which `encode --cluster` has.
 - **The expanded layouts** other than the LFE — 9.1.6 would hold an authored
   7.1.2 bed's top sides and a 9.1.6 bed's wides in the bed element — until a
   decoder renders them.

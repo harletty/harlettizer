@@ -503,14 +503,15 @@ struct OverlayArgs {
 
 /// What a mix does to the elements it makes: how a block's power is weighed,
 /// what counts as audible, how the elements are kept inside the codec's
-/// domain, and what they are rounded to. Shared by `encode` — a fold and an
-/// overlay — and `iamf --objects --overlay`.
+/// domain, and what they are rounded to. Shared by `encode` and `iamf --objects`,
+/// a fold and an overlay alike.
 #[derive(clap::Args)]
 struct MixArgs {
     /// Round the mixed elements to this many bits.
     ///
     /// Only means anything where something is mixed — `encode --cluster`,
-    /// and the few elements `--overlay` adds a source to. A mix is a sum over
+    /// `iamf --objects` folding more objects than it has elements, and the
+    /// few elements `--overlay` adds a source to. A mix is a sum over
     /// real weights, so its low bits are the noise of the multiplication
     /// rather than signal, and a lossless coder carries them anyway. Under an
     /// overlay the elements nothing was added to are copied and keep every

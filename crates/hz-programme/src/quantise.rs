@@ -66,6 +66,11 @@ impl Quantiser {
         self.full_scale
     }
 
+    /// What a sample is rounded to, in the domain's integers.
+    pub fn step(&self) -> f64 {
+        self.step
+    }
+
     /// The top of the domain as a fraction of full scale — what a limiter
     /// keeps a mix under.
     pub fn ceiling(&self) -> f64 {
