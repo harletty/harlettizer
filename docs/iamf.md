@@ -4,6 +4,7 @@
 harlettizer iamf programme.atmos --out programme.iamf                # FLAC, lossless
 harlettizer iamf programme.atmos --out programme.iamf --codec opus   # Opus, for distribution
 harlettizer iamf programme.atmos --out programme.iamf --objects      # IAMF v2.0 objects
+harlettizer iamf programme.atmos --out programme.mka                 # the same, in Matroska
 ```
 
 Takes a master set or an ADM BW64 file, renders it to a 7.1.4 bed, and writes
@@ -306,6 +307,47 @@ anti-collapse mask (`1u8 << i` with `i` past seven) on packets libopus writes
 for an ordinary tone — a panic in a debug build and the wrong mask bit in a
 release one. The tests here decode with libopus instead.
 
+## Into Matroska
+
+```bash
+harlettizer iamf programme.atmos --out programme.mka [any other option]
+```
+
+An `--out` ending in `.mka` or `.mkv` puts the sequence in Matroska, as the
+file's one audio track — the sequence itself is the same, whatever the other
+options ask for. Matroska has no IAMF mapping yet
+([matroska-specification#940](https://github.com/ietf-wg-cellar/matroska-specification/issues/940)),
+so the file follows the draft Omniphony proposed there, which reads IAMF's
+own ISO-BMFF encapsulation into Matroska the way the AV1 mapping does:
+
+- `CodecID` `A_IAMF`, and a `CodecPrivate` that is the `IAConfigurationBox`
+  payload — the version byte 1, the descriptors' length as a LEB128, then the
+  descriptors, loudness patched in as in the standalone stream;
+- one temporal unit per `SimpleBlock`, its OBUs exactly as the standalone
+  stream has them but for the temporal delimiter, which a block makes
+  redundant — every unit is a key frame;
+- the trims stay in the OBUs, the decoder's to apply: `CodecDelay` states the
+  start trim (Opus's pre-skip, nothing for a lossless codec) and the segment's
+  `Duration` what is left after both, and no `DiscardPadding` asks for the end
+  trim twice;
+- `SeekPreRoll` from the roll distance — 80 ms for Opus at 20 ms frames,
+  nought otherwise;
+- `Channels` 2, which a reader ignores, as IAMF's own codec headers do;
+  `BitDepth` for FLAC and LPCM; a cue on every cluster, every five seconds.
+
+It is written as it goes, a cluster at a time, like the standalone stream:
+the sizes, the duration and the seek head are fixed-width placeholders
+patched at the end, so the output has to be a file, not a pipe.
+
+Checked: the codec private data and the blocks, a delimiter put back before
+each, are the standalone stream byte for byte (in the tests, and on the
+71 s programme as FLAC, Opus and v2.0 objects); `mkvinfo` and `mkvmerge -J`
+read the files without an error or a warning; and mkvmerge 101 carries the
+track through a remux untouched — codec private data, `CodecDelay`,
+`SeekPreRoll`, key frames — with `--sync`, a name, a language and tags added,
+which is how a track joins a film. FFmpeg 9 does not know `A_IAMF`; the
+mapping's reference reader is Omniphony's mpv fork.
+
 ## Into MP4
 
 The output is a standalone OBU stream. FFmpeg puts it into an MP4 with one
@@ -329,7 +371,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 
 | Option | Default | What it does |
 |---|---|---|
-| `--out <FILE>` | required | Write the sequence here |
+| `--out <FILE>` | required | Write the sequence here: in Matroska if it ends in `.mka` or `.mkv`, a standalone stream otherwise |
 | `--codec <CODEC>` | `flac` | `flac`, `lpcm`, or `opus` in a build with the `opus` feature |
 | `--bits <BITS>` | `24` | 16 or 24; 32 for LPCM; none for Opus |
 | `--bitrate <KBPS>` | `64` | Opus only: kilobits a second for each channel |

@@ -19,6 +19,11 @@
 //! patched when the programme ends. The fields are fixed-width, so the patch
 //! changes no length and nothing after it moves.
 //!
+//! The same sequence can be written into Matroska instead, as the one track
+//! of an `.mka` ([`Writer::matroska`], see [`crate::matroska`]): the
+//! descriptors become the track's codec private data and each temporal unit
+//! a block.
+//!
 //! # A codec with a delay
 //!
 //! Opus hands each sample back a lookahead late, so its timeline is shifted:
@@ -31,6 +36,7 @@
 
 use crate::flac;
 use crate::layout::{Layout, STEREO_SOUND_SYSTEM};
+use crate::matroska::{self, Muxer};
 use crate::obu::{ObuType, put_leb128, put_obu, q7_8};
 #[cfg(feature = "opus")]
 use crate::opus;
@@ -228,9 +234,19 @@ const ADVANCED_2: usize = 28;
 /// then three Q7.8 fields.
 const LOUDNESS_FIELDS: usize = 6;
 
+/// How the sequence is laid out in the output.
+enum Framing {
+    /// A standalone IA sequence: the descriptors, then every unit opened by
+    /// a temporal delimiter.
+    Standalone,
+    /// The one track of a Matroska file.
+    Matroska(Muxer),
+}
+
 /// Writes one IA sequence to `out`.
 pub struct Writer<W: Write + Seek> {
     out: W,
+    framing: Framing,
     config: Config,
     substreams: Vec<Substream>,
     width: usize,
@@ -245,14 +261,26 @@ pub struct Writer<W: Write + Seek> {
     unit: Vec<u8>,
     payload: Vec<u8>,
     units: u64,
+    /// Samples the last unit trims off its end.
+    end_trim: usize,
     /// Whether the substreams are closed: a unit trimmed at its end has
     /// been written, and nothing may follow it.
     ended: bool,
 }
 
 impl<W: Write + Seek> Writer<W> {
-    /// Check `config` and write the descriptors.
-    pub fn new(mut out: W, config: Config) -> Result<Self, Error> {
+    /// Check `config` and write the descriptors: a standalone IA sequence.
+    pub fn new(out: W, config: Config) -> Result<Self, Error> {
+        Self::open(out, config, None)
+    }
+
+    /// Check `config` and start a Matroska file whose one track, `A_IAMF`,
+    /// is the sequence; `writing_app` names what wrote it.
+    pub fn matroska(out: W, config: Config, writing_app: &str) -> Result<Self, Error> {
+        Self::open(out, config, Some(writing_app))
+    }
+
+    fn open(mut out: W, config: Config, matroska: Option<&str>) -> Result<Self, Error> {
         let profile = profile(&config.elements)?;
         let substreams = substreams(&config.elements);
         if substreams.len() > 1 << 16 {
@@ -297,13 +325,32 @@ impl<W: Write + Seek> Writer<W> {
             )));
         }
 
-        let start = out.stream_position()?;
         let (descriptors, offsets) = descriptors(&config, profile, &coder, delay);
-        out.write_all(&descriptors)?;
+        let (framing, start) = match matroska {
+            None => {
+                let start = out.stream_position()?;
+                out.write_all(&descriptors)?;
+                (Framing::Standalone, start)
+            }
+            Some(writing_app) => {
+                let track = matroska::Track {
+                    descriptors: &descriptors,
+                    sample_rate: config.sample_rate,
+                    frame: config.frame,
+                    trimmed: delay,
+                    roll_units: roll_units(&coder, config.frame),
+                    bits: (!matches!(config.codec, Codec::Opus { .. })).then_some(config.bits),
+                    writing_app,
+                };
+                let (muxer, start) = Muxer::start(&mut out, &track)?;
+                (Framing::Matroska(muxer), start)
+            }
+        };
         let width = config.elements.iter().map(Element::channels).sum();
         Ok(Self {
             channels: vec![vec![0; config.frame]; width],
             out,
+            framing,
             config,
             substreams,
             width,
@@ -313,6 +360,7 @@ impl<W: Write + Seek> Writer<W> {
             unit: Vec::new(),
             payload: Vec::new(),
             units: 0,
+            end_trim: 0,
             ended: false,
         })
     }
@@ -404,8 +452,11 @@ impl<W: Write + Seek> Writer<W> {
         let trim = (start > 0 || end > 0).then_some((end as u32, start as u32));
         self.unit.clear();
         // A temporal delimiter opens every unit, which lets a reader find the
-        // unit boundaries without knowing how many substreams there are.
-        put_obu(&mut self.unit, ObuType::TemporalDelimiter, None, &[]);
+        // unit boundaries without knowing how many substreams there are. In
+        // Matroska the block is the boundary, and the delimiter is left out.
+        if let Framing::Standalone = self.framing {
+            put_obu(&mut self.unit, ObuType::TemporalDelimiter, None, &[]);
+        }
         // The parameter blocks start where the unit does, and come before
         // its audio (IAMF §5.1.2: in order of their implied timestamps).
         for block in blocks {
@@ -473,9 +524,13 @@ impl<W: Write + Seek> Writer<W> {
             };
             put_obu(&mut self.unit, kind, trim, &self.payload);
         }
-        self.out.write_all(&self.unit)?;
+        match &mut self.framing {
+            Framing::Standalone => self.out.write_all(&self.unit)?,
+            Framing::Matroska(muxer) => muxer.block(&mut self.out, self.units, &self.unit)?,
+        }
         self.units += 1;
         if end > 0 {
+            self.end_trim = end;
             self.ended = true;
         }
         Ok(())
@@ -488,6 +543,11 @@ impl<W: Write + Seek> Writer<W> {
         // to flush.
         if !self.ended && self.units > 0 && self.delay > 0 {
             self.write_silent_unit(self.config.frame - self.delay)?;
+        }
+        if let Framing::Matroska(muxer) = &mut self.framing {
+            let coded = self.units * self.config.frame as u64;
+            let presented = coded.saturating_sub((self.delay + self.end_trim) as u64);
+            muxer.finish(&mut self.out, presented)?;
         }
         let end = self.out.stream_position()?;
         for (at, loudness) in self.loudness_at.iter().zip(loudness) {
@@ -505,6 +565,17 @@ impl<W: Write + Seek> Writer<W> {
         self.out.seek(SeekFrom::Start(end))?;
         self.out.flush()?;
         Ok(self.out)
+    }
+}
+
+/// Units a decoder has to decode before a seek point to be right at it:
+/// minus the codec config's `audio_roll_distance`.
+#[cfg_attr(not(feature = "opus"), allow(unused_variables))]
+fn roll_units(coder: &Coder, frame: usize) -> usize {
+    match coder {
+        #[cfg(feature = "opus")]
+        Coder::Opus { .. } => usize::from(opus::roll_distance(frame).unsigned_abs()),
+        _ => 0,
     }
 }
 

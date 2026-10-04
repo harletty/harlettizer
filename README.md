@@ -14,7 +14,7 @@ Pure Rust, headless, GPL-3.0-or-later.
 ```bash
 harlettizer convert programme.atmos programme_adm.wav                  # master set -> ADM BW64
 harlettizer encode  programme.atmos --out programme.thd --cluster 12   # the immersive bitstream
-harlettizer iamf    programme.atmos --out programme.iamf               # a 7.1.4 bed as IAMF
+harlettizer iamf    programme.atmos --out programme.iamf               # a 7.1.4 bed as IAMF (.mka: in Matroska)
 ```
 
 ## What it does
@@ -26,7 +26,7 @@ Three commands, each taking a master file set (`.atmos` + `.atmos.audio` +
 |---|---|
 | `convert` | One container to the other, either direction |
 | `encode` | The programme as a TrueHD stream: its elements coded losslessly, its object metadata carried in the access units, its objects clustered into the twelve to sixteen elements a delivery stream holds, and — on request — real 2.0, 5.1 and 7.1 folds inside the stream for decoders that stop early |
-| `iamf` | The programme as IAMF: by default rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence — FLAC or LPCM, or Opus in a build with the `opus` feature — with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; with `--objects`, its objects carried as IAMF v2.0 objects instead, folded by the clustering when there are more than twenty-seven; see [docs/iamf.md](docs/iamf.md) |
+| `iamf` | The programme as IAMF: by default rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence — FLAC or LPCM, or Opus in a build with the `opus` feature — with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; with `--objects`, its objects carried as IAMF v2.0 objects instead, folded by the clustering when there are more than twenty-seven; as a standalone stream, or as the one track of an `.mka`; see [docs/iamf.md](docs/iamf.md) |
 
 **Everything an encode writes is decoded back and compared, not inspected.**
 The test suite decodes every presentation of every stream it writes through a
