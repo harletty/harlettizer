@@ -214,6 +214,7 @@ dependencies = [
  "hz-io",
  "hz-meta",
  "hz-mlp",
+ "hz-programme",
  "hz-render",
 ]
 
@@ -264,6 +265,16 @@ version = "0.0.0"
 dependencies = [
  "hz-core",
  "rayon",
+]
+
+[[package]]
+name = "hz-programme"
+version = "0.0.0"
+dependencies = [
+ "hz-cluster",
+ "hz-core",
+ "hz-io",
+ "hz-render",
 ]
 
 [[package]]

@@ -3,7 +3,9 @@
 # Crates are added phase by phase (see PLAN.md). The dependency rule is that
 # the codec crates (hz-ac3, hz-mlp, hz-ac4, hz-iamf) never depend on each other; they
 # all sit on hz-core / hz-analysis / hz-render, and only hz-cli knows all of
-# them.
+# them. What every writer does before its own format — reading a master,
+# its tracks and paths, rendering, mixing, overlaying — is hz-programme, which
+# knows no codec crate either.
 [workspace]
 resolver = "3"
 members = [
@@ -15,6 +17,7 @@ members = [
     "crates/hz-io",
     "crates/hz-meta",
     "crates/hz-mlp",
+    "crates/hz-programme",
     "crates/hz-render",
     "xtask",
 ]
@@ -35,6 +38,7 @@ hz-analysis = { path = "crates/hz-analysis" }
 hz-io = { path = "crates/hz-io" }
 hz-meta = { path = "crates/hz-meta" }
 hz-mlp = { path = "crates/hz-mlp" }
+hz-programme = { path = "crates/hz-programme" }
 hz-render = { path = "crates/hz-render" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"

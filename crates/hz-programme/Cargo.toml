@@ -1,0 +1,15 @@
+[package]
+name = "hz-programme"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "What every writer does to a programme before its own format: reading it, its tracks and paths, rendering, mixing, overlaying, coding samples"
+
+[dependencies]
+hz-cluster.workspace = true
+hz-core.workspace = true
+hz-io.workspace = true
+hz-render.workspace = true

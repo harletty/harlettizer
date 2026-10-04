@@ -14,7 +14,7 @@
 //! - **as they are**, each object its own element, folded block by block
 //!   with `hz-cluster` when there are more objects than IAMF carries;
 //! - **`--overlay K`**: the master's elements kept and its last K objects
-//!   panned onto them — the computation of [`crate::overlay`], the one
+//!   panned onto them — the computation of [`hz_programme::overlay`], the one
 //!   `encode --overlay` writes into a TrueHD stream;
 //! - **`--voices-to-bed K`**: the master's last K objects rendered on the
 //!   room's cube into a dialogue element of their own, which the mix
@@ -52,15 +52,19 @@
 //! screen scaling. IAMF v2.0 positions a point and leaves the rest to the
 //! renderer.
 
-use crate::encode::Progress;
 use crate::iamf::{self, Config, Measure, Output};
-use crate::overlay::{self, Overlaid};
-use crate::source::{Source, keyframes_of, tracks};
-use hz_cluster::scene::{Scene, Source as SceneSource};
+use hz_cluster::scene::Source as SceneSource;
 use hz_core::{Error, Result, speakers};
 use hz_iamf::{Animation, Element, PositionBlock, PositionKind, Subblock};
-use hz_io::adm::model::TypeDefinition;
 use hz_io::container::SampleFormat;
+use hz_programme::follow::Following;
+use hz_programme::mix::Mixer;
+use hz_programme::overlay::{self, Overlaid};
+use hz_programme::path::Path;
+use hz_programme::progress::Progress;
+use hz_programme::quantise::{Levels, Quantiser};
+use hz_programme::source::Source;
+use hz_programme::{Part, parts_of};
 use hz_render::{Keyframe, Layout, Mixdown};
 use std::io::Write;
 
@@ -78,234 +82,45 @@ const DIALOGUE_RANGE: f64 = 12.0;
 /// a decoder playing it plays nothing a source could be heard through.
 const MUTED: f64 = 1e-5;
 
-/// Where an object is and how loud, at one moment.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct State {
-    position: [f64; 3],
-    gain: f64,
-}
-
-impl State {
-    fn lerp(self, to: State, a: f64) -> State {
-        State {
-            position: [0, 1, 2].map(|i| self.position[i] + (to.position[i] - self.position[i]) * a),
-            gain: self.gain + (to.gain - self.gain) * a,
-        }
-    }
-}
-
-/// A stretch of an object's path: a straight line from `from` at `start` to
-/// `to` at `end`, which is a standstill when they agree.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Segment {
-    start: u64,
-    /// `u64::MAX` for the last, which lasts.
-    end: u64,
-    from: State,
-    to: State,
-}
-
-impl Segment {
-    fn at(&self, t: u64) -> State {
-        if self.end == u64::MAX || self.from == self.to {
-            return self.from;
-        }
-        let a = (t.saturating_sub(self.start)) as f64 / (self.end - self.start) as f64;
-        self.from.lerp(self.to, a.min(1.0))
-    }
-
-    fn still(&self) -> bool {
-        self.from.position == self.to.position
-    }
-}
-
-/// An object's path through the programme, from the master's updates.
-#[derive(Debug, Clone)]
-struct Path {
-    segments: Vec<Segment>,
-}
-
-impl Path {
-    /// The updates as a path: each one moves the object from wherever it is
-    /// when the update arrives — part way along a ramp the update cuts short,
-    /// if it does — to where it asks, over the samples it asks for.
-    ///
-    /// Before its first update it is where and as loud as that update says,
-    /// which is what `encode` seeds an element with: a master whose first
-    /// update comes a few samples in still has audio before it, and a path
-    /// that was silent until then dropped those samples from every object —
-    /// near-silence on the masters seen, 171 samples of it, but not the
-    /// master's.
-    fn new(keyframes: &[Keyframe]) -> Self {
-        let mut keyframes = keyframes.to_vec();
-        keyframes.sort_by_key(|k| k.sample_pos);
-        let mut from = keyframes.first().map_or(
-            State {
-                position: [0.0, 1.0, 0.0],
-                gain: 0.0,
-            },
-            |k| State {
-                position: k.position,
-                gain: k.gain,
-            },
-        );
-        let mut to = from;
-        let (mut ramp_start, mut ramp_end) = (0u64, 0u64);
-        let mut last = 0u64;
-        let mut segments = Vec::new();
-        let value = |from: State, to: State, start: u64, end: u64, t: u64| {
-            if t >= end || end == start {
-                to
+/// The subblocks of `[a, b)` of an object on `path`, sample times that may start before the
+/// programme does — the codec's delay puts the first unit's start there,
+/// and the object is where it begins until the programme does.
+fn path_subblocks(path: &Path, a: i64, b: i64, hint: &mut usize, out: &mut Vec<Subblock>) {
+    out.clear();
+    let mut t = a;
+    while t < b {
+        let (end, from, to) = if t < 0 {
+            let p = path.origin();
+            (b.min(0), p, p)
+        } else {
+            let segment = *path.segment(t as u64, hint);
+            let end = if segment.end == u64::MAX {
+                b
             } else {
-                from.lerp(to, (t - start) as f64 / (end - start) as f64)
-            }
+                b.min(segment.end as i64)
+            };
+            let from = segment.at(t as u64).position;
+            let to = segment.at(end as u64).position;
+            (end, from, to)
         };
-        let close = |segments: &mut Vec<Segment>,
-                     from: State,
-                     to: State,
-                     start: u64,
-                     end: u64,
-                     last: u64,
-                     t: u64| {
-            // The ramp's share of [last, t), then the hold after it.
-            if end > last {
-                let stop = end.min(t);
-                if stop > last {
-                    segments.push(Segment {
-                        start: last,
-                        end: stop,
-                        from: value(from, to, start, end, last),
-                        to: value(from, to, start, end, stop),
-                    });
-                }
-            }
-            let hold = end.max(last);
-            if t > hold {
-                let at = value(from, to, start, end, hold);
-                segments.push(Segment {
-                    start: hold,
-                    end: t,
-                    from: at,
-                    to: at,
-                });
-            }
+        let duration = (end - t) as u32;
+        let animation = if from == to {
+            Animation::Step(from)
+        } else {
+            Animation::Linear(from, to)
         };
-        for keyframe in &keyframes {
-            let t = keyframe.sample_pos;
-            close(&mut segments, from, to, ramp_start, ramp_end, last, t);
-            let now = value(from, to, ramp_start, ramp_end, t);
-            let target = State {
-                position: keyframe.position,
-                gain: keyframe.gain,
-            };
-            from = if keyframe.ramp_samples == 0 {
-                target
-            } else {
-                now
-            };
-            to = target;
-            ramp_start = t;
-            ramp_end = t + u64::from(keyframe.ramp_samples);
-            last = last.max(t);
-        }
-        close(
-            &mut segments,
-            from,
-            to,
-            ramp_start,
-            ramp_end,
-            last,
-            ramp_end.max(last),
-        );
-        segments.push(Segment {
-            start: ramp_end.max(last),
-            end: u64::MAX,
-            from: to,
-            to,
-        });
-        segments.retain(|s| s.end > s.start);
-        Self { segments }
-    }
-
-    /// The segment holding sample `t`, searched from `hint` onwards: the
-    /// callers walk forwards.
-    fn segment(&self, t: u64, hint: &mut usize) -> &Segment {
-        if self.segments[*hint].start > t {
-            *hint = 0;
-        }
-        while self.segments[*hint].end <= t {
-            *hint += 1;
-        }
-        &self.segments[*hint]
-    }
-
-    /// Where the object starts.
-    fn origin(&self) -> [f64; 3] {
-        self.segments[0].from.position
-    }
-
-    /// The gain at sample `t`.
-    fn gain(&self, t: u64, hint: &mut usize) -> f64 {
-        self.segment(t, hint).at(t).gain
-    }
-
-    /// The subblocks of `[a, b)`, sample times that may start before the
-    /// programme does — the codec's delay puts the first unit's start there,
-    /// and the object is where it begins until the programme does.
-    fn subblocks(&self, a: i64, b: i64, hint: &mut usize, out: &mut Vec<Subblock>) {
-        out.clear();
-        let mut t = a;
-        while t < b {
-            let (end, from, to) = if t < 0 {
-                let p = self.origin();
-                (b.min(0), p, p)
-            } else {
-                let segment = *self.segment(t as u64, hint);
-                let end = if segment.end == u64::MAX {
-                    b
-                } else {
-                    b.min(segment.end as i64)
-                };
-                let from = segment.at(t as u64).position;
-                let to = segment.at(end as u64).position;
-                (end, from, to)
-            };
-            let duration = (end - t) as u32;
-            let animation = if from == to {
-                Animation::Step(from)
-            } else {
-                Animation::Linear(from, to)
-            };
-            // A standstill that follows one at the same place is the same
-            // subblock, longer.
-            match (out.last_mut(), animation) {
-                (Some(last), Animation::Step(p)) if last.animation == Animation::Step(p) => {
-                    last.duration += duration;
-                }
-                _ => out.push(Subblock {
-                    duration,
-                    animation,
-                }),
+        // A standstill that follows one at the same place is the same
+        // subblock, longer.
+        match (out.last_mut(), animation) {
+            (Some(last), Animation::Step(p)) if last.animation == Animation::Step(p) => {
+                last.duration += duration;
             }
-            t = end;
+            _ => out.push(Subblock {
+                duration,
+                animation,
+            }),
         }
-    }
-
-    /// When the object, standing at `position` at sample `t`, next moves:
-    /// `None` if it never does.
-    fn still_until(&self, t: i64, position: [f64; 3], hint: &mut usize) -> Option<u64> {
-        self.segment(t.max(0) as u64, hint);
-        let mut i = *hint;
-        while let Some(segment) = self.segments.get(i) {
-            if !segment.still() || segment.from.position != position {
-                return Some(segment.start);
-            }
-            if segment.end == u64::MAX {
-                return None;
-            }
-            i += 1;
-        }
-        None
+        t = end;
     }
 }
 
@@ -362,90 +177,6 @@ impl Trace {
         }
         Ok(())
     }
-}
-
-/// One track of the master, sorted by what it becomes.
-enum Part {
-    /// The low frequency channel.
-    Lfe { channel: usize },
-    /// A bed channel other than the LFE: a speaker feed, `name` the master's
-    /// own name for its channel and `position` its speaker's place.
-    Bed {
-        channel: usize,
-        name: &'static str,
-        position: [f64; 3],
-    },
-    /// An object and its updates.
-    Object {
-        channel: usize,
-        keyframes: Vec<Keyframe>,
-    },
-}
-
-impl Part {
-    fn channel(&self) -> usize {
-        match self {
-            Self::Lfe { channel } | Self::Bed { channel, .. } | Self::Object { channel, .. } => {
-                *channel
-            }
-        }
-    }
-}
-
-/// The master's tracks, the LFE first and the rest in track order — the
-/// order `encode` numbers a programme's elements in, which an overlay's
-/// arithmetic depends on.
-fn parts_of(path: &std::path::Path, source: &Source) -> Result<Vec<Part>> {
-    let described = source.adm();
-    let mut lfe = None;
-    let mut rest = Vec::new();
-    for track in tracks(path, described, source.channels())? {
-        match track.format.type_definition {
-            TypeDefinition::DirectSpeakers => {
-                let label = track.speaker_label();
-                let name = speakers::master_name_for_label(label)
-                    .or_else(|| speakers::by_master_name(label).map(|s| s.master));
-                if speakers::is_lfe_label(label) {
-                    if lfe.replace(track.source_channel).is_some() {
-                        return Err(Error::unsupported(
-                            path,
-                            "two LFE channels; an IAMF layout carries one",
-                        ));
-                    }
-                    continue;
-                }
-                let position = name
-                    .and_then(hz_render::fold::bed_position)
-                    .ok_or_else(|| {
-                        Error::unsupported(
-                            path,
-                            format!(
-                                "track {} is the bed channel `{label}`, which has no place in the \
-                             room to put it at",
-                                track.number
-                            ),
-                        )
-                    })?;
-                rest.push(Part::Bed {
-                    channel: track.source_channel,
-                    name: name.expect("a channel with a place has a name"),
-                    position,
-                });
-            }
-            TypeDefinition::Objects => rest.push(Part::Object {
-                channel: track.source_channel,
-                keyframes: keyframes_of(track.format, described.sample_rate),
-            }),
-            other => eprintln!(
-                "note: track {} is `{other}` audio, which IAMF objects do not take; left out",
-                track.number
-            ),
-        }
-    }
-    let mut parts = Vec::with_capacity(rest.len() + 1);
-    parts.extend(lfe.map(|channel| Part::Lfe { channel }));
-    parts.extend(rest);
-    Ok(parts)
 }
 
 /// The master's own name for a channel an IAMF layout labels `label`, which
@@ -740,8 +471,8 @@ struct OverlaySummary {
 /// What a run did, beyond what every run reports.
 #[derive(Default)]
 struct Account {
-    clipped: u64,
-    peak: f64,
+    /// The coded elements' samples: the loudest, and how many were clamped.
+    levels: Levels,
     blocks_written: u64,
     moves: u64,
 }
@@ -1016,7 +747,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 /// Keep the master's elements and pan its last `sources` objects onto them:
-/// `encode --overlay`'s computation — see [`crate::overlay`] — written as
+/// `encode --overlay`'s computation — see [`hz_programme::overlay`] — written as
 /// IAMF.
 ///
 /// The elements are numbered as `encode` numbers them — the LFE first, then
@@ -1036,24 +767,8 @@ fn run_overlay(
 ) -> Result<()> {
     let path = config.input.as_path();
     let options = &config.overlaying;
-    if sources == 0 {
-        return Err(Error::unsupported(
-            path,
-            "`--overlay 0`; an overlay with no sources is a plain encode of the master, which is \
-             what leaving the flag off already does",
-        ));
-    }
-    let Some(kept) = parts.len().checked_sub(sources).filter(|kept| *kept > 0) else {
-        return Err(Error::unsupported(
-            path,
-            format!(
-                "{sources} overlay sources out of {} objects; the sources are the master's *last* \
-                 objects and the ones before them are the elements they are panned onto, so there \
-                 has to be at least one of those",
-                parts.len()
-            ),
-        ));
-    };
+    let mixing = &config.mixing;
+    let kept = overlay::kept(path, parts.len(), sources)?;
     if let Some(bed) = parts[kept..]
         .iter()
         .position(|part| !matches!(part, Part::Object { .. }))
@@ -1075,25 +790,16 @@ fn run_overlay(
             "no element to overlay onto but the LFE, which has no direction to pan a source to",
         ));
     }
-    if !(16..=24).contains(&options.fold_depth) {
+    if !(16..=24).contains(&mixing.fold_depth) {
         return Err(Error::unsupported(
             path,
             format!(
                 "a fold depth of {} bits; an IA sequence's mixed elements are rounded to 16 to 24",
-                options.fold_depth
+                mixing.fold_depth
             ),
         ));
     }
-    if options.beds_asked < 0.0 {
-        return Err(Error::unsupported(
-            path,
-            format!(
-                "a bed reach of {}; it is a distance, so nought declines the preference and \
-                 anything below that is a typed minus sign",
-                options.beds_asked
-            ),
-        ));
-    }
+    options.check(path)?;
 
     // The bed element, from the kept bed channels; a source is never a bed.
     let (bed, left) = plan_bed(&parts[..kept]);
@@ -1150,16 +856,11 @@ fn run_overlay(
     }
     // Spare elements: what is left of the budget, for the sources nearest
     // the front, when asked for.
-    let origins: Vec<Option<[f64; 3]>> = parts[kept..]
-        .iter()
-        .map(|part| match part {
-            Part::Object { keyframes, .. } => {
-                Some(keyframes.first().copied().unwrap_or_default().position)
-            }
-            _ => None,
-        })
-        .collect();
-    let slots = overlay::spare_slots(&origins, BUDGET - channels, options.spare);
+    let slots = overlay::spare_slots(
+        &overlay::origins(&parts[kept..]),
+        BUDGET - channels,
+        options.spare,
+    );
     for &index in &slots {
         let Part::Object { channel, keyframes } = &parts[kept + index] else {
             unreachable!("a source is an object")
@@ -1174,15 +875,9 @@ fn run_overlay(
 
     // Bed channels judged as `encode` judges them, on this stream's own grid:
     // what the positions are coded as.
-    let described: Vec<Option<(&[Keyframe], bool)>> = parts[..kept]
-        .iter()
-        .map(|part| match part {
-            Part::Lfe { .. } => None,
-            Part::Bed { .. } => Some((&[][..], true)),
-            Part::Object { keyframes, .. } => Some((&keyframes[..], false)),
-        })
-        .collect();
-    let beds = overlay::beds_among(&described, |position| kind.quantise(position));
+    let beds = overlay::beds_among(&overlay::described(&parts[..kept]), |position| {
+        kind.quantise(position)
+    });
     let declared_beds = parts[..kept]
         .iter()
         .filter(|part| matches!(part, Part::Bed { .. }))
@@ -1229,8 +924,7 @@ fn run_overlay(
         })
         .collect();
     let width = bed_width + carried.len();
-    let full_scale = f64::from(1u32 << (config.bits - 1));
-    let depth = options.fold_depth.min(config.bits);
+    let depth = mixing.fold_depth.min(config.bits);
     let first = usize::from(matches!(parts.first(), Some(Part::Lfe { .. })));
     let engine_width = kept + overlaid.slots.len();
 
@@ -1255,20 +949,8 @@ fn run_overlay(
             .iter()
             .map(|part| Live {
                 next: 0,
-                // As `encode` states them: an object at its first update, a
-                // bed channel at its speaker in the bed class, the LFE at
-                // nothing in particular.
-                state: match part {
-                    Part::Object { keyframes, .. } => {
-                        keyframes.first().copied().unwrap_or_default()
-                    }
-                    Part::Bed { position, .. } => Keyframe {
-                        position: *position,
-                        mode: hz_cluster::class::BED,
-                        ..Keyframe::default()
-                    },
-                    Part::Lfe { .. } => Keyframe::default(),
-                },
+                // As `encode` states them — see [`Part::initial`].
+                state: part.initial(),
             })
             .collect(),
         overlaid,
@@ -1284,23 +966,16 @@ fn run_overlay(
         pending_frames: 0,
         exhausted: false,
         at: 0,
-        scene: Scene::weighed(f64::from(sample_rate), options.weighing)
-            .map_err(|why| Error::unsupported(path, why.to_string()))?,
-        signals: Vec::new(),
-        object_gains: Vec::new(),
-        mixed: vec![Vec::new(); engine_width],
-        from: Vec::new(),
-        limiter: options.limit.then(hz_cluster::mix::Limiter::new),
-        floor: hz_cluster::floor::Floor::for_dialnorm(options.dialnorm),
-        renderers: hz_cluster::metric::delivery()
-            .map_err(|why| Error::unsupported(path, why.to_string()))?,
-        full_scale,
-        step: f64::from(1u32 << (config.bits - depth)),
-        peak: 0.0,
-        clipped: 0,
-        blocks: 0,
-        mean: 0.0,
-        worst: 0.0,
+        mixer: Mixer::new(
+            f64::from(sample_rate),
+            mixing.weighing,
+            mixing.dialnorm,
+            mixing.headroom.limits(),
+            engine_width,
+        )
+        .map_err(|why| Error::unsupported(path, why.to_string()))?,
+        mixed: Quantiser::bits(config.bits).stepped(f64::from(1u32 << (config.bits - depth))),
+        levels: Levels::default(),
     }));
     drive(Drive {
         config,
@@ -1336,18 +1011,13 @@ struct Live {
 /// ramping its gains over the samples each asks for — the render the bed mode
 /// makes, onto a different layout.
 struct Voices {
-    mixdown: Mixdown,
-    tracks: Vec<VoiceTrack>,
+    following: Following,
+    /// The master channel each voice is.
+    channels: Vec<usize>,
     /// One block of the voices' samples, interleaved, and what the mixdown
     /// makes of them, both reused.
     input: Vec<f32>,
     rendered: Vec<f64>,
-}
-
-struct VoiceTrack {
-    channel: usize,
-    keyframes: Vec<Keyframe>,
-    next: usize,
 }
 
 impl Voices {
@@ -1356,82 +1026,47 @@ impl Voices {
             name: layout.name,
             speakers: layout.labels.iter().map(|label| canonical(label)).collect(),
         };
-        let mut mixdown = Mixdown::new(&room)?;
-        let tracks = voices
+        let mut following = Following::new(Mixdown::new(&room)?);
+        let channels = voices
             .iter()
             .enumerate()
             .map(|(index, &part)| {
-                mixdown.object(index);
                 let Part::Object { channel, keyframes } = &parts[part] else {
                     unreachable!("a voice is an object")
                 };
-                let mut keyframes = keyframes.clone();
-                keyframes.sort_by_key(|k| k.sample_pos);
-                // Heard from the first sample, at its first update — see
-                // [`Path::new`].
-                if let Some(first) = keyframes.first() {
-                    mixdown.update(
-                        index,
-                        &Keyframe {
-                            ramp_samples: 0,
-                            ..*first
-                        },
-                    );
-                }
-                VoiceTrack {
-                    channel: *channel,
-                    keyframes,
-                    next: 0,
-                }
+                following.object(index, keyframes);
+                *channel
             })
             .collect();
         Ok(Self {
-            mixdown,
-            tracks,
+            following,
+            channels,
             input: Vec::new(),
             rendered: Vec::new(),
         })
     }
 
+    fn channels(&self) -> usize {
+        self.following.channels()
+    }
+
     /// The voices of `got` frames from sample `at`, rendered into
-    /// `self.rendered`, the bed's width a frame. Split at every update a voice
-    /// makes inside them, so that each lands on its own sample.
+    /// `self.rendered`, the dialogue element's width a frame.
     fn render(&mut self, raw: &[i32], stride: usize, got: usize, at: u64, input_scale: f64) {
-        let voices = self.tracks.len();
-        let width = self.mixdown.channels();
+        let voices = self.channels.len();
+        let width = self.following.channels();
         self.input.clear();
         for frame in raw[..got * stride].chunks_exact(stride) {
             self.input.extend(
-                self.tracks
+                self.channels
                     .iter()
-                    .map(|track| (f64::from(frame[track.channel]) * input_scale) as f32),
+                    .map(|&channel| (f64::from(frame[channel]) * input_scale) as f32),
             );
         }
         self.rendered.clear();
         self.rendered.resize(got * width, 0.0);
-        let mut done = 0;
-        while done < got {
-            let now = at + done as u64;
-            let mut next_update = u64::MAX;
-            for (index, track) in self.tracks.iter_mut().enumerate() {
-                while let Some(state) = track.keyframes.get(track.next) {
-                    if state.sample_pos > now {
-                        next_update = next_update.min(state.sample_pos);
-                        break;
-                    }
-                    self.mixdown.update(index, state);
-                    track.next += 1;
-                }
-            }
-            let end = next_update.saturating_sub(at).min(got as u64) as usize;
-            self.mixdown.render(
-                &self.input[done * voices..got * voices],
-                voices,
-                end - done,
-                &mut self.rendered[done * width..got * width],
-            );
-            done = end;
-        }
+        self.following
+            .render(&self.input, voices, got, at, &mut self.rendered);
     }
 }
 
@@ -1452,9 +1087,7 @@ struct BedFill {
 #[derive(Debug, Clone, Copy)]
 struct Scale {
     input: f64,
-    full: f64,
-    low: f64,
-    high: f64,
+    output: Quantiser,
 }
 
 impl Scale {
@@ -1462,12 +1095,7 @@ impl Scale {
     /// when it had to be.
     #[inline]
     fn code(&self, x: f64, account: &mut Account) -> i32 {
-        account.peak = account.peak.max(x.abs());
-        let scaled = (x * self.full).round();
-        if scaled < self.low || scaled > self.high {
-            account.clipped += 1;
-        }
-        scaled.clamp(self.low, self.high) as i32
+        self.output.code(x, &mut account.levels)
     }
 }
 
@@ -1498,7 +1126,7 @@ impl BedFill {
         }
         if let Some((first, voices)) = &mut self.dialogue {
             voices.render(raw, stride, got, at, scale.input);
-            let channels = voices.mixdown.channels();
+            let channels = voices.channels();
             for (n, frame) in voices.rendered.chunks_exact(channels).take(got).enumerate() {
                 for (c, &x) in frame.iter().enumerate() {
                     q[n * width + *first + c] = scale.code(x, account);
@@ -1519,26 +1147,15 @@ enum Pooled {
 /// `hz-cluster` — where each element goes, and how much of each object it
 /// carries.
 ///
-/// The same fold the TrueHD encode makes, from the same crate, less one
+/// The same fold the TrueHD encode makes, from the same crates, less one
 /// thing: it places each block's elements on that block's own energies, with
 /// none of the look-ahead the TrueHD encode smooths them with.
 struct Folding {
     bed: BedFill,
     sources: Vec<(usize, Pooled)>,
-    scene: Scene,
     clusterer: hz_cluster::Clusterer,
-    limiter: hz_cluster::mix::Limiter,
-    renderers: Vec<Box<dyn hz_render::Renderer>>,
-    floor: hz_cluster::floor::Floor,
-    signals: Vec<Vec<f32>>,
-    ones: Vec<f64>,
-    mixed: Vec<Vec<f32>>,
-    from: Vec<Vec<f64>>,
     previous: Option<hz_cluster::Clustering>,
-    error_sum: f64,
-    error_worst: f64,
-    judged: u64,
-    limited: u64,
+    mixer: Mixer,
 }
 
 impl Folding {
@@ -1552,27 +1169,19 @@ impl Folding {
         use hz_cluster::{Clusterer, Weighting};
         let fail = |why: hz_core::Error| Error::unsupported(path, why.to_string());
         let n = sources.len();
+        // The sample rate does not reach a flat weighing; the fold is
+        // steered by plain power, as it was.
+        let mut mixer = Mixer::new(48_000.0, Weighing::Flat, -31.0, true, count).map_err(fail)?;
+        mixer.signals = vec![Vec::new(); n];
+        mixer.gains = vec![1.0; n];
         Ok(Self {
             bed,
             sources,
-            // The sample rate does not reach a flat weighing; the fold is
-            // steered by plain power, as it was.
-            scene: Scene::weighed(48_000.0, Weighing::Flat).map_err(fail)?,
             clusterer: Clusterer::new(count, Weighting::Fitted)
                 .map_err(fail)?
                 .flooring(hz_cluster::floor::Floor::for_dialnorm(-31.0)),
-            limiter: hz_cluster::mix::Limiter::new(),
-            renderers: hz_cluster::metric::delivery().map_err(fail)?,
-            floor: hz_cluster::floor::Floor::for_dialnorm(-31.0),
-            signals: vec![Vec::new(); n],
-            ones: vec![1.0; n],
-            mixed: vec![Vec::new(); count],
-            from: Vec::new(),
             previous: None,
-            error_sum: 0.0,
-            error_worst: 0.0,
-            judged: 0,
-            limited: 0,
+            mixer,
         })
     }
 
@@ -1592,21 +1201,21 @@ impl Folding {
         carried: &mut [Carried],
         account: &mut Account,
     ) -> Result<()> {
-        use hz_cluster::scene::Source as SceneSource;
         let first = self.bed.width;
         let block = match &carried[0].placement {
             Placement::Folded(folded) => folded.block,
             _ => unreachable!("a fold's elements are folded"),
         };
-        let ceiling = scale.high / scale.full;
+        let ceiling = scale.output.ceiling();
+        let mixer = &mut self.mixer;
         let mut start = 0;
         while start < got {
             let len = block.min(got - start);
             let t0 = at + start as u64;
             // The scene of this block: every source's samples with its gain
             // on them, and where it is at the block's end.
-            self.scene.start();
-            for (signal, (channel, pooled)) in self.signals.iter_mut().zip(&mut self.sources) {
+            mixer.scene.start();
+            for (signal, (channel, pooled)) in mixer.signals.iter_mut().zip(&mut self.sources) {
                 signal.clear();
                 let (position, pinned) = match pooled {
                     Pooled::Pinned(position) => {
@@ -1626,7 +1235,7 @@ impl Folding {
                         (object_path.segment(end, hint).at(end).position, None)
                     }
                 };
-                self.scene.push(
+                mixer.scene.push(
                     &SceneSource {
                         position,
                         pinned,
@@ -1640,43 +1249,17 @@ impl Folding {
                     signal.iter().map(|&x| f64::from(x)),
                 );
             }
-            self.scene.finish();
+            mixer.scene.finish();
 
             let clustering = self
                 .clusterer
-                .cluster(self.scene.objects(), self.previous.as_ref())
+                .cluster(mixer.scene.objects(), self.previous.as_ref())
                 .map_err(|why| {
                     Error::unsupported(std::path::Path::new("the fold"), why.to_string())
                 })?;
-            self.from.clear();
-            match &self.previous {
-                Some(before) if before.weights.len() == clustering.weights.len() => {
-                    self.from.extend(before.weights.iter().cloned());
-                }
-                _ => self.from.extend(clustering.weights.iter().cloned()),
-            }
-            hz_cluster::mix::mix(
-                &self.signals,
-                &self.ones,
-                &self.from,
-                &clustering.weights,
-                len,
-                &mut self.mixed,
-            );
-            if self.limiter.apply(&mut self.mixed, ceiling) {
-                self.limited += 1;
-            }
-            if let Ok(report) = hz_cluster::metric::error_with(
-                self.scene.objects(),
-                &clustering,
-                &self.renderers,
-                &self.floor,
-            ) {
-                self.error_sum += report.mean;
-                self.error_worst = self.error_worst.max(report.worst);
-                self.judged += 1;
-            }
-            for (element, signal) in self.mixed.iter().enumerate() {
+            mixer.fold(&clustering, self.previous.as_ref(), len, ceiling);
+            mixer.judge(&clustering);
+            for (element, signal) in mixer.mixed.iter().enumerate() {
                 for n in 0..len {
                     q[(start + n) * width + first + element] =
                         scale.code(f64::from(signal[n]), account);
@@ -1725,22 +1308,11 @@ struct Overlay {
     exhausted: bool,
     /// Samples read from the master.
     at: u64,
-    scene: Scene,
-    signals: Vec<Vec<f32>>,
-    object_gains: Vec<f64>,
-    mixed: Vec<Vec<f32>>,
-    from: Vec<Vec<f64>>,
-    limiter: Option<hz_cluster::mix::Limiter>,
-    floor: hz_cluster::floor::Floor,
-    renderers: Vec<Box<dyn hz_render::Renderer>>,
-    full_scale: f64,
-    /// What a mixed sample is rounded to, in the codec's integers.
-    step: f64,
-    peak: f64,
-    clipped: u64,
-    blocks: u64,
-    mean: f64,
-    worst: f64,
+    mixer: Mixer,
+    /// What a mixed sample is rounded to, in the codec's integers, and what
+    /// the mixed samples came to.
+    mixed: Quantiser,
+    levels: Levels,
 }
 
 impl Overlay {
@@ -1779,7 +1351,7 @@ impl Overlay {
     ) -> Result<()> {
         let block = self.block;
         self.raw.resize(block * stride, 0);
-        let frames = iamf::fill(source, &mut self.raw, block, stride)?;
+        let frames = source.fill(&mut self.raw, block)?;
         if frames == 0 {
             self.exhausted = true;
             return Ok(());
@@ -1795,10 +1367,7 @@ impl Overlay {
             let Part::Object { keyframes, .. } = part else {
                 continue;
             };
-            while live.next < keyframes.len() && keyframes[live.next].sample_pos <= end {
-                live.state = keyframes[live.next];
-                live.next += 1;
-            }
+            hz_programme::path::advance(keyframes, &mut live.next, &mut live.state, end);
         }
 
         // The scene, and each object's samples: every track but the LFE, the
@@ -1807,20 +1376,20 @@ impl Overlay {
         // element with its gain already in its samples, since that is where
         // an IAMF object carries it, and a source at its stated gain.
         let kept = self.overlaid.elements;
-        self.scene.start();
-        self.object_gains.clear();
+        self.mixer.scene.start();
+        self.mixer.gains.clear();
         let objects = self.parts.len() - self.first;
-        self.signals.resize_with(objects, Vec::new);
+        self.mixer.signals.resize_with(objects, Vec::new);
         for (object, part_index) in (self.first..self.parts.len()).enumerate() {
             let state = self.live[part_index].state;
             let channel = self.parts[part_index].channel();
-            let signal = &mut self.signals[object];
+            let signal = &mut self.mixer.signals[object];
             signal.clear();
             signal.extend(
                 (0..frames)
                     .map(|n| (f64::from(self.raw[n * stride + channel]) * scale.input) as f32),
             );
-            self.scene.push(
+            self.mixer.scene.push(
                 &SceneSource {
                     position: state.position,
                     gain: state.gain,
@@ -1831,7 +1400,7 @@ impl Overlay {
                 },
                 signal.iter().map(|sample| f64::from(*sample)),
             );
-            self.object_gains.push(state.gain);
+            self.mixer.gains.push(state.gain);
             if part_index < kept
                 && let Some((gain_path, hint)) = &mut self.gains[part_index]
             {
@@ -1843,7 +1412,7 @@ impl Overlay {
                 }
             }
         }
-        self.scene.finish();
+        self.mixer.scene.finish();
 
         // What a decoder applies to each element's samples: nothing more —
         // the gain is in them already — unless the master silenced it.
@@ -1865,32 +1434,17 @@ impl Overlay {
             ));
         }
         let elements = self.to_channel.len();
-        let spent = self
-            .overlaid
-            .span(
+        self.mixer
+            .overlay(
+                &mut self.overlaid,
                 overlay::Block {
                     first: self.first,
                     elements,
                     frames,
                 },
-                overlay::Buffers {
-                    scene: &self.scene,
-                    signals: &self.signals,
-                    gains: &mut self.object_gains,
-                    mixed: &mut self.mixed,
-                    from: &mut self.from,
-                    limiter: self.limiter.as_mut(),
-                    ceiling: (self.full_scale - 1.0) / self.full_scale,
-                    floor: &self.floor,
-                    renderers: &self.renderers,
-                },
+                self.mixed.ceiling(),
             )
             .map_err(|e| Error::io(path, e))?;
-        self.blocks += 1;
-        if let Some((mean, worst)) = spent.cost {
-            self.mean += mean;
-            self.worst = self.worst.max(worst);
-        }
 
         // Out, into the frames waiting to be handed out: a copied element as
         // the master's samples with its gain, a mixed one rounded to the fold
@@ -1926,15 +1480,10 @@ impl Overlay {
                     }
                 },
                 None => {
-                    let signal = &self.mixed[element];
+                    let signal = &self.mixer.mixed[element];
                     for n in 0..frames {
-                        out[n * width + channel] = overlay::quantise(
-                            signal[n],
-                            self.full_scale,
-                            self.step,
-                            &mut self.peak,
-                            &mut self.clipped,
-                        );
+                        out[n * width + channel] =
+                            self.mixed.code(f64::from(signal[n]), &mut self.levels);
                     }
                 }
             }
@@ -1976,7 +1525,7 @@ impl Feed {
             return overlay.fill(source, stride, want, scale, q, account);
         }
         raw.resize(want * stride, 0);
-        let got = iamf::fill(source, raw, want, stride)?;
+        let got = source.fill(raw, want)?;
         if got == 0 {
             return Ok(0);
         }
@@ -2118,12 +1667,9 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let path = config.input.as_path();
     let format = *source.pcm_format();
     let sample_rate = source.sample_rate();
-    let full = f64::from(1u32 << (config.bits - 1));
     let scale = Scale {
         input: 1.0 / f64::from(1u32 << (format.bits_per_channel - 1)),
-        full,
-        low: -full,
-        high: full - 1.0,
+        output: Quantiser::bits(config.bits),
     };
     let width: usize = elements.iter().map(Element::channels).sum();
     debug_assert_eq!(
@@ -2273,7 +1819,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     .iter_mut()
                     .zip(&unit.samples[..got * width])
                 {
-                    *f = (f64::from(q) / full) as f32;
+                    *f = (f64::from(q) / scale.output.full_scale()) as f32;
                 }
 
                 // The blocks that start with this unit, on the sequence's
@@ -2294,7 +1840,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
                                 continue;
                             }
                             let subblocks = &mut out.1;
-                            moving.path.subblocks(a, b, &mut moving.blocks, subblocks);
+                            path_subblocks(&moving.path, a, b, &mut moving.blocks, subblocks);
                             if let [
                                 Subblock {
                                     animation: Animation::Step(p),
@@ -2526,14 +2072,14 @@ fn drive(job: Drive<'_>) -> Result<()> {
             "  fold         {:.4} mean over the presentations, {:.3} at its worst, as a fraction \
              of the object's own gains; blocks of {}, no look-ahead; {} blocks where the limiter \
              brought every element down",
-            if folding.judged > 0 {
-                folding.error_sum / folding.judged as f64
-            } else {
-                0.0
-            },
-            folding.error_worst,
+            folding.mixer.cost.mean(),
+            folding.mixer.cost.worst,
             cluster_block(frame),
-            folding.limited
+            folding
+                .mixer
+                .limiter
+                .as_ref()
+                .map_or(0, |limiter| limiter.limited)
         ),
         Feed::Overlaid(overlay) => {
             let summary = overlay_summary.as_ref().expect("an overlay's summary");
@@ -2541,11 +2087,11 @@ fn drive(job: Drive<'_>) -> Result<()> {
             println!(
                 "  floor        {:.1} dBFS at the playback level a dialnorm of {:.0} implies; a \
                  source was above it in {:.1} % of the blocks, and is guarded in those",
-                overlay.floor.threshold_dbfs(),
-                config.overlaying.dialnorm,
-                100.0 * overlaid.voiced as f64 / overlay.blocks.max(1) as f64
+                overlay.mixer.floor.threshold_dbfs(),
+                config.mixing.dialnorm,
+                100.0 * overlaid.voiced as f64 / overlay.mixer.cost.blocks.max(1) as f64
             );
-            overlay::summary(overlaid, overlay.blocks, summary.beds_first);
+            overlay::summary(overlaid, overlay.mixer.cost.blocks, summary.beds_first);
             println!(
                 "  depth        the elements a source reached rounded to {} bits{}; blocks of {}, \
                  as encode decides an overlay on, {} sources",
@@ -2560,7 +2106,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
             );
             println!(
                 "  headroom     {}{}",
-                match &overlay.limiter {
+                match &overlay.mixer.limiter {
                     Some(limiter) => format!(
                         "{} blocks where the limiter brought every element down, the mix \
                          peaking at {:.2} of full scale before it",
@@ -2568,10 +2114,10 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     ),
                     None => "no limiter".to_string(),
                 },
-                if overlay.clipped > 0 {
+                if overlay.levels.clipped > 0 {
                     format!(
                         "; {} mixed samples went outside the codec's domain and were clamped",
-                        overlay.clipped
+                        overlay.levels.clipped
                     )
                 } else {
                     String::new()
@@ -2580,10 +2126,10 @@ fn drive(job: Drive<'_>) -> Result<()> {
             let remarks = overlay::remarks(
                 overlaid,
                 &overlay::Totals {
-                    blocks: overlay.blocks,
-                    mean: overlay.mean,
-                    clipped: overlay.clipped,
-                    limiter: overlay.limiter.as_ref(),
+                    blocks: overlay.mixer.cost.blocks,
+                    mean: overlay.mixer.cost.sum,
+                    clipped: overlay.levels.clipped,
+                    limiter: overlay.mixer.limiter.as_ref(),
                 },
                 overlay.block as f64 / f64::from(sample_rate),
             );
@@ -2602,12 +2148,12 @@ fn drive(job: Drive<'_>) -> Result<()> {
     println!(
         "  levels       {} samples clipped, the loudest element at {:.2} of full scale with its \
          gain",
-        account.clipped, account.peak
+        account.levels.clipped, account.levels.peak
     );
-    if account.clipped > 0 {
+    if account.levels.clipped > 0 {
         eprintln!(
             "warning: {} samples clipped; an element's gain took it past full scale",
-            account.clipped
+            account.levels.clipped
         );
     }
     iamf::report_written(config, at, sample_rate)?;
@@ -2717,53 +2263,13 @@ mod tests {
         }
     }
 
-    fn x_at(path: &Path, t: u64) -> f64 {
-        path.segment(t, &mut 0).at(t).position[0]
-    }
-
-    /// Holds, ramps, a ramp cut short by the next update, and a jump.
-    #[test]
-    fn a_path_follows_the_updates() {
-        let path = Path::new(&[
-            keyframe(0, -1.0, 1.0, 0),
-            keyframe(100, 1.0, 1.0, 200),
-            // Cuts the ramp at its midpoint, x = 0, and heads back.
-            keyframe(200, -1.0, 0.5, 100),
-            keyframe(400, 0.5, 1.0, 0),
-        ]);
-        assert_eq!(x_at(&path, 50), -1.0);
-        assert!((x_at(&path, 150) + 0.5).abs() < 1e-12);
-        assert!(x_at(&path, 200).abs() < 1e-12);
-        assert!((x_at(&path, 250) + 0.5).abs() < 1e-12);
-        assert_eq!(x_at(&path, 300), -1.0);
-        assert_eq!(x_at(&path, 399), -1.0);
-        assert_eq!(x_at(&path, 400), 0.5);
-        assert_eq!(x_at(&path, 1_000_000), 0.5);
-        let gain = |t| path.segment(t, &mut 0).at(t).gain;
-        assert!((gain(250) - 0.75).abs() < 1e-12);
-    }
-
-    /// Before its first update an object is where and as loud as that update
-    /// says — its audio from the first sample, as `encode` carries it — and
-    /// a ramp the first update asks for has nothing to ramp from.
-    #[test]
-    fn an_object_plays_from_the_first_sample() {
-        let path = Path::new(&[keyframe(171, 0.3, 0.5, 0)]);
-        assert_eq!(path.segment(0, &mut 0).at(0).gain, 0.5);
-        assert_eq!(path.segment(171, &mut 0).at(171).gain, 0.5);
-        assert_eq!(path.origin(), [0.3, 1.0, 0.0]);
-        let ramped = Path::new(&[keyframe(171, 0.3, 0.5, 1000)]);
-        assert_eq!(ramped.segment(500, &mut 0).at(500).gain, 0.5);
-        assert_eq!(ramped.still_until(0, [0.3, 1.0, 0.0], &mut 0), None);
-    }
-
     /// A unit's subblocks break where the path does, a standstill is one
     /// step, and the time before the programme holds the origin.
     #[test]
     fn subblocks_break_where_the_path_does() {
         let path = Path::new(&[keyframe(0, -1.0, 1.0, 0), keyframe(300, 1.0, 1.0, 400)]);
         let mut out = Vec::new();
-        path.subblocks(-312, 648, &mut 0, &mut out);
+        path_subblocks(&path, -312, 648, &mut 0, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].duration, 612);
         assert_eq!(out[0].animation, Animation::Step([-1.0, 1.0, 0.0]));

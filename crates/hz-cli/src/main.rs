@@ -4,10 +4,10 @@ mod convert;
 mod encode;
 mod iamf;
 mod iamf_objects;
-mod overlay;
-mod source;
 
 use clap::{Parser, Subcommand};
+use hz_programme::mix::{self, Headroom, Mixing};
+use hz_programme::overlay;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -525,7 +525,7 @@ struct MixArgs {
     /// sixteen to twenty-four, and never more than its `--bits`. Match it to
     /// the *source* master rather than guessing: a programme mastered at
     /// eighteen bits gains nothing from twenty. See `docs/encode.md`.
-    #[arg(long, value_name = "BITS", default_value_t = encode::FOLD_BITS)]
+    #[arg(long, value_name = "BITS", default_value_t = mix::FOLD_BITS)]
     fold_depth: u32,
 
     /// The programme's dialnorm in decibels, −31 to −1, which sets the floor
@@ -579,17 +579,29 @@ impl MixArgs {
         }
     }
 
-    fn headroom(&self, input: &std::path::Path) -> hz_core::Result<encode::Headroom> {
+    fn headroom(&self, input: &std::path::Path) -> hz_core::Result<Headroom> {
         match self.headroom.as_str() {
-            "both" => Ok(encode::Headroom::Both),
-            "bound" => Ok(encode::Headroom::Bound),
-            "limit" => Ok(encode::Headroom::Limit),
-            "off" => Ok(encode::Headroom::Off),
+            "both" => Ok(Headroom::Both),
+            "bound" => Ok(Headroom::Bound),
+            "limit" => Ok(Headroom::Limit),
+            "off" => Ok(Headroom::Off),
             other => Err(hz_core::Error::unsupported(
                 input,
                 format!("`{other}` for the headroom; both, bound, limit or off"),
             )),
         }
+    }
+
+    /// The mix as both commands take it.
+    fn mixing(&self, input: &std::path::Path) -> hz_core::Result<Mixing> {
+        let weighing = self.weighing(input);
+        let headroom = self.headroom(input);
+        Ok(Mixing {
+            fold_depth: self.fold_depth,
+            dialnorm: self.dialnorm,
+            headroom: headroom?,
+            weighing: weighing?,
+        })
     }
 }
 
@@ -601,14 +613,21 @@ impl OverlayArgs {
         (self.overlay_beds > 0.0).then_some(self.overlay_beds)
     }
 
-    fn bounds(&self) -> overlay::Bounds {
-        overlay::Bounds {
-            drift: self.overlay_drift,
-            spread: self.overlay_spread,
-            wobble: self.overlay_wobble,
-            level: self.overlay_level,
-            cost: self.overlay_cost,
-            fallback: self.overlay_fallback,
+    /// The overlay as both commands take it.
+    fn options(self) -> overlay::Options {
+        overlay::Options {
+            beds_first: self.beds_first(),
+            beds_asked: self.overlay_beds,
+            bounds: overlay::Bounds {
+                drift: self.overlay_drift,
+                spread: self.overlay_spread,
+                wobble: self.overlay_wobble,
+                level: self.overlay_level,
+                cost: self.overlay_cost,
+                fallback: self.overlay_fallback,
+            },
+            spare: self.overlay_spare,
+            report: self.overlay_report,
         }
     }
 }
@@ -639,8 +658,7 @@ fn main() -> ExitCode {
             presentations,
             progress,
         } => {
-            let weighing = mixing.weighing(&input);
-            let headroom = mixing.headroom(&input);
+            let mixing = mixing.mixing(&input);
             let beds = match beds.as_str() {
                 "auto" => Ok(encode::Beds::Auto),
                 "pinned" => Ok(encode::Beds::Pinned),
@@ -676,22 +694,10 @@ fn main() -> ExitCode {
                     fast,
                     cluster,
                     overlay,
-                    overlay_beds: overlaid.beds_first(),
-                    overlay_beds_asked: overlaid.overlay_beds,
-                    overlay_drift: overlaid.overlay_drift,
-                    overlay_spread: overlaid.overlay_spread,
-                    overlay_wobble: overlaid.overlay_wobble,
-                    overlay_level: overlaid.overlay_level,
-                    overlay_cost: overlaid.overlay_cost,
-                    overlay_fallback: overlaid.overlay_fallback,
-                    overlay_spare: overlaid.overlay_spare,
-                    overlay_report: overlaid.overlay_report,
-                    fold_depth: mixing.fold_depth,
+                    overlaying: overlaid.options(),
+                    mixing: mixing?,
                     fold_search,
                     beds: beds?,
-                    dialnorm: mixing.dialnorm,
-                    headroom: headroom?,
-                    weighing: weighing?,
                     smooth_behind,
                     fold_hold,
                     drc,
@@ -766,21 +772,7 @@ fn main() -> ExitCode {
                     format!("`{other}` for the headphones; stereo or binaural"),
                 )),
             };
-            let weighing = mixing.weighing(&input);
-            let headroom = mixing.headroom(&input);
-            let overlaying = weighing.and_then(|weighing| {
-                Ok(iamf::Overlaying {
-                    beds_first: overlaid.beds_first(),
-                    beds_asked: overlaid.overlay_beds,
-                    bounds: overlaid.bounds(),
-                    spare: overlaid.overlay_spare,
-                    report: overlaid.overlay_report,
-                    fold_depth: mixing.fold_depth,
-                    dialnorm: mixing.dialnorm,
-                    limit: headroom?.limits(),
-                    weighing,
-                })
-            });
+            let mixing = mixing.mixing(&input);
             codec.and_then(|codec| {
                 iamf::run(iamf::Config {
                     input,
@@ -796,7 +788,8 @@ fn main() -> ExitCode {
                     elements,
                     overlay,
                     voices_to_bed,
-                    overlaying: overlaying?,
+                    overlaying: overlaid.options(),
+                    mixing: mixing?,
                 })
             })
         }

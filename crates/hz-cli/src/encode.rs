@@ -39,18 +39,19 @@
 //! nine with silent elements marked inactive, which is what the syntax has
 //! the flag for.
 
-use crate::overlay::{self, Bounds, Overlaid};
-use crate::source::{Source, keyframes_of, tracks};
-use hz_cluster::mix::Limiter;
 use hz_cluster::scene::{Loudness as Weighing, Scene, Source as SceneSource};
 use hz_cluster::smooth::{SMOOTHING, Smoother, Smoothing};
 use hz_cluster::{Clusterer, Clustering, Weighting};
-use hz_core::speakers;
 use hz_core::{Error, Result};
-use hz_io::adm::model::TypeDefinition;
 use hz_meta::oamd::{Block, Gain, Object, ObjectAudioMetadata, Position, Ramp, Render, Size};
 use hz_mlp::hierarchy::Presentation;
 use hz_mlp::{Config as StreamConfig, Encoder, SampleBits};
+use hz_programme::mix::{Mixer, Mixing};
+use hz_programme::overlay::{self, Overlaid};
+use hz_programme::path;
+use hz_programme::progress::Progress;
+use hz_programme::quantise::{Levels, Quantiser};
+use hz_programme::source::Source;
 use hz_render::{Keyframe, Layout, ObjectFold};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -129,51 +130,20 @@ pub struct Config {
     /// objects onto them — see [`hz_cluster::overlay`]. Mutually exclusive
     /// with [`Config::cluster`].
     pub overlay: Option<usize>,
-    /// How far a bed-only fit may land from a source before the moving
-    /// elements are let in — `hz_cluster::overlay::BEDS_FIRST`. `None`
-    /// declines the preference and fits over every element. Only means
-    /// anything with `--overlay`.
-    pub overlay_beds: Option<f64>,
-    /// What the caller actually typed for it, so that a negative reach can be
-    /// refused rather than read as the preference declined.
-    pub overlay_beds_asked: f64,
-    /// What an overlay refuses to write — see [`Bounds`], which documents
-    /// every one of these and why it is where it is. Nought turns one off.
-    /// Only mean anything with `--overlay`.
-    pub overlay_drift: f64,
-    pub overlay_spread: f64,
-    pub overlay_wobble: f64,
-    pub overlay_level: f64,
-    pub overlay_cost: f64,
-    /// Whether a source the fit could not place acceptably is routed to the
-    /// nearest bed element outright. Only means anything with `--overlay`.
-    pub overlay_fallback: bool,
-    /// Whether a source may take a spare element of its own when the master
-    /// brings fewer than sixteen — see [`spare_slots`]. Off, the stream is
-    /// exactly as wide as the master and every source is panned. Only means
-    /// anything with `--overlay`.
-    pub overlay_spare: bool,
-    /// Write, per block, exactly what the overlay did with it — see
-    /// [`crate::overlay::Overlaid::report`]. For `cargo xtask overlay-check`, which cannot
-    /// check the arithmetic without the weights that produced it.
-    pub overlay_report: Option<PathBuf>,
+    /// What shapes `--overlay` beyond its sources — see
+    /// [`overlay::Options`]. Only means anything with `--overlay`.
+    pub overlaying: overlay::Options,
     /// What dynamic range word the stream states — see [`Drc`].
     pub drc: Option<Drc>,
     /// How a bed channel other than the low frequency one is folded — see
     /// [`Beds`]. Only means anything with `--cluster`.
     pub beds: Beds,
-    /// The programme's dialnorm in decibels, which sets the floor under what
-    /// an object has to carry to be heard at the playback level — see
-    /// `hz_cluster::floor`. Only means anything with `--cluster`.
-    pub dialnorm: f64,
-    /// How the fold keeps its elements inside the codec's domain — see
-    /// [`Headroom`]. Only means anything with `--cluster`.
-    pub headroom: Headroom,
-    /// How a block's power is weighed before it steers the fold — see
-    /// `hz_cluster::scene::Loudness`. The default is the constant every
-    /// measurement in `docs/clustering.md` was made under; the perceptual
-    /// rule is there to be listened to. Only means anything with `--cluster`.
-    pub weighing: Weighing,
+    /// What a mix does to the elements it makes — see [`Mixing`]: what they
+    /// are rounded to (see [`FOLD_DEPTHS`] for the bounds), what counts as
+    /// audible, how they are kept inside the codec's domain and how a
+    /// block's power is weighed before it steers the fold. Only means
+    /// anything with `--cluster` or `--overlay`.
+    pub mixing: Mixing,
     /// Blocks behind the one being placed whose energies steady it — see
     /// `hz_cluster::smooth`. The blocks ahead are the constant's; only the
     /// reach behind is a knob, because it is the half of that window the
@@ -189,9 +159,6 @@ pub struct Config {
     pub presentations: bool,
     /// Report progress on standard error — see [`Progress`].
     pub progress: bool,
-    /// What the folded elements are rounded to, in bits — see [`FOLD_BITS`]
-    /// for why they are rounded at all, and [`FOLD_DEPTHS`] for the bounds.
-    pub fold_depth: u32,
     /// Passes of the search that places each element on the fold's own cost —
     /// see [`hz_cluster::place`]. Zero declines it and takes the positions the
     /// clustering of directions settled on.
@@ -204,67 +171,6 @@ pub struct Config {
     /// protection fields are signed with, when it holds one. See
     /// [`hz_mlp::protection`].
     pub settings: hz_io::settings::Settings,
-}
-
-/// How far along the encode is, on standard error, for a caller driving a bar.
-///
-/// # Why it is a flag and why it is stderr
-///
-/// The summary this command prints is its *answer* and goes to standard
-/// output; progress is scaffolding that is meaningless once the thing has
-/// finished, so it goes to standard error and only when asked for. A caller
-/// reading both streams — which is what a process host does — can then tell
-/// the two apart by their shape rather than by guessing.
-///
-/// # One line per whole percent
-///
-/// Not one per access unit: a two-hour programme is 216 000 of them and a bar
-/// cannot show more than a hundred positions anyway. So a line goes out only
-/// when the whole percent changes, which caps the output at a hundred lines
-/// whatever the length, and the format is fixed and dull —
-/// `progress <n>%` — because something is going to parse it with a regular
-/// expression.
-///
-/// The denominator is the input's own frame count, which both containers state
-/// in their header. So this is a real fraction of the work and not an estimate
-/// from how much has been written, which would depend on how well the material
-/// compresses.
-pub(crate) struct Progress {
-    total: u64,
-    last: u64,
-}
-
-impl Progress {
-    /// `None` when the flag is off, or when the input does not say how long it
-    /// is — a percentage of an unknown total is a number made up.
-    pub(crate) fn new(wanted: bool, total: u64) -> Option<Self> {
-        (wanted && total > 0).then_some(Self {
-            total,
-            last: u64::MAX,
-        })
-    }
-
-    /// The percent to report for `at` frames done, or `None` if the whole
-    /// percent has not moved since the last one.
-    ///
-    /// Separated from printing it so that a test can watch the sequence: what
-    /// matters about this is that it starts at nothing, ends at everything,
-    /// never goes backwards and never repeats itself, and none of that is
-    /// visible from the outside once it has gone to standard error.
-    fn stepped(&mut self, at: u64) -> Option<u64> {
-        let percent = at.min(self.total) * 100 / self.total;
-        (percent != self.last).then(|| {
-            self.last = percent;
-            percent
-        })
-    }
-
-    /// Report `at` frames of `total` done, if that has moved the whole percent.
-    pub(crate) fn at(&mut self, at: u64) {
-        if let Some(percent) = self.stepped(at) {
-            eprintln!("progress {percent}%");
-        }
-    }
 }
 
 /// How a bed channel other than the low frequency one is carried by a fold.
@@ -290,40 +196,6 @@ pub enum Beds {
     Auto,
     Pinned,
     Free,
-}
-
-/// How a fold keeps its elements inside the codec's domain.
-///
-/// An element is a sum, and two coherent objects in one element pass full
-/// scale. The fit can **bound** an element's coherent peak to the domain by
-/// solving the objects it carries under an upper bound on their weights —
-/// see `hz_cluster::headroom` — and a **limiter** with one gain for every
-/// element can hold whatever is left, ahead of the peak. The limiter alone
-/// by default, because the metric says so: the bound is on the coherent
-/// worst case, which forty tones in nine contributions an element pass in
-/// every block while the mix itself passes full scale in few, and it costs
-/// a fifth of the fold's mean for half the clips; the limiter takes every
-/// clip for nothing the metric sees, and what it costs — a gain that dips
-/// at the peaks — the report states. See `docs/clustering.md`. Both, the
-/// bound alone, or neither, for the measurement; with neither, the mix is
-/// clamped and the clips counted, which is what it was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Headroom {
-    Both,
-    Bound,
-    #[default]
-    Limit,
-    Off,
-}
-
-impl Headroom {
-    fn bounds(self) -> bool {
-        matches!(self, Self::Both | Self::Bound)
-    }
-
-    pub(crate) fn limits(self) -> bool {
-        matches!(self, Self::Both | Self::Limit)
-    }
 }
 
 /// One element of the programme, and what the master says about it.
@@ -390,46 +262,22 @@ struct Clustered {
 /// What a folding encode carries between blocks.
 struct Fold {
     shape: Shape,
-    /// Every presentation the stream will be played through, and what the fold
-    /// has cost over them so far. An encoder that folds a scene and does not
-    /// say what it cost is asking to be trusted.
-    renderers: Vec<Box<dyn hz_render::Renderer>>,
-    blocks: u64,
-    mean: f64,
-    worst: f64,
-    /// Samples the mix pushed outside the codec's domain.
-    clipped: u64,
-    /// What a mixed sample is rounded to — see [`FOLD_BITS`].
-    step: f64,
-    /// The loudest sample the fold has produced so far, as a fraction of full
-    /// scale. What decides whether a cascade can be carried: it stores more
-    /// than it was given, and the programme's own peak says how much of the
-    /// codec's domain is left to store it in.
-    peak: f64,
+    /// The scene, the objects' samples and the elements' mix, kept across
+    /// blocks, and what the fold has cost so far over every presentation the
+    /// stream will be played through — see [`Mixer`].
+    mixer: Mixer,
+    /// What a mixed sample is rounded to — see [`hz_programme::mix::FOLD_BITS`]
+    /// — in the codec's twenty-four bit domain.
+    quantiser: Quantiser,
+    /// What the mixed samples came to: the samples pushed outside the codec's
+    /// domain, and the loudest, as a fraction of full scale — what decides
+    /// whether a cascade can be carried: it stores more than it was given,
+    /// and the programme's own peak says how much of the codec's domain is
+    /// left to store it in.
+    levels: Levels,
     /// The last payload handed to the encoder, so that a block which says the
     /// same thing says nothing.
     last_payload: Vec<u8>,
-    /// Everything a block needs, kept across blocks.
-    ///
-    /// These were ten allocations an access unit in the hot path. They are now
-    /// reused buffers, refilled once a metadata block.
-    ///
-    /// The scene is held rather than built because the energy it computes is
-    /// K-weighted and a filter has state — and because it is the *same* scene
-    /// `cargo xtask cluster` builds, which is the only way the harness's
-    /// report is a report about this stream. See [`hz_cluster::scene`].
-    scene: Scene,
-    signals: Vec<Vec<f32>>,
-    gains: Vec<f64>,
-    mixed: Vec<Vec<f32>>,
-    from: Vec<Vec<f64>>,
-    /// What an object has to carry to be heard — see `hz_cluster::floor`.
-    floor: hz_cluster::floor::Floor,
-    /// Objects under the room's floor, summed over the blocks.
-    inaudible: u64,
-    /// The limiter on what the bound leaves, when there is one — see
-    /// [`Headroom`].
-    limiter: Option<Limiter>,
 }
 
 impl Fold {
@@ -564,11 +412,12 @@ fn energies_of(
 /// Everything a block-at-a-time encode carries that is the same whichever
 /// shape it is, so that the two constructions state only what differs.
 fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
+    let mixing = &config.mixing;
+    let fail = |why: hz_core::Error| Error::unsupported(&config.input, why.to_string());
     Ok(Fold {
         // Replaced by the caller; a shape is the one thing this cannot guess.
         shape: Shape::Clustered(Box::new(Clustered {
-            clusterer: Clusterer::new(hz_cluster::MIN_ELEMENTS, Weighting::Fitted)
-                .map_err(|why| Error::unsupported(&config.input, why.to_string()))?,
+            clusterer: Clusterer::new(hz_cluster::MIN_ELEMENTS, Weighting::Fitted).map_err(fail)?,
             clustered: 0,
             previous: None,
             placing: Vec::new(),
@@ -583,24 +432,17 @@ fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
             carried: Vec::new(),
             bounded: 0,
         })),
-        renderers: hz_cluster::metric::delivery()
-            .map_err(|why| Error::unsupported(&config.input, why.to_string()))?,
-        blocks: 0,
-        mean: 0.0,
-        worst: 0.0,
-        clipped: 0,
-        step: fold_step(config.fold_depth),
-        peak: 0.0,
+        mixer: Mixer::new(
+            sample_rate,
+            mixing.weighing,
+            mixing.dialnorm,
+            mixing.headroom.limits(),
+            width,
+        )
+        .map_err(fail)?,
+        quantiser: Quantiser::new(FULL_SCALE, fold_step(mixing.fold_depth)),
+        levels: Levels::default(),
         last_payload: Vec::new(),
-        scene: Scene::weighed(sample_rate, config.weighing)
-            .map_err(|why| Error::unsupported(&config.input, why.to_string()))?,
-        signals: Vec::new(),
-        gains: Vec::new(),
-        mixed: vec![Vec::new(); width],
-        from: Vec::new(),
-        floor: hz_cluster::floor::Floor::for_dialnorm(config.dialnorm),
-        inaudible: 0,
-        limiter: config.headroom.limits().then(Limiter::new),
     })
 }
 
@@ -706,14 +548,14 @@ pub fn run(config: Config) -> Result<()> {
                     format!("{wanted} elements to fold into"),
                 ));
             }
-            if !FOLD_DEPTHS.contains(&config.fold_depth) {
+            if !FOLD_DEPTHS.contains(&config.mixing.fold_depth) {
                 return Err(Error::unsupported(
                     &config.input,
                     format!(
                         "a fold depth of {} bits; {} to {} — below that the format's own \
                          dead-bit field cannot say what was rounded away, and above it there \
                          is nothing finer to keep",
-                        config.fold_depth,
+                        config.mixing.fold_depth,
                         FOLD_DEPTHS.start(),
                         FOLD_DEPTHS.end()
                     ),
@@ -756,8 +598,10 @@ pub fn run(config: Config) -> Result<()> {
                             holding: config.fold_hold,
                             ..hz_cluster::place::Search::default()
                         })
-                        .flooring(hz_cluster::floor::Floor::for_dialnorm(config.dialnorm))
-                        .bounding(config.headroom.bounds()),
+                        .flooring(hz_cluster::floor::Floor::for_dialnorm(
+                            config.mixing.dialnorm,
+                        ))
+                        .bounding(config.mixing.headroom.bounds()),
                     clustered,
                     previous: None,
                     placing: Vec::new(),
@@ -784,26 +628,7 @@ pub fn run(config: Config) -> Result<()> {
             // plus, when `--overlay-spare` asks for it, whatever spare slots
             // the sources could take.
             Some(sources) => {
-                if sources == 0 {
-                    return Err(Error::unsupported(
-                        &config.input,
-                        "`--overlay 0`; an overlay with no sources is a plain encode of the \
-                         master, which is what leaving the flag off already does"
-                            .to_string(),
-                    ));
-                }
-                let element_parts = parts.len().checked_sub(sources).filter(|kept| *kept > 0);
-                let Some(element_parts) = element_parts else {
-                    return Err(Error::unsupported(
-                        &config.input,
-                        format!(
-                            "{sources} overlay sources out of {} objects; the sources are the \
-                             master's *last* objects and the ones before them are the elements \
-                             they are panned onto, so there has to be at least one of those",
-                            parts.len()
-                        ),
-                    ));
-                };
+                let element_parts = overlay::kept(&config.input, parts.len(), sources)?;
                 if !(hz_cluster::MIN_ELEMENTS..=hz_mlp::format::MAX_CHANNELS)
                     .contains(&element_parts)
                 {
@@ -816,39 +641,20 @@ pub fn run(config: Config) -> Result<()> {
                         ),
                     ));
                 }
-                if !FOLD_DEPTHS.contains(&config.fold_depth) {
+                if !FOLD_DEPTHS.contains(&config.mixing.fold_depth) {
                     return Err(Error::unsupported(
                         &config.input,
                         format!(
                             "a fold depth of {} bits; {} to {}",
-                            config.fold_depth,
+                            config.mixing.fold_depth,
                             FOLD_DEPTHS.start(),
                             FOLD_DEPTHS.end()
                         ),
                     ));
                 }
-                // Only the asked-for value can be negative: the command line
-                // turns anything not above nought into `None`, so testing the
-                // option as well was testing a thing that cannot happen.
-                if config.overlay_beds_asked < 0.0 {
-                    return Err(Error::unsupported(
-                        &config.input,
-                        format!(
-                            "a bed reach of {}; it is a distance, so nought declines the \
-                             preference and anything below that is a typed minus sign",
-                            config.overlay_beds_asked
-                        ),
-                    ));
-                }
-                let bounds = Bounds {
-                    drift: config.overlay_drift,
-                    spread: config.overlay_spread,
-                    wobble: config.overlay_wobble,
-                    level: config.overlay_level,
-                    cost: config.overlay_cost,
-                    fallback: config.overlay_fallback,
-                };
-                let slots = spare_slots(&parts, element_parts, sources, config.overlay_spare);
+                let options = &config.overlaying;
+                options.check(&config.input)?;
+                let slots = spare_slots(&parts, element_parts, sources, options.spare);
                 let width = element_parts + slots.len();
                 let channels = (0..element_parts)
                     .chain(slots.iter().map(|index| element_parts + index))
@@ -867,9 +673,9 @@ pub fn run(config: Config) -> Result<()> {
                                 .count(),
                             slots,
                             channels,
-                            bounds,
-                            beds_first: config.overlay_beds,
-                            report: config.overlay_report.as_deref(),
+                            bounds: options.bounds,
+                            beds_first: options.beds_first,
+                            report: options.report.as_deref(),
                             seconds_a_block: BLOCK_UNITS as f64
                                 * unit_seconds(source.sample_rate()),
                         },
@@ -1034,7 +840,7 @@ pub fn run(config: Config) -> Result<()> {
             // own is: a second `Scene` because a weighted one carries filter
             // state and these two are reading different spans, each of them
             // contiguous.
-            let mut ahead_scene = Scene::weighed(sample_rate, config.weighing)
+            let mut ahead_scene = Scene::weighed(sample_rate, config.mixing.weighing)
                 .map_err(|why| Error::unsupported(input, why.to_string()))?;
 
             std::thread::scope(|scope| -> Result<()> {
@@ -1529,19 +1335,19 @@ pub fn run(config: Config) -> Result<()> {
         ),
     }
     if let Some(fold) = &folded
-        && fold.blocks > 0
+        && fold.mixer.cost.blocks > 0
     {
         if let Shape::Clustered(_) = &fold.shape {
             println!(
                 "  fold         {:.4} mean over the presentations, {:.3} at its worst, \
                  as a fraction of the object's own gains",
-                fold.mean / fold.blocks as f64,
-                fold.worst
+                fold.mixer.cost.mean(),
+                fold.mixer.cost.worst
             );
         }
         println!(
             "  weighed by   {}",
-            match config.weighing {
+            match config.mixing.weighing {
                 Weighing::Flat => "the plain power, what a meter reads".to_string(),
                 Weighing::KWeighted => "the K-weighted power of BS.1770".to_string(),
                 Weighing::Perceptual(perception) => format!(
@@ -1596,16 +1402,16 @@ pub fn run(config: Config) -> Result<()> {
             Shape::Clustered(_) => println!(
                 "  floor        {:.1} dBFS at the playback level a dialnorm of {:.0} implies; \
                  {:.2} objects a block under it",
-                fold.floor.threshold_dbfs(),
-                config.dialnorm,
-                fold.inaudible as f64 / fold.blocks as f64
+                fold.mixer.floor.threshold_dbfs(),
+                config.mixing.dialnorm,
+                fold.mixer.cost.inaudible as f64 / fold.mixer.cost.blocks as f64
             ),
             Shape::Overlaid(overlaid) => println!(
                 "  floor        {:.1} dBFS at the playback level a dialnorm of {:.0} implies; a \
                  source was above it in {:.1} % of the blocks, and is guarded in those",
-                fold.floor.threshold_dbfs(),
-                config.dialnorm,
-                100.0 * overlaid.voiced as f64 / fold.blocks.max(1) as f64
+                fold.mixer.floor.threshold_dbfs(),
+                config.mixing.dialnorm,
+                100.0 * overlaid.voiced as f64 / fold.mixer.cost.blocks.max(1) as f64
             ),
         }
         if let Shape::Clustered(clustered) = &fold.shape
@@ -1622,7 +1428,11 @@ pub fn run(config: Config) -> Result<()> {
             );
         }
         if let Shape::Overlaid(overlaid) = &fold.shape {
-            overlay::summary(overlaid, fold.blocks, config.overlay_beds);
+            overlay::summary(
+                overlaid,
+                fold.mixer.cost.blocks,
+                config.overlaying.beds_first,
+            );
         }
         println!(
             "  depth        {} rounded to {} bits{}",
@@ -1630,8 +1440,8 @@ pub fn run(config: Config) -> Result<()> {
                 Shape::Clustered(_) => "elements",
                 Shape::Overlaid(_) => "the elements a source reached",
             },
-            config.fold_depth,
-            if config.fold_depth == 24 {
+            config.mixing.fold_depth,
+            if config.mixing.fold_depth == 24 {
                 ", which is every bit the mix made"
             } else {
                 ""
@@ -1644,7 +1454,7 @@ pub fn run(config: Config) -> Result<()> {
                 Shape::Clustered(clustered) => clustered.bounded,
                 Shape::Overlaid(_) => 0,
             },
-            match &fold.limiter {
+            match &fold.mixer.limiter {
                 Some(limiter) => format!(
                     "{} blocks where the limiter brought every element down, the mix peaking at \
                      {:.2} of full scale before it",
@@ -1653,11 +1463,11 @@ pub fn run(config: Config) -> Result<()> {
                 None => "no limiter".to_string(),
             }
         );
-        if fold.clipped > 0 {
+        if fold.levels.clipped > 0 {
             println!(
                 "  clipped      {} samples of the mix went outside the codec's domain \
                  and were clamped",
-                fold.clipped
+                fold.levels.clipped
             );
         }
     }
@@ -1685,10 +1495,10 @@ pub fn run(config: Config) -> Result<()> {
         let remarks = overlay::remarks(
             overlaid,
             &overlay::Totals {
-                blocks: fold.blocks,
-                mean: fold.mean,
-                clipped: fold.clipped,
-                limiter: fold.limiter.as_ref(),
+                blocks: fold.mixer.cost.blocks,
+                mean: fold.mixer.cost.sum,
+                clipped: fold.levels.clipped,
+                limiter: fold.mixer.limiter.as_ref(),
             },
             BLOCK_UNITS as f64 * unit_seconds(source.sample_rate()),
         );
@@ -1708,69 +1518,48 @@ impl Part {
     }
 }
 
-/// What the master set's tracks are, in the order the stream will carry them.
+/// What the master set's tracks are, in the order the stream will carry them
+/// — see [`hz_programme::parts_of`].
 ///
 /// The low frequency channel goes first because the payload's own flag says it
 /// does: when a programme declares one, it is the first element and everything
 /// after it is a dynamic object.
 fn parts_of(path: &std::path::Path, source: &Source, folding: bool) -> Result<Vec<Part>> {
-    let description = source.adm();
-    let mut lfe = None;
-    let mut objects = Vec::new();
-
-    for track in tracks(path, description, source.channels())? {
-        let number = track.number;
-        let source_channel = track.source_channel;
-        match track.format.type_definition {
-            TypeDefinition::DirectSpeakers => {
-                let label = track.speaker_label();
-                if speakers::is_lfe_label(label) {
-                    lfe = Some(Part::Lfe { source_channel });
-                } else if folding {
-                    // A bed channel is an object that never leaves its
-                    // speaker's place, and the fold decides what to do with
-                    // it — see [`Beds`]. A label with no place in the cube is
-                    // refused rather than guessed at.
-                    let Some(position) = hz_render::fold::bed_position(label) else {
-                        return Err(Error::unsupported(
-                            path,
-                            format!(
-                                "track {number} is the bed channel `{label}`, which has no \
-                                 known place in the cube to fold at"
-                            ),
-                        ));
-                    };
-                    objects.push(Part::Object {
-                        source_channel,
-                        keyframes: vec![Keyframe {
-                            position,
-                            mode: hz_cluster::class::BED,
-                            ..Keyframe::default()
-                        }],
-                        bed: Some(position),
-                    });
-                } else {
-                    return Err(Error::unsupported(
-                        path,
-                        format!(
-                            "track {number} is the bed channel `{label}`; a bed other than the \
-                             LFE is carried only by a folding encode, `--cluster`"
-                        ),
-                    ));
-                }
-            }
-            TypeDefinition::Objects => objects.push(Part::Object {
-                source_channel,
-                keyframes: keyframes_of(track.format, description.sample_rate),
-                bed: None,
-            }),
-            other => eprintln!("note: track {number} is `{other}` audio; left out"),
-        }
-    }
-
     let mut parts = Vec::with_capacity(MIN_ELEMENTS);
-    parts.extend(lfe);
-    parts.extend(objects);
+    for part in hz_programme::parts_of(path, source)? {
+        parts.push(match part {
+            hz_programme::Part::Lfe { channel } => Part::Lfe {
+                source_channel: channel,
+            },
+            // A bed channel is an object that never leaves its speaker's
+            // place, and the fold decides what to do with it — see [`Beds`].
+            hz_programme::Part::Bed {
+                channel, position, ..
+            } if folding => Part::Object {
+                source_channel: channel,
+                keyframes: vec![Keyframe {
+                    position,
+                    mode: hz_cluster::class::BED,
+                    ..Keyframe::default()
+                }],
+                bed: Some(position),
+            },
+            hz_programme::Part::Bed { name, .. } => {
+                return Err(Error::unsupported(
+                    path,
+                    format!(
+                        "`{name}` is a bed channel; a bed other than the LFE is carried only by \
+                         a folding encode, `--cluster`"
+                    ),
+                ));
+            }
+            hz_programme::Part::Object { channel, keyframes } => Part::Object {
+                source_channel: channel,
+                keyframes,
+                bed: None,
+            },
+        });
+    }
     // A master with more objects than a stream has elements is exactly what
     // `--cluster` is for, so the cap only applies when nothing is folding
     // them.
@@ -1804,11 +1593,7 @@ fn advance(live: &mut [Live], parts: &[Part], at: u64) -> bool {
         let Part::Object { keyframes, .. } = &parts[entry.part_index] else {
             continue;
         };
-        while entry.next < keyframes.len() && keyframes[entry.next].sample_pos <= at {
-            entry.state = keyframes[entry.next];
-            entry.next += 1;
-            moved = true;
-        }
+        moved |= path::advance(keyframes, &mut entry.next, &mut entry.state, at);
     }
     moved
 }
@@ -2093,9 +1878,9 @@ fn fold_span(
     // The scene, and each object's signal for this block. The buffers are the
     // fold's own and are refilled, not reallocated.
     let pin_beds = matches!(&fold.shape, Shape::Clustered(clustered) if clustered.pin_beds);
-    fold.scene.start();
-    fold.gains.clear();
-    fold.signals.resize_with(states.len(), Vec::new);
+    fold.mixer.scene.start();
+    fold.mixer.gains.clear();
+    fold.mixer.signals.resize_with(states.len(), Vec::new);
     let mut object = 0usize;
     for (part_index, state) in states {
         let Part::Object {
@@ -2106,7 +1891,7 @@ fn fold_span(
         else {
             continue;
         };
-        let signal = &mut fold.signals[object];
+        let signal = &mut fold.mixer.signals[object];
         signal.clear();
         signal.reserve(frames);
         for sample in 0..frames {
@@ -2118,7 +1903,7 @@ fn fold_span(
         // over a block rather than over forty samples, which is the difference
         // between an estimate and a sample of noise, and weighted the way a
         // listener weighs it — see `hz_cluster::scene`.
-        fold.scene.push(
+        fold.mixer.scene.push(
             &SceneSource {
                 position: state.position,
                 gain: state.gain,
@@ -2129,13 +1914,13 @@ fn fold_span(
             },
             signal.iter().map(|sample| f64::from(*sample)),
         );
-        fold.gains.push(state.gain);
+        fold.mixer.gains.push(state.gain);
         object += 1;
     }
-    fold.signals.truncate(object);
+    fold.mixer.signals.truncate(object);
     // Weighed against each other, now that every object is in — which is a
     // step only the perceptual rule has anything to do in.
-    fold.scene.finish();
+    fold.mixer.scene.finish();
 
     // Which shape this is decides where the weights come from and what the
     // payload says; everything either side of that is the same work.
@@ -2165,23 +1950,6 @@ fn fold_span(
     }
 }
 
-/// One mixed sample into the codec's domain.
-///
-/// An element is a *sum*, and a sum of objects that happen to agree is louder
-/// than any of them. Clamped rather than wrapped: the codec's domain is
-/// twenty-four bits and a value outside it wraps to the other end of the
-/// range, which a decoder reports as a saturated recorrelator and a listener
-/// hears as a crack. Counted, because a fold that clips is a fold whose
-/// objects wanted more headroom than the mix left, and that is worth knowing
-/// rather than swallowing.
-///
-/// Counted against the domain *before* the step is applied: a sample the mix
-/// pushed past full scale is a clip, and one the rounding nudged over is not.
-#[inline]
-fn quantise(value: f32, step: f64, peak: &mut f64, clipped: &mut u64) -> i32 {
-    overlay::quantise(value, FULL_SCALE, step, peak, clipped)
-}
-
 /// Keep the master's elements and pan its last few objects onto them, for one
 /// block — see [`Overlaid::span`], which decides it. This states what a
 /// decoder of this stream applies to each element — the gain its payload
@@ -2203,20 +1971,9 @@ fn overlay_span(
 ) -> Result<Vec<u8>> {
     let Fold {
         shape,
-        scene,
-        signals,
-        gains,
-        mixed,
-        from,
-        limiter,
-        floor,
-        renderers,
-        step,
-        peak,
-        clipped,
-        blocks,
-        mean,
-        worst,
+        mixer,
+        quantiser,
+        levels,
         ..
     } = fold;
     let Shape::Overlaid(overlaid) = shape else {
@@ -2243,31 +2000,17 @@ fn overlay_span(
             .iter()
             .map(|(_, state)| overlay::Voice::of(state, stated_gain(state.gain))),
     );
-    let spent = overlaid
-        .span(
+    mixer
+        .overlay(
+            overlaid,
             overlay::Block {
                 first: usize::from(lfe_channel.is_some()),
                 elements,
                 frames,
             },
-            overlay::Buffers {
-                scene,
-                signals,
-                gains,
-                mixed,
-                from,
-                limiter: limiter.as_mut(),
-                ceiling: CEILING / FULL_SCALE,
-                floor,
-                renderers,
-            },
+            CEILING / FULL_SCALE,
         )
         .map_err(|e| Error::io(path, e))?;
-    *blocks += 1;
-    if let Some((block_mean, block_worst)) = spent.cost {
-        *mean += block_mean;
-        *worst = worst.max(block_worst);
-    }
 
     // Element by element rather than sample by sample: which of the two an
     // element is was decided once for the whole block, so asking again at
@@ -2281,10 +2024,10 @@ fn overlay_span(
                 }
             }
             None => {
-                let signal = &mixed[element];
+                let signal = &mixer.mixed[element];
                 for sample in 0..frames {
                     out[sample * elements + element] =
-                        quantise(signal[sample], *step, peak, clipped);
+                        quantiser.code(f64::from(signal[sample]), levels);
                 }
             }
         }
@@ -2311,14 +2054,9 @@ fn cluster_span(
 ) -> Result<Vec<u8>> {
     let Fold {
         shape,
-        scene,
-        signals,
-        gains,
-        mixed,
-        from,
-        limiter,
-        renderers,
-        floor,
+        mixer,
+        quantiser,
+        levels,
         ..
     } = fold;
     let Shape::Clustered(clustered) = shape else {
@@ -2334,7 +2072,7 @@ fn cluster_span(
     // for what there is.
     clustered
         .smoother
-        .place(scene.objects(), &mut clustered.placing);
+        .place(mixer.scene.objects(), &mut clustered.placing);
     let clustering = clustered
         .clusterer
         .cluster(&clustered.placing, clustered.previous.as_ref())
@@ -2357,7 +2095,7 @@ fn cluster_span(
             clustering
                 .weights
                 .iter()
-                .zip(scene.objects())
+                .zip(mixer.scene.objects())
                 .map(|(row, object)| {
                     let weight = row[element];
                     object.energy.max(0.0) * weight * weight
@@ -2368,25 +2106,17 @@ fn cluster_span(
         .motion
         .record(&clustered.written, &clustered.carried);
 
-    // What the weights ramp *from*: the previous block's, or this block's own
-    // at the very start, where there is nothing to ramp from.
-    from.clear();
-    match &clustered.previous {
-        Some(previous) if previous.weights.len() == clustering.weights.len() => {
-            from.extend(previous.weights.iter().cloned());
-        }
-        _ => from.extend(clustering.weights.iter().cloned()),
-    }
-
-    hz_cluster::mix::mix(signals, gains, from, &clustering.weights, frames, mixed);
+    // The weights ramp from the previous block's, and whatever the bound
+    // left goes through a limiter with one gain for every element — see
+    // `hz_cluster::headroom`. The limiter counts its own blocks.
+    mixer.fold(
+        &clustering,
+        clustered.previous.as_ref(),
+        frames,
+        CEILING / FULL_SCALE,
+    );
     if clustering.bounded > 0 {
         clustered.bounded += 1;
-    }
-    // Whatever the bound left goes through a limiter with one gain for
-    // every element — see `hz_cluster::headroom`. The limiter counts its
-    // own blocks.
-    if let Some(limiter) = limiter {
-        limiter.apply(mixed, CEILING / FULL_SCALE);
     }
 
     // The low frequency channel is *copied*, not mixed, so it is not rounded:
@@ -2396,21 +2126,14 @@ fn cluster_span(
         if let Some(channel) = lfe_channel {
             out[sample * elements] = block[sample * source_channels + channel];
         }
-        for (element, signal) in mixed.iter().enumerate() {
+        for (element, signal) in mixer.mixed.iter().enumerate() {
             out[sample * elements + first + element] =
-                quantise(signal[sample], fold.step, &mut fold.peak, &mut fold.clipped);
+                quantiser.code(f64::from(signal[sample]), levels);
         }
     }
 
     // What it cost, over every presentation the stream will be played through.
-    if let Ok(report) =
-        hz_cluster::metric::error_with(scene.objects(), &clustering, renderers, floor)
-    {
-        fold.blocks += 1;
-        fold.mean += report.mean;
-        fold.worst = fold.worst.max(report.worst);
-        fold.inaudible += report.inaudible as u64;
-    }
+    mixer.judge(&clustering);
 
     // The whole block to reach the new positions, which is what stops an
     // element's position stepping — the same argument as the weights', and the
@@ -2668,28 +2391,6 @@ const CEILING: f64 = 8_388_607.0;
 #[cfg(test)]
 const FLOOR: f64 = -8_388_608.0;
 
-/// What a folded element's samples are rounded to.
-///
-/// # Why a fold rounds at all
-///
-/// Sixteen objects do not go into eleven elements without loss — that is what
-/// a fold *is* — and once a step has accepted losing the difference between
-/// two directions, keeping the difference between two values 2^-24 apart is
-/// not a principle, it is an oversight. A mix of objects fills all
-/// twenty-four bits with a product of real weights, and a lossless coder then
-/// has to carry every one of them: the low four are noise from the
-/// multiplication and cost about a fifth of the stream.
-///
-/// Measured on a two-hour programme folded 17 → 12: the reference encoder's
-/// elements have exactly four dead low bits everywhere, ours had none, and
-/// the difference accounts for the whole of a 1.33× size gap — our coder is
-/// 0.95× the reference on identical audio. See `docs/encode.md`.
-///
-/// Twenty bits puts the rounding noise at about −120 dBFS, under the
-/// programme's own noise floor and under what any playback chain resolves.
-/// `--full-depth` declines the trade.
-pub const FOLD_BITS: u32 = 20;
-
 /// What the stream states as its dynamic range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Drc {
@@ -2900,7 +2601,7 @@ mod tests {
                             .filter(|part| matches!(part, Part::Object { bed: Some(_), .. }))
                             .count(),
                         channels: parts[..elements].iter().map(Part::source_channel).collect(),
-                        bounds: Bounds::default(),
+                        bounds: overlay::Bounds::default(),
                         beds_first: Some(hz_cluster::overlay::BEDS_FIRST),
                         report: None,
                         seconds_a_block: BLOCK_UNITS as f64 * unit_seconds(48_000),
@@ -2908,24 +2609,15 @@ mod tests {
                 )
                 .expect("an overlay"),
             )),
-            renderers: hz_cluster::metric::delivery().expect("the presentations"),
-            blocks: 0,
-            mean: 0.0,
-            worst: 0.0,
-            clipped: 0,
+            mixer: Mixer {
+                floor: hz_cluster::floor::Floor::relative_only(),
+                ..Mixer::new(48_000.0, Weighing::Flat, -31.0, false, width).expect("a mixer")
+            },
             // Every bit the mix made: a test about what the arithmetic does
             // should not be reading the fold's rounding noise.
-            step: fold_step(24),
-            peak: 0.0,
+            quantiser: Quantiser::new(FULL_SCALE, fold_step(24)),
+            levels: Levels::default(),
             last_payload: Vec::new(),
-            scene: Scene::weighed(48_000.0, Weighing::Flat).expect("a scene"),
-            signals: Vec::new(),
-            gains: Vec::new(),
-            mixed: vec![Vec::new(); width],
-            from: Vec::new(),
-            floor: hz_cluster::floor::Floor::relative_only(),
-            inaudible: 0,
-            limiter: None,
         }
     }
 
@@ -2997,7 +2689,7 @@ mod tests {
                 assert!(same, "element {element} was not copied through unchanged");
             }
         }
-        assert_eq!(fold.clipped, 0);
+        assert_eq!(fold.levels.clipped, 0);
     }
 
     /// An element a decoder will turn down by 6 dB has the source's
@@ -3459,9 +3151,9 @@ mod tests {
                 overlaid.live.capacity(),
                 overlaid.resultants.capacity(),
                 overlaid.energies.capacity(),
-                fold.from.capacity(),
-                fold.signals.capacity(),
-                fold.gains.capacity(),
+                fold.mixer.from.capacity(),
+                fold.mixer.signals.capacity(),
+                fold.mixer.gains.capacity(),
             ]);
         }
 
@@ -3575,7 +3267,7 @@ mod tests {
         // The room's own floor, as an encode has it: the other tests here
         // decline it because they silence by gain, and this one is about a
         // source that is quiet rather than off.
-        fold.floor = hz_cluster::floor::Floor::for_dialnorm(-31.0);
+        fold.mixer.floor = hz_cluster::floor::Floor::for_dialnorm(-31.0);
         let states = states_of(&parts);
         let mut written = Vec::new();
         for block in [&loud, &faint, &faint] {
@@ -4675,69 +4367,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod progress_tests {
-    use super::*;
-
-    /// Off, or with nothing to be a fraction of, there is no reporter — a
-    /// percentage of an unknown total is a number made up.
-    #[test]
-    fn there_is_nothing_to_report_without_a_total_or_a_flag() {
-        assert!(Progress::new(false, 48_000).is_none());
-        assert!(Progress::new(true, 0).is_none());
-        assert!(Progress::new(true, 1).is_some());
-    }
-
-    /// A whole programme's worth of units yields at most a hundred and one
-    /// lines, in order, without repeating — which is the whole reason it is a
-    /// whole percent and not a frame count.
-    #[test]
-    fn a_run_reports_each_whole_percent_once_and_in_order() {
-        // Two hours at 48 kHz, in forty-sample access units: 216 000 calls.
-        let total = 48_000u64 * 3600 * 2;
-        let mut progress = Progress::new(true, total).expect("a reporter");
-        let mut seen = Vec::new();
-        let mut at = 0u64;
-        if let Some(percent) = progress.stepped(at) {
-            seen.push(percent);
-        }
-        while at < total {
-            at = (at + 40).min(total);
-            if let Some(percent) = progress.stepped(at) {
-                seen.push(percent);
-            }
-        }
-
-        assert_eq!(seen.first(), Some(&0), "it starts at nothing");
-        assert_eq!(seen.last(), Some(&100), "and ends at everything");
-        assert_eq!(seen.len(), 101, "one line a percent, and no more");
-        assert!(
-            seen.windows(2).all(|pair| pair[1] > pair[0]),
-            "never backwards, never twice"
-        );
-    }
-
-    /// A short run reports fewer lines rather than the same hundred: eight
-    /// frames cannot be twelve and a half per cent done.
-    #[test]
-    fn a_run_shorter_than_a_hundred_frames_reports_what_it_has() {
-        let mut progress = Progress::new(true, 8).expect("a reporter");
-        let seen: Vec<u64> = (0..=8).filter_map(|at| progress.stepped(at)).collect();
-        assert_eq!(seen, vec![0, 12, 25, 37, 50, 62, 75, 87, 100]);
-    }
-
-    /// And a caller that overshoots its own total — a final unit padded past
-    /// the end — does not get a hundred and four per cent.
-    #[test]
-    fn overshooting_the_total_still_ends_at_a_hundred() {
-        let mut progress = Progress::new(true, 100).expect("a reporter");
-        assert_eq!(progress.stepped(100), Some(100));
-        assert_eq!(progress.stepped(140), None);
-    }
-}
-
-#[cfg(test)]
 mod depth_tests {
     use super::*;
+    use hz_programme::mix::FOLD_BITS;
 
     /// Twenty bits is a step of sixteen, twenty-four is a step of one.
     #[test]

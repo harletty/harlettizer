@@ -11,14 +11,18 @@
 //! layouts the mix presentation states: 7.1.4, and the stereo pair a decoder
 //! folds it to.
 
-use crate::encode::Progress;
-use crate::source::{Source, keyframes_of, tracks};
 use hz_analysis::loudness::{ChannelWeight, Meter};
 use hz_analysis::truepeak::TruePeak;
-use hz_core::{Error, Result, speakers};
+use hz_core::{Error, Result};
 use hz_iamf::{Codec, Element, Headphones, Loudness, PositionKind, Writer};
-use hz_io::adm::model::TypeDefinition;
 use hz_io::container::SampleFormat;
+use hz_programme::follow::Following;
+use hz_programme::mix::Mixing;
+use hz_programme::overlay;
+use hz_programme::progress::Progress;
+use hz_programme::quantise::{Levels, Quantiser};
+use hz_programme::source::Source;
+use hz_programme::{Part, parts_of};
 use hz_render::{Keyframe, Layout, Mixdown};
 use std::fs::File;
 use std::io::BufWriter;
@@ -43,37 +47,17 @@ pub struct Config {
     pub elements: Option<usize>,
     /// With `objects`: keep the master's elements and pan its last this-many
     /// objects onto them — `encode --overlay`, written as IAMF. See
-    /// [`crate::overlay`].
+    /// [`hz_programme::overlay`].
     pub overlay: Option<usize>,
     /// With `objects`: render the master's last this-many objects into the
     /// bed element, and carry the rest as objects.
     pub voices_to_bed: Option<usize>,
     /// What shapes an overlay: the same options, with the same defaults, as
     /// `encode --overlay`.
-    pub overlaying: Overlaying,
-}
-
-/// What shapes `--overlay` beyond its sources, as `encode` takes it.
-pub struct Overlaying {
-    /// How far a bed-only fit may land from a source before the moving
-    /// elements are let in; `None` declines the preference.
-    pub beds_first: Option<f64>,
-    /// What was typed for it, so that a negative reach is refused rather than
-    /// read as the preference declined.
-    pub beds_asked: f64,
-    pub bounds: crate::overlay::Bounds,
-    /// Whether a source may take a spare element of its own.
-    pub spare: bool,
-    /// Where the block-by-block account goes.
-    pub report: Option<PathBuf>,
-    /// What the mixed elements are rounded to, in bits.
-    pub fold_depth: u32,
-    /// What sets the audibility floor: see `hz_cluster::floor`.
-    pub dialnorm: f64,
-    /// Whether a limiter keeps the mixed elements inside the codec's domain.
-    pub limit: bool,
-    /// How a block's power is weighed.
-    pub weighing: hz_cluster::scene::Loudness,
+    pub overlaying: overlay::Options,
+    /// What a mix does to the elements it makes: the same options, with the
+    /// same defaults, as `encode`'s.
+    pub mixing: Mixing,
 }
 
 /// Samples a channel per temporal unit, unless asked otherwise: a FLAC block
@@ -92,14 +76,6 @@ pub const OPUS_FRAME: usize = 960;
 /// 7.1.4 at about 720 kbit/s, between a streaming service's immersive tier
 /// and a disc's.
 pub const OPUS_BITRATE: u32 = 64;
-
-/// An object of the master: its input channel, its updates, and the next one
-/// to act on.
-struct Moving {
-    source: usize,
-    keyframes: Vec<Keyframe>,
-    next: usize,
-}
 
 /// The output, open, with its descriptors written.
 pub(crate) type Output = Writer<BufWriter<File>>;
@@ -149,25 +125,6 @@ pub(crate) fn open_presenting(
         hz_iamf::Error::Io(e) => Error::io(&config.out, e),
         hz_iamf::Error::Unsupported(what) => Error::unsupported(&config.out, what),
     })
-}
-
-/// Read up to `want` frames into `raw`, as many reads as it takes: how many
-/// landed, fewer only at the end of the input.
-pub(crate) fn fill(
-    source: &mut Source,
-    raw: &mut [i32],
-    want: usize,
-    stride: usize,
-) -> Result<usize> {
-    let mut got = 0;
-    while got < want {
-        let landed = source.read(&mut raw[got * stride..want * stride])?;
-        if landed == 0 {
-            break;
-        }
-        got += landed;
-    }
-    Ok(got)
 }
 
 /// The loudness of what a decoder hands back, measured as it goes: a 7.1.4
@@ -300,37 +257,30 @@ pub fn run(config: Config) -> Result<()> {
     let width = layout.channels();
     let lfe = layout.index_of("LFE1").expect("7.1.4 has an LFE");
 
-    // Every track to a source of the mixdown.
-    let mut mixdown = Mixdown::new(&layout)?;
-    let mut moving = Vec::new();
+    // Every track to a source of the mixdown, in the master's order: a bed
+    // channel to its speaker, or — one 7.1.4 does not have, a wide, a top
+    // side — an object that never moves from its speaker; an object on its
+    // path.
+    let mut following = Following::new(Mixdown::new(&layout)?);
     let (mut routed, mut placed, mut objects) = (0usize, 0usize, 0usize);
-    let described = source.adm();
-    for track in tracks(path, described, stride)? {
-        match track.format.type_definition {
-            TypeDefinition::DirectSpeakers => {
-                let label = track.speaker_label();
-                // Either spelling: an ADM label, or a master's channel name.
-                let label = speakers::by_master_name(label).map_or(label, |s| s.label);
-                if speakers::is_lfe_label(label) {
-                    mixdown.speaker(track.source_channel, lfe);
-                    routed += 1;
-                } else if let Some(channel) = layout.index_of(label) {
-                    mixdown.speaker(track.source_channel, channel);
+    for part in parts_of(path, &source)? {
+        match part {
+            Part::Lfe { channel } => {
+                following.mixdown().speaker(channel, lfe);
+                routed += 1;
+            }
+            Part::Bed {
+                channel,
+                name,
+                position,
+            } => {
+                let label = hz_core::speakers::by_master_name(name).map_or(name, |s| s.label);
+                let mixdown = following.mixdown();
+                if let Some(speaker) = layout.index_of(label) {
+                    mixdown.speaker(channel, speaker);
                     routed += 1;
                 } else {
-                    // A bed channel 7.1.4 does not have — a wide, a top
-                    // side — is an object that never moves from its speaker.
-                    let position = hz_render::fold::bed_position(label).ok_or_else(|| {
-                        Error::unsupported(
-                            path,
-                            format!(
-                                "track {} is the bed channel `{label}`, which has no place in \
-                                 the room to render it at",
-                                track.number
-                            ),
-                        )
-                    })?;
-                    let index = mixdown.object(track.source_channel);
+                    let index = mixdown.object(channel);
                     mixdown.update(
                         index,
                         &Keyframe {
@@ -341,32 +291,10 @@ pub fn run(config: Config) -> Result<()> {
                     placed += 1;
                 }
             }
-            TypeDefinition::Objects => {
-                let index = mixdown.object(track.source_channel);
-                let keyframes = keyframes_of(track.format, described.sample_rate);
-                // Where and as loud as its first update says from the first
-                // sample, as `encode` and `--objects` carry it, rather than
-                // silent until that update arrives.
-                if let Some(first) = keyframes.iter().min_by_key(|k| k.sample_pos) {
-                    mixdown.update(
-                        index,
-                        &Keyframe {
-                            ramp_samples: 0,
-                            ..*first
-                        },
-                    );
-                }
-                moving.push(Moving {
-                    source: index,
-                    keyframes,
-                    next: 0,
-                });
+            Part::Object { channel, keyframes } => {
+                following.object(channel, &keyframes);
                 objects += 1;
             }
-            other => eprintln!(
-                "note: track {} is `{other}` audio, which a bed render does not take; left out",
-                track.number
-            ),
         }
     }
     if routed + placed + objects == 0 {
@@ -388,15 +316,14 @@ pub fn run(config: Config) -> Result<()> {
     let mut measured = vec![0f32; frame * width];
     let mut measure = Measure::new(sample_rate);
 
-    let full_scale = f64::from(1u32 << (config.bits - 1));
-    let (low, high) = (-full_scale, full_scale - 1.0);
-    let mut clipped = 0u64;
-    let mut mix_peak = 0.0f64;
+    let quantiser = Quantiser::bits(config.bits);
+    let full_scale = quantiser.full_scale();
+    let mut levels = Levels::default();
 
     let mut at = 0u64;
     while at < total {
         let want = (total - at).min(frame as u64) as usize;
-        let got = fill(&mut source, &mut raw, want, stride)?;
+        let got = source.fill(&mut raw, want)?;
         if got == 0 {
             break;
         }
@@ -407,29 +334,13 @@ pub fn run(config: Config) -> Result<()> {
         // The block, split at every update the master makes inside it so
         // that each lands on its own sample.
         mixed[..got * width].fill(0.0);
-        let mut done = 0;
-        while done < got {
-            let now = at + done as u64;
-            let mut next_update = u64::MAX;
-            for object in &mut moving {
-                while let Some(state) = object.keyframes.get(object.next) {
-                    if state.sample_pos > now {
-                        next_update = next_update.min(state.sample_pos);
-                        break;
-                    }
-                    mixdown.update(object.source, state);
-                    object.next += 1;
-                }
-            }
-            let end = next_update.saturating_sub(at).min(got as u64) as usize;
-            mixdown.render(
-                &input[done * stride..got * stride],
-                stride,
-                end - done,
-                &mut mixed[done * width..got * width],
-            );
-            done = end;
-        }
+        following.render(
+            &input[..got * stride],
+            stride,
+            got,
+            at,
+            &mut mixed[..got * width],
+        );
 
         // Into the codec's integers, and measured as a decoder will hand them
         // back: the bed as it is, and folded to stereo the decoder's way.
@@ -437,12 +348,7 @@ pub fn run(config: Config) -> Result<()> {
             .iter_mut()
             .zip(&mixed[..got * width])
         {
-            let scaled = (m * full_scale).round();
-            mix_peak = mix_peak.max(m.abs());
-            if scaled < low || scaled > high {
-                clipped += 1;
-            }
-            *q = scaled.clamp(low, high) as i32;
+            *q = quantiser.code(m, &mut levels);
         }
         for (f, &q) in measured[..got * width]
             .iter_mut()
@@ -507,13 +413,15 @@ pub fn run(config: Config) -> Result<()> {
     );
     report_loudness(loudness);
     println!(
-        "  headroom     {clipped} samples clipped, the bed peaking at {mix_peak:.2} of full scale \
-         before the codec's integers"
+        "  headroom     {} samples clipped, the bed peaking at {:.2} of full scale before the \
+         codec's integers",
+        levels.clipped, levels.peak
     );
-    if clipped > 0 {
+    if levels.clipped > 0 {
         eprintln!(
-            "warning: the render clipped {clipped} samples; the master's objects sum past full \
-             scale on 7.1.4"
+            "warning: the render clipped {} samples; the master's objects sum past full scale on \
+             7.1.4",
+            levels.clipped
         );
     }
     report_written(&config, at, sample_rate)

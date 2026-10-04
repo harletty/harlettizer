@@ -15,13 +15,14 @@
 //! See [`hz_cluster::overlay`] for what the mode is for, and `docs/encode.md`
 //! for what it guarantees and why it refuses.
 
+use crate::part::Part;
 use hz_cluster::Clustering;
 use hz_cluster::mix::Limiter;
 use hz_cluster::scene::Scene;
 use hz_core::{Error, Result};
 use hz_render::Keyframe;
 use hz_render::Mode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What an overlay refuses to write, and what it only remarks on.
 ///
@@ -48,7 +49,7 @@ use std::path::Path;
 /// time, and a guard that counted silent blocks would measure how much of the
 /// programme nobody is speaking in.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Bounds {
+pub struct Bounds {
     /// How far a source may be from where it asked to be, in degrees, before
     /// the block counts against it. Refused past [`OVERLAY_SHARE`] of the
     /// voiced blocks, or on any run longer than [`OVERLAY_RUN`].
@@ -57,7 +58,7 @@ pub(crate) struct Bounds {
     /// the point at which a voice is in a different part of the room from the
     /// picture, which is what a dub cannot ship with. Half of it is remarked
     /// on, which is about where the rear blur stops forgiving.
-    pub(crate) drift: f64,
+    pub drift: f64,
     /// The least the strongest element carrying a source may hold, as a
     /// fraction of the source's own level. Under it the source is diffuse:
     /// no one element is rendering it, so it arrives from everywhere the fit
@@ -65,7 +66,7 @@ pub(crate) struct Bounds {
     ///
     /// A half is one element holding three quarters of the power. Refused past
     /// [`OVERLAY_SHARE`] of the voiced blocks.
-    pub(crate) spread: f64,
+    pub spread: f64,
     /// How much of the source's movement may be movement nobody asked for, as
     /// a percentage of the windows it was heard in — `hz_cluster::motion`'s
     /// `wobbling`, measured on where the carriers actually put the source.
@@ -75,7 +76,7 @@ pub(crate) struct Bounds {
     /// a still voice carried by moving elements. This is the guard that
     /// catches it, and it is the only one that needs a time axis to see the
     /// defect at all.
-    pub(crate) wobble: f64,
+    pub wobble: f64,
     /// How far a source's rendered level may be from what it asked for, in
     /// decibels, on any presentation the stream is played through.
     ///
@@ -88,14 +89,14 @@ pub(crate) struct Bounds {
     /// catches the case the note was worried about, a voice landed on an
     /// element with a small stereo fold coefficient and vanishing from the
     /// downmix.
-    pub(crate) level: f64,
+    pub level: f64,
     /// The worst a source's fold may cost, as a fraction of its own gain
     /// vector — `hz_cluster::metric`'s own measure, restricted to the sources.
     /// The elements are not in it: they are not folded.
-    pub(crate) cost: f64,
+    pub cost: f64,
     /// Whether a source the fit could not place acceptably is routed to the
     /// nearest bed element outright. See [`Overlaid::fell_back`].
-    pub(crate) fallback: bool,
+    pub fallback: bool,
 }
 
 /// The bounds as they ship — see [`Bounds`], which says where each comes
@@ -119,6 +120,94 @@ impl Default for Bounds {
     }
 }
 
+/// What shapes an overlay beyond its sources: the same options, with the
+/// same defaults, whichever stream it is written into, because it is the
+/// same computation.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// How far a bed-only fit may land from a source before the moving
+    /// elements are let in — `hz_cluster::overlay::BEDS_FIRST`. `None`
+    /// declines the preference and fits over every element.
+    pub beds_first: Option<f64>,
+    /// What the caller actually typed for it, so that a negative reach can be
+    /// refused rather than read as the preference declined.
+    pub beds_asked: f64,
+    /// What an overlay refuses to write — see [`Bounds`].
+    pub bounds: Bounds,
+    /// Whether a source may take a spare element of its own when the stream
+    /// has room for more elements than the master brings — see
+    /// [`spare_slots`]. Off, the stream is exactly as wide as the master and
+    /// every source is panned.
+    pub spare: bool,
+    /// Where the block-by-block account goes — see [`Setup::report`].
+    pub report: Option<PathBuf>,
+}
+
+impl Options {
+    /// Refuse what no overlay can be asked for.
+    ///
+    /// Only the asked-for reach can be negative: the command line turns
+    /// anything not above nought into `None`, so testing the option as well
+    /// would be testing a thing that cannot happen.
+    pub fn check(&self, input: &Path) -> Result<()> {
+        if self.beds_asked < 0.0 {
+            return Err(Error::unsupported(
+                input,
+                format!(
+                    "a bed reach of {}; it is a distance, so nought declines the preference \
+                     and anything below that is a typed minus sign",
+                    self.beds_asked
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// How many of a master's `parts` an overlay of its last `sources` objects
+/// keeps as elements: the ones before the sources, of which there has to be
+/// at least one.
+pub fn kept(input: &Path, parts: usize, sources: usize) -> Result<usize> {
+    if sources == 0 {
+        return Err(Error::unsupported(
+            input,
+            "`--overlay 0`; an overlay with no sources is a plain encode of the master, which is \
+             what leaving the flag off already does",
+        ));
+    }
+    parts
+        .checked_sub(sources)
+        .filter(|kept| *kept > 0)
+        .ok_or_else(|| {
+            Error::unsupported(
+                input,
+                format!(
+                    "{sources} overlay sources out of {parts} objects; the sources are the \
+                     master's *last* objects and the ones before them are the elements they are \
+                     panned onto, so there has to be at least one of those"
+                ),
+            )
+        })
+}
+
+/// What [`beds_among`] reads of each of `parts`: its keyframes and whether
+/// the master declared it a bed channel, or `None` for the LFE.
+pub fn described(parts: &[Part]) -> Vec<Option<(&[Keyframe], bool)>> {
+    parts
+        .iter()
+        .map(|part| match part {
+            Part::Lfe { .. } => None,
+            Part::Bed { .. } => Some((&[][..], true)),
+            Part::Object { keyframes, .. } => Some((&keyframes[..], false)),
+        })
+        .collect()
+}
+
+/// What [`spare_slots`] reads of each source: where it starts.
+pub fn origins(sources: &[Part]) -> Vec<Option<[f64; 3]>> {
+    sources.iter().map(Part::origin).collect()
+}
+
 /// What share of the voiced blocks a bound may be exceeded in before the
 /// encode is refused.
 ///
@@ -126,7 +215,7 @@ impl Default for Bounds {
 /// programme is a block, and a dub that is refused for one block is a dub
 /// nobody can ship; not more, because a twentieth of the voiced blocks is
 /// already several seconds of dialogue in the wrong place over a feature.
-const OVERLAY_SHARE: f64 = 0.05;
+pub const OVERLAY_SHARE: f64 = 0.05;
 
 /// The longest unbroken run a bound may be exceeded for, in seconds, whatever
 /// the share.
@@ -135,7 +224,7 @@ const OVERLAY_SHARE: f64 = 0.05;
 /// and says nothing about whether it is wrong *all at once*, and those are
 /// different failures: a twentieth scattered over a feature is a fault nobody
 /// localises, and a twentieth in one place is a scene.
-const OVERLAY_RUN: f64 = 2.0;
+pub const OVERLAY_RUN: f64 = 2.0;
 
 /// Samples in one overlay block: thirty-two forty-sample units, 1280 at
 /// 48 kHz (26.7 ms) and as many more as the rate is a multiple of its family's
@@ -145,7 +234,7 @@ const OVERLAY_RUN: f64 = 2.0;
 /// The same block whatever the stream is written as, because the block is
 /// where the fit is decided and the weights ramp across: two writers with
 /// different blocks would write different overlays of one programme.
-pub(crate) fn block_samples(sample_rate: u32) -> usize {
+pub fn block_samples(sample_rate: u32) -> usize {
     let base = if sample_rate.is_multiple_of(44_100) && !sample_rate.is_multiple_of(48_000) {
         44_100
     } else {
@@ -154,40 +243,11 @@ pub(crate) fn block_samples(sample_rate: u32) -> usize {
     1280 * (sample_rate / base).max(1) as usize
 }
 
-/// One mixed sample into a writer's integers, `full_scale` to the unit and
-/// rounded to `step`.
-///
-/// An element is a *sum*, and a sum of objects that happen to agree is louder
-/// than any of them. Clamped rather than wrapped, and counted, because an
-/// overlay that clips is one whose elements had no headroom left for what was
-/// added to them. Counted against the domain *before* the step is applied: a
-/// sample the mix pushed past full scale is a clip, and one the rounding
-/// nudged over is not. The ceiling is the top of the domain that lands on the
-/// step, so that one sample near full scale does not take a block's wasted
-/// low bits with it.
-#[inline]
-pub(crate) fn quantise(
-    value: f32,
-    full_scale: f64,
-    step: f64,
-    peak: &mut f64,
-    clipped: &mut u64,
-) -> i32 {
-    let (floor, ceiling) = (-full_scale, full_scale - 1.0);
-    let raw = (f64::from(value) * full_scale).round();
-    *peak = peak.max(raw.abs() / full_scale);
-    if !(floor..=ceiling).contains(&raw) {
-        *clipped += 1;
-    }
-    let top = (ceiling / step).floor() * step;
-    ((raw / step).round() * step).clamp(floor, top) as i32
-}
-
 /// One kept element as a block ends: where the master has put it, and what a
 /// decoder applies to its own samples.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Kept {
-    pub(crate) position: [f64; 3],
+pub struct Kept {
+    pub position: [f64; 3],
     /// What a decoder multiplies the element's samples by before rendering
     /// it, so what a source's weight onto it is divided by for the sum to
     /// come out where the source asked; nought for an element a decoder
@@ -196,22 +256,22 @@ pub(crate) struct Kept {
     /// The writer's to say: a TrueHD element's gain is in its metadata, in
     /// the whole decibels the syntax carries; an IAMF object's is in its
     /// samples already, and this is one while it is heard at all.
-    pub(crate) stated: f64,
+    pub stated: f64,
 }
 
 /// One source as a block ends: where it asks to be, how wide, how it asks to
 /// be rendered, and — for a source that took a spare element of its own —
 /// what a decoder applies to that element.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Voice {
-    pub(crate) position: [f64; 3],
-    pub(crate) spread: f64,
-    pub(crate) mode: Mode,
-    pub(crate) stated: f64,
+pub struct Voice {
+    pub position: [f64; 3],
+    pub spread: f64,
+    pub mode: Mode,
+    pub stated: f64,
 }
 
 impl Voice {
-    pub(crate) fn of(state: &Keyframe, stated: f64) -> Self {
+    pub fn of(state: &Keyframe, stated: f64) -> Self {
         Self {
             position: state.position,
             spread: state.spread,
@@ -222,119 +282,119 @@ impl Voice {
 }
 
 /// What an overlay is set up with, once for the programme.
-pub(crate) struct Setup<'a> {
+pub struct Setup<'a> {
     /// How many trailing objects of the master are sources.
-    pub(crate) sources: usize,
+    pub sources: usize,
     /// Elements the master brought, the low frequency channel included.
-    pub(crate) elements: usize,
+    pub elements: usize,
     /// Which sources take a spare element of their own — see
     /// [`spare_slots`].
-    pub(crate) slots: Vec<usize>,
+    pub slots: Vec<usize>,
     /// Which elements are bed channels — see [`beds_among`].
-    pub(crate) beds: Vec<bool>,
+    pub beds: Vec<bool>,
     /// How many of those the master declared.
-    pub(crate) declared_beds: usize,
+    pub declared_beds: usize,
     /// The master channel of each element, slots included: see
     /// [`Overlaid::channels`].
-    pub(crate) channels: Vec<Option<usize>>,
-    pub(crate) bounds: Bounds,
+    pub channels: Vec<Option<usize>>,
+    pub bounds: Bounds,
     /// How far a bed-only fit may land before the moving elements are let in;
     /// `None` declines the preference. See `hz_cluster::overlay::BEDS_FIRST`.
-    pub(crate) beds_first: Option<f64>,
+    pub beds_first: Option<f64>,
     /// Where the block-by-block account goes, if anywhere.
-    pub(crate) report: Option<&'a Path>,
+    pub report: Option<&'a Path>,
     /// How long one block lasts, for the ruler that measures movement.
-    pub(crate) seconds_a_block: f64,
+    pub seconds_a_block: f64,
 }
 
 /// One block, as the writer hands it over.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Block {
+pub struct Block {
     /// One when element 0 is the low frequency channel, which has no signal
     /// among the objects; nought otherwise. The other kept elements are the
     /// objects in order, element `first + o` carrying object `o`.
-    pub(crate) first: usize,
+    pub first: usize,
     /// Elements the stream carries: the kept ones, then the spare slots.
-    pub(crate) elements: usize,
-    pub(crate) frames: usize,
+    pub elements: usize,
+    pub frames: usize,
 }
 
 /// What a block mixes through: the writer's buffers, kept across blocks.
-pub(crate) struct Buffers<'a> {
+pub struct Buffers<'a> {
     /// The block's scene, every object in it — the kept elements' and the
     /// sources' — pushed and finished: where the energies the fit and the
     /// guards weigh by come from.
-    pub(crate) scene: &'a Scene,
+    pub scene: &'a Scene,
     /// Every object's samples for the block, as the mix takes them: the kept
     /// elements', then the sources'.
-    pub(crate) signals: &'a [Vec<f32>],
+    pub signals: &'a [Vec<f32>],
     /// Each object's gain, applied before its weights: the sources' are the
     /// caller's, the elements' are set to one here.
-    pub(crate) gains: &'a mut [f64],
-    pub(crate) mixed: &'a mut Vec<Vec<f32>>,
+    pub gains: &'a mut [f64],
+    pub mixed: &'a mut Vec<Vec<f32>>,
     /// The previous block's mix matrix, which this one ramps from.
-    pub(crate) from: &'a mut Vec<Vec<f64>>,
-    pub(crate) limiter: Option<&'a mut Limiter>,
+    pub from: &'a mut Vec<Vec<f64>>,
+    pub limiter: Option<&'a mut Limiter>,
     /// The top of the writer's domain, as a fraction of full scale, for the
     /// limiter.
-    pub(crate) ceiling: f64,
-    pub(crate) floor: &'a hz_cluster::floor::Floor,
-    pub(crate) renderers: &'a [Box<dyn hz_render::Renderer>],
+    pub ceiling: f64,
+    pub floor: &'a hz_cluster::floor::Floor,
+    pub renderers: &'a [Box<dyn hz_render::Renderer>],
 }
 
 /// What a block cost, for the writer's running totals.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Spent {
+pub struct Spent {
     /// The sources' fold cost over the presentations, mean and worst, when
     /// any source was judged.
-    pub(crate) cost: Option<(f64, f64)>,
+    pub cost: Option<(f64, f64)>,
 }
 
 /// The writer's running totals, which the guards read beside their own.
-pub(crate) struct Totals<'a> {
-    pub(crate) blocks: u64,
+pub struct Totals<'a> {
+    pub blocks: u64,
     /// The sources' fold cost, summed over the blocks.
-    pub(crate) mean: f64,
-    pub(crate) clipped: u64,
-    pub(crate) limiter: Option<&'a Limiter>,
+    pub mean: f64,
+    pub clipped: u64,
+    pub limiter: Option<&'a Limiter>,
 }
 
 /// Keeping the master's elements and panning its last few objects onto them
 /// — `--overlay`. See [`hz_cluster::overlay`] for what this is for.
-pub(crate) struct Overlaid {
-    pub(crate) overlay: hz_cluster::overlay::Overlay,
+pub struct Overlaid {
+    pub overlay: hz_cluster::overlay::Overlay,
     /// How many trailing objects of the master are sources rather than
     /// elements.
-    pub(crate) sources: usize,
+    pub sources: usize,
     /// Elements the master brought, the low frequency channel included. The
     /// sources that took a spare slot are written after these.
-    pub(crate) elements: usize,
+    pub elements: usize,
     /// One source's weights over this block's carriers, and the elements'
     /// metadata for the payload. Both are refilled rather than rebuilt: a
     /// block is 27 ms, and an allocation a block is an allocation forty times
     /// a second for the length of a feature.
-    pub(crate) row: Vec<f64>,
+    pub row: Vec<f64>,
     /// Which elements this block mixed, for the limiter.
-    pub(crate) live: Vec<bool>,
+    pub live: Vec<bool>,
     /// The sources that were panned rather than given an element, and their
     /// rows, rebuilt each block — what the metric judges.
-    pub(crate) panned: Vec<hz_cluster::Object>,
+    pub panned: Vec<hz_cluster::Object>,
     /// Whether each source took a spare element, by index. The same fact as
     /// [`Overlaid::slots`], in the shape three hot loops a block want it in.
-    pub(crate) slotted: Vec<bool>,
+    pub slotted: Vec<bool>,
     /// Which source took which spare element of its own, in the order the
     /// slots are written. See [`spare_slots`] and `docs/encode.md`.
-    pub(crate) slots: Vec<usize>,
+    pub slots: Vec<usize>,
     /// The elements a source may be panned onto this block: active, not
     /// muted, and not the low frequency channel. Refilled every block.
-    pub(crate) carriers: Vec<hz_cluster::overlay::Carrier>,
+    pub carriers: Vec<hz_cluster::overlay::Carrier>,
     /// Which elements are bed channels — see [`beds_among`], which works it
     /// out rather than trusting the master to declare it. Decided once, since
     /// it is a property of the whole programme and not of a block.
-    pub(crate) beds: Vec<bool>,
+    pub beds: Vec<bool>,
     /// How many of them the master declared, so the summary can say which
     /// regime a run was in.
-    pub(crate) declared_beds: usize,
+    pub declared_beds: usize,
     /// `weights[source][element]` as the fit gave them: what the held set is
     /// judged on and what the mix is built from.
     ///
@@ -343,91 +403,91 @@ pub(crate) struct Overlaid {
     /// latest answer and `weights` is the spare the next fit will fill —
     /// which is the right way round for the next block and the wrong way
     /// round for anything reading them afterwards.
-    pub(crate) weights: Vec<Vec<f64>>,
-    pub(crate) previous: Vec<Vec<f64>>,
+    pub weights: Vec<Vec<f64>>,
+    pub previous: Vec<Vec<f64>>,
     /// The sources as the fit sees them, rebuilt each block from the master's
     /// state and the block's own energies.
-    pub(crate) fitting: Vec<hz_cluster::Object>,
+    pub fitting: Vec<hz_cluster::Object>,
     /// The mix matrix over every object of the master: an element carrying
     /// itself, a source spread over the carriers and divided by their gains.
-    pub(crate) mix: Vec<Vec<f64>>,
+    pub mix: Vec<Vec<f64>>,
     /// Where every element is this block, for the presentations.
-    pub(crate) positions: Vec<[f64; 3]>,
+    pub positions: Vec<[f64; 3]>,
     /// And the gain the payload states for each, in the same order: what a
     /// decoder rendering the elements applies, so what the presentations
     /// have to fold them at to sound like it.
-    pub(crate) stated: Vec<f64>,
+    pub stated: Vec<f64>,
     /// Which elements a source reaches this block or reached last — the rest
     /// are copied through rather than mixed, and so are not rounded either.
-    pub(crate) touched: Vec<bool>,
+    pub touched: Vec<bool>,
     /// Per element, the source channel it is copied from, or `None` when it is
     /// one of the few that this block actually mixes.
-    pub(crate) copy_from: Vec<Option<usize>>,
+    pub copy_from: Vec<Option<usize>>,
     /// Element-blocks copied through untouched, and element-blocks mixed.
-    pub(crate) copied: u64,
-    pub(crate) remixed: u64,
+    pub copied: u64,
+    pub remixed: u64,
     /// Blocks where an audible source had no carrier at all.
-    pub(crate) stranded: u64,
+    pub stranded: u64,
     /// How far the carriers put the audible sources from where they asked to
     /// be, summed and at its worst — see `hz_cluster::overlay::drift`.
-    pub(crate) drift: f64,
-    pub(crate) drifted: u64,
-    pub(crate) worst_drift: f64,
+    pub drift: f64,
+    pub drifted: u64,
+    pub worst_drift: f64,
     /// What the encode refuses to write, and what it only remarks on.
-    pub(crate) bounds: Bounds,
+    pub bounds: Bounds,
     /// Source-blocks in which each bound was exceeded, over the voiced ones.
     /// The denominator is [`Overlaid::drifted`]: a source is counted once a
     /// block, in the blocks it was audible in.
-    pub(crate) over_drift: u64,
+    pub over_drift: u64,
     /// And over half of it, which is what the remark is about — a remark that
     /// quotes the refusal's share beside the half bound contradicts itself.
-    pub(crate) over_half_drift: u64,
-    pub(crate) over_spread: u64,
-    pub(crate) over_level: u64,
-    pub(crate) over_cost: u64,
+    pub over_half_drift: u64,
+    pub over_spread: u64,
+    pub over_level: u64,
+    pub over_cost: u64,
     /// The longest unbroken run of blocks a source was past the drift bound
     /// for, and the run each source is in now. In blocks; the summary turns
     /// them into seconds.
-    pub(crate) run: Vec<u64>,
-    pub(crate) worst_run: u64,
+    pub run: Vec<u64>,
+    pub worst_run: u64,
     /// The same for a source with nowhere at all to go, and the run it is in.
-    pub(crate) stranded_run: Vec<u64>,
-    pub(crate) worst_stranded_run: u64,
+    pub stranded_run: Vec<u64>,
+    pub worst_stranded_run: u64,
     /// How far a source's rendered level strayed on any presentation, at its
     /// worst, in decibels; and the worst a source's fold cost, with what each
     /// presentation cost in the block that was worst.
-    pub(crate) worst_level: f64,
-    pub(crate) worst_cost: f64,
-    pub(crate) worst_cost_where: String,
+    pub worst_level: f64,
+    pub worst_cost: f64,
+    pub worst_cost_where: String,
     /// Where the carriers actually put each source, block after block, and
     /// what of that movement nobody asked for — `hz_cluster::motion`. The
     /// sources are static, so all of it is invented.
-    pub(crate) motion: hz_cluster::motion::Motion,
-    pub(crate) resultants: Vec<[f64; 3]>,
-    pub(crate) energies: Vec<f64>,
+    pub motion: hz_cluster::motion::Motion,
+    pub resultants: Vec<[f64; 3]>,
+    pub energies: Vec<f64>,
     /// Where each source was last heard, held through the silence after it so
     /// that a phrase boundary is not read as movement. `None` before a source
     /// has ever been audible.
-    pub(crate) resting: Vec<Option<[f64; 3]>>,
+    pub resting: Vec<Option<[f64; 3]>>,
     /// Whether each source was above the floor this block and the last, which
     /// is what decides an element is copied rather than what its weights say.
-    pub(crate) audible: Vec<bool>,
-    pub(crate) was_audible: Vec<bool>,
+    pub audible: Vec<bool>,
+    pub was_audible: Vec<bool>,
     /// Blocks in which nothing at all was mixed — every element copied — which
     /// is the share of the *running time* the fast path took, as against the
     /// share of element-blocks it took.
-    pub(crate) whole: u64,
+    pub whole: u64,
     /// Blocks in which at least one source was above the audibility floor,
     /// which is what every share below is a share *of*. A dub is silent most
     /// of the time, and a guard counting silent blocks would measure how much
     /// of the programme nobody is speaking in.
-    pub(crate) voiced: u64,
+    pub voiced: u64,
     /// Source-blocks routed to the nearest bed because the fit could not place
     /// them acceptably — see `--overlay-fallback`.
-    pub(crate) fell_back: u64,
+    pub fell_back: u64,
     /// The clustering the sources are judged as, rebuilt each block: the
     /// elements where the master put them, and the sources' own weights.
-    pub(crate) judged: Clustering,
+    pub judged: Clustering,
     /// Where the block-by-block account goes, when one was asked for.
     ///
     /// # Why an encoder writes down its own workings
@@ -447,26 +507,26 @@ pub(crate) struct Overlaid {
     ///
     /// Off by default and free when off: a run that asks for no account
     /// touches none of this.
-    pub(crate) report: Option<std::io::BufWriter<std::fs::File>>,
+    pub report: Option<std::io::BufWriter<std::fs::File>>,
     /// Blocks and samples written so far, so the account can say where it is
     /// without the span loop having to tell it.
-    pub(crate) reported_blocks: u64,
-    pub(crate) reported_at: u64,
+    pub reported_blocks: u64,
+    pub reported_at: u64,
     /// The master channel each element's own audio is — the kept elements',
     /// then the spare slots' sources' — or `None` for an element that has
     /// none. What a copied element is copied from, and what the account names.
-    pub(crate) channels: Vec<Option<usize>>,
+    pub channels: Vec<Option<usize>>,
     /// What a decoder applies to each element this block, by element: what a
     /// source's weight onto it is divided by, nought for one it silences.
-    pub(crate) by_element: Vec<f64>,
+    pub by_element: Vec<f64>,
     /// The block's kept elements and sources, as the caller states them —
     /// see [`Overlaid::span`]. Filled by the caller and refilled every block.
-    pub(crate) kept: Vec<Option<Kept>>,
-    pub(crate) voices: Vec<Voice>,
+    pub kept: Vec<Option<Kept>>,
+    pub voices: Vec<Voice>,
 }
 
 impl Overlaid {
-    pub(crate) fn new(input: &Path, setup: Setup<'_>) -> Result<Self> {
+    pub fn new(input: &Path, setup: Setup<'_>) -> Result<Self> {
         let Setup {
             sources,
             elements,
@@ -585,7 +645,7 @@ impl Overlaid {
     /// re-voiced stream and a re-encoded one. The low frequency channel is always
     /// copied, and so is an element a source took a spare slot in, which
     /// carries that source alone.
-    pub(crate) fn span(&mut self, block: Block, buffers: Buffers<'_>) -> std::io::Result<Spent> {
+    pub fn span(&mut self, block: Block, buffers: Buffers<'_>) -> std::io::Result<Spent> {
         let Block {
             first,
             elements,
@@ -1150,9 +1210,9 @@ impl Overlaid {
 }
 
 /// One thing the guards found, and how seriously.
-pub(crate) struct Remark {
-    pub(crate) refused: bool,
-    pub(crate) said: String,
+pub struct Remark {
+    pub refused: bool,
+    pub said: String,
 }
 
 /// What the guards say about the stream that was just written.
@@ -1164,7 +1224,7 @@ pub(crate) struct Remark {
 /// The stream is **left on disk** when this refuses. A refusal is a statement
 /// about what is in the file, and the fastest way to check a bound nobody has
 /// listened to yet is to listen to what it stopped.
-pub(crate) fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Vec<Remark> {
+pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Vec<Remark> {
     let mut out = Vec::new();
     let bounds = overlaid.bounds;
     let voiced = overlaid.voiced.max(1) as f64;
@@ -1364,7 +1424,7 @@ pub(crate) fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64
 /// untouched and how far the sources ended up from where they asked to be.
 /// Everything else an overlay could report is the clustering's and is not
 /// stated here, because an overlay does not do it.
-pub(crate) fn summary(overlaid: &Overlaid, blocks: u64, beds_reach: Option<f64>) {
+pub fn summary(overlaid: &Overlaid, blocks: u64, beds_reach: Option<f64>) {
     let element_blocks = overlaid.copied + overlaid.remixed;
     println!(
         "  overlay      {} elements kept, {} sources panned onto them{}",
@@ -1466,7 +1526,7 @@ pub(crate) fn summary(overlaid: &Overlaid, blocks: u64, beds_reach: Option<f64>)
 /// The stream is left where it was written: a refusal is a statement about
 /// what is in the file, and the fastest way to check a bound nobody has
 /// listened to yet is to listen to what it stopped.
-pub(crate) fn verdict(remarks: &[Remark], out: &Path) -> Result<()> {
+pub fn verdict(remarks: &[Remark], out: &Path) -> Result<()> {
     for remark in remarks.iter().filter(|remark| !remark.refused) {
         println!("  note         {}", remark.said);
     }
@@ -1515,7 +1575,7 @@ pub(crate) fn verdict(remarks: &[Remark], out: &Path) -> Result<()> {
 /// a speaker's place is not a bed: it is an object that happens to be still,
 /// and pinning a source to it would be choosing a place the mix never called a
 /// speaker.
-pub(crate) fn beds_among<Q: PartialEq>(
+pub fn beds_among<Q: PartialEq>(
     elements: &[Option<(&[Keyframe], bool)>],
     grid: impl Fn([f64; 3]) -> Q,
 ) -> Vec<bool> {
@@ -1559,7 +1619,7 @@ pub(crate) fn beds_among<Q: PartialEq>(
 /// so where an error is least forgiven. Stated as an angle rather than as a
 /// channel name on purpose: the sources are objects at speaker places and
 /// what makes one the centre is where it is, not what a master called it.
-pub(crate) fn spare_slots(origins: &[Option<[f64; 3]>], spare: usize, allowed: bool) -> Vec<usize> {
+pub fn spare_slots(origins: &[Option<[f64; 3]>], spare: usize, allowed: bool) -> Vec<usize> {
     let sources = origins.len();
     if !allowed || spare == 0 || sources == 0 {
         return Vec::new();
@@ -1596,36 +1656,5 @@ mod tests {
         assert_eq!(block_samples(96_000), 2560);
         assert_eq!(block_samples(44_100), 1280);
         assert_eq!(block_samples(88_200), 2560);
-    }
-
-    /// Rounded to the step, clamped to the top of the domain that lands on
-    /// it, and a clip counted only where the mix itself went past full scale.
-    #[test]
-    fn a_mixed_sample_lands_on_the_step_inside_the_domain() {
-        let (mut peak, mut clipped) = (0.0, 0u64);
-        let full = 8_388_608.0;
-        assert_eq!(
-            quantise(0.5, full, 16.0, &mut peak, &mut clipped),
-            4_194_304
-        );
-        assert_eq!(
-            quantise(
-                1.0 / full as f32 * 23.0,
-                full,
-                16.0,
-                &mut peak,
-                &mut clipped
-            ),
-            16
-        );
-        assert_eq!(clipped, 0);
-        let top = quantise(1.0, full, 16.0, &mut peak, &mut clipped);
-        assert_eq!(top, 8_388_592);
-        assert_eq!(clipped, 1);
-        assert_eq!(
-            quantise(-1.0, full, 16.0, &mut peak, &mut clipped),
-            -8_388_608
-        );
-        assert_eq!(clipped, 1);
     }
 }
