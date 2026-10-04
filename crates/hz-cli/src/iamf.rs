@@ -41,6 +41,39 @@ pub struct Config {
     /// With `objects`: the most object elements to use, folding the master's
     /// objects into them when it has more.
     pub elements: Option<usize>,
+    /// With `objects`: keep the master's elements and pan its last this-many
+    /// objects onto them — `encode --overlay`, written as IAMF. See
+    /// [`crate::overlay`].
+    pub overlay: Option<usize>,
+    /// With `objects`: render the master's last this-many objects into the
+    /// bed element, and carry the rest as objects.
+    pub voices_to_bed: Option<usize>,
+    /// What shapes an overlay: the same options, with the same defaults, as
+    /// `encode --overlay`.
+    pub overlaying: Overlaying,
+}
+
+/// What shapes `--overlay` beyond its sources, as `encode` takes it.
+pub struct Overlaying {
+    /// How far a bed-only fit may land from a source before the moving
+    /// elements are let in; `None` declines the preference.
+    pub beds_first: Option<f64>,
+    /// What was typed for it, so that a negative reach is refused rather than
+    /// read as the preference declined.
+    pub beds_asked: f64,
+    pub bounds: crate::overlay::Bounds,
+    /// Whether a source may take a spare element of its own.
+    pub spare: bool,
+    /// Where the block-by-block account goes.
+    pub report: Option<PathBuf>,
+    /// What the mixed elements are rounded to, in bits.
+    pub fold_depth: u32,
+    /// What sets the audibility floor: see `hz_cluster::floor`.
+    pub dialnorm: f64,
+    /// Whether a limiter keeps the mixed elements inside the codec's domain.
+    pub limit: bool,
+    /// How a block's power is weighed.
+    pub weighing: hz_cluster::scene::Loudness,
 }
 
 /// Samples a channel per temporal unit, unless asked otherwise: a FLAC block
@@ -81,6 +114,21 @@ fn is_matroska(out: &std::path::Path) -> bool {
 
 /// Open `config.out` and start a sequence of these elements there.
 pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
+    open_presenting(
+        config,
+        sample_rate,
+        elements,
+        hz_iamf::Presentation::default(),
+    )
+}
+
+/// [`open`], the mix presentation stating `presentation` as well.
+pub(crate) fn open_presenting(
+    config: &Config,
+    sample_rate: u32,
+    elements: Vec<Element>,
+    presentation: hz_iamf::Presentation,
+) -> Result<Output> {
     let out_file = File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
     let iamf_config = hz_iamf::Config {
         elements,
@@ -89,6 +137,7 @@ pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) ->
         bits: config.bits,
         frame: config.frame,
         headphones: config.headphones,
+        presentation,
     };
     let out = BufWriter::new(out_file);
     let writer = if is_matroska(&config.out) {
@@ -294,9 +343,22 @@ pub fn run(config: Config) -> Result<()> {
             }
             TypeDefinition::Objects => {
                 let index = mixdown.object(track.source_channel);
+                let keyframes = keyframes_of(track.format, described.sample_rate);
+                // Where and as loud as its first update says from the first
+                // sample, as `encode` and `--objects` carry it, rather than
+                // silent until that update arrives.
+                if let Some(first) = keyframes.iter().min_by_key(|k| k.sample_pos) {
+                    mixdown.update(
+                        index,
+                        &Keyframe {
+                            ramp_samples: 0,
+                            ..*first
+                        },
+                    );
+                }
                 moving.push(Moving {
                     source: index,
-                    keyframes: keyframes_of(track.format, described.sample_rate),
+                    keyframes,
                     next: 0,
                 });
                 objects += 1;
@@ -461,7 +523,7 @@ fn decibels(linear: f64) -> f64 {
     20.0 * linear.log10()
 }
 
-fn lkfs(value: f64) -> String {
+pub(crate) fn lkfs(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.1} LKFS")
     } else {

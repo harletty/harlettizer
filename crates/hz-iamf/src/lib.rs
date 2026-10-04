@@ -19,6 +19,7 @@
 //!     bits: 24,
 //!     frame: 4096,
 //!     headphones: Headphones::Stereo,
+//!     presentation: Default::default(),
 //! };
 //! let mut writer = Writer::new(std::fs::File::create("programme.iamf")?, config)?;
 //! writer.push(&vec![0i32; 4096 * 12], &[])?;
@@ -38,4 +39,7 @@ pub mod stream;
 
 pub use layout::Layout;
 pub use position::{Animation, PositionKind, Subblock};
-pub use stream::{Codec, Config, Element, Error, Headphones, Loudness, PositionBlock, Writer};
+pub use stream::{
+    Anchor, Codec, Config, Element, Error, GainOffset, Headphones, Labels, Loudness, PositionBlock,
+    Presentation, Writer,
+};

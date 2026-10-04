@@ -4,6 +4,7 @@ mod convert;
 mod encode;
 mod iamf;
 mod iamf_objects;
+mod overlay;
 mod source;
 
 use clap::{Parser, Subcommand};
@@ -122,138 +123,11 @@ enum Command {
         #[arg(long, value_name = "SOURCES", conflicts_with = "cluster")]
         overlay: Option<usize>,
 
-        /// How far a fit confined to the bed elements may land from a source,
-        /// as a fraction of what the source radiates, before the moving
-        /// elements are let in. Zero declines the preference and fits over
-        /// every element.
-        ///
-        /// A bed is still and a dynamic element is wherever the mix put it
-        /// this block, so a static source carried by a moving element is
-        /// rendered somewhere different every block although it never asked to
-        /// move. Preferring the beds is what stops that, and the default is one
-        /// step back from where it would start deciding anything: over a 7.1
-        /// bed everything the floor ring covers costs under a tenth and
-        /// anything with height costs over a half. Only means anything with
-        /// `--overlay`. See `hz_cluster::overlay`.
-        #[arg(long, value_name = "REACH", default_value_t = hz_cluster::overlay::BEDS_FIRST, allow_hyphen_values = true)]
-        overlay_beds: f64,
+        #[command(flatten)]
+        overlaid: OverlayArgs,
 
-        /// Refuse the encode if a source ends up more than this many degrees
-        /// from where it asked to be, on more than a twentieth of the blocks
-        /// it is audible in or for an unbroken run of more than two seconds.
-        ///
-        /// Thirty degrees is not a localisation bound — it is far past one.
-        /// It is the point at which a voice is in a different part of the room
-        /// from the picture, which is what a dub cannot ship with; half of it
-        /// is remarked on instead, which is about where the rear blur stops
-        /// forgiving. Nought declines the guard.
-        #[arg(long, value_name = "DEGREES", default_value_t = encode::OVERLAY_DRIFT)]
-        overlay_drift: f64,
-
-        /// Refuse the encode if the strongest element carrying a source holds
-        /// less than this fraction of it, on more than a twentieth of the
-        /// blocks it is audible in.
-        ///
-        /// Under it the source is diffuse: no one element is rendering it, so
-        /// it arrives from everywhere the fit reached and moves whenever any
-        /// of those elements does. A half is one element holding three
-        /// quarters of the power. Nought declines the guard.
-        #[arg(long, value_name = "WEIGHT", default_value_t = encode::OVERLAY_SPREAD)]
-        overlay_spread: f64,
-
-        /// Refuse the encode if more than this percentage of the windows a
-        /// source was heard in carry movement nobody asked for.
-        ///
-        /// The sources of a dub are static, so every out-and-back in where
-        /// the carriers put them is the breathing an overlay can produce: a
-        /// still voice carried by moving elements. This is the only guard
-        /// with a time axis, and so the only one that can see that defect at
-        /// all. Nought declines it. See `hz_cluster::motion`.
-        #[arg(long, value_name = "PERCENT", default_value_t = encode::OVERLAY_WOBBLE)]
-        overlay_wobble: f64,
-
-        /// Refuse the encode if a source's rendered level is more than this
-        /// many decibels from what it asked for, on any presentation, for
-        /// more than a twentieth of the blocks it is audible in.
-        ///
-        /// The case this is for: a voice landed on an element with a small
-        /// stereo fold coefficient, which survives 7.1.4 and vanishes in the
-        /// downmix. Computed from the geometry rather than from the audio —
-        /// what a source comes out at on a presentation is a linear function
-        /// of its weights and the elements' positions — so it is exact rather
-        /// than estimated. Nought declines the guard.
-        #[arg(long, value_name = "DB", default_value_t = encode::OVERLAY_LEVEL)]
-        overlay_level: f64,
-
-        /// Refuse the encode if the worst source's fold costs more than this,
-        /// as a fraction of its own gain vector, on more than a twentieth of
-        /// the blocks it is audible in.
-        ///
-        /// `hz_cluster::metric`'s own measure, restricted to the sources; the
-        /// elements are not in it, since an overlay does not fold them.
-        /// Nought declines the guard.
-        #[arg(long, value_name = "ERROR", default_value_t = encode::OVERLAY_COST)]
-        overlay_cost: f64,
-
-        /// Route a source the fit could not place acceptably to the nearest
-        /// bed element outright, rather than leaving it where the fit put it.
-        /// On by default; `--overlay-fallback false` leaves the fit alone.
-        ///
-        /// A source on one bed is slightly misplaced and perfectly sharp,
-        /// which is the trade: audible and a little off beats diffuse and
-        /// wandering. Borrowing an inactive element for the stretch, or
-        /// falling back to a full `--cluster`, are decisions about a
-        /// programme and are the caller's, not this.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-        overlay_fallback: bool,
-
-        /// Let a source take a spare element of its own when the master
-        /// brings fewer than sixteen, rather than being panned onto the
-        /// master's elements. Off by default: the stream carries exactly the
-        /// elements the master brought, and every source is panned.
-        ///
-        /// A source with an element of its own is carried bit for bit and
-        /// costs nothing, which is the best a source can get — and it makes
-        /// the stream wider than the original: a twelve-element master
-        /// re-voiced with four sources ships as sixteen. Whether a dub may
-        /// change the original's width is a decision about the programme, so
-        /// it is asked for rather than assumed. The spares go to the sources
-        /// nearest the front centre. Only means anything with `--overlay`.
-        /// See `docs/encode.md`.
-        #[arg(long, action = clap::ArgAction::SetTrue)]
-        overlay_spare: bool,
-
-        /// Write, per block, exactly what the overlay did with it: which
-        /// elements were copied and from which channel, which were mixed, and
-        /// the weights and gains it mixed them with.
-        ///
-        /// For `cargo xtask overlay-check`, which has to reproduce the
-        /// arithmetic to check it and cannot re-derive the fit without
-        /// re-deriving the thing being checked. Not a format anything else
-        /// should read; it says what this encoder did and nothing about what
-        /// the stream is.
-        #[arg(long, value_name = "PATH")]
-        overlay_report: Option<PathBuf>,
-
-        /// Round the folded elements to this many bits.
-        ///
-        /// Only means anything where something is mixed — `--cluster`, and the
-        /// few elements `--overlay` adds a source to. A mix is a sum over real
-        /// weights, so its low bits are the noise of the multiplication rather
-        /// than signal, and a lossless coder carries them anyway. Under an
-        /// overlay the elements nothing was added to are copied and keep every
-        /// bit they arrived with, so this decides the depth of part of the
-        /// stream and not all of it. Twenty is worth about a third of the
-        /// stream against twenty-four and puts the rounding noise near
-        /// −120 dBFS.
-        ///
-        /// Twenty-four keeps every bit the mix made. Seventeen is the floor,
-        /// because below it the format's own dead-bit field can no longer say
-        /// what was rounded away. Match it to the *source* master rather than
-        /// guessing: a programme mastered at eighteen bits gains nothing from
-        /// twenty. See `docs/encode.md`.
-        #[arg(long, value_name = "BITS", default_value_t = encode::FOLD_BITS)]
-        fold_depth: u32,
+        #[command(flatten)]
+        mixing: MixArgs,
 
         /// Passes of the search that places each element where the fold's own
         /// cost is lowest, rather than where the clustering of directions put
@@ -282,41 +156,6 @@ enum Command {
         /// the LFE is refused. See `docs/clustering.md`.
         #[arg(long, value_name = "RULE", default_value = "auto")]
         beds: String,
-
-        /// The programme's dialnorm in decibels, −31 to −1, which sets the
-        /// floor under what an object has to carry to be heard at the
-        /// playback level: full scale at 105 dB SPL less the gain a decoder
-        /// applies to bring the dialogue to −31, and the threshold of hearing
-        /// under that. Below it an object seeds nothing and sets no worst
-        /// case. `--overlay` reads it too: it is what decides a source is
-        /// audible, and so which blocks its guards are counted over. See
-        /// `hz_cluster::floor`.
-        #[arg(long, value_name = "DB", default_value_t = -31.0, allow_hyphen_values = true)]
-        dialnorm: f64,
-
-        /// How the fold keeps its elements inside the codec's domain:
-        /// `limit`, a limiter with one gain for every element, ahead of the
-        /// peak; `bound`, the fit bounding an element's coherent peak, which
-        /// costs error and does not take every clip; `both`; or `off`, which
-        /// clamps and counts the clips as it did. `--overlay` uses the
-        /// limiter half of it on the elements it mixes into; the bound is the
-        /// clusterer's own and has nothing to bound where no element is
-        /// placed. See `hz_cluster::headroom`.
-        #[arg(long, value_name = "RULE", default_value = "limit")]
-        headroom: String,
-
-        /// How a block's power is weighed before it steers the fold: `flat`,
-        /// the plain power a meter reads; `kweighted`, through the K filter
-        /// of BS.1770; or `perceptual`, what each object adds to the loudness
-        /// of the scene, band by band, with what is near it masking it.
-        ///
-        /// Flat is what every measurement in `docs/clustering.md` was made
-        /// under, and the perceptual rule did not beat it on the metric; it
-        /// is here to be listened to. It costs about a third of the encode's
-        /// time. Only means anything with `--cluster`. See
-        /// `hz_cluster::scene::Loudness`.
-        #[arg(long, value_name = "RULE", default_value = "flat")]
-        loudness: String,
 
         /// Blocks *behind* the one being placed whose energies steady it.
         ///
@@ -472,9 +311,11 @@ enum Command {
 
         /// Carry the master's objects as IAMF v2.0 objects — each its own
         /// element, its path as position parameter blocks — rather than
-        /// rendering them to a 7.1.4 bed. The LFE travels in an element of its
-        /// own and other bed channels as objects that stand at their speakers.
-        /// At most twenty-eight channels in all. Few decoders read v2.0 yet.
+        /// rendering them to a 7.1.4 bed. The master's bed channels, the LFE
+        /// among them, travel as one channel-based element on the smallest
+        /// IAMF layout that has them all; a bed channel no IAMF layout has (a
+        /// top side, a wide) as an object that stands at its speaker. At most
+        /// twenty-eight channels in all. Few decoders read v2.0 yet.
         #[arg(long)]
         objects: bool,
 
@@ -485,19 +326,291 @@ enum Command {
         #[arg(long, value_name = "CODING", default_value = "cart16")]
         positions: String,
 
-        /// With `--objects`: the most object elements to carry — twenty-seven
-        /// beside an LFE unless asked, seventeen to stay within advanced-1. A
-        /// master with more objects and bed channels than this has its objects
-        /// folded into this many elements, block by block, by the same
-        /// clustering `encode --cluster` uses; its bed channels keep elements
-        /// of their own.
-        #[arg(long, value_name = "N")]
+        /// With `--objects`: the most object elements to carry — what is left
+        /// of twenty-eight channels beside the bed element unless asked,
+        /// seventeen beside an LFE element to stay within advanced-1. A master
+        /// with more objects than this has them folded into this many
+        /// elements, block by block, by the same clustering `encode --cluster`
+        /// uses.
+        #[arg(long, value_name = "N", conflicts_with = "overlay")]
         elements: Option<usize>,
+
+        /// With `--objects`: keep the master's elements exactly as they are and
+        /// pan its last this-many objects onto them — `encode --overlay`, the
+        /// same computation, written as IAMF.
+        ///
+        /// For a programme being re-voiced: everything before the last K
+        /// objects is an element and is kept — its bed as the bed element, its
+        /// objects as object elements with the master's own paths — and the K
+        /// sources (a dubbed dialogue, one object per channel of the track it
+        /// came from) are panned onto them by `hz_cluster::overlay`, under the
+        /// same guards, which refuse the encode as `encode` does. An element
+        /// no source reaches is copied, not mixed. The sequence carries as many
+        /// elements as the master brought, within IAMF's own limits. See
+        /// `docs/iamf.md`.
+        #[arg(
+            long,
+            value_name = "SOURCES",
+            requires = "objects",
+            conflicts_with = "voices_to_bed"
+        )]
+        overlay: Option<usize>,
+
+        /// With `--objects`: render the master's last this-many objects — the
+        /// dubbed voices — into a dialogue element of their own, on the room's
+        /// cube as the bed mode renders, and carry the rest — the M&E — as
+        /// `--objects` alone does, its bed as its bed element.
+        ///
+        /// The dialogue element's layout is the smallest that holds where the
+        /// voices go. The mix presentation labels it `Dialogue`, lets a
+        /// listener move it 12 dB either way (an IAMF v2.0 element gain
+        /// offset), and states the loudness anchored on dialogue — the element
+        /// alone, measured as the mix is. See `docs/iamf.md`.
+        #[arg(long, value_name = "VOICES", requires = "objects")]
+        voices_to_bed: Option<usize>,
+
+        #[command(flatten)]
+        overlaid: OverlayArgs,
+
+        #[command(flatten)]
+        mixing: MixArgs,
 
         /// Report how far along the encode is, on standard error.
         #[arg(long)]
         progress: bool,
     },
+}
+
+/// What shapes an overlay beyond which sources it has: its guards, whether a
+/// source may take a spare element, and the account of what it did. The same
+/// flags, with the same defaults, on `encode` and on `iamf --objects`, because
+/// it is the same computation whichever stream it is written into.
+#[derive(clap::Args)]
+struct OverlayArgs {
+    /// How far a fit confined to the bed elements may land from a source,
+    /// as a fraction of what the source radiates, before the moving
+    /// elements are let in. Zero declines the preference and fits over
+    /// every element.
+    ///
+    /// A bed is still and a dynamic element is wherever the mix put it
+    /// this block, so a static source carried by a moving element is
+    /// rendered somewhere different every block although it never asked to
+    /// move. Preferring the beds is what stops that, and the default is one
+    /// step back from where it would start deciding anything: over a 7.1
+    /// bed everything the floor ring covers costs under a tenth and
+    /// anything with height costs over a half. Only means anything with
+    /// `--overlay`. See `hz_cluster::overlay`.
+    #[arg(long, value_name = "REACH", default_value_t = hz_cluster::overlay::BEDS_FIRST, allow_hyphen_values = true)]
+    overlay_beds: f64,
+
+    /// Refuse the encode if a source ends up more than this many degrees
+    /// from where it asked to be, on more than a twentieth of the blocks
+    /// it is audible in or for an unbroken run of more than two seconds.
+    ///
+    /// Thirty degrees is not a localisation bound — it is far past one.
+    /// It is the point at which a voice is in a different part of the room
+    /// from the picture, which is what a dub cannot ship with; half of it
+    /// is remarked on instead, which is about where the rear blur stops
+    /// forgiving. Nought declines the guard.
+    #[arg(long, value_name = "DEGREES", default_value_t = overlay::OVERLAY_DRIFT)]
+    overlay_drift: f64,
+
+    /// Refuse the encode if the strongest element carrying a source holds
+    /// less than this fraction of it, on more than a twentieth of the
+    /// blocks it is audible in.
+    ///
+    /// Under it the source is diffuse: no one element is rendering it, so
+    /// it arrives from everywhere the fit reached and moves whenever any
+    /// of those elements does. A half is one element holding three
+    /// quarters of the power. Nought declines the guard.
+    #[arg(long, value_name = "WEIGHT", default_value_t = overlay::OVERLAY_SPREAD)]
+    overlay_spread: f64,
+
+    /// Refuse the encode if more than this percentage of the windows a
+    /// source was heard in carry movement nobody asked for.
+    ///
+    /// The sources of a dub are static, so every out-and-back in where
+    /// the carriers put them is the breathing an overlay can produce: a
+    /// still voice carried by moving elements. This is the only guard
+    /// with a time axis, and so the only one that can see that defect at
+    /// all. Nought declines it. See `hz_cluster::motion`.
+    #[arg(long, value_name = "PERCENT", default_value_t = overlay::OVERLAY_WOBBLE)]
+    overlay_wobble: f64,
+
+    /// Refuse the encode if a source's rendered level is more than this
+    /// many decibels from what it asked for, on any presentation, for
+    /// more than a twentieth of the blocks it is audible in.
+    ///
+    /// The case this is for: a voice landed on an element with a small
+    /// stereo fold coefficient, which survives 7.1.4 and vanishes in the
+    /// downmix. Computed from the geometry rather than from the audio —
+    /// what a source comes out at on a presentation is a linear function
+    /// of its weights and the elements' positions — so it is exact rather
+    /// than estimated. Nought declines the guard.
+    #[arg(long, value_name = "DB", default_value_t = overlay::OVERLAY_LEVEL)]
+    overlay_level: f64,
+
+    /// Refuse the encode if the worst source's fold costs more than this,
+    /// as a fraction of its own gain vector, on more than a twentieth of
+    /// the blocks it is audible in.
+    ///
+    /// `hz_cluster::metric`'s own measure, restricted to the sources; the
+    /// elements are not in it, since an overlay does not fold them.
+    /// Nought declines the guard.
+    #[arg(long, value_name = "ERROR", default_value_t = overlay::OVERLAY_COST)]
+    overlay_cost: f64,
+
+    /// Route a source the fit could not place acceptably to the nearest
+    /// bed element outright, rather than leaving it where the fit put it.
+    /// On by default; `--overlay-fallback false` leaves the fit alone.
+    ///
+    /// A source on one bed is slightly misplaced and perfectly sharp,
+    /// which is the trade: audible and a little off beats diffuse and
+    /// wandering. Borrowing an inactive element for the stretch, or
+    /// falling back to a full `--cluster`, are decisions about a
+    /// programme and are the caller's, not this.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    overlay_fallback: bool,
+
+    /// Let a source take a spare element of its own when the master
+    /// brings fewer than sixteen, rather than being panned onto the
+    /// master's elements. Off by default: the stream carries exactly the
+    /// elements the master brought, and every source is panned.
+    ///
+    /// A source with an element of its own is carried bit for bit and
+    /// costs nothing, which is the best a source can get — and it makes
+    /// the stream wider than the original: a twelve-element master
+    /// re-voiced with four sources ships as sixteen. Whether a dub may
+    /// change the original's width is a decision about the programme, so
+    /// it is asked for rather than assumed. The spares go to the sources
+    /// nearest the front centre. Only means anything with `--overlay`.
+    /// See `docs/encode.md`.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    overlay_spare: bool,
+
+    /// Write, per block, exactly what the overlay did with it: which
+    /// elements were copied and from which channel, which were mixed, and
+    /// the weights and gains it mixed them with.
+    ///
+    /// For `cargo xtask overlay-check`, which has to reproduce the
+    /// arithmetic to check it and cannot re-derive the fit without
+    /// re-deriving the thing being checked. Not a format anything else
+    /// should read; it says what this encoder did and nothing about what
+    /// the stream is.
+    #[arg(long, value_name = "PATH")]
+    overlay_report: Option<PathBuf>,
+}
+
+/// What a mix does to the elements it makes: how a block's power is weighed,
+/// what counts as audible, how the elements are kept inside the codec's
+/// domain, and what they are rounded to. Shared by `encode` — a fold and an
+/// overlay — and `iamf --objects --overlay`.
+#[derive(clap::Args)]
+struct MixArgs {
+    /// Round the mixed elements to this many bits.
+    ///
+    /// Only means anything where something is mixed — `encode --cluster`,
+    /// and the few elements `--overlay` adds a source to. A mix is a sum over
+    /// real weights, so its low bits are the noise of the multiplication
+    /// rather than signal, and a lossless coder carries them anyway. Under an
+    /// overlay the elements nothing was added to are copied and keep every
+    /// bit they arrived with, so this decides the depth of part of the stream
+    /// and not all of it. Twenty is worth about a third of a TrueHD stream
+    /// against twenty-four and puts the rounding noise near −120 dBFS; FLAC
+    /// takes the same zeroes off the bottom of a subframe as wasted bits.
+    ///
+    /// Twenty-four keeps every bit the mix made. A TrueHD stream takes
+    /// seventeen to twenty-four, because below seventeen the format's own
+    /// dead-bit field can no longer say what was rounded away; an IA sequence
+    /// sixteen to twenty-four, and never more than its `--bits`. Match it to
+    /// the *source* master rather than guessing: a programme mastered at
+    /// eighteen bits gains nothing from twenty. See `docs/encode.md`.
+    #[arg(long, value_name = "BITS", default_value_t = encode::FOLD_BITS)]
+    fold_depth: u32,
+
+    /// The programme's dialnorm in decibels, −31 to −1, which sets the floor
+    /// under what an object has to carry to be heard at the playback level:
+    /// full scale at 105 dB SPL less the gain a decoder applies to bring the
+    /// dialogue to −31, and the threshold of hearing under that. Below it an
+    /// object seeds nothing and sets no worst case in a fold; under
+    /// `--overlay` it is what decides a source is audible, and so which
+    /// elements are mixed rather than copied and which blocks its guards are
+    /// counted over. See `hz_cluster::floor`.
+    #[arg(long, value_name = "DB", default_value_t = -31.0, allow_hyphen_values = true)]
+    dialnorm: f64,
+
+    /// How a mix keeps its elements inside the codec's domain: `limit`, a
+    /// limiter with one gain for every element, ahead of the peak; `bound`,
+    /// the fit bounding an element's coherent peak, which costs error and
+    /// does not take every clip; `both`; or `off`, which clamps and counts
+    /// the clips. `--overlay` uses the limiter half of it on the elements it
+    /// mixes into; the bound is the clusterer's own and has nothing to bound
+    /// where no element is placed. See `hz_cluster::headroom`.
+    #[arg(long, value_name = "RULE", default_value = "limit")]
+    headroom: String,
+
+    /// How a block's power is weighed before it steers the mix: `flat`, the
+    /// plain power a meter reads; `kweighted`, through the K filter of
+    /// BS.1770; or `perceptual`, what each object adds to the loudness of the
+    /// scene, band by band, with what is near it masking it.
+    ///
+    /// Flat is what every measurement in `docs/clustering.md` was made under,
+    /// and the perceptual rule did not beat it on the metric; it is here to
+    /// be listened to. It costs about a third of a folding encode's time. In
+    /// a fold it steers where the elements go; under `--overlay` it is the
+    /// energy that decides a source is audible. See
+    /// `hz_cluster::scene::Loudness`.
+    #[arg(long, value_name = "RULE", default_value = "flat")]
+    loudness: String,
+}
+
+impl MixArgs {
+    fn weighing(&self, input: &std::path::Path) -> hz_core::Result<hz_cluster::scene::Loudness> {
+        match self.loudness.as_str() {
+            "flat" => Ok(hz_cluster::scene::Loudness::Flat),
+            "kweighted" | "k" => Ok(hz_cluster::scene::Loudness::KWeighted),
+            "perceptual" => Ok(hz_cluster::scene::Loudness::Perceptual(
+                hz_cluster::scene::PERCEPTION,
+            )),
+            other => Err(hz_core::Error::unsupported(
+                input,
+                format!("`{other}` for the loudness; flat, kweighted or perceptual"),
+            )),
+        }
+    }
+
+    fn headroom(&self, input: &std::path::Path) -> hz_core::Result<encode::Headroom> {
+        match self.headroom.as_str() {
+            "both" => Ok(encode::Headroom::Both),
+            "bound" => Ok(encode::Headroom::Bound),
+            "limit" => Ok(encode::Headroom::Limit),
+            "off" => Ok(encode::Headroom::Off),
+            other => Err(hz_core::Error::unsupported(
+                input,
+                format!("`{other}` for the headroom; both, bound, limit or off"),
+            )),
+        }
+    }
+}
+
+impl OverlayArgs {
+    /// Nought is not a reach, it is the preference declined: no bed-only fit
+    /// lands within nothing of the source. A negative one is neither, and the
+    /// writer refuses it rather than read a typed minus sign as "declined".
+    fn beds_first(&self) -> Option<f64> {
+        (self.overlay_beds > 0.0).then_some(self.overlay_beds)
+    }
+
+    fn bounds(&self) -> overlay::Bounds {
+        overlay::Bounds {
+            drift: self.overlay_drift,
+            spread: self.overlay_spread,
+            wobble: self.overlay_wobble,
+            level: self.overlay_level,
+            cost: self.overlay_cost,
+            fallback: self.overlay_fallback,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -516,48 +629,18 @@ fn main() -> ExitCode {
             fast,
             cluster,
             overlay,
-            overlay_beds,
-            overlay_drift,
-            overlay_spread,
-            overlay_wobble,
-            overlay_level,
-            overlay_cost,
-            overlay_fallback,
-            overlay_spare,
-            overlay_report,
-            fold_depth,
+            overlaid,
+            mixing,
             fold_search,
             beds,
-            dialnorm,
-            headroom,
-            loudness,
             smooth_behind,
             fold_hold,
             drc,
             presentations,
             progress,
         } => {
-            let weighing = match loudness.as_str() {
-                "flat" => Ok(hz_cluster::scene::Loudness::Flat),
-                "kweighted" | "k" => Ok(hz_cluster::scene::Loudness::KWeighted),
-                "perceptual" => Ok(hz_cluster::scene::Loudness::Perceptual(
-                    hz_cluster::scene::PERCEPTION,
-                )),
-                other => Err(hz_core::Error::unsupported(
-                    &input,
-                    format!("`{other}` for the loudness; flat, kweighted or perceptual"),
-                )),
-            };
-            let headroom = match headroom.as_str() {
-                "both" => Ok(encode::Headroom::Both),
-                "bound" => Ok(encode::Headroom::Bound),
-                "limit" => Ok(encode::Headroom::Limit),
-                "off" => Ok(encode::Headroom::Off),
-                other => Err(hz_core::Error::unsupported(
-                    &input,
-                    format!("`{other}` for the headroom; both, bound, limit or off"),
-                )),
-            };
+            let weighing = mixing.weighing(&input);
+            let headroom = mixing.headroom(&input);
             let beds = match beds.as_str() {
                 "auto" => Ok(encode::Beds::Auto),
                 "pinned" => Ok(encode::Beds::Pinned),
@@ -593,24 +676,20 @@ fn main() -> ExitCode {
                     fast,
                     cluster,
                     overlay,
-                    // Nought is not a reach, it is the preference declined:
-                    // no bed-only fit lands within nothing of the source. A
-                    // negative one is neither, and silently reading it as
-                    // "declined" would hide a typed minus sign.
-                    overlay_beds: (overlay_beds > 0.0).then_some(overlay_beds),
-                    overlay_beds_asked: overlay_beds,
-                    overlay_drift,
-                    overlay_spread,
-                    overlay_wobble,
-                    overlay_level,
-                    overlay_cost,
-                    overlay_fallback,
-                    overlay_spare,
-                    overlay_report,
-                    fold_depth,
+                    overlay_beds: overlaid.beds_first(),
+                    overlay_beds_asked: overlaid.overlay_beds,
+                    overlay_drift: overlaid.overlay_drift,
+                    overlay_spread: overlaid.overlay_spread,
+                    overlay_wobble: overlaid.overlay_wobble,
+                    overlay_level: overlaid.overlay_level,
+                    overlay_cost: overlaid.overlay_cost,
+                    overlay_fallback: overlaid.overlay_fallback,
+                    overlay_spare: overlaid.overlay_spare,
+                    overlay_report: overlaid.overlay_report,
+                    fold_depth: mixing.fold_depth,
                     fold_search,
                     beds: beds?,
-                    dialnorm,
+                    dialnorm: mixing.dialnorm,
                     headroom: headroom?,
                     weighing: weighing?,
                     smooth_behind,
@@ -635,6 +714,10 @@ fn main() -> ExitCode {
             objects,
             positions,
             elements,
+            overlay,
+            voices_to_bed,
+            overlaid,
+            mixing,
             progress,
         } => {
             let codec = match (codec.as_str(), bitrate) {
@@ -683,6 +766,21 @@ fn main() -> ExitCode {
                     format!("`{other}` for the headphones; stereo or binaural"),
                 )),
             };
+            let weighing = mixing.weighing(&input);
+            let headroom = mixing.headroom(&input);
+            let overlaying = weighing.and_then(|weighing| {
+                Ok(iamf::Overlaying {
+                    beds_first: overlaid.beds_first(),
+                    beds_asked: overlaid.overlay_beds,
+                    bounds: overlaid.bounds(),
+                    spare: overlaid.overlay_spare,
+                    report: overlaid.overlay_report,
+                    fold_depth: mixing.fold_depth,
+                    dialnorm: mixing.dialnorm,
+                    limit: headroom?.limits(),
+                    weighing,
+                })
+            });
             codec.and_then(|codec| {
                 iamf::run(iamf::Config {
                     input,
@@ -696,6 +794,9 @@ fn main() -> ExitCode {
                     progress,
                     objects: objects?,
                     elements,
+                    overlay,
+                    voices_to_bed,
+                    overlaying: overlaying?,
                 })
             })
         }

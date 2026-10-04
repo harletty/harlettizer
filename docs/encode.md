@@ -161,6 +161,13 @@ them and the sources are panned onto them, treating the element positions as a
 time-varying loudspeaker set — clustering with frozen centres. See
 `hz_cluster::overlay`.
 
+The arithmetic is the encoder's and not the format's: it lives in
+`crates/hz-cli/src/overlay.rs`, and `iamf --objects --overlay K` runs the same
+computation with the same options and writes it as IAMF — see
+[docs/iamf.md](iamf.md#--overlay-a-re-voiced-programme-kept). All that differs
+is what a decoder applies to an element: here its whole-decibel gain from the
+payload, which a source added to it is divided by.
+
 ### The input contract
 
 One master set or ADM BW64 file, as usual, with its channels in this order:

@@ -39,6 +39,7 @@
 //! nine with silent elements marked inactive, which is what the syntax has
 //! the flag for.
 
+use crate::overlay::{self, Bounds, Overlaid};
 use crate::source::{Source, keyframes_of, tracks};
 use hz_cluster::mix::Limiter;
 use hz_cluster::scene::{Loudness as Weighing, Scene, Source as SceneSource};
@@ -153,7 +154,7 @@ pub struct Config {
     /// anything with `--overlay`.
     pub overlay_spare: bool,
     /// Write, per block, exactly what the overlay did with it — see
-    /// [`Overlaid::report`]. For `cargo xtask overlay-check`, which cannot
+    /// [`crate::overlay::Overlaid::report`]. For `cargo xtask overlay-check`, which cannot
     /// check the arithmetic without the weights that produced it.
     pub overlay_report: Option<PathBuf>,
     /// What dynamic range word the stream states — see [`Drc`].
@@ -320,7 +321,7 @@ impl Headroom {
         matches!(self, Self::Both | Self::Bound)
     }
 
-    fn limits(self) -> bool {
+    pub(crate) fn limits(self) -> bool {
         matches!(self, Self::Both | Self::Limit)
     }
 }
@@ -384,275 +385,6 @@ struct Clustered {
     carried: Vec<f64>,
     /// How many blocks the fit bounded an element's coherent peak in.
     bounded: u64,
-}
-
-/// What an overlay refuses to write, and what it only remarks on.
-///
-/// # Why an encoder refuses at all
-///
-/// Every other thing this encoder measures it *reports*: the fold's cost, the
-/// wobble, the clipped samples. A caller reads the summary and decides. An
-/// overlay is different in one way that matters — it is run by a pipeline, on
-/// a programme nobody has listened to yet, and the failure it can produce is
-/// **a line of dialogue in the wrong place or missing from a downmix**. That
-/// is not a number a log should carry quietly past a caller who did not think
-/// to grep for it. So the bounds below stop the encode: `error: …` on standard
-/// error and a non-zero exit, which a process host already turns into a failed
-/// step.
-///
-/// Each bound is a flag, and nought turns that one off — because a bound
-/// chosen here is chosen without a programme to choose it on, and a caller who
-/// has listened knows better than this does. See `docs/encode.md`.
-///
-/// # Voiced blocks
-///
-/// Every count below is over the blocks in which the source was **above the
-/// audibility floor** — see [`hz_cluster::floor`]. A dub is silent most of the
-/// time, and a guard that counted silent blocks would measure how much of the
-/// programme nobody is speaking in.
-#[derive(Debug, Clone, Copy)]
-struct Bounds {
-    /// How far a source may be from where it asked to be, in degrees, before
-    /// the block counts against it. Refused past [`OVERLAY_SHARE`] of the
-    /// voiced blocks, or on any run longer than [`OVERLAY_RUN`].
-    ///
-    /// Thirty degrees is not a localisation bound — it is far past one. It is
-    /// the point at which a voice is in a different part of the room from the
-    /// picture, which is what a dub cannot ship with. Half of it is remarked
-    /// on, which is about where the rear blur stops forgiving.
-    drift: f64,
-    /// The least the strongest element carrying a source may hold, as a
-    /// fraction of the source's own level. Under it the source is diffuse:
-    /// no one element is rendering it, so it arrives from everywhere the fit
-    /// reached and moves whenever any of those elements does.
-    ///
-    /// A half is one element holding three quarters of the power. Refused past
-    /// [`OVERLAY_SHARE`] of the voiced blocks.
-    spread: f64,
-    /// How much of the source's movement may be movement nobody asked for, as
-    /// a percentage of the windows it was heard in — `hz_cluster::motion`'s
-    /// `wobbling`, measured on where the carriers actually put the source.
-    ///
-    /// The sources of a dub are **static**, so every out-and-back in that
-    /// measurement is the breathing the mode's own documentation warns about:
-    /// a still voice carried by moving elements. This is the guard that
-    /// catches it, and it is the only one that needs a time axis to see the
-    /// defect at all.
-    wobble: f64,
-    /// How far a source's rendered level may be from what it asked for, in
-    /// decibels, on any presentation the stream is played through.
-    ///
-    /// The guard the note that specified this mode called for in loudness
-    /// terms, and it is computed from geometry rather than from BS.1770 over
-    /// the audio: what a source comes out at on a presentation is a linear
-    /// function of its weights and the elements' positions, which
-    /// `hz_cluster::metric` already reports per presentation as `energy`. No
-    /// filter, no block of audio, exact rather than estimated — and it
-    /// catches the case the note was worried about, a voice landed on an
-    /// element with a small stereo fold coefficient and vanishing from the
-    /// downmix.
-    level: f64,
-    /// The worst a source's fold may cost, as a fraction of its own gain
-    /// vector — `hz_cluster::metric`'s own measure, restricted to the sources.
-    /// The elements are not in it: they are not folded.
-    cost: f64,
-    /// Whether a source the fit could not place acceptably is routed to the
-    /// nearest bed element outright. See [`Overlaid::fell_back`].
-    fallback: bool,
-}
-
-/// The bounds as they ship — see [`Bounds`], which says where each comes
-/// from. One place, so the flag's default and the struct's cannot drift apart.
-pub const OVERLAY_DRIFT: f64 = 30.0;
-pub const OVERLAY_SPREAD: f64 = 0.5;
-pub const OVERLAY_WOBBLE: f64 = 5.0;
-pub const OVERLAY_LEVEL: f64 = 2.0;
-pub const OVERLAY_COST: f64 = 0.5;
-
-impl Default for Bounds {
-    fn default() -> Self {
-        Self {
-            drift: OVERLAY_DRIFT,
-            spread: OVERLAY_SPREAD,
-            wobble: OVERLAY_WOBBLE,
-            level: OVERLAY_LEVEL,
-            cost: OVERLAY_COST,
-            fallback: true,
-        }
-    }
-}
-
-/// What share of the voiced blocks a bound may be exceeded in before the
-/// encode is refused.
-///
-/// A twentieth. Not nought, because a bound crossed in one block of a
-/// programme is a block, and a dub that is refused for one block is a dub
-/// nobody can ship; not more, because a twentieth of the voiced blocks is
-/// already several seconds of dialogue in the wrong place over a feature.
-const OVERLAY_SHARE: f64 = 0.05;
-
-/// The longest unbroken run a bound may be exceeded for, in seconds, whatever
-/// the share.
-///
-/// Two seconds is a sentence. A share says how much of a programme is wrong
-/// and says nothing about whether it is wrong *all at once*, and those are
-/// different failures: a twentieth scattered over a feature is a fault nobody
-/// localises, and a twentieth in one place is a scene.
-const OVERLAY_RUN: f64 = 2.0;
-
-/// Keeping the master's elements and panning its last few objects onto them
-/// — `--overlay`. See [`hz_cluster::overlay`] for what this is for.
-struct Overlaid {
-    overlay: hz_cluster::overlay::Overlay,
-    /// How many trailing objects of the master are sources rather than
-    /// elements.
-    sources: usize,
-    /// Elements the master brought, the low frequency channel included. The
-    /// sources that took a spare slot are written after these.
-    elements: usize,
-    /// One source's weights over this block's carriers, and the elements'
-    /// metadata for the payload. Both are refilled rather than rebuilt: a
-    /// block is 27 ms, and an allocation a block is an allocation forty times
-    /// a second for the length of a feature.
-    row: Vec<f64>,
-    /// Which elements this block mixed, for the limiter.
-    live: Vec<bool>,
-    /// The sources that were panned rather than given an element, and their
-    /// rows, rebuilt each block — what the metric judges.
-    panned: Vec<hz_cluster::Object>,
-    /// Whether each source took a spare element, by index. The same fact as
-    /// [`Overlaid::slots`], in the shape three hot loops a block want it in.
-    slotted: Vec<bool>,
-    /// Which source took which spare element of its own, in the order the
-    /// slots are written. See [`Config::overlay`] and `docs/encode.md`.
-    slots: Vec<usize>,
-    /// The elements a source may be panned onto this block: active, not
-    /// muted, and not the low frequency channel. Refilled every block.
-    carriers: Vec<hz_cluster::overlay::Carrier>,
-    /// Which elements are bed channels — see [`beds_among`], which works it
-    /// out rather than trusting the master to declare it. Decided once, since
-    /// it is a property of the whole programme and not of a block.
-    beds: Vec<bool>,
-    /// How many of them the master declared, so the summary can say which
-    /// regime a run was in.
-    declared_beds: usize,
-    /// `weights[source][element]` as the fit gave them: what the held set is
-    /// judged on and what the mix is built from.
-    ///
-    /// Two buffers that **swap** at the end of every block, so that a block
-    /// costs no allocation. Between blocks `previous` therefore holds the
-    /// latest answer and `weights` is the spare the next fit will fill —
-    /// which is the right way round for the next block and the wrong way
-    /// round for anything reading them afterwards.
-    weights: Vec<Vec<f64>>,
-    previous: Vec<Vec<f64>>,
-    /// The sources as the fit sees them, rebuilt each block from the master's
-    /// state and the block's own energies.
-    fitting: Vec<hz_cluster::Object>,
-    /// The mix matrix over every object of the master: an element carrying
-    /// itself, a source spread over the carriers and divided by their gains.
-    mix: Vec<Vec<f64>>,
-    /// Where every element is this block, for the presentations.
-    positions: Vec<[f64; 3]>,
-    /// And the gain the payload states for each, in the same order: what a
-    /// decoder rendering the elements applies, so what the presentations
-    /// have to fold them at to sound like it.
-    stated: Vec<f64>,
-    /// Which elements a source reaches this block or reached last — the rest
-    /// are copied through rather than mixed, and so are not rounded either.
-    touched: Vec<bool>,
-    /// Per element, the source channel it is copied from, or `None` when it is
-    /// one of the few that this block actually mixes.
-    copy_from: Vec<Option<usize>>,
-    /// Element-blocks copied through untouched, and element-blocks mixed.
-    copied: u64,
-    remixed: u64,
-    /// Blocks where an audible source had no carrier at all.
-    stranded: u64,
-    /// How far the carriers put the audible sources from where they asked to
-    /// be, summed and at its worst — see `hz_cluster::overlay::drift`.
-    drift: f64,
-    drifted: u64,
-    worst_drift: f64,
-    /// What the encode refuses to write, and what it only remarks on.
-    bounds: Bounds,
-    /// Source-blocks in which each bound was exceeded, over the voiced ones.
-    /// The denominator is [`Overlaid::drifted`]: a source is counted once a
-    /// block, in the blocks it was audible in.
-    over_drift: u64,
-    /// And over half of it, which is what the remark is about — a remark that
-    /// quotes the refusal's share beside the half bound contradicts itself.
-    over_half_drift: u64,
-    over_spread: u64,
-    over_level: u64,
-    over_cost: u64,
-    /// The longest unbroken run of blocks a source was past the drift bound
-    /// for, and the run each source is in now. In blocks; the summary turns
-    /// them into seconds.
-    run: Vec<u64>,
-    worst_run: u64,
-    /// The same for a source with nowhere at all to go, and the run it is in.
-    stranded_run: Vec<u64>,
-    worst_stranded_run: u64,
-    /// How far a source's rendered level strayed on any presentation, at its
-    /// worst, in decibels; and the worst a source's fold cost, with what each
-    /// presentation cost in the block that was worst.
-    worst_level: f64,
-    worst_cost: f64,
-    worst_cost_where: String,
-    /// Where the carriers actually put each source, block after block, and
-    /// what of that movement nobody asked for — `hz_cluster::motion`. The
-    /// sources are static, so all of it is invented.
-    motion: hz_cluster::motion::Motion,
-    resultants: Vec<[f64; 3]>,
-    energies: Vec<f64>,
-    /// Where each source was last heard, held through the silence after it so
-    /// that a phrase boundary is not read as movement. `None` before a source
-    /// has ever been audible.
-    resting: Vec<Option<[f64; 3]>>,
-    /// Whether each source was above the floor this block and the last, which
-    /// is what decides an element is copied rather than what its weights say.
-    audible: Vec<bool>,
-    was_audible: Vec<bool>,
-    /// Blocks in which nothing at all was mixed — every element copied — which
-    /// is the share of the *running time* the fast path took, as against the
-    /// share of element-blocks it took.
-    whole: u64,
-    /// Blocks in which at least one source was above the audibility floor,
-    /// which is what every share below is a share *of*. A dub is silent most
-    /// of the time, and a guard counting silent blocks would measure how much
-    /// of the programme nobody is speaking in.
-    voiced: u64,
-    /// Source-blocks routed to the nearest bed because the fit could not place
-    /// them acceptably — see `--overlay-fallback`.
-    fell_back: u64,
-    /// The clustering the sources are judged as, rebuilt each block: the
-    /// elements where the master put them, and the sources' own weights.
-    judged: Clustering,
-    /// Where the block-by-block account goes, when one was asked for.
-    ///
-    /// # Why an encoder writes down its own workings
-    ///
-    /// The invariants this mode rests on are statements about *arithmetic*:
-    /// an element no source reached is the master's samples unchanged, and one
-    /// a source reached is those samples plus the sources under the weights
-    /// the fit chose, ramped across the block. A checker holding only the
-    /// master and the decoded stream can verify the first and can only guess
-    /// at the second — it would have to re-derive the fit, which is the very
-    /// thing being checked.
-    ///
-    /// So the encoder says what it did: which elements it copied, which it
-    /// mixed, and with what. `cargo xtask overlay-check` then recomputes the
-    /// mix with `hz_cluster::mix::mix` — the same function, not a second
-    /// implementation of it — and compares sample for sample.
-    ///
-    /// Off by default and free when off: a run that asks for no account
-    /// touches none of this.
-    report: Option<std::io::BufWriter<std::fs::File>>,
-    /// Blocks and samples written so far, so the account can say where it is
-    /// without the span loop having to tell it.
-    reported_blocks: u64,
-    reported_at: u64,
 }
 
 /// What a folding encode carries between blocks.
@@ -829,20 +561,6 @@ fn energies_of(
     out.extend(scene.finish().iter().map(|object| object.energy));
 }
 
-/// The shell a block's sources are judged in: only the positions and the
-/// weights are read by `hz_cluster::metric`, and both are refilled every
-/// block. Held rather than built so that judging a block costs no allocation.
-fn blank_clustering() -> Clustering {
-    Clustering {
-        positions: Vec::new(),
-        directions: Vec::new(),
-        weights: Vec::new(),
-        owners: Vec::new(),
-        modes: Vec::new(),
-        bounded: 0,
-    }
-}
-
 /// Everything a block-at-a-time encode carries that is the same whichever
 /// shape it is, so that the two constructions state only what differs.
 fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
@@ -887,112 +605,44 @@ fn blank_fold(config: &Config, sample_rate: f64, width: usize) -> Result<Fold> {
 }
 
 /// Which of the master's elements are bed channels, whether or not the master
-/// says so.
+/// says so — see [`overlay::beds_among`] for why that cannot be read off the
+/// declaration and what counts as one.
 ///
-/// # Why this cannot be read off the declaration
-///
-/// `parts_of` marks an element a bed when the master declares it one — an ADM
-/// `DirectSpeakers` track, or a `bedInstances` entry. **A dub's master
-/// declares no such thing.** A programme decoded back out of a delivery
-/// stream carries its 7.1 bed as ordinary objects that never move from their
-/// speakers' places, and declares only the low frequency channel as a bed;
-/// that is what a decoder can reconstruct, and it is what arrives here.
-///
-/// So on the one input this mode exists for, every bed-related mechanism was
-/// inert: the beds-first preference needs one bed and one non-bed to have
-/// anything to choose between, `nearest_bed` returned nothing, the fallback
-/// was a no-op, and a source with every carrier muted had nowhere to be
-/// rescued to. Every test that exercised a bed did so on a synthetic master
-/// that declares one, so none of them saw it.
-///
-/// # What counts as a bed
-///
-/// An element that **never moves** and sits **exactly at a speaker's place**,
-/// both judged on the wire's own grid — the positions a payload can code, a
+/// Judged on the wire's own grid — the positions a payload can code, a
 /// sixty-second of the room across and a fifteenth up. Two positions that
 /// code to the same triple are the same position as far as any decoder is
-/// concerned, so that is the right resolution to ask the question at, and it
-/// needs no tolerance invented here.
-///
-/// A static object somewhere that is *not* a speaker's place is not a bed: it
-/// is an object that happens to be still, and pinning a source to it would be
-/// choosing a place the mix never called a speaker.
+/// concerned, so that is the right resolution to ask the question at.
 fn beds_among(parts: &[Part], elements: usize) -> Vec<bool> {
-    let places: Vec<hz_meta::oamd::Position> = hz_core::speakers::SPEAKERS
-        .iter()
-        .filter(|speaker| !speaker.is_lfe())
-        .filter_map(|speaker| hz_render::fold::bed_position(speaker.master))
-        .map(hz_meta::oamd::Position::from_master)
-        .collect();
-
-    (0..elements)
+    let described: Vec<Option<(&[Keyframe], bool)>> = (0..elements)
         .map(|element| match parts.get(element) {
-            Some(Part::Object { keyframes, bed, .. }) => {
-                if bed.is_some() {
-                    return true;
-                }
-                let Some(first) = keyframes.first() else {
-                    return false;
-                };
-                let at = hz_meta::oamd::Position::from_master(first.position);
-                keyframes
-                    .iter()
-                    .all(|frame| hz_meta::oamd::Position::from_master(frame.position) == at)
-                    && places.contains(&at)
-            }
-            _ => false,
+            Some(Part::Object { keyframes, bed, .. }) => Some((&keyframes[..], bed.is_some())),
+            _ => None,
         })
-        .collect()
+        .collect();
+    overlay::beds_among(&described, hz_meta::oamd::Position::from_master)
 }
 
 /// Which sources take a spare element of their own, in the order those
-/// elements are written.
+/// elements are written — see [`overlay::spare_slots`].
 ///
 /// A stream carries sixteen elements and a master being re-voiced usually
 /// brings sixteen, so this is normally empty and everything is panned. When
 /// the master brings fewer, a source can have an element to itself instead —
 /// which is exactly what a plain encode would have written for it — and then
-/// it is not panned at all, costs nothing, and is carried bit for bit.
-///
-/// # Only when asked for
-///
-/// A spare element makes the stream wider than the master: a twelve-element
-/// original re-voiced with four sources would ship as sixteen. By default a
-/// re-voiced programme keeps the original's width — `allowed` is false, this
-/// is empty however much room there was, and every source is panned onto
-/// the elements the master brought. `--overlay-spare` is what lets the
-/// sources take the room.
-///
-/// # Which sources get them
-///
-/// The ones nearest the front centre, which is where a dub's dialogue is and
-/// so where an error is least forgiven. Stated as an angle rather than as a
-/// channel name on purpose: the sources are objects at speaker places and
-/// what makes one the centre is where it is, not what a master called it.
+/// it is not panned at all, costs nothing, and is carried bit for bit. A
+/// twelve-element original re-voiced with four sources would ship as sixteen,
+/// which is why it is only done when asked for.
 fn spare_slots(parts: &[Part], elements: usize, sources: usize, allowed: bool) -> Vec<usize> {
+    let origins: Vec<Option<[f64; 3]>> = (0..sources)
+        .map(|index| match parts.get(elements + index) {
+            Some(Part::Object { keyframes, .. }) => {
+                Some(keyframes.first().copied().unwrap_or_default().position)
+            }
+            _ => None,
+        })
+        .collect();
     let spare = hz_mlp::format::MAX_CHANNELS.saturating_sub(elements);
-    if !allowed || spare == 0 || sources == 0 {
-        return Vec::new();
-    }
-    let ahead = |index: usize| -> f64 {
-        let Some(Part::Object { keyframes, .. }) = parts.get(elements + index) else {
-            return f64::MIN;
-        };
-        let at = keyframes.first().copied().unwrap_or_default().position;
-        let length = (at[0] * at[0] + at[1] * at[1] + at[2] * at[2]).sqrt();
-        if length < 1e-12 { -1.0 } else { at[1] / length }
-    };
-    let mut order: Vec<usize> = (0..sources).collect();
-    // Nearest the front first, and a stable tie broken by the master's own
-    // order so that the same input always writes the same stream.
-    order.sort_by(|a, b| {
-        ahead(*b)
-            .partial_cmp(&ahead(*a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(b))
-    });
-    order.truncate(spare.min(sources));
-    order
+    overlay::spare_slots(&origins, spare, allowed)
 }
 
 /// Where one element is now, and which update said so.
@@ -1200,79 +850,30 @@ pub fn run(config: Config) -> Result<()> {
                 };
                 let slots = spare_slots(&parts, element_parts, sources, config.overlay_spare);
                 let width = element_parts + slots.len();
+                let channels = (0..element_parts)
+                    .chain(slots.iter().map(|index| element_parts + index))
+                    .map(|part| parts[part].source_channel())
+                    .collect();
                 Some(Fold {
-                    shape: Shape::Overlaid(Box::new(Overlaid {
-                        overlay: hz_cluster::overlay::Overlay::new()
-                            .map_err(|why| Error::unsupported(&config.input, why.to_string()))?
-                            .preferring(config.overlay_beds),
-                        sources,
-                        elements: element_parts,
-                        row: Vec::new(),
-                        live: Vec::new(),
-                        slotted: {
-                            let mut flags = vec![false; sources];
-                            for index in &slots {
-                                flags[*index] = true;
-                            }
-                            flags
+                    shape: Shape::Overlaid(Box::new(Overlaid::new(
+                        &config.input,
+                        overlay::Setup {
+                            sources,
+                            elements: element_parts,
+                            beds: beds_among(&parts, element_parts),
+                            declared_beds: parts[..element_parts]
+                                .iter()
+                                .filter(|part| matches!(part, Part::Object { bed: Some(_), .. }))
+                                .count(),
+                            slots,
+                            channels,
+                            bounds,
+                            beds_first: config.overlay_beds,
+                            report: config.overlay_report.as_deref(),
+                            seconds_a_block: BLOCK_UNITS as f64
+                                * unit_seconds(source.sample_rate()),
                         },
-                        panned: Vec::new(),
-                        slots,
-                        beds: beds_among(&parts, element_parts),
-                        declared_beds: parts[..element_parts]
-                            .iter()
-                            .filter(|part| matches!(part, Part::Object { bed: Some(_), .. }))
-                            .count(),
-                        carriers: Vec::new(),
-                        weights: Vec::new(),
-                        previous: vec![vec![0.0; width]; sources],
-                        fitting: Vec::new(),
-                        mix: Vec::new(),
-                        positions: Vec::new(),
-                        stated: Vec::new(),
-                        touched: Vec::new(),
-                        copy_from: Vec::new(),
-                        copied: 0,
-                        remixed: 0,
-                        stranded: 0,
-                        drift: 0.0,
-                        drifted: 0,
-                        worst_drift: 0.0,
-                        bounds,
-                        over_drift: 0,
-                        over_half_drift: 0,
-                        over_spread: 0,
-                        over_level: 0,
-                        over_cost: 0,
-                        run: vec![0; sources],
-                        worst_run: 0,
-                        stranded_run: Vec::new(),
-                        worst_stranded_run: 0,
-                        worst_level: 0.0,
-                        worst_cost: 0.0,
-                        worst_cost_where: String::new(),
-                        motion: hz_cluster::motion::Motion::new(
-                            hz_cluster::motion::HEARING,
-                            BLOCK_UNITS as f64 * unit_seconds(source.sample_rate()),
-                        ),
-                        resultants: Vec::new(),
-                        energies: Vec::new(),
-                        resting: Vec::new(),
-                        audible: Vec::new(),
-                        was_audible: Vec::new(),
-                        whole: 0,
-                        voiced: 0,
-                        fell_back: 0,
-                        judged: blank_clustering(),
-                        report: match &config.overlay_report {
-                            Some(path) => Some(std::io::BufWriter::new(
-                                std::fs::File::create(path).map_err(|e| Error::io(path, e))?,
-                            )),
-                            None => None,
-                        },
-                        reported_blocks: 0,
-                        reported_at: 0,
-                    })),
+                    )?)),
                     ..blank_fold(&config, f64::from(source.sample_rate()), width)?
                 })
             }
@@ -2021,7 +1622,7 @@ pub fn run(config: Config) -> Result<()> {
             );
         }
         if let Shape::Overlaid(overlaid) = &fold.shape {
-            overlay_summary(overlaid, fold.blocks, &config);
+            overlay::summary(overlaid, fold.blocks, config.overlay_beds);
         }
         println!(
             "  depth        {} rounded to {} bits{}",
@@ -2081,35 +1682,17 @@ pub fn run(config: Config) -> Result<()> {
     if let Some(fold) = &folded
         && let Shape::Overlaid(overlaid) = &fold.shape
     {
-        let remarks = overlay_remarks(
+        let remarks = overlay::remarks(
             overlaid,
-            fold,
+            &overlay::Totals {
+                blocks: fold.blocks,
+                mean: fold.mean,
+                clipped: fold.clipped,
+                limiter: fold.limiter.as_ref(),
+            },
             BLOCK_UNITS as f64 * unit_seconds(source.sample_rate()),
         );
-        for remark in remarks.iter().filter(|remark| !remark.refused) {
-            println!("  note         {}", remark.said);
-        }
-        let refusals: Vec<&Remark> = remarks.iter().filter(|remark| remark.refused).collect();
-        if !refusals.is_empty() {
-            // `error:` on standard error, because that is the line a process
-            // host greps for and the shape every other refusal here takes.
-            // The stream is left where it was written: a refusal is a
-            // statement about what is in the file, and the fastest way to
-            // check a bound nobody has listened to yet is to listen to what
-            // it stopped.
-            for refusal in &refusals {
-                eprintln!("error: overlay: {}", refusal.said);
-            }
-            return Err(Error::refused(
-                &config.out,
-                format!(
-                    "the overlay is outside {} of its bounds; the stream was written and left \
-                     in place so that it can be heard, and every bound is a flag that turns it \
-                     off — see docs/encode.md",
-                    refusals.len()
-                ),
-            ));
-        }
+        overlay::verdict(&remarks, &config.out)?;
     }
     Ok(())
 }
@@ -2596,13 +2179,122 @@ fn fold_span(
 /// pushed past full scale is a clip, and one the rounding nudged over is not.
 #[inline]
 fn quantise(value: f32, step: f64, peak: &mut f64, clipped: &mut u64) -> i32 {
-    let raw = (f64::from(value) * FULL_SCALE).round();
-    *peak = peak.max(raw.abs() / FULL_SCALE);
-    if !(FLOOR..=CEILING).contains(&raw) {
-        *clipped += 1;
+    overlay::quantise(value, FULL_SCALE, step, peak, clipped)
+}
+
+/// Keep the master's elements and pan its last few objects onto them, for one
+/// block — see [`Overlaid::span`], which decides it. This states what a
+/// decoder of this stream applies to each element — the gain its payload
+/// states, in the whole decibels the syntax carries, which a source added to
+/// the element is divided by — and writes what was decided: an element copied
+/// from the master's block as it is, or mixed and rounded to `--fold-depth`.
+#[allow(clippy::too_many_arguments)]
+fn overlay_span(
+    fold: &mut Fold,
+    path: &std::path::Path,
+    states: &[(usize, Keyframe)],
+    parts: &[Part],
+    block: &[i32],
+    source_channels: usize,
+    frames: usize,
+    lfe_channel: Option<usize>,
+    elements: usize,
+    out: &mut [i32],
+) -> Result<Vec<u8>> {
+    let Fold {
+        shape,
+        scene,
+        signals,
+        gains,
+        mixed,
+        from,
+        limiter,
+        floor,
+        renderers,
+        step,
+        peak,
+        clipped,
+        blocks,
+        mean,
+        worst,
+        ..
+    } = fold;
+    let Shape::Overlaid(overlaid) = shape else {
+        unreachable!("an overlay span over an overlay fold")
+    };
+    let kept_elements = overlaid.elements;
+    let sources = overlaid.sources;
+    overlaid.kept.clear();
+    overlaid.kept.extend(
+        states
+            .iter()
+            .take(kept_elements)
+            .map(|(part_index, state)| match parts[*part_index] {
+                Part::Object { .. } => Some(overlay::Kept {
+                    position: state.position,
+                    stated: stated_gain(state.gain),
+                }),
+                _ => None,
+            }),
+    );
+    overlaid.voices.clear();
+    overlaid.voices.extend(
+        states[kept_elements..kept_elements + sources]
+            .iter()
+            .map(|(_, state)| overlay::Voice::of(state, stated_gain(state.gain))),
+    );
+    let spent = overlaid
+        .span(
+            overlay::Block {
+                first: usize::from(lfe_channel.is_some()),
+                elements,
+                frames,
+            },
+            overlay::Buffers {
+                scene,
+                signals,
+                gains,
+                mixed,
+                from,
+                limiter: limiter.as_mut(),
+                ceiling: CEILING / FULL_SCALE,
+                floor,
+                renderers,
+            },
+        )
+        .map_err(|e| Error::io(path, e))?;
+    *blocks += 1;
+    if let Some((block_mean, block_worst)) = spent.cost {
+        *mean += block_mean;
+        *worst = worst.max(block_worst);
     }
-    let ceiling = (CEILING / step).floor() * step;
-    ((raw / step).round() * step).clamp(FLOOR, ceiling) as i32
+
+    // Element by element rather than sample by sample: which of the two an
+    // element is was decided once for the whole block, so asking again at
+    // every sample is a branch a million times a second that always answers
+    // the same. Most elements are the copy, which is now a strided run.
+    for element in 0..elements {
+        match overlaid.copy_from[element] {
+            Some(channel) => {
+                for sample in 0..frames {
+                    out[sample * elements + element] = block[sample * source_channels + channel];
+                }
+            }
+            None => {
+                let signal = &mixed[element];
+                for sample in 0..frames {
+                    out[sample * elements + element] =
+                        quantise(signal[sample], *step, peak, clipped);
+                }
+            }
+        }
+    }
+
+    // No payload from here. An overlay's element metadata is the master's and
+    // the master states it once an access unit, so the producer writes one per
+    // unit from `Waiting::units`; building a thirty-third one from the block's
+    // last state would be the same bytes computed twice.
+    Ok(Vec::new())
 }
 
 /// Fold the block's objects into fewer elements, and say where they went.
@@ -2732,552 +2424,6 @@ fn cluster_span(
     Ok(payload)
 }
 
-/// Keep the master's elements and pan its last few objects onto them.
-///
-/// The elements arrive as they are: element `e` carries its own channel, at
-/// its own level, under its own metadata. A source is panned onto the elements
-/// that are live this block — see [`hz_cluster::overlay`] — and added to them,
-/// pre-divided by each element's *stated* gain so that what a decoder renders
-/// is the element as it was plus the source where it asked to be.
-///
-/// # The fast path is the point
-///
-/// An element no source reaches this block, and reached by none last block
-/// either, is **copied**. Not summed with a row of zeroes and not rounded to
-/// `--fold-depth`: the samples the master brought, written out unchanged. On a
-/// dub that is most of the programme, and it is the difference between a
-/// re-voiced stream and a re-encoded one. The low frequency channel is always
-/// copied, as it is in a clustering fold, and so is an element a source took a
-/// spare slot in, which carries that source alone.
-#[allow(clippy::too_many_arguments)]
-fn overlay_span(
-    fold: &mut Fold,
-    path: &std::path::Path,
-    states: &[(usize, Keyframe)],
-    parts: &[Part],
-    block: &[i32],
-    source_channels: usize,
-    frames: usize,
-    lfe_channel: Option<usize>,
-    elements: usize,
-    out: &mut [i32],
-) -> Result<Vec<u8>> {
-    let Fold {
-        shape,
-        scene,
-        signals,
-        gains,
-        mixed,
-        from,
-        limiter,
-        floor,
-        renderers,
-        ..
-    } = fold;
-    let Shape::Overlaid(overlaid) = shape else {
-        unreachable!("an overlay span over an overlay fold")
-    };
-    let first = usize::from(lfe_channel.is_some());
-    let sources = overlaid.sources;
-    let objects = signals.len();
-    // The master's own objects, which are the elements, and the ones appended
-    // after them, which are the sources. An object's index among the signals
-    // is its part's, less the low frequency channel that has no signal of its
-    // own here.
-    let carried = objects.saturating_sub(sources);
-
-    // Where each element is, and what a decoder will apply to it. Both are the
-    // master's, read off this block's state; the elements are the parts before
-    // the sources, and a spare slot's element is the source that took it.
-    overlaid.carriers.clear();
-    overlaid.positions.clear();
-    overlaid.stated.clear();
-    let mut stated = [1.0f64; hz_mlp::format::MAX_CHANNELS];
-    for (part_index, state) in states.iter().take(overlaid.elements) {
-        let element = *part_index;
-        let Part::Object { bed, .. } = &parts[element] else {
-            // The low frequency channel has no position and is never panned
-            // onto: vector-base panning needs a direction and it has none, and
-            // the presentations fold it by its own rule.
-            continue;
-        };
-        overlaid.positions.push(state.position);
-        // An element a decoder will silence carries nothing a source could be
-        // heard through, and dividing by its gain would divide by nought.
-        // *Muted*, and not "inactive": the master's keyframes carry no active
-        // flag, so a silenced element is one whose stated gain is nought and
-        // nothing here can see any other kind.
-        let gain = stated_gain(state.gain);
-        stated[element] = gain;
-        overlaid.stated.push(gain);
-        if gain <= 0.0 {
-            continue;
-        }
-        overlaid.carriers.push(hz_cluster::overlay::Carrier {
-            element,
-            position: state.position,
-            bed: overlaid.beds.get(element).copied().unwrap_or(bed.is_some()),
-        });
-    }
-    // A source that took a spare element of its own is an element the
-    // presentations fold like any other, and it is never a carrier: the scene
-    // a source is panned onto is the master's, not the other sources'. Its
-    // audio is the source's own, and the payload states the source's gain
-    // for it, so that is the gain it is folded at.
-    for index in &overlaid.slots {
-        let state = &states[overlaid.elements + index].1;
-        overlaid.positions.push(state.position);
-        overlaid.stated.push(stated_gain(state.gain));
-    }
-
-    // Fit the sources onto them.
-    let scene_objects = scene.objects();
-    overlaid.fitting.clear();
-    for index in 0..sources {
-        let object = carried + index;
-        overlaid.fitting.push(hz_cluster::Object {
-            position: states[overlaid.elements + index].1.position,
-            energy: scene_objects.get(object).map_or(0.0, |o| o.energy),
-            size: states[overlaid.elements + index].1.spread,
-            pinned: None,
-            mode: states[overlaid.elements + index].1.mode,
-            peak: 0.0,
-        });
-    }
-    overlaid.overlay.fit(
-        elements,
-        &overlaid.carriers,
-        &overlaid.fitting,
-        Some(&overlaid.previous),
-        &mut overlaid.weights,
-    );
-
-    // What the fit did to each source, and whether it is good enough to ship.
-    //
-    // This runs *before* the mix, because the fallback changes the weights:
-    // a source the fit could not place acceptably is routed to the nearest
-    // bed outright, which is audible and slightly misplaced rather than
-    // diffuse and wandering. See [`Bounds`].
-    overlaid.resultants.clear();
-    overlaid.energies.clear();
-    overlaid.run.resize(overlaid.sources, 0);
-    overlaid.resting.resize(overlaid.sources, None);
-    overlaid.stranded_run.resize(overlaid.sources, 0);
-    std::mem::swap(&mut overlaid.was_audible, &mut overlaid.audible);
-    overlaid.audible.clear();
-    overlaid.audible.resize(overlaid.sources, false);
-    overlaid.was_audible.resize(overlaid.sources, false);
-    for index in 0..overlaid.sources {
-        let source = overlaid.fitting[index];
-        let slotted = overlaid.slotted[index];
-        // A source with an element of its own is exactly where it asked to
-        // be, and a source nobody can hear is not a fact about the
-        // programme. Neither is judged, and neither breaks a run.
-        let voiced = !slotted && floor.heard(source.energy.max(0.0));
-        overlaid.audible[index] = voiced;
-        overlaid
-            .energies
-            .push(if voiced { source.energy.max(0.0) } else { 0.0 });
-        if !voiced {
-            // **A source nobody can hear carries nothing** — but its weights
-            // are left exactly as they were.
-            //
-            // Zeroing them was the first answer, and it put a fade at every
-            // phrase onset: the next audible block then ramped the voice up
-            // from nought over 27 ms, because a weight that changed is a
-            // weight the mixer crossfades. The weights were never the problem.
-            // A silent source contributes `w · 0` whatever `w` is, so what has
-            // to change for an element to be *copied* is not the weight but
-            // the question asked of it — which is now whether any source
-            // reaching it was **audible**, this block or the last. See where
-            // `touched` is decided.
-            //
-            // Keeping them also keeps the held set: the fit is handed the last
-            // real answer rather than a row of noughts, so hysteresis survives
-            // a pause instead of restarting after every phrase.
-            // Where it went is held at the last place it was heard, not reset
-            // to where it asked to be. `Motion` judges a window by the
-            // loudest the source got anywhere in it, so a window straddling a
-            // phrase boundary is judged — and pushing the asked direction
-            // through the silence would show it leaving its carriers and
-            // coming back, an out-and-back of twice the drift at every
-            // onset and release. That is the guard reporting punctuation.
-            let held = overlaid
-                .resting
-                .get(index)
-                .copied()
-                .flatten()
-                .unwrap_or_else(|| hz_cluster::direction(source.position));
-            overlaid.resultants.push(held);
-            // And silence ends a run: two phrases either side of a pause are
-            // two runs, not one long one.
-            overlaid.run[index] = 0;
-            overlaid.stranded_run[index] = 0;
-            continue;
-        }
-
-        // The source's weights over this block's carriers rather than over
-        // every element, which is the shape the measures want. One buffer,
-        // refilled: this runs once per audible source per block.
-        let row = &mut overlaid.row;
-        row.clear();
-        row.extend(
-            overlaid
-                .carriers
-                .iter()
-                .map(|carrier| overlaid.weights[index][carrier.element]),
-        );
-        let mut drift = hz_cluster::overlay::drift(source.position, &overlaid.carriers, row);
-        let mut spread = hz_cluster::overlay::spread(row);
-
-        // The fallback, on the two conditions a fallback can fix: the source
-        // went nowhere at all, or it went somewhere far enough off, or it
-        // went everywhere at once. Where it went slightly wrong the fit's
-        // answer is better than a bed's, and it is left alone.
-        let unplaceable = drift.is_none()
-            || drift.is_some_and(|at| overlaid.bounds.drift > 0.0 && at > overlaid.bounds.drift)
-            || (overlaid.bounds.spread > 0.0 && spread.strongest < overlaid.bounds.spread);
-        if unplaceable && overlaid.bounds.fallback {
-            if let Some(slot) =
-                hz_cluster::overlay::nearest_bed(&overlaid.carriers, source.position)
-            {
-                row.iter_mut().for_each(|weight| *weight = 0.0);
-                row[slot] = 1.0;
-                for (carrier, weight) in overlaid.carriers.iter().zip(row.iter()) {
-                    overlaid.weights[index][carrier.element] = *weight;
-                }
-                drift = hz_cluster::overlay::drift(source.position, &overlaid.carriers, row);
-                spread = hz_cluster::overlay::spread(row);
-                overlaid.fell_back += 1;
-            }
-        }
-
-        match drift {
-            Some(at) => {
-                overlaid.drift += at;
-                overlaid.drifted += 1;
-                overlaid.worst_drift = overlaid.worst_drift.max(at);
-                if overlaid.bounds.drift > 0.0 && at > overlaid.bounds.drift / 2.0 {
-                    overlaid.over_half_drift += 1;
-                }
-                if overlaid.bounds.drift > 0.0 && at > overlaid.bounds.drift {
-                    overlaid.over_drift += 1;
-                    overlaid.run[index] += 1;
-                    overlaid.worst_run = overlaid.worst_run.max(overlaid.run[index]);
-                } else {
-                    overlaid.run[index] = 0;
-                }
-                overlaid.stranded_run[index] = 0;
-                let went = hz_cluster::overlay::resultant(&overlaid.carriers, row)
-                    .unwrap_or_else(|| hz_cluster::direction(source.position));
-                overlaid.resting[index] = Some(went);
-                overlaid.resultants.push(went);
-            }
-            // Audible, and carried by nothing at all: every element silenced
-            // by the gain it states, and no bed to fall back to either.
-            // Counted rather than guessed at.
-            None => {
-                // A source that went nowhere was still *audible*, so it counts
-                // towards the blocks the shares are over. Without this the
-                // denominator was the blocks that were placed, and a run
-                // stranded throughout divided by one.
-                overlaid.stranded += 1;
-                overlaid.drifted += 1;
-                overlaid.run[index] = 0;
-                overlaid.stranded_run[index] += 1;
-                overlaid.worst_stranded_run = overlaid
-                    .worst_stranded_run
-                    .max(overlaid.stranded_run[index]);
-                let held = overlaid
-                    .resting
-                    .get(index)
-                    .copied()
-                    .flatten()
-                    .unwrap_or_else(|| hz_cluster::direction(source.position));
-                overlaid.resultants.push(held);
-            }
-        }
-        if overlaid.bounds.spread > 0.0 && spread.strongest < overlaid.bounds.spread {
-            overlaid.over_spread += 1;
-        }
-    }
-
-    // What the sources cost and what level they come out at, on every
-    // presentation the stream is played through — the elements as the master
-    // placed them, the sources' own weights, and `hz_cluster::metric`'s own
-    // measures over the two. The elements are not in this: they are not
-    // folded, so they cost nothing by construction.
-    overlaid.judged.positions.clear();
-    overlaid
-        .judged
-        .positions
-        .extend(overlaid.carriers.iter().map(|carrier| carrier.position));
-    // Only the sources that were actually panned. One that took a spare
-    // element of its own is not folded at all — it *is* an element, carried
-    // whole and rendered from its own place — so judging its unused pan lets
-    // a source that costs nothing by construction push the guards around.
-    overlaid.panned.clear();
-    let mut judged = 0usize;
-    for index in 0..overlaid.sources {
-        if overlaid.slotted[index] {
-            continue;
-        }
-        // Filled in place: the rows are the same shape block after block once
-        // the carrier count settles, so this allocates on the first block and
-        // never again.
-        if overlaid.judged.weights.len() <= judged {
-            overlaid.judged.weights.push(Vec::new());
-        }
-        let row = &mut overlaid.judged.weights[judged];
-        row.clear();
-        row.extend(
-            overlaid
-                .carriers
-                .iter()
-                .map(|carrier| overlaid.weights[index][carrier.element]),
-        );
-        overlaid.panned.push(overlaid.fitting[index]);
-        judged += 1;
-    }
-    overlaid.judged.weights.truncate(judged);
-    if !overlaid.carriers.is_empty()
-        && !overlaid.panned.is_empty()
-        && let Ok(report) =
-            hz_cluster::metric::error_with(&overlaid.panned, &overlaid.judged, renderers, floor)
-    {
-        fold.mean += report.mean;
-        fold.worst = fold.worst.max(report.worst);
-        if report.worst > overlaid.worst_cost {
-            overlaid.worst_cost = report.worst;
-            // Which presentation it was worst on, and what the source asked
-            // for there. A cost is a *relative* error — how far the carriers
-            // land from the source, over what the source itself radiates on
-            // that layout — so a refusal that does not name the layout leaves
-            // a caller unable to tell a real geometric miss from a small
-            // denominator. Kept only for the worst block, which is the one
-            // the refusal quotes.
-            overlaid.worst_cost_where.clear();
-            for layer in &report.layouts {
-                if !overlaid.worst_cost_where.is_empty() {
-                    overlaid.worst_cost_where.push_str(", ");
-                }
-                // The cost *and* its denominator. A relative error cannot be
-                // read without the vector it is relative to: a presentation
-                // the source barely reaches has a small own norm, and a small
-                // absolute error over it is a large relative one. Printing
-                // both is what lets a caller tell that case from a real miss
-                // without taking anybody's word for it.
-                overlaid.worst_cost_where.push_str(&format!(
-                    "{} {:.2} of {:.2}",
-                    layer.name, layer.worst, layer.own
-                ));
-            }
-        }
-        if overlaid.bounds.cost > 0.0 && report.worst > overlaid.bounds.cost {
-            overlaid.over_cost += 1;
-        }
-        // The level on the *worst* presentation and not the mean of them: a
-        // voice that survives 7.1.4 and vanishes in stereo has vanished.
-        let strayed = report
-            .layouts
-            .iter()
-            .map(|layer| {
-                if layer.energy > 1e-6 {
-                    (20.0 * layer.energy.log10()).abs()
-                } else {
-                    0.0
-                }
-            })
-            .fold(0.0f64, f64::max);
-        overlaid.worst_level = overlaid.worst_level.max(strayed);
-        if overlaid.bounds.level > 0.0 && strayed > overlaid.bounds.level {
-            overlaid.over_level += 1;
-        }
-    }
-    // Where the carriers put the sources, block after block. The sources are
-    // static, so anything this calls movement is movement nobody asked for.
-    overlaid
-        .motion
-        .record(&overlaid.resultants, &overlaid.energies);
-    if overlaid.energies.iter().any(|energy| *energy > 0.0) {
-        overlaid.voiced += 1;
-    }
-    fold.blocks += 1;
-
-    // Which elements are mixed and which are copied. An element is mixed if a
-    // source reaches it now *or* reached it last block, because the weights
-    // ramp across the boundary and a ramp from something to nothing is still
-    // something for most of the block.
-    overlaid.copy_from.clear();
-    overlaid.copy_from.resize(elements, None);
-    overlaid.touched.clear();
-    overlaid.touched.resize(elements, false);
-    for (index, row) in overlaid.weights.iter().enumerate() {
-        if overlaid.slotted[index] {
-            continue;
-        }
-        // A source that nobody could hear in this block or the last reaches
-        // nothing, whatever its weights say: it contributed `w · 0` to both,
-        // so the elements it names are the master's own samples and are
-        // copied. One block of memory because the weights ramp across a
-        // boundary — the block after a source falls silent still carries the
-        // tail of the block before it.
-        if !overlaid.audible[index] && !overlaid.was_audible[index] {
-            continue;
-        }
-        let was = overlaid.previous.get(index);
-        for element in 0..elements {
-            if row[element] != 0.0 || was.is_some_and(|was| was[element] != 0.0) {
-                overlaid.touched[element] = true;
-            }
-        }
-    }
-    for (element, part) in parts.iter().enumerate().take(overlaid.elements) {
-        if !overlaid.touched[element]
-            && let Some(channel) = part.source_channel()
-        {
-            overlaid.copy_from[element] = Some(channel);
-        }
-    }
-    // A source that took a spare slot is an element of its own carrying
-    // nothing else, so it is copied too, and its metadata is its own.
-    for (slot, index) in overlaid.slots.iter().enumerate() {
-        let element = overlaid.elements + slot;
-        if let Some(channel) = parts[overlaid.elements + index].source_channel() {
-            overlaid.copy_from[element] = Some(channel);
-        }
-    }
-
-    // The mix matrix over every object: an element carries itself at unity
-    // when it is mixed at all, and a source is spread over the carriers,
-    // divided by each one's stated gain so the sum renders where it asked to.
-    overlaid.mix.clear();
-    overlaid.mix.resize_with(objects, Vec::new);
-    for row in overlaid.mix.iter_mut() {
-        row.clear();
-        row.resize(elements, 0.0);
-    }
-    for object in 0..carried {
-        let element = object + first;
-        if overlaid.copy_from[element].is_none() {
-            overlaid.mix[object][element] = 1.0;
-        }
-        // An element's own audio goes through as it is: the level a decoder
-        // applies is in the metadata, which is the master's, so applying it
-        // here as well would apply it twice.
-        gains[object] = 1.0;
-    }
-    for index in 0..sources {
-        if overlaid.slotted[index] {
-            continue;
-        }
-        for element in 0..elements {
-            let weight = overlaid.weights[index][element];
-            if weight != 0.0 && stated[element] > 0.0 {
-                overlaid.mix[carried + index][element] = weight / stated[element];
-            }
-        }
-    }
-
-    // What the weights ramp from: the previous block's matrix, or this one's
-    // where there is nothing to ramp from.
-    if from.len() != objects || from.first().is_none_or(|row| row.len() != elements) {
-        from.clear();
-        from.extend(overlaid.mix.iter().cloned());
-    }
-    // **An element's own signal is never ramped.** Only a source's weight is.
-    //
-    // A copied element has no row in the matrix at all — that is what makes it
-    // free — so the block after a source first reaches it, the previous
-    // matrix has a nought on its diagonal and this one has a one. Left alone,
-    // `hz_cluster::mix::mix` reads that as a weight to interpolate and fades
-    // the element's *own* audio up from silence across the block: 27 ms of
-    // the programme nobody touched, arriving at 0.13, 0.38, 0.62 and 0.88 of
-    // itself over the four quarters of the block, with a step at each end.
-    // Every change of carrier set does it — a held set flipping, a fallback
-    // taken, a moving carrier arriving, an element unmuting — so on a dub it
-    // is a hole and a click in the M&E at every phrase.
-    //
-    // The diagonal is therefore forced to what this block asks for before the
-    // ramp is applied. A source's weights still ramp, which is what the
-    // crossfade is for; the audio that was already there does not.
-    for object in 0..carried {
-        let element = object + first;
-        let carries_itself = overlaid.mix[object][element];
-        if carries_itself != 0.0 {
-            from[object][element] = carries_itself;
-        }
-    }
-    hz_cluster::mix::mix(signals, gains, from, &overlaid.mix, frames, mixed);
-    let mut limited = false;
-    if let Some(limiter) = limiter {
-        // Only the elements this block actually mixed. The rest are copied
-        // straight out of the master and never reach `mixed` at all, so their
-        // rows are noughts the limiter would otherwise scan twice a block.
-        overlaid.live.clear();
-        overlaid
-            .live
-            .extend(overlaid.copy_from.iter().map(Option::is_none));
-        limited = limiter.apply_to(mixed, CEILING / FULL_SCALE, &overlaid.live);
-    }
-
-    // Element by element rather than sample by sample: which of the two an
-    // element is was decided once for the whole block, so asking again at
-    // every sample is a branch a million times a second that always answers
-    // the same. Most elements are the copy, which is now a strided run.
-    for element in 0..elements {
-        match overlaid.copy_from[element] {
-            Some(channel) => {
-                for sample in 0..frames {
-                    out[sample * elements + element] = block[sample * source_channels + channel];
-                }
-            }
-            None => {
-                let signal = &mixed[element];
-                for sample in 0..frames {
-                    out[sample * elements + element] =
-                        quantise(signal[sample], fold.step, &mut fold.peak, &mut fold.clipped);
-                }
-            }
-        }
-    }
-    if overlaid.copy_from.iter().all(Option::is_some) {
-        overlaid.whole += 1;
-    }
-    overlaid.copied += overlaid
-        .copy_from
-        .iter()
-        .filter(|from| from.is_some())
-        .count() as u64;
-    overlaid.remixed += overlaid
-        .copy_from
-        .iter()
-        .filter(|from| from.is_none())
-        .count() as u64;
-
-    // What this block did, for a checker that has to reproduce it. Written
-    // before the buffers are swapped, while `overlaid.mix` still holds the
-    // weights this block ended at.
-    if overlaid.report.is_some() {
-        write_overlay_report(
-            overlaid, parts, gains, from, carried, frames, elements, limited,
-        )
-        .map_err(|e| Error::io(path, e))?;
-    }
-    overlaid.reported_blocks += 1;
-    overlaid.reported_at += frames as u64;
-
-    std::mem::swap(from, &mut overlaid.mix);
-    std::mem::swap(&mut overlaid.previous, &mut overlaid.weights);
-
-    // No payload from here. An overlay's element metadata is the master's and
-    // the master states it once an access unit, so the producer writes one per
-    // unit from `Waiting::units`; building a thirty-third one from the block's
-    // last state would be the same bytes computed twice.
-    let _ = path;
-    Ok(Vec::new())
-}
-
 /// Whether the elements say what they said at the unit before.
 ///
 /// The cheap half of deciding a payload. Two states that differ still often
@@ -3299,89 +2445,6 @@ fn held(said: &[Keyframe], states: &[(usize, Keyframe)], kept: usize) -> bool {
 fn remember(said: &mut Vec<Keyframe>, states: &[(usize, Keyframe)], kept: usize) {
     said.clear();
     said.extend(states.iter().take(kept).map(|(_, state)| *state));
-}
-
-/// One block of the account described at [`Overlaid::report`].
-///
-/// A line-based format on purpose: it is read by one tool, it has to survive
-/// being looked at by eye when that tool and this disagree, and a structured
-/// one would put a parser between the encoder's answer and the question being
-/// asked of it.
-///
-/// ```text
-/// element <index> <source channel>    once, before any block: which master
-///                                     channel the element's own audio is —
-///                                     a copy names it too, but an element
-///                                     mixed on every block is never copied
-/// block <index> <first sample> <frames> <limited>
-/// copy <element> <source channel>     an element taken from the master whole
-/// mix <element>                       an element the block summed
-/// w <source> <element> <from> <to>    a weight, already divided by the
-///                                     element's stated gain, ramped across
-///                                     the block from `from` to `to`
-/// g <source> <gain>                   the source's own gain, applied before
-///                                     the weight, as `hz_cluster::mix` does
-/// ```
-#[allow(clippy::too_many_arguments)]
-fn write_overlay_report(
-    overlaid: &mut Overlaid,
-    parts: &[Part],
-    gains: &[f64],
-    from: &[Vec<f64>],
-    carried: usize,
-    frames: usize,
-    elements: usize,
-    limited: bool,
-) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let block = overlaid.reported_blocks;
-    let at = overlaid.reported_at;
-    // Split the borrow: the writer is one field and everything it reads is
-    // another, which is what lets this take `&mut Overlaid` and still read.
-    let Overlaid {
-        report,
-        copy_from,
-        mix,
-        sources,
-        slotted,
-        ..
-    } = overlaid;
-    let Some(out) = report.as_mut() else {
-        return Ok(());
-    };
-    if block == 0 {
-        for (element, part) in parts.iter().enumerate().take(elements) {
-            if let Some(channel) = part.source_channel() {
-                writeln!(out, "element {element} {channel}")?;
-            }
-        }
-    }
-    writeln!(out, "block {block} {at} {frames} {}", u8::from(limited))?;
-    for (element, from) in copy_from.iter().enumerate().take(elements) {
-        match from {
-            Some(channel) => writeln!(out, "copy {element} {channel}")?,
-            None => writeln!(out, "mix {element}")?,
-        }
-    }
-    for index in 0..*sources {
-        if slotted[index] {
-            continue;
-        }
-        let row = carried + index;
-        writeln!(out, "g {index} {:.17e}", gains[row])?;
-        for element in 0..elements {
-            let to = mix[row][element];
-            let was = from
-                .get(row)
-                .and_then(|row| row.get(element))
-                .copied()
-                .unwrap_or(to);
-            if to != 0.0 || was != 0.0 {
-                writeln!(out, "w {index} {element} {was:.17e} {to:.17e}")?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// What an overlay states for its elements at one instant.
@@ -3443,315 +2506,6 @@ fn ramp_of_states(states: &[(usize, Keyframe)], parts: &[Part], elements: usize)
         Ramp::None
     } else {
         Ramp::Samples(longest.min(2047) as u16)
-    }
-}
-
-/// One thing the guards found, and how seriously.
-struct Remark {
-    refused: bool,
-    said: String,
-}
-
-/// What the guards say about the stream that was just written.
-///
-/// Every share is over the blocks a source was **audible** in, and the
-/// sources that took a spare element of their own are not judged at all: they
-/// are exactly where they asked to be, by construction.
-///
-/// The stream is **left on disk** when this refuses. A refusal is a statement
-/// about what is in the file, and the fastest way to check a bound nobody has
-/// listened to yet is to listen to what it stopped.
-fn overlay_remarks(overlaid: &Overlaid, fold: &Fold, seconds_a_block: f64) -> Vec<Remark> {
-    let mut out = Vec::new();
-    let bounds = overlaid.bounds;
-    let voiced = overlaid.voiced.max(1) as f64;
-    let placed = overlaid.drifted.max(1) as f64;
-    let mut say = |refused: bool, said: String| out.push(Remark { refused, said });
-
-    if bounds.drift > 0.0 && overlaid.drifted > 0 {
-        let share = overlaid.over_drift as f64 / placed;
-        let run = overlaid.worst_run as f64 * seconds_a_block;
-        if share > OVERLAY_SHARE {
-            say(
-                true,
-                format!(
-                    "{:.1} % of the blocks a source was audible in put it more than {:.0}° from \
-                     where it asked to be, which is past the {:.0} % this refuses at",
-                    100.0 * share,
-                    bounds.drift,
-                    100.0 * OVERLAY_SHARE
-                ),
-            );
-        } else if run > OVERLAY_RUN {
-            say(
-                true,
-                format!(
-                    "a source stayed more than {:.0}° from where it asked to be for {run:.1} s \
-                     without a break, which is past the {OVERLAY_RUN:.0} s this refuses at — a \
-                     share says how much of a programme is wrong and not whether it is wrong all \
-                     at once",
-                    bounds.drift
-                ),
-            );
-        } else if overlaid.worst_drift > bounds.drift / 2.0 {
-            say(
-                false,
-                format!(
-                    "a source reached {:.1}° from where it asked to be, past the {:.0}° a rear \
-                     blur stops forgiving; {:.1} % of the audible blocks are over that",
-                    overlaid.worst_drift,
-                    bounds.drift / 2.0,
-                    // The share over the *half* bound, which is what this
-                    // sentence is about. Printing the share over the refusal
-                    // bound here said "0.0 % over 15°" on a run whose mean
-                    // drift was 15.4°, which is a number that contradicts the
-                    // sentence around it.
-                    100.0 * overlaid.over_half_drift as f64 / placed
-                ),
-            );
-        }
-    }
-
-    if bounds.spread > 0.0 && overlaid.drifted > 0 {
-        let share = overlaid.over_spread as f64 / placed;
-        if share > OVERLAY_SHARE {
-            say(
-                true,
-                format!(
-                    "{:.1} % of the blocks a source was audible in left no element holding {:.2} \
-                     of it, so it is rendered from everywhere the fit reached rather than from \
-                     somewhere",
-                    100.0 * share,
-                    bounds.spread
-                ),
-            );
-        } else if share > 0.0 {
-            say(
-                false,
-                format!(
-                    "{:.1} % of the audible blocks spread a source with no element holding {:.2} \
-                     of it",
-                    100.0 * share,
-                    bounds.spread
-                ),
-            );
-        }
-    }
-
-    if bounds.wobble > 0.0 && overlaid.motion.windows() > 0 {
-        let wobbling = 100.0 * overlaid.motion.wobbling();
-        if wobbling > bounds.wobble {
-            say(
-                true,
-                format!(
-                    "{wobbling:.2} % of the windows a source was heard in carry movement nobody \
-                     asked for — a carrier moved under a source that did not — which is past the \
-                     {:.0} % this refuses at; {:.2}°/s of it",
-                    bounds.wobble,
-                    overlaid.motion.invented()
-                ),
-            );
-        } else if wobbling > bounds.wobble / 5.0 {
-            say(
-                false,
-                format!(
-                    "{wobbling:.2} % of the windows a source was heard in carry movement nobody \
-                     asked for, {:.2}°/s of it — see hz_cluster::motion",
-                    overlaid.motion.invented()
-                ),
-            );
-        }
-    }
-
-    if overlaid.stranded > 0 {
-        // On the same share and the same run as drift. A source-block with
-        // nowhere to go is a hole in the dub, but one of them is 27 ms and a
-        // programme is not unshippable for it; what makes it unshippable is
-        // that it keeps happening, or that it happens for a whole phrase.
-        let share = overlaid.stranded as f64 / placed.max(1.0);
-        let run = overlaid.worst_stranded_run as f64 * seconds_a_block;
-        let said = format!(
-            "{} source-blocks ({:.1} %) were audible with no element to carry them at all — \
-             every candidate muted, and no bed to fall back to — the longest stretch {run:.1} s",
-            overlaid.stranded,
-            100.0 * share
-        );
-        say(share > OVERLAY_SHARE || run > OVERLAY_RUN, said);
-    }
-
-    if bounds.level > 0.0 && overlaid.voiced > 0 {
-        let share = overlaid.over_level as f64 / voiced;
-        if share > OVERLAY_SHARE {
-            say(
-                true,
-                format!(
-                    "{:.1} % of the voiced blocks render a source more than {:.1} dB from the \
-                     level it asked for on some presentation, {:.2} dB at its worst — a voice \
-                     that survives the wide layout and vanishes in the downmix",
-                    100.0 * share,
-                    bounds.level,
-                    overlaid.worst_level
-                ),
-            );
-        } else if overlaid.worst_level > bounds.level / 2.0 {
-            say(
-                false,
-                format!(
-                    "a source's rendered level strayed {:.2} dB on some presentation",
-                    overlaid.worst_level
-                ),
-            );
-        }
-    }
-
-    if bounds.cost > 0.0 && overlaid.voiced > 0 {
-        let share = overlaid.over_cost as f64 / voiced;
-        if share > OVERLAY_SHARE {
-            say(
-                true,
-                format!(
-                    "{:.1} % of the voiced blocks cost the worst source more than {:.2} of its \
-                     own gain vector, {:.3} at its worst ({}). A source at a speaker's place \
-                     costs nothing; this much means the elements the master brought cannot \
-                     reach where the source asked to be",
-                    100.0 * share,
-                    bounds.cost,
-                    overlaid.worst_cost,
-                    overlaid.worst_cost_where
-                ),
-            );
-        } else if fold.blocks > 0 && fold.mean / fold.blocks as f64 > 0.05 {
-            say(
-                false,
-                format!(
-                    "the sources cost {:.4} of their own gains on average",
-                    fold.mean / fold.blocks as f64
-                ),
-            );
-        }
-    }
-
-    if fold.clipped > 0 {
-        say(
-            true,
-            format!(
-                "{} samples went outside the codec's domain and were clamped; an overlay that \
-                 clips is one whose elements had no headroom left for what was added to them",
-                fold.clipped
-            ),
-        );
-    } else if let Some(limiter) = &fold.limiter
-        && limiter.limited > 0
-    {
-        say(
-            false,
-            format!(
-                "{} blocks where the limiter brought every element down, the mix peaking at \
-                 {:.2} of full scale before it",
-                limiter.limited, limiter.peak
-            ),
-        );
-    }
-    out
-}
-
-/// What an overlay did, in the encoder's own summary.
-///
-/// The two numbers that matter are how much of the programme came through
-/// untouched and how far the sources ended up from where they asked to be.
-/// Everything else an overlay could report is the clustering's and is not
-/// stated here, because an overlay does not do it.
-fn overlay_summary(overlaid: &Overlaid, blocks: u64, config: &Config) {
-    let element_blocks = overlaid.copied + overlaid.remixed;
-    println!(
-        "  overlay      {} elements kept, {} sources panned onto them{}",
-        overlaid.elements,
-        overlaid.sources - overlaid.slots.len(),
-        if overlaid.slots.is_empty() {
-            String::new()
-        } else {
-            format!(
-                ", {} taking a spare element of its own",
-                overlaid.slots.len()
-            )
-        }
-    );
-    if element_blocks > 0 {
-        println!(
-            "  untouched    {:.1} % of the element-blocks copied through, neither mixed nor \
-             rounded ({} of {}); {:.1} % of the programme's blocks touched nothing at all",
-            100.0 * overlaid.copied as f64 / element_blocks as f64,
-            overlaid.copied,
-            element_blocks,
-            // The share of *time*, beside the share of element-blocks. They
-            // answer different questions: how much of the scene came through
-            // untouched, and how much of the running time nothing was mixed
-            // in at all — which on a dub is the silence between the phrases,
-            // and is what the fast path is worth.
-            100.0 * overlaid.whole as f64 / blocks.max(1) as f64
-        );
-    }
-    if overlaid.drifted > 0 {
-        println!(
-            "  drift        {:.2}° mean between where a source asked to be and where its \
-             carriers put it, {:.2}° at its worst, over {:.2} audible sources a block",
-            overlaid.drift / overlaid.drifted as f64,
-            overlaid.worst_drift,
-            overlaid.drifted as f64 / blocks.max(1) as f64,
-        );
-    }
-    let beds = overlaid.beds.iter().filter(|bed| **bed).count();
-    println!(
-        "  beds         {} of {} elements are bed channels, {}",
-        beds,
-        overlaid.elements,
-        match (beds, overlaid.declared_beds) {
-            (0, _) => "so nothing prefers one and the fallback has nowhere to go".to_string(),
-            (found, 0) => format!(
-                "all {found} of them worked out from the master — static, and exactly at a \
-                 speaker's place on the wire's own grid — since it declares none"
-            ),
-            (found, declared) if found == declared => format!("all {found} declared by the master"),
-            (found, declared) => format!(
-                "{declared} declared by the master and {} worked out from being static at a \
-                 speaker's place",
-                found - declared
-            ),
-        }
-    );
-    println!(
-        "  carried by   {}",
-        match config.overlay_beds {
-            Some(reach) => format!(
-                "the beds wherever a bed-only fit lands within {reach:.2} of what the source \
-                 radiates, and the moving elements only where it does not"
-            ),
-            None => "whatever fits best, the moving elements included".to_string(),
-        }
-    );
-    if overlaid.fell_back > 0 && overlaid.drifted > 0 {
-        println!(
-            "  fell back    {:.1} % of the audible source-blocks were put on the nearest bed \
-             outright, the fit having placed them too far off or too widely ({} of {})",
-            100.0 * overlaid.fell_back as f64 / overlaid.drifted as f64,
-            overlaid.fell_back,
-            overlaid.drifted
-        );
-    }
-    if overlaid.motion.windows() > 0 {
-        println!(
-            "  unasked      {:.2} % of the windows a source was heard in carry movement nobody \
-             asked for, {:.2}°/s of it — a carrier moved under a source that did not",
-            100.0 * overlaid.motion.wobbling(),
-            overlaid.motion.invented(),
-        );
-    }
-    if overlaid.stranded > 0 {
-        println!(
-            "  stranded     {} source-blocks were audible with every element \
-             silenced by their stated gain, and went nowhere",
-            overlaid.stranded
-        );
     }
 }
 
@@ -3911,6 +2665,7 @@ fn plain_presentations(
 /// Full scale for the codec's twenty-four bit domain, and its two ends.
 const FULL_SCALE: f64 = 8_388_608.0;
 const CEILING: f64 = 8_388_607.0;
+#[cfg(test)]
 const FLOOR: f64 = -8_388_608.0;
 
 /// What a folded element's samples are rounded to.
@@ -4130,66 +2885,29 @@ mod tests {
     }
 
     fn overlay_fold(parts: &[Part], sources: usize, width: usize) -> Fold {
+        let elements = parts.len() - sources;
         Fold {
-            shape: Shape::Overlaid(Box::new(Overlaid {
-                overlay: hz_cluster::overlay::Overlay::new().expect("a reference"),
-                sources,
-                elements: parts.len() - sources,
-                row: Vec::new(),
-                live: Vec::new(),
-                slotted: vec![false; sources],
-                panned: Vec::new(),
-                slots: Vec::new(),
-                beds: beds_among(parts, parts.len() - sources),
-                declared_beds: parts[..parts.len() - sources]
-                    .iter()
-                    .filter(|part| matches!(part, Part::Object { bed: Some(_), .. }))
-                    .count(),
-                carriers: Vec::new(),
-                weights: Vec::new(),
-                previous: vec![vec![0.0; width]; sources],
-                fitting: Vec::new(),
-                mix: Vec::new(),
-                positions: Vec::new(),
-                stated: Vec::new(),
-                touched: Vec::new(),
-                copy_from: Vec::new(),
-                copied: 0,
-                remixed: 0,
-                stranded: 0,
-                drift: 0.0,
-                drifted: 0,
-                worst_drift: 0.0,
-                bounds: Bounds::default(),
-                over_drift: 0,
-                over_half_drift: 0,
-                over_spread: 0,
-                over_level: 0,
-                over_cost: 0,
-                run: vec![0; sources],
-                worst_run: 0,
-                stranded_run: Vec::new(),
-                worst_stranded_run: 0,
-                worst_level: 0.0,
-                worst_cost: 0.0,
-                worst_cost_where: String::new(),
-                motion: hz_cluster::motion::Motion::new(
-                    hz_cluster::motion::HEARING,
-                    BLOCK_UNITS as f64 * unit_seconds(48_000),
-                ),
-                resultants: Vec::new(),
-                energies: Vec::new(),
-                resting: Vec::new(),
-                audible: Vec::new(),
-                was_audible: Vec::new(),
-                whole: 0,
-                voiced: 0,
-                fell_back: 0,
-                judged: blank_clustering(),
-                report: None,
-                reported_blocks: 0,
-                reported_at: 0,
-            })),
+            shape: Shape::Overlaid(Box::new(
+                Overlaid::new(
+                    std::path::Path::new("a master"),
+                    overlay::Setup {
+                        sources,
+                        elements,
+                        slots: Vec::new(),
+                        beds: beds_among(parts, elements),
+                        declared_beds: parts[..elements]
+                            .iter()
+                            .filter(|part| matches!(part, Part::Object { bed: Some(_), .. }))
+                            .count(),
+                        channels: parts[..elements].iter().map(Part::source_channel).collect(),
+                        bounds: Bounds::default(),
+                        beds_first: Some(hz_cluster::overlay::BEDS_FIRST),
+                        report: None,
+                        seconds_a_block: BLOCK_UNITS as f64 * unit_seconds(48_000),
+                    },
+                )
+                .expect("an overlay"),
+            )),
             renderers: hz_cluster::metric::delivery().expect("the presentations"),
             blocks: 0,
             mean: 0.0,
@@ -5299,6 +4017,10 @@ mod tests {
         if let Shape::Overlaid(overlaid) = &mut fold.shape {
             overlaid.elements = element_parts;
             overlaid.slotted = vec![false, true, true];
+            overlaid.channels = (0..element_parts)
+                .chain(slots.iter().map(|index| element_parts + index))
+                .map(|part| parts[part].source_channel())
+                .collect();
             overlaid.slots = slots;
             overlaid.previous = vec![vec![0.0; elements]; 3];
         }
