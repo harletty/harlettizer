@@ -1174,11 +1174,19 @@ fn run_overlay(
             .iter()
             .map(|part| Live {
                 next: 0,
+                // As `encode` states them: an object at its first update, a
+                // bed channel at its speaker in the bed class, the LFE at
+                // nothing in particular.
                 state: match part {
                     Part::Object { keyframes, .. } => {
                         keyframes.first().copied().unwrap_or_default()
                     }
-                    _ => Keyframe::default(),
+                    Part::Bed { position, .. } => Keyframe {
+                        position: *position,
+                        mode: hz_cluster::class::BED,
+                        ..Keyframe::default()
+                    },
+                    Part::Lfe { .. } => Keyframe::default(),
                 },
             })
             .collect(),
@@ -2175,7 +2183,8 @@ fn drive(job: Drive<'_>) -> Result<()> {
                                 {
                                     None => units_total.saturating_sub(unit_index).max(1),
                                     Some(next) => ((next as i64 - a) / frame as i64).max(1) as u64,
-                                };
+                                }
+                                .min(longest_still(frame, sample_rate));
                                 subblocks[0].duration = (units * frame as u64) as u32;
                                 moving.covered_until = unit_index + units;
                             } else {
@@ -2455,6 +2464,25 @@ fn drive(job: Drive<'_>) -> Result<()> {
     }
 }
 
+/// Parameter ticks a block may last and still be decoded to the sample.
+///
+/// libiamf scales a parameter's durations to the sample clock by
+/// `(rate + 0.1) / parameter_rate` and truncates — iamf-rs does the same,
+/// after it — so at a parameter rate of the sample rate a block of `d` ticks
+/// lasts `⌊d · (1 + 0.1 / rate)⌋` samples: exactly `d` below ten seconds of
+/// ticks (480 000 at 48 kHz), one sample more from there, and every block
+/// after it starts that much late. An object standing still for minutes as
+/// one block put its next move up to tens of samples late; the decoder's
+/// positions every 256 showed it a whole step late. No block is that long: a
+/// standstill is restated every ten seconds, which costs a few bytes a
+/// minute.
+const EXACT_SECONDS: u64 = 10;
+
+/// The most whole units of `frame` samples a standstill block covers.
+fn longest_still(frame: usize, sample_rate: u32) -> u64 {
+    ((EXACT_SECONDS * u64::from(sample_rate) - 1) / frame as u64).max(1)
+}
+
 /// Samples in one clustering block: the most that divides the unit and is
 /// no longer than the 1280 the TrueHD encode decides on (26.7 ms) — long
 /// enough that a block's power is an estimate rather than noise, short
@@ -2592,6 +2620,30 @@ mod tests {
         assert!((to[0] - (-1.0 + 2.0 * 348.0 / 400.0)).abs() < 1e-12);
         let total: u32 = out.iter().map(|s| s.duration).sum();
         assert_eq!(total, 960);
+    }
+
+    /// No standstill block reaches the duration libiamf's rate scaling
+    /// lengthens: at 48 kHz, 117 units of 4096 (479 232 ticks) and 499 of
+    /// 960.
+    #[test]
+    fn a_standstill_block_stays_inside_what_a_decoder_times_exactly() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            for frame in [480, 960, 1920, 2880, 4096, 4608] {
+                let ticks = longest_still(frame, rate) * frame as u64;
+                // The decoder's own arithmetic times it to the sample, and
+                // one unit more would not be.
+                let scaled = |ticks: u64| {
+                    (ticks as f64 * ((f64::from(rate) + 0.1) / f64::from(rate))) as u64
+                };
+                assert_eq!(scaled(ticks), ticks, "{rate} {frame}");
+                assert_ne!(
+                    scaled(ticks + frame as u64),
+                    ticks + frame as u64,
+                    "{rate} {frame}"
+                );
+            }
+        }
+        assert_eq!(longest_still(4096, 48_000), 117);
     }
 
     #[test]
