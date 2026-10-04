@@ -14,6 +14,7 @@
 //! hands it whatever its format decides — the grid a position is coded on,
 //! the gain a decoder applies to an element, the domain of its integers.
 
+pub mod fold;
 pub mod follow;
 pub mod mix;
 pub mod overlay;
