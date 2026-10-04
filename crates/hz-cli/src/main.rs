@@ -4,6 +4,7 @@ mod convert;
 mod encode;
 mod iamf;
 mod iamf_objects;
+mod overlay;
 mod source;
 
 use clap::{Parser, Subcommand};
@@ -147,7 +148,7 @@ enum Command {
         /// from the picture, which is what a dub cannot ship with; half of it
         /// is remarked on instead, which is about where the rear blur stops
         /// forgiving. Nought declines the guard.
-        #[arg(long, value_name = "DEGREES", default_value_t = encode::OVERLAY_DRIFT)]
+        #[arg(long, value_name = "DEGREES", default_value_t = overlay::OVERLAY_DRIFT)]
         overlay_drift: f64,
 
         /// Refuse the encode if the strongest element carrying a source holds
@@ -158,7 +159,7 @@ enum Command {
         /// it arrives from everywhere the fit reached and moves whenever any
         /// of those elements does. A half is one element holding three
         /// quarters of the power. Nought declines the guard.
-        #[arg(long, value_name = "WEIGHT", default_value_t = encode::OVERLAY_SPREAD)]
+        #[arg(long, value_name = "WEIGHT", default_value_t = overlay::OVERLAY_SPREAD)]
         overlay_spread: f64,
 
         /// Refuse the encode if more than this percentage of the windows a
@@ -169,7 +170,7 @@ enum Command {
         /// still voice carried by moving elements. This is the only guard
         /// with a time axis, and so the only one that can see that defect at
         /// all. Nought declines it. See `hz_cluster::motion`.
-        #[arg(long, value_name = "PERCENT", default_value_t = encode::OVERLAY_WOBBLE)]
+        #[arg(long, value_name = "PERCENT", default_value_t = overlay::OVERLAY_WOBBLE)]
         overlay_wobble: f64,
 
         /// Refuse the encode if a source's rendered level is more than this
@@ -182,7 +183,7 @@ enum Command {
         /// what a source comes out at on a presentation is a linear function
         /// of its weights and the elements' positions — so it is exact rather
         /// than estimated. Nought declines the guard.
-        #[arg(long, value_name = "DB", default_value_t = encode::OVERLAY_LEVEL)]
+        #[arg(long, value_name = "DB", default_value_t = overlay::OVERLAY_LEVEL)]
         overlay_level: f64,
 
         /// Refuse the encode if the worst source's fold costs more than this,
@@ -192,7 +193,7 @@ enum Command {
         /// `hz_cluster::metric`'s own measure, restricted to the sources; the
         /// elements are not in it, since an overlay does not fold them.
         /// Nought declines the guard.
-        #[arg(long, value_name = "ERROR", default_value_t = encode::OVERLAY_COST)]
+        #[arg(long, value_name = "ERROR", default_value_t = overlay::OVERLAY_COST)]
         overlay_cost: f64,
 
         /// Route a source the fit could not place acceptably to the nearest
