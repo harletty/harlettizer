@@ -1020,11 +1020,16 @@ impl Overlaid {
         // The diagonal is therefore forced to what this block asks for before the
         // ramp is applied. A source's weights still ramp, which is what the
         // crossfade is for; the audio that was already there does not.
-        for object in 0..carried {
-            let element = object + first;
-            let carries_itself = self.mix[object][element];
+        for (object, (asked, ramped)) in self
+            .mix
+            .iter()
+            .zip(from.iter_mut())
+            .enumerate()
+            .take(carried)
+        {
+            let carries_itself = asked[object + first];
             if carries_itself != 0.0 {
-                from[object][element] = carries_itself;
+                ramped[object + first] = carries_itself;
             }
         }
         hz_cluster::mix::mix(signals, gains, from, &self.mix, frames, mixed);
@@ -1123,14 +1128,13 @@ impl Overlaid {
                 None => writeln!(out, "mix {element}")?,
             }
         }
-        for index in 0..*sources {
-            if slotted[index] {
+        for (index, slotted) in slotted.iter().enumerate().take(*sources) {
+            if *slotted {
                 continue;
             }
             let row = carried + index;
             writeln!(out, "g {index} {:.17e}", gains[row])?;
-            for element in 0..elements {
-                let to = mix[row][element];
+            for (element, &to) in mix[row].iter().enumerate().take(elements) {
                 let was = from
                     .get(row)
                     .and_then(|row| row.get(element))
