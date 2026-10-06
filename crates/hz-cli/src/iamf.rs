@@ -71,11 +71,13 @@ pub const OPUS_FRAME: usize = 960;
 
 /// Opus kilobits a second for each channel unless asked otherwise.
 ///
-/// YouTube's IAMF streams carry about 46 a channel. This is a step above,
-/// for a programme that is an encode's output rather than a stream's: a
-/// 7.1.4 at about 720 kbit/s, between a streaming service's immersive tier
-/// and a disc's.
-pub const OPUS_BITRATE: u32 = 64;
+/// YouTube's IAMF streams carry about 46 a channel. This is well above, for
+/// a programme that is an encode's output rather than a stream's: a coupled
+/// pair at 192, past the 128 Xiph calls transparent for stereo, and a mono
+/// substream — an object, the centre, with no joint stereo to lean on — at
+/// 96. At 64 a channel CELT folds 16 to 20 kHz rather than coding it; at 96
+/// it codes it. A 7.1.4 comes to about 1.08 Mbit/s.
+pub const OPUS_BITRATE: u32 = 96;
 
 /// The output, open, with its descriptors written.
 pub(crate) type Output = Writer<BufWriter<File>>;
