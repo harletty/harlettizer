@@ -92,7 +92,9 @@ are fixed-width, so nothing moves.
 Each audio frame is one bare FLAC frame, every one exactly
 `num_samples_per_frame` long (the last is padded and the padding trimmed in
 the OBU header), and the codec config holds a `STREAMINFO` with both block
-sizes the frame size, frame sizes and MD5 unknown and one channel (§3.11.3).
+sizes the frame size, frame sizes and MD5 unknown, and two channels whatever
+a substream carries — the field IAMF fixes, which a decoder reads from each
+frame header instead (§3.11.3).
 Two constraints narrow FLAC itself: the channel assignment is **0 or 1** — no
 mid/side — and the frame header states its rate and depth outright.
 
@@ -103,9 +105,9 @@ order twelve, fifteen-bit coefficients with the rounding error carried), the
 residual Rice-coded over the best of up to eight partition levels, with an
 escape for raw partitions. It stays inside the streamable subset at 48 kHz.
 
-**Depth is 16 or 24 bits.** RFC 9639 names 32-bit frames, but decoders older
-than it — libFLAC before 1.4, symphonia — read that code as reserved and
-refuse the frame. LPCM takes 32.
+**Depth is 16 or 24 bits.** IAMF takes 16, 24 or 32, and RFC 9639 names
+32-bit frames, but decoders older than it — libFLAC before 1.4, symphonia —
+read that code as reserved and refuse the frame. LPCM takes 32.
 
 Measured on a 71-second programme rendered to 7.1.4, against `flac -8` at the
 same block size:
