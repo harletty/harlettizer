@@ -94,13 +94,14 @@ struct Plan {
 impl Encoder {
     /// An encoder for `block`-sample frames at `sample_rate` and `bits`.
     pub fn new(sample_rate: u32, bits: u32, block: usize) -> Result<Self, Unsupported> {
-        // RFC 9639 names 32 bits too, but decoders older than it — libFLAC
-        // before 1.4, symphonia — read that code as reserved and refuse the
-        // frame, and a browser's decoder is not something to bet on.
-        if ![8, 12, 16, 20, 24].contains(&bits) {
+        // IAMF takes 16, 24 or 32 (§3.11.3). RFC 9639 names 32 bits, but
+        // decoders older than it — libFLAC before 1.4, symphonia — read that
+        // code as reserved and refuse the frame, and a browser's decoder is
+        // not something to bet on.
+        if ![16, 24].contains(&bits) {
             return Err(Unsupported(format!(
-                "{bits}-bit FLAC; the frame header names 8, 12, 16, 20 or 24 bits for \
-                 every decoder in use"
+                "{bits}-bit FLAC; IAMF takes 16, 24 or 32 bits, and the decoders in use \
+                 stop at 24"
             )));
         }
         if sample_rate_code(sample_rate).is_none() {
@@ -133,11 +134,12 @@ impl Encoder {
         self.block
     }
 
-    /// The `STREAMINFO` block as IAMF constrains it: both block sizes the
-    /// frame size, the frame sizes and the signature unknown, and one channel
-    /// — the real count of each substream is in its own frame headers.
+    /// The `STREAMINFO` block as IAMF constrains it (§3.11.3): both block
+    /// sizes the frame size, the frame sizes and the signature unknown, and
+    /// two channels — the field the spec fixes, whatever a substream carries;
+    /// the real count of each is in its own frame headers.
     pub fn stream_info(&self) -> [u8; 34] {
-        stream_info(self.sample_rate, self.bits, self.block, 1)
+        stream_info(self.sample_rate, self.bits, self.block, 2)
     }
 
     /// The codec config's `decoder_config`: the metadata blocks, which is
@@ -710,10 +712,7 @@ fn sample_rate_code(rate: u32) -> Option<(u32, Option<(u32, u32)>)> {
 
 fn sample_size_code(bits: u32) -> u32 {
     match bits {
-        8 => 1,
-        12 => 2,
         16 => 4,
-        20 => 5,
         24 => 6,
         _ => unreachable!("checked when the encoder was made"),
     }
@@ -900,7 +899,7 @@ mod tests {
 
     #[test]
     fn noise_round_trips_at_every_depth() {
-        for bits in [16, 20, 24] {
+        for bits in [16, 24] {
             let amplitude = ((1i64 << (bits - 1)) - 1) as i32;
             let n = 1024 * 3;
             round_trip(bits, 1024, vec![noise(u64::from(bits), n, amplitude)]);
@@ -943,6 +942,23 @@ mod tests {
                 value = (value << 6) | u64::from(b & 0x3f);
             }
             assert_eq!(value, number);
+        }
+    }
+
+    /// IAMF fixes the channel field at two and the depth at 16, 24 or 32,
+    /// whatever a substream carries.
+    #[test]
+    fn the_stream_info_is_iamfs() {
+        for bits in [16, 24] {
+            let info = Encoder::new(48_000, bits, 1024).unwrap().stream_info();
+            // Rate (20 bits), channels − 1 (3), depth − 1 (5), from byte 10.
+            let packed = u32::from_be_bytes([info[10], info[11], info[12], info[13]]);
+            assert_eq!(packed >> 12, 48_000);
+            assert_eq!((packed >> 9) & 0b111, 1, "channels − 1");
+            assert_eq!((packed >> 4) & 0b1_1111, bits - 1, "depth − 1");
+        }
+        for bits in [8, 12, 20, 32] {
+            assert!(Encoder::new(48_000, bits, 1024).is_err(), "{bits} bits");
         }
     }
 
