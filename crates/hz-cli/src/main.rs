@@ -291,8 +291,9 @@ enum Command {
         bits: Option<u32>,
 
         /// Opus only: kilobits a second for each channel. A coupled pair is
-        /// coded at twice it and the LFE at a quarter, so 64 puts a 7.1.4 at
-        /// about 720 kbit/s. YouTube's IAMF streams run at about 46.
+        /// coded at twice it and the LFE at a quarter, so the default, 96,
+        /// puts a 7.1.4 at about 1.08 Mbit/s. YouTube's IAMF streams run at
+        /// about 46.
         #[arg(long, value_name = "KBPS")]
         bitrate: Option<u32>,
 

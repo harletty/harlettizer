@@ -123,7 +123,7 @@ About 1.5 s for the 71 s programme on one core, render included.
 
 ```bash
 cargo build --release -p hz-cli --features opus
-harlettizer iamf programme.atmos --out programme.iamf --codec opus [--bitrate 64]
+harlettizer iamf programme.atmos --out programme.iamf --codec opus [--bitrate 96]
 ```
 
 The one codec here that is not written here. A lossy coder is judged by ear
@@ -166,14 +166,18 @@ What IAMF fixes (§3.11.1), and what is chosen:
   more silence — in the last unit if it has room, in one more otherwise — and
   the overhang trimmed off the end. What a decoder keeps is the programme,
   sample for sample in length and in time.
-- **Bitrate** is per channel, 64 kbit/s unless asked: a coupled pair at twice
+- **Bitrate** is per channel, 96 kbit/s unless asked: a coupled pair at twice
   it, the LFE at a quarter and band-limited to narrowband, which is all it
-  carries — about 720 kbit/s for a 7.1.4. YouTube's IAMF streams carry about
-  46 a channel (sixteen mono substreams of third-order ambisonics, in a
-  capture of one). Unconstrained VBR, complexity 10, music.
+  carries — about 1.08 Mbit/s for a 7.1.4. At 64 a channel CELT keeps 16 to
+  20 kHz only as folded energy; at 96 it codes it. A mono substream (an
+  object, the centre) has no joint stereo to lean on, and in an immersive
+  render may well be heard alone, so it is held to the same margin as a pair.
+  YouTube's IAMF streams carry about 46 a channel (sixteen mono substreams of
+  third-order ambisonics, in a capture of one). Unconstrained VBR,
+  complexity 10, music.
 
-On the same 71 s programme: 6.5 MB at 732 kbit/s against 70 MB of FLAC, in
-2.4 s. FFmpeg's native Opus decoder and libopus both decode every substream
+On the same 71 s programme, at 64 a channel: 6.5 MB at 732 kbit/s against
+70 MB of FLAC, in 2.4 s. FFmpeg's native Opus decoder and libopus both decode every substream
 to exactly the programme's length and aligned with the bed to the sample
 (the LFE's cross-correlation peaks within ten samples, as close as a signal
 under 120 Hz says); iamf-rs renders it, and FFmpeg's `ebur128` reads its
@@ -580,7 +584,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--out <FILE>` | required | Write the sequence here: in Matroska if it ends in `.mka` or `.mkv`, a standalone stream otherwise |
 | `--codec <CODEC>` | `flac` | `flac`, `lpcm`, or `opus` in a build with the `opus` feature |
 | `--bits <BITS>` | `24` | 16 or 24; 32 for LPCM; none for Opus |
-| `--bitrate <KBPS>` | `64` | Opus only: kilobits a second for each channel |
+| `--bitrate <KBPS>` | `96` | Opus only: kilobits a second for each channel |
 | `--frame-size <SAMPLES>` | `4096`, Opus `960` | Samples a channel per temporal unit: the FLAC block size, at most 4608; an Opus packet's length, 480, 960, 1920 or 2880 |
 | `--headphones <MODE>` | `stereo` | What a decoder playing to headphones does: `stereo`, the loudspeaker fold, or `binaural`, its own binaural renderer |
 | `--frames <N>` | | Stop after this many frames of audio |
