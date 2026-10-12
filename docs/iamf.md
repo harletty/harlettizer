@@ -288,9 +288,9 @@ refused (`--objects` alone folds it). Refusals are `encode`'s, word for word:
 on disk.
 
 **Checked against TrueHD, as an oracle only.** On the first five minutes of a
-real AtmosFer re-voiced master (Tron: Ares, LFE + 20 objects, the last 7 the
-French voices; the options its TrueHD encode was made with less the TrueHD
-ones: `--overlay 7 --fold-depth 20 --overlay-drift 0 --overlay-cost 0`):
+real AtmosFer re-voiced master (LFE + 20 objects, the last 7 the dubbed
+voices; the options its TrueHD encode was made with less the TrueHD ones:
+`--overlay 7 --fold-depth 20 --overlay-drift 0 --overlay-cost 0`):
 
 | | |
 |---|---|
@@ -348,7 +348,7 @@ a speaker's place lands on that channel alone — its samples, unchanged.
   folded exactly as the mix is measured, gated as BS.1770 gates and with no
   speech gate — the element carries nothing but the voices.
 
-Checked on the first five minutes of Tron: Ares (`--voices-to-bed 7`): the
+Checked on the first five minutes of that master (`--voices-to-bed 7`): the
 voices at the seven places of a 7.1 make a 7.1 dialogue element — beside the
 LFE element and 13 object elements, 15 elements and 22 channels, advanced-2.
 Decoded by the IAMF fork, the dialogue's channels are the trace's bit for bit
@@ -374,25 +374,24 @@ its path through the room is piecewise linear, and IAMF's position blocks are
 exactly that: runs of subblocks, each a step or a line. The path is computed
 once from the updates (a ramp an update cuts short is left from where it had
 got to), and every block is cut from it: a unit's subblocks break where the
-path does, so a move that starts mid-unit starts on its sample; an object
-standing still costs one block for as long as it stands — up to ten seconds,
-restated after that (see below); and the codec's
-delay is carried, the blocks counting on the sequence's timeline while the
-audio is trimmed by the pre-skip. Coded as the master's cube coordinates —
-`cart16` (default) or `cart8` — or as `polar`, the cube put on the sphere by
-BS.2127's conversion. On a 71 s programme of eleven objects, positions cost
-about 7 kbit/s in `cart16`.
+path does, so a move that starts mid-unit starts on its sample; and the
+codec's delay is carried, the blocks counting on the sequence's timeline
+while the audio is trimmed by the pre-skip. Coded as the master's cube
+coordinates — `cart16` (default) or `cart8` — or as `polar`, the cube put on
+the sphere by BS.2127's conversion.
 
-**Ten seconds a block at most.** libiamf scales a parameter's durations to
-the sample clock by `(rate + 0.1) / parameter_rate` and truncates, and iamf-rs
-does as it does, so a block of `d` ticks lasts `⌊d · (1 + 0.1 / rate)⌋`
-samples: exactly `d` below ten seconds' worth, one sample more from there —
-and every block after it starts that much late. An object standing still for
-minutes as one block had its next move decoded up to tens of samples late, and
-the decoder's positions, sampled every 256, put a jump a whole step late
-(found on Tron, after a 256-unit standstill). A standstill is therefore
-restated every ten seconds — 117 units of 4096 at 48 kHz — for about 2 % more
-blocks.
+**Every unit is a key frame.** Every unit carries one block for every
+animated object, each lasting exactly the unit — an object standing still is
+restated every unit, as a step, and the unit that flushes an Opus delay
+restates where the last blocks left the objects. IAMF would let one block
+cover a standstill of many units, and the sequences written before this did
+so (up to ten seconds, the most libiamf's parameter-rate scaling times to
+the sample); but a decoder joining such a sequence at a unit inside the span
+— a seek, in a container — had the object at its definition's default until
+the next block, for as long as the standstill lasted. Restating costs about
+fifteen bytes an object a unit: on a two-hour programme of twenty objects at
+4096-sample units, 23 MB on 5.7 GB, 0.4 %. Sequences written before
+this change should be written again.
 
 An object element has a mix gain and nothing finer, so an object's **gain**
 — ramps included — is applied to its samples, sample by sample. Its **size**
@@ -466,7 +465,7 @@ offsets — and the decoder's output is compared with it:
 | Opus, the same | every object to the programme's length and aligned to the sample; 22 011 positions on the master's timeline, the pre-skip accounted, to 1e-5 |
 | 40 objects + 7.1.2 bed folded into 27 + LFE (advanced-2, substream ids past 17 stated in the frames) | all 27 elements exact; LFE exact; 101 250 positions to half an LSB |
 | advanced-1 (`--elements 17`) Opus `cart8`, and `polar` FLAC | decoded |
-| `harletty --codec iamf decode`, which writes a master set: Tron, LFE + 20 objects, 5 min, FLAC, `--objects` / `--voices-to-bed 7` | all 21 channels bit-exact against the master; with the voices in a 7.1.4 bed, its 12 channels exact against the trace and the 13 objects and the LFE against the master |
+| `harletty --codec iamf decode`, which writes a master set: a real master, LFE + 20 objects, 5 min, FLAC, `--objects` / `--voices-to-bed 7` | all 21 channels bit-exact against the master; with the voices in a 7.1.4 bed, its 12 channels exact against the trace and the 13 objects and the LFE against the master |
 | a synthetic 7.1.2 bed + 8 objects, LPCM | the 7.1 bed element and the two top sides as still objects, all 18 channels bit-exact against the master |
 
 The syntax — parameter definition types, coordinate widths, the animation

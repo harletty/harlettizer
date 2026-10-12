@@ -126,6 +126,56 @@ fn path_subblocks(path: &Path, a: i64, b: i64, hint: &mut usize, out: &mut Vec<S
     }
 }
 
+/// State where every animated object is over `[a, b)`, one unit: a block for
+/// each element on a path or in a fold, into `out[..n]` as `(element,
+/// subblocks)`, and `n`. A still object has no block; its definition's
+/// default is where it is.
+///
+/// Every unit restates every animated object, and a block lasts exactly its
+/// unit, so every unit is a key frame: a decoder that joins the stream at any
+/// unit — a seek, in a container — has every object where it belongs from the
+/// first unit it reads. One block over a standstill of many units, which
+/// IAMF allows, left an object at its default from a seek until its next
+/// block, for as long as the standstill lasted; and the block had to stay
+/// under the ten seconds libiamf's rate scaling times to the sample. A block
+/// a unit costs about fifteen bytes an object a unit — a few kilobits a
+/// second for a programme of twenty objects.
+fn state_blocks(
+    carried: &mut [Carried],
+    first_object: usize,
+    a: i64,
+    b: i64,
+    out: &mut [(usize, Vec<Subblock>)],
+) -> usize {
+    let mut stated = 0;
+    for (e, element) in carried.iter_mut().enumerate() {
+        let (index, subblocks) = &mut out[stated];
+        match &mut element.placement {
+            Placement::Still => continue,
+            Placement::Path(moving) => {
+                path_subblocks(&moving.path, a, b, &mut moving.blocks, subblocks);
+            }
+            Placement::Folded(folded) => {
+                cluster_subblocks(&folded.history, folded.base, folded.block, a, b, subblocks);
+            }
+        }
+        *index = first_object + e;
+        stated += 1;
+    }
+    stated
+}
+
+/// Whether a unit's subblocks move the object: anything but one step.
+fn moved(subblocks: &[Subblock]) -> bool {
+    !matches!(
+        subblocks,
+        [Subblock {
+            animation: Animation::Step(_),
+            ..
+        }]
+    )
+}
+
 /// What `HZ_IAMF_TRACE` writes: see the module note.
 struct Trace {
     dir: std::path::PathBuf,
@@ -364,8 +414,6 @@ struct Moving {
     blocks: usize,
     measure: usize,
     trace: usize,
-    /// Units already covered by a block written earlier.
-    covered_until: u64,
 }
 
 /// A fold's element: where each block put it, ramping there across the
@@ -440,7 +488,6 @@ impl Carried {
                 blocks: 0,
                 measure: 0,
                 trace: 0,
-                covered_until: 0,
             })),
             next_update: 0,
         }
@@ -1904,9 +1951,6 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let total = config
         .frames
         .map_or(source.frames(), |limit| limit.min(source.frames()));
-    // Units on the sequence's timeline, the codec's delay and its flush
-    // included: what a standstill to the end has to cover.
-    let units_total = (total + delay as u64).div_ceil(frame as u64) + 1;
     let mut progress = Progress::new(config.progress, total);
 
     let mut raw = Vec::with_capacity(frame * source.channels());
@@ -1985,76 +2029,12 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     unit_index as i64 * frame as i64 - delay,
                     (unit_index as i64 + 1) * frame as i64 - delay,
                 );
-                unit.stated = 0;
-                for (e, element) in carried.iter_mut().enumerate() {
-                    let out = &mut unit.blocks[unit.stated];
-                    out.0 = first_object + e;
-                    match &mut element.placement {
-                        Placement::Still => continue,
-                        Placement::Path(moving) => {
-                            if moving.covered_until > unit_index {
-                                continue;
-                            }
-                            let subblocks = &mut out.1;
-                            path_subblocks(&moving.path, a, b, &mut moving.blocks, subblocks);
-                            if let [
-                                Subblock {
-                                    animation: Animation::Step(p),
-                                    ..
-                                },
-                            ] = subblocks.as_slice()
-                            {
-                                // Standing still: one block for as long as
-                                // it does, in whole units, to the end if it
-                                // never moves again.
-                                let p = *p;
-                                let units = match moving.path.still_until(a, p, &mut moving.blocks)
-                                {
-                                    None => units_total.saturating_sub(unit_index).max(1),
-                                    Some(next) => ((next as i64 - a) / frame as i64).max(1) as u64,
-                                }
-                                .min(longest_still(frame, sample_rate));
-                                subblocks[0].duration = (units * frame as u64) as u32;
-                                moving.covered_until = unit_index + units;
-                            } else {
-                                account.moves += 1;
-                                moving.covered_until = unit_index + 1;
-                                if last {
-                                    // The codec's flush comes after the last
-                                    // unit, and a unit no block covers would
-                                    // put the object at its default.
-                                    let end = match subblocks.last().map(|s| s.animation) {
-                                        Some(Animation::Step(p) | Animation::Linear(_, p)) => p,
-                                        None => moving.path.origin(),
-                                    };
-                                    subblocks.push(Subblock {
-                                        duration: (2 * frame) as u32,
-                                        animation: Animation::Step(end),
-                                    });
-                                }
-                            }
-                        }
-                        Placement::Folded(folded) => {
-                            cluster_subblocks(
-                                &folded.history,
-                                folded.base,
-                                folded.block,
-                                a,
-                                b,
-                                &mut out.1,
-                            );
-                            if last {
-                                let end = *folded.history.last().expect("a block was folded");
-                                out.1.push(Subblock {
-                                    duration: (2 * frame) as u32,
-                                    animation: Animation::Step(end),
-                                });
-                            }
-                        }
-                    }
-                    unit.stated += 1;
-                }
+                unit.stated = state_blocks(&mut carried, first_object, a, b, &mut unit.blocks);
                 account.blocks_written += unit.stated as u64;
+                account.moves += unit.blocks[..unit.stated]
+                    .iter()
+                    .filter(|(_, subblocks)| moved(subblocks))
+                    .count() as u64;
 
                 if let Some(trace) = trace.as_mut() {
                     for (e, element) in carried.iter_mut().enumerate() {
@@ -2342,25 +2322,6 @@ fn drive(job: Drive<'_>) -> Result<()> {
     }
 }
 
-/// Parameter ticks a block may last and still be decoded to the sample.
-///
-/// libiamf scales a parameter's durations to the sample clock by
-/// `(rate + 0.1) / parameter_rate` and truncates — iamf-rs does the same,
-/// after it — so at a parameter rate of the sample rate a block of `d` ticks
-/// lasts `⌊d · (1 + 0.1 / rate)⌋` samples: exactly `d` below ten seconds of
-/// ticks (480 000 at 48 kHz), one sample more from there, and every block
-/// after it starts that much late. An object standing still for minutes as
-/// one block put its next move up to tens of samples late; the decoder's
-/// positions every 256 showed it a whole step late. No block is that long: a
-/// standstill is restated every ten seconds, which costs a few bytes a
-/// minute.
-const EXACT_SECONDS: u64 = 10;
-
-/// The most whole units of `frame` samples a standstill block covers.
-fn longest_still(frame: usize, sample_rate: u32) -> u64 {
-    ((EXACT_SECONDS * u64::from(sample_rate) - 1) / frame as u64).max(1)
-}
-
 /// Samples in one clustering block: the most that divides the unit and is
 /// no longer than the 1280 the TrueHD encode decides on (26.7 ms) — long
 /// enough that a block's power is an estimate rather than noise, short
@@ -2485,35 +2446,152 @@ mod tests {
         assert_eq!(total, 960);
     }
 
-    /// No standstill block reaches the duration libiamf's rate scaling
-    /// lengthens: at 48 kHz, 117 units of 4096 (479 232 ticks) and 499 of
-    /// 960.
-    #[test]
-    fn a_standstill_block_stays_inside_what_a_decoder_times_exactly() {
-        for rate in [44_100u32, 48_000, 96_000] {
-            for frame in [480, 960, 1920, 2880, 4096, 4608] {
-                let ticks = longest_still(frame, rate) * frame as u64;
-                // The decoder's own arithmetic times it to the sample, and
-                // one unit more would not be.
-                let scaled = |ticks: u64| {
-                    (ticks as f64 * ((f64::from(rate) + 0.1) / f64::from(rate))) as u64
-                };
-                assert_eq!(scaled(ticks), ticks, "{rate} {frame}");
-                assert_ne!(
-                    scaled(ticks + frame as u64),
-                    ticks + frame as u64,
-                    "{rate} {frame}"
-                );
-            }
+    /// One OBU as read back: its type and its payload.
+    fn obus(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let header = bytes[at];
+            at += 1;
+            let size = leb128(bytes, &mut at) as usize;
+            assert_eq!(header & 0b11, 0, "no trim, no extension");
+            out.push((header >> 3, bytes[at..at + size].to_vec()));
+            at += size;
         }
-        assert_eq!(longest_still(4096, 48_000), 117);
+        out
     }
 
+    fn leb128(bytes: &[u8], at: &mut usize) -> u64 {
+        let mut value = 0;
+        let mut shift = 0;
+        loop {
+            let b = bytes[*at];
+            *at += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    /// Every unit states one block for every animated object — an object
+    /// standing still for a hundred units as much as one moving — each block
+    /// lasting exactly its unit; a still object states none. Read back from
+    /// the written sequence: a parameter block an animated element a unit,
+    /// its duration the frame, one step while the object stands and a run of
+    /// subblocks in the unit it moves.
     #[test]
-    fn a_standstill_knows_when_it_ends() {
-        let path = Path::new(&[keyframe(0, -1.0, 1.0, 0), keyframe(5000, 1.0, 1.0, 0)]);
-        assert_eq!(path.still_until(0, [-1.0, 1.0, 0.0], &mut 0), Some(5000));
-        assert_eq!(path.still_until(6000, [1.0, 1.0, 0.0], &mut 0), None);
+    fn every_unit_places_every_animated_object() {
+        let frame = 256i64;
+        // The codec's delay shifts the first unit before the programme.
+        let delay = 100i64;
+        let units = 60;
+        // Still for 10 000 samples (39 units), a 400-sample move, then still.
+        let path = Path::new(&[keyframe(0, -1.0, 1.0, 0), keyframe(10_000, 1.0, 1.0, 400)]);
+        let mut history = Vec::new();
+        for j in 0..20 {
+            history.push([(j as f64 * 0.1).sin(), 1.0, 0.0]);
+        }
+        let mut carried = vec![
+            Carried::still(0, 0, [0.0, 1.0, 0.0]),
+            Carried::moving(1, 1, path),
+            Carried::folded(2, 64),
+        ];
+        let Placement::Folded(folded) = &mut carried[2].placement else {
+            unreachable!()
+        };
+        folded.history = history;
+
+        let elements = vec![
+            Element::Object {
+                kind: PositionKind::Cart16,
+                default: [0.0, 1.0, 0.0],
+            };
+            3
+        ];
+        let mut writer = hz_iamf::Writer::new(
+            std::io::Cursor::new(Vec::new()),
+            hz_iamf::Config {
+                elements,
+                codec: hz_iamf::Codec::Lpcm,
+                sample_rate: 48_000,
+                bits: 16,
+                frame: frame as usize,
+                headphones: hz_iamf::Headphones::Stereo,
+                presentation: Default::default(),
+            },
+        )
+        .unwrap();
+        let mut out: Vec<(usize, Vec<Subblock>)> = (0..3).map(|_| (0, Vec::new())).collect();
+        let mut moves = Vec::new();
+        let samples = vec![0i32; frame as usize * 3];
+        for unit in 0..units {
+            let (a, b) = (unit * frame - delay, (unit + 1) * frame - delay);
+            let stated = state_blocks(&mut carried, 0, a, b, &mut out);
+            assert_eq!(stated, 2, "unit {unit}");
+            assert_eq!(out[0].0, 1);
+            assert_eq!(out[1].0, 2);
+            for (_, subblocks) in &out[..stated] {
+                assert_eq!(
+                    subblocks.iter().map(|s| i64::from(s.duration)).sum::<i64>(),
+                    frame,
+                    "unit {unit}"
+                );
+            }
+            if moved(&out[0].1) {
+                moves.push(unit);
+            }
+            let blocks: Vec<hz_iamf::PositionBlock> = out[..stated]
+                .iter()
+                .map(|(element, subblocks)| hz_iamf::PositionBlock {
+                    element: *element,
+                    subblocks,
+                })
+                .collect();
+            writer.push(&samples, &blocks).unwrap();
+        }
+        // The move covers samples 10 000 to 10 400 of the programme: with
+        // the delay counted, unit 39 starts at 9 884 and unit 41 at 10 396,
+        // four samples before the ramp ends.
+        assert_eq!(moves, [39, 40, 41]);
+
+        let silence = hz_iamf::Loudness {
+            integrated: -70.0,
+            digital_peak: -70.0,
+            true_peak: -70.0,
+        };
+        let bytes = writer.finish([silence; 2]).unwrap().into_inner();
+        let obus = obus(&bytes);
+        let mut unit = 0i64;
+        let mut i = 0;
+        while i < obus.len() {
+            let (kind, _) = &obus[i];
+            if *kind != 4 {
+                // A descriptor.
+                i += 1;
+                continue;
+            }
+            // A unit: its delimiter, two parameter blocks, three frames.
+            let blocks: Vec<&Vec<u8>> = obus[i + 1..i + 3].iter().map(|o| &o.1).collect();
+            assert!(obus[i + 1..i + 3].iter().all(|o| o.0 == 3), "unit {unit}");
+            assert!(obus[i + 3..i + 6].iter().all(|o| (6..9).contains(&o.0)));
+            for (block, element) in blocks.iter().zip([1u64, 2]) {
+                let mut at = 0;
+                assert_eq!(leb128(block, &mut at), 2000 + element, "unit {unit}");
+                assert_eq!(leb128(block, &mut at), frame as u64, "unit {unit}");
+                let constant = leb128(block, &mut at);
+                if element == 1 {
+                    // One step while it stands; a line, or a run of
+                    // subblocks, as it moves.
+                    let one_step = constant != 0 && leb128(block, &mut at) == 0;
+                    assert_eq!(!one_step, moves.contains(&unit), "unit {unit}");
+                }
+            }
+            unit += 1;
+            i += 6;
+        }
+        assert_eq!(unit, units);
     }
 
     #[test]

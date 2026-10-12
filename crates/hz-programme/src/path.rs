@@ -179,23 +179,6 @@ impl Path {
     pub fn gain(&self, t: u64, hint: &mut usize) -> f64 {
         self.segment(t, hint).at(t).gain
     }
-
-    /// When the object, standing at `position` at sample `t`, next moves:
-    /// `None` if it never does.
-    pub fn still_until(&self, t: i64, position: [f64; 3], hint: &mut usize) -> Option<u64> {
-        self.segment(t.max(0) as u64, hint);
-        let mut i = *hint;
-        while let Some(segment) = self.segments.get(i) {
-            if !segment.still() || segment.from.position != position {
-                return Some(segment.start);
-            }
-            if segment.end == u64::MAX {
-                return None;
-            }
-            i += 1;
-        }
-        None
-    }
 }
 
 /// Move `state` to the latest of `keyframes` in force at sample `at`,
@@ -282,6 +265,5 @@ mod tests {
         assert_eq!(path.origin(), [0.3, 1.0, 0.0]);
         let ramped = Path::new(&[keyframe(171, 0.3, 0.5, 1000)]);
         assert_eq!(ramped.segment(500, &mut 0).at(500).gain, 0.5);
-        assert_eq!(ramped.still_until(0, [0.3, 1.0, 0.0], &mut 0), None);
     }
 }
