@@ -537,10 +537,15 @@ own ISO-BMFF encapsulation into Matroska the way the AV1 mapping does:
 - one temporal unit per `SimpleBlock`, its OBUs exactly as the standalone
   stream has them but for the temporal delimiter, which a block makes
   redundant — every unit is a key frame;
-- the trims stay in the OBUs, the decoder's to apply: `CodecDelay` states the
-  start trim (Opus's pre-skip, nothing for a lossless codec) and the segment's
-  `Duration` what is left after both, and no `DiscardPadding` asks for the end
-  trim twice;
+- the trims stay in the OBUs, the decoder's to apply, and the container
+  restates them for a player that cannot decode the track: `CodecDelay` states
+  the start trim (Opus's pre-skip, nothing for a lossless codec), the unit
+  that trims its end — the short last one, or the one that flushes Opus's
+  delay — is a `BlockGroup` whose `DiscardPadding` states that trim (with the
+  `BlockDuration` a track that states `DefaultDuration` owes every group),
+  and the segment's `Duration` is what is left after both. A player applies one of
+  the two, never both; mpv with orender keeps the decoder's and ignores the
+  `DiscardPadding`;
 - `SeekPreRoll` from the roll distance — 80 ms for Opus at 20 ms frames,
   nought otherwise;
 - `Channels` 2, which a reader ignores, as IAMF's own codec headers do;

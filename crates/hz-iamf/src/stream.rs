@@ -705,7 +705,7 @@ impl<W: Write + Seek> Writer<W> {
         }
         match &mut self.framing {
             Framing::Standalone => self.out.write_all(&self.unit)?,
-            Framing::Matroska(muxer) => muxer.block(&mut self.out, self.units, &self.unit)?,
+            Framing::Matroska(muxer) => muxer.block(&mut self.out, self.units, &self.unit, end)?,
         }
         self.units += 1;
         if end > 0 {

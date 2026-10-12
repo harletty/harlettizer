@@ -6,12 +6,18 @@
 //!
 //! - `CodecPrivate` is the `IAConfigurationBox` payload — a version byte, 1,
 //!   then the descriptors' length as a LEB128, then the descriptors;
-//! - every `SimpleBlock` is one temporal unit, its OBUs as the standalone
-//!   stream has them minus the temporal delimiter, whose one bit of news —
-//!   whether the unit is a key frame — moves to the block's flags;
-//! - `CodecDelay` is what the stream trims off its start and `SeekPreRoll`
-//!   what its roll distance asks for, and the trims stay in the OBUs: the
-//!   decoder applies them, and no `DiscardPadding` asks for them twice;
+//! - every block is one temporal unit, its OBUs as the standalone stream has
+//!   them minus the temporal delimiter, whose one bit of news — whether the
+//!   unit is a key frame — moves to the block's flags; and every unit is a
+//!   key frame (see [`crate::stream`]), so every block is a `SimpleBlock`
+//!   flagged key, except the one below;
+//! - the trims stay in the OBUs, the decoder's to apply, and the container
+//!   restates them for a player that cannot decode the track: `CodecDelay` is
+//!   what the stream trims off its start, and a unit that trims its end is a
+//!   `BlockGroup` whose `DiscardPadding` says how much, with the
+//!   `BlockDuration` a track that states `DefaultDuration` owes every group —
+//!   a player applies one of the two, never both; `SeekPreRoll` is what the
+//!   roll distance asks for;
 //! - `Channels` is 2 and means nothing, as in IAMF's own codec headers.
 //!
 //! Written as it goes, a cluster at a time, straight to the output: a
@@ -60,6 +66,10 @@ const BIT_DEPTH: u32 = 0x6264;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+const BLOCK_DURATION: u32 = 0x9B;
+const DISCARD_PADDING: u32 = 0x75A2;
 const CUES: u32 = 0x1C53_BB6B;
 const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
@@ -225,12 +235,15 @@ impl Muxer {
     }
 
     /// Write temporal unit `index` — its OBUs, without a temporal delimiter
-    /// — as a key frame.
+    /// — as a key frame; `end_trim` is the samples a channel its audio
+    /// frames trim off its end, which the block then restates as
+    /// `DiscardPadding`.
     pub(crate) fn block<W: Write + Seek>(
         &mut self,
         out: &mut W,
         index: u64,
         unit: &[u8],
+        end_trim: usize,
     ) -> io::Result<()> {
         let ticks = self.ticks(index * self.frame);
         let opens = match self.cluster {
@@ -253,13 +266,39 @@ impl Muxer {
         // offset from it.
         let offset = (ticks - start) as i16;
         self.block.clear();
-        put_id(&mut self.block, SIMPLE_BLOCK);
-        put_size(&mut self.block, 4 + unit.len() as u64);
+        if end_trim == 0 {
+            put_id(&mut self.block, SIMPLE_BLOCK);
+            put_size(&mut self.block, 4 + unit.len() as u64);
+            put_size(&mut self.block, TRACK);
+            self.block.extend_from_slice(&offset.to_be_bytes());
+            self.block.push(0x80); // key frame, no lacing
+            out.write_all(&self.block)?;
+            return out.write_all(unit);
+        }
+        // A `Block` has the `SimpleBlock`'s header without its key flag —
+        // a `BlockGroup` says so by carrying no `ReferenceBlock`. The track
+        // states `DefaultDuration`, which makes `BlockDuration` (in ticks)
+        // mandatory in every group; the padding is a signed count of
+        // nanoseconds.
+        let mut tail = Vec::with_capacity(24);
+        put_uint(&mut tail, BLOCK_DURATION, self.ticks(self.frame));
+        put_sint(
+            &mut tail,
+            DISCARD_PADDING,
+            (end_trim as u128 * 1_000_000_000 / u128::from(self.sample_rate)) as i64,
+        );
+        let block_size = 4 + unit.len() as u64;
+        let block_len = header_len(BLOCK, block_size as usize) + block_size;
+        put_id(&mut self.block, BLOCK_GROUP);
+        put_size(&mut self.block, block_len + tail.len() as u64);
+        put_id(&mut self.block, BLOCK);
+        put_size(&mut self.block, block_size);
         put_size(&mut self.block, TRACK);
         self.block.extend_from_slice(&offset.to_be_bytes());
-        self.block.push(0x80); // key frame, no lacing
+        self.block.push(0); // no lacing
         out.write_all(&self.block)?;
-        out.write_all(unit)
+        out.write_all(unit)?;
+        out.write_all(&tail)
     }
 
     /// Close the file: the last cluster, the cues, the seek head, and the
@@ -384,6 +423,17 @@ fn put_uint(out: &mut Vec<u8>, id: u32, value: u64) {
     put_bytes(out, id, &value.to_be_bytes()[8 - width..]);
 }
 
+/// A signed integer in the fewest bytes that hold it, two's complement.
+fn put_sint(out: &mut Vec<u8>, id: u32, value: i64) {
+    let width = (1..=8)
+        .find(|&w| {
+            let bits = 8 * w - 1;
+            w == 8 || (-(1i64 << bits)..(1i64 << bits)).contains(&value)
+        })
+        .expect("eight bytes hold any i64");
+    put_bytes(out, id, &value.to_be_bytes()[8 - width..]);
+}
+
 /// A `Void` element `room` bytes long in all, header included.
 fn put_void(out: &mut Vec<u8>, room: usize) {
     assert!(room >= 2, "a Void element takes two bytes at least");
@@ -438,6 +488,26 @@ mod tests {
         out.clear();
         put_uint(&mut out, CODEC_DELAY, 6_500_000);
         assert_eq!(out, [0x56, 0xaa, 0x83, 0x63, 0x2e, 0xa0]);
+    }
+
+    #[test]
+    fn signed_integers_take_the_fewest_bytes_that_hold_them() {
+        let mut out = Vec::new();
+        put_sint(&mut out, DISCARD_PADDING, 0);
+        assert_eq!(out, [0x75, 0xa2, 0x81, 0]);
+        out.clear();
+        put_sint(&mut out, DISCARD_PADDING, 127);
+        assert_eq!(out, [0x75, 0xa2, 0x81, 0x7f]);
+        out.clear();
+        put_sint(&mut out, DISCARD_PADDING, 128);
+        assert_eq!(out, [0x75, 0xa2, 0x82, 0x00, 0x80]);
+        out.clear();
+        put_sint(&mut out, DISCARD_PADDING, -129);
+        assert_eq!(out, [0x75, 0xa2, 0x82, 0xff, 0x7f]);
+        out.clear();
+        // 3096 samples at 16 kHz.
+        put_sint(&mut out, DISCARD_PADDING, 193_500_000);
+        assert_eq!(out, [0x75, 0xa2, 0x84, 0x0b, 0x88, 0x93, 0x60]);
     }
 
     use crate::layout::SEVEN_ONE_FOUR;
@@ -535,8 +605,11 @@ mod tests {
     /// each, give back the standalone sequence byte for byte, loudness
     /// included. And around them, everything a reader goes by is right: the
     /// sizes nest, the seek head and the cues point at what they say, the
-    /// blocks count time from their clusters, and the duration is what the
-    /// stream presents after its trim.
+    /// blocks count time from their clusters, the duration is what the
+    /// stream presents after its trim, and the one unit that trims its end
+    /// — the short last one — is a `BlockGroup` whose `DiscardPadding`
+    /// restates that trim beside the `BlockDuration` the track's
+    /// `DefaultDuration` makes mandatory, every other a key `SimpleBlock`.
     #[test]
     fn the_file_carries_the_standalone_sequence_and_says_where_it_is() {
         let config = Config {
@@ -637,15 +710,31 @@ mod tests {
             let mut at = segment.at + uint(&file, only(&positions, CUE_CLUSTER_POSITION)) as usize;
             assert_eq!(vint(&file, &mut at, true) as u32, CLUSTER);
             for block in &fields[1..] {
-                assert_eq!(block.id, SIMPLE_BLOCK);
-                let mut at = block.at;
+                let last = unit == 49;
+                let (data, flags) = if last {
+                    assert_eq!(block.id, BLOCK_GROUP, "unit {unit}");
+                    let group = children(&file, block.at, block.end);
+                    assert_eq!(group.len(), 3);
+                    assert_eq!(group[0].id, BLOCK);
+                    // The unit's 4096 samples at 16 kHz, in ticks.
+                    assert_eq!(group[1].id, BLOCK_DURATION);
+                    assert_eq!(uint(&file, group[1]), 256);
+                    // 3096 samples at 16 kHz.
+                    assert_eq!(group[2].id, DISCARD_PADDING);
+                    assert_eq!(uint(&file, group[2]), 193_500_000);
+                    (group[0], 0)
+                } else {
+                    assert_eq!(block.id, SIMPLE_BLOCK, "unit {unit}");
+                    (*block, 0x80)
+                };
+                let mut at = data.at;
                 assert_eq!(vint(&file, &mut at, false), TRACK);
                 let offset = i16::from_be_bytes([file[at], file[at + 1]]);
                 let ticks = (unit * 4096 * 1000 + 8000) / 16_000;
                 assert_eq!(start + offset as u64, ticks, "unit {unit}");
-                assert_eq!(file[at + 2], 0x80);
+                assert_eq!(file[at + 2], flags);
                 rebuilt.extend_from_slice(&[4 << 3, 0]);
-                rebuilt.extend_from_slice(&file[at + 3..block.end]);
+                rebuilt.extend_from_slice(&file[at + 3..data.end]);
                 unit += 1;
             }
         }
@@ -654,6 +743,29 @@ mod tests {
             rebuilt == standalone,
             "the blocks are not the standalone sequence"
         );
+    }
+
+    /// A sequence of whole units trims nothing at its end, and writes no
+    /// `BlockGroup`.
+    #[test]
+    fn a_sequence_without_an_end_trim_has_only_simple_blocks() {
+        let config = Config {
+            elements: vec![Element::Channels(SEVEN_ONE_FOUR)],
+            codec: Codec::Lpcm,
+            sample_rate: 16_000,
+            bits: 16,
+            frame: 1024,
+            headphones: Headphones::Stereo,
+            presentation: Default::default(),
+        };
+        let file = sequence(Some("test"), &config, &[1024; 7]);
+        let top = children(&file, 0, file.len());
+        let parts = children(&file, top[1].at, top[1].end);
+        let clusters: Vec<_> = parts.iter().filter(|p| p.id == CLUSTER).collect();
+        assert_eq!(clusters.len(), 1);
+        let fields = children(&file, clusters[0].at, clusters[0].end);
+        assert_eq!(fields.len(), 8);
+        assert!(fields[1..].iter().all(|f| f.id == SIMPLE_BLOCK));
     }
 
     /// Opus states its pre-skip as the codec delay and its roll distance as
