@@ -943,9 +943,9 @@ mod tests {
     }
 
     /// The ramp is state like the rest. A master states `rampLength` once
-    /// and moves by it for the rest of the programme: Tron's states it 49
-    /// times in 95 148 events. Read per event, every move after the first
-    /// was a jump.
+    /// and moves by it for the rest of the programme: a real master states
+    /// it 49 times in 95 148 events. Read per event, every move after the
+    /// first was a jump.
     #[test]
     fn the_ramp_carries_forward_until_the_master_changes_it() {
         let (config, _) = master();
