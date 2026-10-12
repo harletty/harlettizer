@@ -14,8 +14,10 @@
 //! - the trims stay in the OBUs, the decoder's to apply, and the container
 //!   restates them for a player that cannot decode the track: `CodecDelay` is
 //!   what the stream trims off its start, and a unit that trims its end is a
-//!   `BlockGroup` whose `DiscardPadding` says how much — a player applies one
-//!   of the two, never both; `SeekPreRoll` is what the roll distance asks for;
+//!   `BlockGroup` whose `DiscardPadding` says how much, with the
+//!   `BlockDuration` a track that states `DefaultDuration` owes every group —
+//!   a player applies one of the two, never both; `SeekPreRoll` is what the
+//!   roll distance asks for;
 //! - `Channels` is 2 and means nothing, as in IAMF's own codec headers.
 //!
 //! Written as it goes, a cluster at a time, straight to the output: a
@@ -66,6 +68,7 @@ const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
 const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
+const BLOCK_DURATION: u32 = 0x9B;
 const DISCARD_PADDING: u32 = 0x75A2;
 const CUES: u32 = 0x1C53_BB6B;
 const CUE_POINT: u32 = 0xBB;
@@ -273,18 +276,21 @@ impl Muxer {
             return out.write_all(unit);
         }
         // A `Block` has the `SimpleBlock`'s header without its key flag —
-        // a `BlockGroup` says so by carrying no `ReferenceBlock` — and the
-        // padding is a signed count of nanoseconds.
-        let mut padding = Vec::with_capacity(12);
+        // a `BlockGroup` says so by carrying no `ReferenceBlock`. The track
+        // states `DefaultDuration`, which makes `BlockDuration` (in ticks)
+        // mandatory in every group; the padding is a signed count of
+        // nanoseconds.
+        let mut tail = Vec::with_capacity(24);
+        put_uint(&mut tail, BLOCK_DURATION, self.ticks(self.frame));
         put_sint(
-            &mut padding,
+            &mut tail,
             DISCARD_PADDING,
             (end_trim as u128 * 1_000_000_000 / u128::from(self.sample_rate)) as i64,
         );
         let block_size = 4 + unit.len() as u64;
         let block_len = header_len(BLOCK, block_size as usize) + block_size;
         put_id(&mut self.block, BLOCK_GROUP);
-        put_size(&mut self.block, block_len + padding.len() as u64);
+        put_size(&mut self.block, block_len + tail.len() as u64);
         put_id(&mut self.block, BLOCK);
         put_size(&mut self.block, block_size);
         put_size(&mut self.block, TRACK);
@@ -292,7 +298,7 @@ impl Muxer {
         self.block.push(0); // no lacing
         out.write_all(&self.block)?;
         out.write_all(unit)?;
-        out.write_all(&padding)
+        out.write_all(&tail)
     }
 
     /// Close the file: the last cluster, the cues, the seek head, and the
@@ -602,7 +608,8 @@ mod tests {
     /// blocks count time from their clusters, the duration is what the
     /// stream presents after its trim, and the one unit that trims its end
     /// — the short last one — is a `BlockGroup` whose `DiscardPadding`
-    /// restates that trim, every other a key `SimpleBlock`.
+    /// restates that trim beside the `BlockDuration` the track's
+    /// `DefaultDuration` makes mandatory, every other a key `SimpleBlock`.
     #[test]
     fn the_file_carries_the_standalone_sequence_and_says_where_it_is() {
         let config = Config {
@@ -707,11 +714,14 @@ mod tests {
                 let (data, flags) = if last {
                     assert_eq!(block.id, BLOCK_GROUP, "unit {unit}");
                     let group = children(&file, block.at, block.end);
-                    assert_eq!(group.len(), 2);
+                    assert_eq!(group.len(), 3);
                     assert_eq!(group[0].id, BLOCK);
-                    assert_eq!(group[1].id, DISCARD_PADDING);
+                    // The unit's 4096 samples at 16 kHz, in ticks.
+                    assert_eq!(group[1].id, BLOCK_DURATION);
+                    assert_eq!(uint(&file, group[1]), 256);
                     // 3096 samples at 16 kHz.
-                    assert_eq!(uint(&file, group[1]), 193_500_000);
+                    assert_eq!(group[2].id, DISCARD_PADDING);
+                    assert_eq!(uint(&file, group[2]), 193_500_000);
                     (group[0], 0)
                 } else {
                     assert_eq!(block.id, SIMPLE_BLOCK, "unit {unit}");
