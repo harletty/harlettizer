@@ -165,6 +165,17 @@ fn state_blocks(
     stated
 }
 
+/// A unit's stated blocks as the writer takes them.
+fn stated(blocks: &[(usize, Vec<Subblock>)]) -> Vec<PositionBlock<'_>> {
+    blocks
+        .iter()
+        .map(|(element, subblocks)| PositionBlock {
+            element: *element,
+            subblocks,
+        })
+        .collect()
+}
+
 /// Whether a unit's subblocks move the object: anything but one step.
 fn moved(subblocks: &[Subblock]) -> bool {
     !matches!(
@@ -1830,6 +1841,11 @@ struct Unit {
     /// first `stated` of them.
     blocks: Vec<(usize, Vec<Subblock>)>,
     stated: usize,
+    /// The programme's last unit; `after` then places the objects over the
+    /// unit that follows it, should the codec's delay be flushed in one.
+    last: bool,
+    after: Vec<(usize, Vec<Subblock>)>,
+    after_stated: usize,
 }
 
 /// The sequence header's profile, by name, for these elements — the rule
@@ -1969,6 +1985,9 @@ fn drive(job: Drive<'_>) -> Result<()> {
             frames: 0,
             blocks: (0..carried.len()).map(|_| (0, Vec::new())).collect(),
             stated: 0,
+            last: false,
+            after: (0..carried.len()).map(|_| (0, Vec::new())).collect(),
+            after_stated: 0,
         });
     }
 
@@ -1976,14 +1995,14 @@ fn drive(job: Drive<'_>) -> Result<()> {
         let handle = scope.spawn(move || -> std::io::Result<Output> {
             let mut writer = writer;
             while let Ok(unit) = from_main.recv() {
-                let blocks: Vec<PositionBlock> = unit.blocks[..unit.stated]
-                    .iter()
-                    .map(|(element, subblocks)| PositionBlock {
-                        element: *element,
-                        subblocks,
-                    })
-                    .collect();
-                writer.push(&unit.samples[..unit.frames * width], &blocks)?;
+                let blocks = stated(&unit.blocks[..unit.stated]);
+                let samples = &unit.samples[..unit.frames * width];
+                if unit.last {
+                    let after = stated(&unit.after[..unit.after_stated]);
+                    writer.push_last(samples, &blocks, &after)?;
+                } else {
+                    writer.push(samples, &blocks)?;
+                }
                 drop(blocks);
                 if free.send(unit).is_err() {
                     break;
@@ -2035,6 +2054,21 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     .iter()
                     .filter(|(_, subblocks)| moved(subblocks))
                     .count() as u64;
+                unit.last = last;
+                if last {
+                    // The unit after the last, for the codec's flush: the
+                    // path goes on there, over the programme's last samples.
+                    unit.after_stated = state_blocks(
+                        &mut carried,
+                        first_object,
+                        b,
+                        b + frame as i64,
+                        &mut unit.after,
+                    );
+                    if delay > 0 && ((frame - got) as i64) < delay {
+                        account.blocks_written += unit.after_stated as u64;
+                    }
+                }
 
                 if let Some(trace) = trace.as_mut() {
                     for (e, element) in carried.iter_mut().enumerate() {
@@ -2444,6 +2478,51 @@ mod tests {
         assert!((to[0] - (-1.0 + 2.0 * 348.0 / 400.0)).abs() < 1e-12);
         let total: u32 = out.iter().map(|s| s.duration).sum();
         assert_eq!(total, 960);
+    }
+
+    /// The blocks of the unit after the programme's last — what the codec's
+    /// flush unit is placed by — carry the path on: a move that reaches past
+    /// the last pushed unit goes on from where that unit left it, and a fold
+    /// past its last block holds where the block put it.
+    #[test]
+    fn the_unit_after_the_last_carries_the_path_on() {
+        let frame = 256i64;
+        let delay = 100i64;
+        // Still at x = -1 until sample 15 000, then 400 samples to x = 1.
+        let path = Path::new(&[keyframe(0, -1.0, 1.0, 0), keyframe(15_000, 1.0, 1.0, 400)]);
+        let mut carried = vec![Carried::moving(0, 0, path), Carried::folded(1, 64)];
+        let Placement::Folded(folded) = &mut carried[1].placement else {
+            unreachable!()
+        };
+        folded.history = vec![[0.0, 1.0, 0.0], [0.5, 1.0, 0.0]];
+        let mut out: Vec<(usize, Vec<Subblock>)> = (0..2).map(|_| (0, Vec::new())).collect();
+        // The last unit, 58, holds 14 748 to 15 004: the first four samples
+        // of the move.
+        let (a, b) = (58 * frame - delay, 59 * frame - delay);
+        assert_eq!(state_blocks(&mut carried, 0, a, b, &mut out), 2);
+        let [
+            ..,
+            Subblock {
+                animation: Animation::Linear(_, left_at),
+                ..
+            },
+        ] = out[0].1.as_slice()
+        else {
+            panic!("the last unit ends on the move");
+        };
+        let left_at = *left_at;
+        assert!(left_at[0] > -1.0 && left_at[0] < -0.9);
+        // The unit after it: the move goes on from there, the fold holds.
+        assert_eq!(state_blocks(&mut carried, 0, b, b + frame, &mut out), 2);
+        assert_eq!(out[0].1.len(), 1);
+        let Animation::Linear(from, to) = out[0].1[0].animation else {
+            panic!("the move goes on");
+        };
+        assert_eq!(from, left_at);
+        assert!(to[0] > from[0]);
+        assert_eq!(out[0].1[0].duration, frame as u32);
+        assert_eq!(out[1].1.len(), 1);
+        assert_eq!(out[1].1[0].animation, Animation::Step([0.5, 1.0, 0.0]));
     }
 
     /// One OBU as read back: its type and its payload.

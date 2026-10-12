@@ -31,7 +31,10 @@
 //! states the blocks, the writer checks them. So a decoder that joins the
 //! sequence at any unit has every object where it belongs, and in Matroska
 //! every block is a key frame. The unit that flushes a codec's delay, which
-//! no caller pushes, restates where the last blocks left the objects.
+//! no caller pushes, carries the programme's last samples: it is placed by
+//! the blocks the caller hands [`Writer::push_last`] for it — the path going
+//! on past the last pushed unit — or, failing those, holds every object
+//! where its last block left it.
 //!
 //! # A codec with a delay
 //!
@@ -475,8 +478,35 @@ impl<W: Write + Seek> Writer<W> {
     ///
     /// A full frame unless it is the last: a short one is padded with
     /// silence and the padding trimmed at the end, which closes the
-    /// substreams — nothing may follow it.
+    /// substreams — nothing may follow it. A unit a codec's delay has to be
+    /// flushed after is placed as [`Writer::push_last`] says with no blocks.
     pub fn push(&mut self, interleaved: &[i32], blocks: &[PositionBlock]) -> io::Result<()> {
+        self.write(interleaved, blocks, None)
+    }
+
+    /// [`Writer::push`] for the programme's last unit, full or short. `after`
+    /// places the objects over the unit that follows it on the sequence's
+    /// timeline, for the unit that flushes a codec's delay when the padding
+    /// has no room for it: that unit carries the programme's last `delay`
+    /// samples, where an object may still be moving, so the path goes on
+    /// there rather than stopping where the last pushed unit left it. An
+    /// object a block has placed and `after` does not is held where its
+    /// last block left it. Nothing may follow.
+    pub fn push_last(
+        &mut self,
+        interleaved: &[i32],
+        blocks: &[PositionBlock],
+        after: &[PositionBlock],
+    ) -> io::Result<()> {
+        self.write(interleaved, blocks, Some(after))
+    }
+
+    fn write(
+        &mut self,
+        interleaved: &[i32],
+        blocks: &[PositionBlock],
+        after: Option<&[PositionBlock]>,
+    ) -> io::Result<()> {
         let width = self.width;
         for block in blocks {
             assert!(
@@ -509,7 +539,16 @@ impl<W: Write + Seek> Writer<W> {
         let start = if self.units == 0 { self.delay } else { 0 };
         let pad = frame - frames;
         if pad == 0 {
-            return self.write_unit(start, 0, blocks);
+            self.write_unit(start, 0, blocks)?;
+            if let Some(after) = after {
+                // The programme ends on a whole unit: the codec's delay is
+                // flushed in a unit of its own.
+                if self.delay > 0 {
+                    self.write_flush_unit(frame - self.delay, after)?;
+                }
+                self.ended = true;
+            }
+            return Ok(());
         }
         // The programme ends here. What is still inside the codec has to
         // come out too, in this unit if the padding has room for it.
@@ -517,17 +556,18 @@ impl<W: Write + Seek> Writer<W> {
             self.write_unit(start, pad - self.delay, blocks)?;
         } else {
             self.write_unit(start, 0, blocks)?;
-            self.write_silent_unit(frame - (self.delay - pad))?;
+            self.write_flush_unit(frame - (self.delay - pad), after.unwrap_or(&[]))?;
         }
         self.ended = true;
         Ok(())
     }
 
     /// A unit of silence, trimmed by `end` at its end: what flushes a
-    /// codec's delay out after the programme. The objects stay where their
-    /// last blocks left them; a unit no block covers would put them at their
-    /// defaults.
-    fn write_silent_unit(&mut self, end: usize) -> io::Result<()> {
+    /// codec's delay out after the programme, carrying its last `delay`
+    /// samples. The objects are placed by `after`; one `after` leaves out
+    /// stays where its last block left it — a unit no block covers would put
+    /// it at its default.
+    fn write_flush_unit(&mut self, end: usize, after: &[PositionBlock]) -> io::Result<()> {
         for channel in &mut self.channels {
             channel.fill(0);
         }
@@ -537,7 +577,8 @@ impl<W: Write + Seek> Writer<W> {
             .iter()
             .enumerate()
             .filter_map(|(element, at)| {
-                at.map(|at| {
+                let given = after.iter().any(|block| block.element == element);
+                at.filter(|_| !given).map(|at| {
                     let step = Subblock {
                         duration: frame,
                         animation: Animation::Step(at),
@@ -546,13 +587,11 @@ impl<W: Write + Seek> Writer<W> {
                 })
             })
             .collect();
-        let blocks: Vec<PositionBlock> = held
-            .iter()
-            .map(|(element, step)| PositionBlock {
-                element: *element,
-                subblocks: std::slice::from_ref(step),
-            })
-            .collect();
+        let mut blocks: Vec<PositionBlock> = after.to_vec();
+        blocks.extend(held.iter().map(|(element, step)| PositionBlock {
+            element: *element,
+            subblocks: std::slice::from_ref(step),
+        }));
         self.write_unit(0, end, &blocks)
     }
 
@@ -691,10 +730,10 @@ impl<W: Write + Seek> Writer<W> {
         loudness: [Loudness; 2],
         anchored: Option<[f64; 2]>,
     ) -> io::Result<W> {
-        // A programme that ended on a whole unit still has the codec's delay
-        // to flush.
+        // A programme that ended on a whole unit pushed without
+        // [`Writer::push_last`] still has the codec's delay to flush.
         if !self.ended && self.units > 0 && self.delay > 0 {
-            self.write_silent_unit(self.config.frame - self.delay)?;
+            self.write_flush_unit(self.config.frame - self.delay, &[])?;
         }
         if let Framing::Matroska(muxer) = &mut self.framing {
             let coded = self.units * self.config.frame as u64;
@@ -1270,43 +1309,72 @@ mod tests {
         }
     }
 
-    /// The unit that flushes the codec's delay — written by `finish` after a
-    /// programme of whole units, or by `push` after a short last unit the
-    /// delay does not fit in — places every object its blocks placed, where
-    /// its last block left it, for the unit; an object no block placed stays
-    /// at its default.
+    /// The unit that flushes the codec's delay — after a short last unit the
+    /// delay does not fit in, or after a programme of whole units — carries
+    /// the programme's last samples, and places the objects by the blocks
+    /// `push_last` is given for it: here a line that goes on moving. An
+    /// object no `after` block places, or a flush `finish` has to write for
+    /// a programme pushed without `push_last`, is held where its last block
+    /// left it.
     #[cfg(feature = "opus")]
     #[test]
-    fn the_flush_unit_restates_where_the_objects_are() {
+    fn the_flush_unit_carries_the_path_on() {
         let config = object_config(Codec::Opus { bitrate: 64_000 }, 960);
         let silence = Loudness {
             integrated: -70.0,
             digital_peak: -70.0,
             true_peak: -70.0,
         };
+        let line = |from: f64, to: f64| Subblock {
+            duration: 960,
+            animation: Animation::Linear([from, 1.0, 0.0], [to, 1.0, 0.0]),
+        };
+        // Parameter 2001, 960 samples in one constant subblock, then: a
+        // line from x = 1 to x = 0 (type 1, each axis from then to), or a
+        // step at x = 1 (type 0).
+        let head = [0xd1, 0x0f, 0xc0, 0x07, 0xc0, 0x07];
+        let mut moved = head.to_vec();
+        moved.extend([1, 0x7f, 0xff, 0, 0, 0x7f, 0xff, 0x7f, 0xff, 0, 0, 0, 0]);
+        let mut held = head.to_vec();
+        held.extend([0, 0x7f, 0xff, 0x7f, 0xff, 0, 0]);
         // Three whole units, then 900 samples: 60 of padding, under the
-        // 312-sample delay, so the flush is a unit of its own; or three
-        // whole units, flushed by `finish`.
-        for lengths in [vec![960, 960, 960, 900], vec![960, 960, 960]] {
+        // 312-sample delay, so the flush is a unit of its own; three whole
+        // units ended by `push_last`; three whole units ended by `finish`.
+        for (lengths, hand_over, want) in [
+            (vec![960, 960, 960, 900], true, &moved),
+            (vec![960, 960, 960], true, &moved),
+            (vec![960, 960, 960], false, &held),
+        ] {
             let mut writer = Writer::new(Cursor::new(Vec::new()), config.clone()).unwrap();
-            let mut moved = [Subblock {
-                duration: 960,
-                animation: Animation::Linear([-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]),
-            }];
+            let last = lengths.len() - 1;
             for (n, &length) in lengths.iter().enumerate() {
-                if n == 1 {
-                    moved = [step([1.0, 1.0, 0.0], 960)];
-                }
+                // Still at x = -1, then to x = 1 over the second unit,
+                // still there; and on past the end, back towards x = 0.
+                let subblocks = match n {
+                    0 => [step([-1.0, 1.0, 0.0], 960)],
+                    1 => [line(-1.0, 1.0)],
+                    _ => [step([1.0, 1.0, 0.0], 960)],
+                };
                 let block = PositionBlock {
                     element: 1,
-                    subblocks: &moved,
+                    subblocks: &subblocks,
                 };
-                writer.push(&vec![0; length * 2], &[block]).unwrap();
+                let samples = vec![0; length * 2];
+                if n == last && hand_over {
+                    let on = [line(1.0, 0.0)];
+                    let after = PositionBlock {
+                        element: 1,
+                        subblocks: &on,
+                    };
+                    writer.push_last(&samples, &[block], &[after]).unwrap();
+                } else {
+                    writer.push(&samples, &[block]).unwrap();
+                }
             }
             let bytes = writer.finish([silence; 2]).unwrap().into_inner();
             let obus = obus(&bytes);
             let delimiters: Vec<usize> = (0..obus.len()).filter(|&i| obus[i].0 == 4).collect();
-            assert_eq!(delimiters.len(), lengths.len() + 1);
+            assert_eq!(delimiters.len(), lengths.len() + 1, "{lengths:?}");
             // Every unit: a delimiter, one block, two frames.
             for (n, &at) in delimiters.iter().enumerate() {
                 assert_eq!(obus[at + 1].0, 3, "unit {n}");
@@ -1314,11 +1382,7 @@ mod tests {
                 assert_eq!(obus[at + 3].0, 7, "unit {n}");
             }
             let flush = &obus[delimiters[lengths.len()] + 1].2;
-            // Parameter 2001, 960 samples in one constant subblock, a step
-            // to x = 1 (32767), y = 1, z = 0.
-            let mut want = vec![0xd1, 0x0f, 0xc0, 0x07, 0xc0, 0x07, 0];
-            want.extend([0x7f, 0xff, 0x7f, 0xff, 0, 0]);
-            assert_eq!(flush, &want);
+            assert_eq!(flush, want, "{lengths:?} hand over {hand_over}");
             // And the flush unit trims the delay's worth at its end.
             let (_, trim, _) = &obus[delimiters[lengths.len()] + 2];
             let length: usize = lengths.iter().sum();
