@@ -620,6 +620,34 @@ The engine's conversion job types, and the foundation for everything else.
 
 ### Track B — lossy
 
+#### Phase B0 — Groundwork — **done**
+
+- The Evolution frame moved from `hz-mlp` to [`hz-meta::emdf`](crates/hz-meta/src/emdf.rs),
+  so the E-AC-3 writer can use it without depending on the TrueHD crate. It
+  models the whole payload configuration and the protection lengths, and reads
+  the frame behind E-AC-3's sync word. TrueHD streams are byte-identical.
+- `cargo run -p xtask --features eac3-oracle -- eac3 <streams…> [--dump DIR]`
+  reads reference streams through the workspace `eac3` decoder (an optional
+  harness dependency, like `truehd`), reads every Evolution frame again with
+  `hz-meta`, and rewrites it. On six local streams, 11 085 frames: all read as
+  the oracle reads them, all rewritten bit for bit up to the protection fields.
+  `--dump` keeps every payload (`<stem>.emdf`), for the byte-for-byte gates
+  of B3.
+- What the reference streams carry, which B2 and B3 now have to write:
+  - a single **independent 5.1 substream** (acmod 7 + LFE) at 640 or 768 kb/s;
+    the 7.1 streams to hand are a legacy AC-3 core plus a dependent substream,
+    with no Evolution frame at all;
+  - one Evolution frame per syncframe, in the auxiliary data, carrying
+    programme loudness (id 1), programme information (2), object metadata (11)
+    and joint object coding (14);
+  - object metadata and joint object coding **in group 0**, the second frame
+    aligned; loudness with a duration of 1536 samples; none with a sample
+    offset — the configurations `cargo xtask eac3` prints;
+  - protection fields of **32 + 8 bits** — whose computation is still unknown
+    (see the risk register);
+  - downmix configurations 0 and 3, five downmix channels, 11 or 15 objects
+    (12 or 16 elements with the LFE).
+
 #### Phase B1 — AC-3 encoder
 
 The warm-up that builds the MDCT / exponent / bit-allocation machinery
@@ -857,6 +885,7 @@ in the table rather than as a surprise months later.
 | Object clustering quality below the reference engine | Audible; the immersive presentation is the product | Treat as research with its own crate and metric; ship a documented "our clustering" rather than pretending parity |
 | No clustering *input* data: every master to hand is post-clustering output (11/13/15 objects = 12/14/16 clusters) | `hz-cluster` cannot be evaluated on real material | Source authored ADM BW64 masters, or synthesise scenes with known ground truth. Budget this inside phase A2 |
 | Joint object coding parameter estimation | Same | Sequence it after Track A so the project has already shipped something useful |
+| The E-AC-3 Evolution frame's 32 + 8 protection bits: their computation is unknown, and no public decoder checks them | A receiver that checks them may refuse our objects while every offline check passes | Find out on hardware first — B2 re-encodes a reference stream's core and carries its payloads over, before any parameter is estimated. If a receiver refuses, only a trace of a **licensed** encoder can answer it (LEGAL.md §3.1) |
 | Patent exposure | Legal, not technical | Publish the notice, take the posture of comparable projects |
 | Scope drift into container/muxing/IMF work | Never finishes | Out of scope: use FFmpeg/mkvmerge for muxing. This project produces elementary streams and master files only |
 | A measurement taken from an unlicensed run of the reference engine | Fatal, project-ending | Written rule in LEGAL.md §3.1; nothing enters the repository from one |
