@@ -6,7 +6,7 @@
 //! frames encoded after the first few, for each shape of stream — coupled,
 //! uncoupled, stereo with rematrixing, the alternating frame size of 44.1 kHz.
 
-use hz_ac3::{ChannelMode, Config, Encoder, FRAME_SAMPLES, Metadata};
+use hz_ac3::{ChannelMode, Config, Encoder, FRAME_SAMPLES, Format, Metadata};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,13 +35,17 @@ static GLOBAL: Counting = Counting;
 
 #[test]
 fn a_warm_encoder_allocates_nothing() {
-    for (rate, mode, lfe, kbps, coupling) in [
-        (48_000, ChannelMode::ThreeTwo, true, 448, true),
-        (48_000, ChannelMode::ThreeTwo, true, 640, true),
-        (48_000, ChannelMode::Stereo, false, 192, true),
-        (44_100, ChannelMode::Stereo, false, 192, false),
+    for (format, rate, mode, lfe, kbps, coupling) in [
+        (Format::Ac3, 48_000, ChannelMode::ThreeTwo, true, 448, true),
+        (Format::Ac3, 48_000, ChannelMode::ThreeTwo, true, 640, true),
+        (Format::Ac3, 48_000, ChannelMode::Stereo, false, 192, true),
+        (Format::Ac3, 44_100, ChannelMode::Stereo, false, 192, false),
+        (Format::Eac3, 48_000, ChannelMode::ThreeTwo, true, 768, true),
+        (Format::Eac3, 48_000, ChannelMode::ThreeTwo, true, 384, true),
+        (Format::Eac3, 44_100, ChannelMode::Stereo, false, 200, true),
     ] {
         let mut encoder = Encoder::new(Config {
+            format,
             sample_rate: rate,
             mode,
             lfe,
@@ -66,6 +70,10 @@ fn a_warm_encoder_allocates_nothing() {
                 *r = plane;
             }
             out.clear();
+            if format == Format::Eac3 {
+                // An Evolution frame's worth of bytes, every frame.
+                encoder.carry_skip_field(&[0x58, 0x38, 0, 3, 1, 2, 3]);
+            }
             encoder.encode(&refs[..channels], out).unwrap();
         };
         for _ in 0..3 {
@@ -76,6 +84,6 @@ fn a_warm_encoder_allocates_nothing() {
             frame(&mut encoder, &mut planes, &mut out);
         }
         let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        assert_eq!(allocated, 0, "{rate} Hz, {mode:?}, {kbps} kb/s");
+        assert_eq!(allocated, 0, "{format:?} {rate} Hz, {mode:?}, {kbps} kb/s");
     }
 }

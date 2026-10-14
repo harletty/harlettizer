@@ -25,8 +25,8 @@
 use crate::bitalloc::{self, BANDS, COEFS, Codes, Parameters};
 use crate::mdct::{BLOCK, Mdct, WINDOW, kbd_window};
 use crate::tables::{
-    BANDWIDTH, BIT_RATES, CPL_START, DEFAULT_CPL_BAND_STRUCT, FAST_GAIN, FRAME_WORDS,
-    REMATRIX_BANDS, SAMPLE_RATES,
+    BANDWIDTH, BIT_RATES, CPL_START, DEFAULT_CPL_BAND_STRUCT, FAST_GAIN, FRAME_EXP_STRATEGIES,
+    FRAME_WORDS, REMATRIX_BANDS, SAMPLE_RATES,
 };
 use hz_core::bits::BitWriter;
 
@@ -135,13 +135,27 @@ impl Default for Metadata {
     }
 }
 
+/// Which bitstream to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// AC-3, `bsid` 8: nineteen fixed rates, two CRCs.
+    #[default]
+    Ac3,
+    /// One independent E-AC-3 substream, `bsid` 16, six blocks a frame: any
+    /// rate the frame size can say, exponent strategies per frame where one
+    /// fits, and the room for an Evolution frame in a skip field.
+    Eac3,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
+    pub format: Format,
     pub sample_rate: u32,
     pub mode: ChannelMode,
     pub lfe: bool,
-    /// kb/s, one of [`BIT_RATES`]. `None` takes FFmpeg's default for the
-    /// channel count.
+    /// kb/s: for AC-3 one of [`BIT_RATES`], for E-AC-3 any rate a six-block
+    /// frame of whole 16-bit words can carry. `None` takes FFmpeg's default
+    /// for the channel count.
     pub bit_rate: Option<u32>,
     /// Couple the high band where FFmpeg's encoder would, at the band it
     /// would start from. Off never couples.
@@ -299,7 +313,12 @@ pub struct Encoder {
     best: usize,
     qmant: Planes<i16, COEFS>,
     coordinates: [[Coordinates; MAX_CHANNELS]; BLOCKS],
-    new_coordinates: [[bool; MAX_CHANNELS]; BLOCKS],
+    /// Per block and channel: nought, keep the coordinates; one, new ones
+    /// follow; two, new ones follow and the stream need not say so — E-AC-3's
+    /// first coordinates.
+    new_coordinates: [[u8; MAX_CHANNELS]; BLOCKS],
+    /// The same three values for the coupling leak, by block.
+    new_cpl_leak: [u8; BLOCKS],
     rematrix: [[bool; 4]; BLOCKS],
     rematrix_bands: usize,
     new_rematrix: [bool; BLOCKS],
@@ -312,6 +331,15 @@ pub struct Encoder {
     order_len: usize,
     /// The frame being written, its buffer kept from one frame to the next.
     writer: BitWriter,
+    eac3: bool,
+    /// E-AC-3: whether this frame's exponent strategies are each one of the
+    /// thirty-two the frame-level code names, and which.
+    frame_exp: Option<[u8; MAX_CHANNELS]>,
+    /// E-AC-3: the bytes the next frame carries in block 2's skip field —
+    /// where every reference stream carries its Evolution frame — and
+    /// whether it carries any.
+    skip_field: Vec<u8>,
+    skip_pending: bool,
 }
 
 impl Encoder {
@@ -334,10 +362,39 @@ impl Encoder {
             4 => 384,
             _ => 448,
         });
-        let rate_index = BIT_RATES
-            .iter()
-            .position(|rate| u32::from(*rate) == bit_rate)
-            .ok_or_else(|| Unsupported(format!("{bit_rate} kb/s is not an AC-3 bit rate")))?;
+        let eac3 = config.format == Format::Eac3;
+        let (rate_index, frame_size_min) = if eac3 {
+            // Six blocks a frame: whole words, at most 2048 of them.
+            let rate = config.sample_rate as u64;
+            let bps = u64::from(bit_rate) * 1000;
+            let max = 2048 * rate / FRAME_SAMPLES as u64 * 16;
+            let min = rate.div_ceil(FRAME_SAMPLES as u64) * 16;
+            if !(min..=max).contains(&bps) {
+                return Err(Unsupported(format!(
+                    "E-AC-3 at {} Hz with six blocks a frame runs from {} to {} kb/s, not {bit_rate}",
+                    config.sample_rate,
+                    min.div_ceil(1000),
+                    max / 1000
+                )));
+            }
+            // The nearest AC-3 rate, for the tables that choose bandwidth
+            // and coupling by rate; and the words a frame takes, the frame
+            // size alternating above it to keep the average.
+            let nearest = (0..BIT_RATES.len())
+                .min_by_key(|i| (u64::from(BIT_RATES[*i]) * 1000).abs_diff(bps))
+                .expect("rates");
+            let mut words = bps / 16 * FRAME_SAMPLES as u64 / rate;
+            while words > 1 && words * rate / FRAME_SAMPLES as u64 * 16 > bps {
+                words -= 1;
+            }
+            (nearest, 2 * words as usize)
+        } else {
+            let index = BIT_RATES
+                .iter()
+                .position(|rate| u32::from(*rate) == bit_rate)
+                .ok_or_else(|| Unsupported(format!("{bit_rate} kb/s is not an AC-3 bit rate")))?;
+            (index, 2 * usize::from(FRAME_WORDS[index * 2][sr_code]))
+        };
         let m = &config.metadata;
         if !(-31..=-1).contains(&m.dialnorm) {
             return Err(Unsupported(format!(
@@ -347,11 +404,13 @@ impl Encoder {
         }
 
         let frame_size_code = rate_index * 2;
-        let frame_size_min = 2 * usize::from(FRAME_WORDS[frame_size_code][sr_code]);
         let crc_size = |size: usize| ((size >> 2) + (size >> 4)) << 1;
         let mut crc_inv = [0u32; 2];
-        crc_inv[0] = pow_poly(CRC16_POLY >> 1, 8 * crc_size(frame_size_min) as u32 - 16);
-        if sr_code == 1 {
+        // AC-3's first CRC, placed ahead of what it covers; E-AC-3 has none.
+        if !eac3 {
+            crc_inv[0] = pow_poly(CRC16_POLY >> 1, 8 * crc_size(frame_size_min) as u32 - 16);
+        }
+        if !eac3 && sr_code == 1 {
             crc_inv[1] = pow_poly(
                 CRC16_POLY >> 1,
                 8 * crc_size(frame_size_min + 2) as u32 - 16,
@@ -409,7 +468,10 @@ impl Encoder {
             None => 4,
         };
 
-        let codes = Codes::DEFAULT;
+        let codes = Codes {
+            db_per_bit: if eac3 { 2 } else { 3 },
+            ..Codes::DEFAULT
+        };
         let planes = channels + 1;
         let mut encoder = Self {
             mode: config.mode,
@@ -454,16 +516,25 @@ impl Encoder {
             best: 0,
             qmant: Planes::new(planes),
             coordinates: [[Coordinates::default(); MAX_CHANNELS]; BLOCKS],
-            new_coordinates: [[false; MAX_CHANNELS]; BLOCKS],
+            new_coordinates: [[0; MAX_CHANNELS]; BLOCKS],
+            new_cpl_leak: [0; BLOCKS],
             rematrix: [[false; 4]; BLOCKS],
             rematrix_bands,
             new_rematrix: [false; BLOCKS],
             planned_bits: 0,
             order: [0; MAX_CHANNELS],
             order_len: 0,
-            writer: BitWriter::with_capacity(2 * usize::from(FRAME_WORDS[37][2])),
+            writer: BitWriter::with_capacity(4096),
+            eac3,
+            frame_exp: None,
+            skip_field: Vec::with_capacity(512),
+            skip_pending: false,
         };
         encoder.frame_bits_fixed = encoder.count_frame_bits_fixed();
+        if encoder.coupling.is_some() {
+            // The leak is stated once, and E-AC-3 knows the first time is new.
+            encoder.new_cpl_leak[0] = if eac3 { 2 } else { 1 };
+        }
         for ch in 1..=channels {
             encoder.order[encoder.order_len] = ch;
             encoder.order_len += 1;
@@ -486,6 +557,21 @@ impl Encoder {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// E-AC-3: carry these bytes in block 2's skip field of the next frame
+    /// encoded — an Evolution frame behind its sync word, as a reference
+    /// stream carries its object metadata. At most 511 bytes.
+    ///
+    /// # Panics
+    /// On an AC-3 encoder, which has nowhere to put them that a decoder
+    /// reads, or past 511 bytes.
+    pub fn carry_skip_field(&mut self, bytes: &[u8]) {
+        assert!(self.eac3, "skip fields are carried in E-AC-3");
+        assert!(bytes.len() < 512, "a skip field holds at most 511 bytes");
+        self.skip_field.clear();
+        self.skip_field.extend_from_slice(bytes);
+        self.skip_pending = true;
     }
 
     /// Whether the stream couples its high band.
@@ -517,7 +603,7 @@ impl Encoder {
         assert_eq!(input.len(), self.channels, "one slice per channel");
         assert!(input.iter().all(|ch| ch.len() == FRAME_SAMPLES));
 
-        if self.sr_code == 1 {
+        if self.sr_code == 1 || self.eac3 {
             self.adjust_frame_size();
         }
         self.transform(input);
@@ -532,6 +618,7 @@ impl Encoder {
         self.group_exponents();
         self.quantize();
         self.write(out);
+        self.skip_pending = false;
         Ok(())
     }
 
@@ -622,14 +709,19 @@ impl Encoder {
 
         // New coordinates where they moved.
         for blk in 0..BLOCKS {
-            self.new_coordinates[blk] = [false; MAX_CHANNELS];
+            self.new_coordinates[blk] = [0; MAX_CHANNELS];
             for ch in 1..=self.fbw {
-                self.new_coordinates[blk][ch] = blk == 0 || {
+                // E-AC-3 knows the first block's coordinates are new.
+                if blk == 0 {
+                    self.new_coordinates[blk][ch] = if self.eac3 { 2 } else { 1 };
+                    continue;
+                }
+                self.new_coordinates[blk][ch] = u8::from({
                     let moved: f32 = (0..c.bands)
                         .map(|band| (coords[blk - 1][ch][band] - coords[blk][ch][band]).abs())
                         .sum();
                     moved / c.bands as f32 > NEW_CPL_COORD_THRESHOLD
-                };
+                });
             }
         }
 
@@ -646,7 +738,7 @@ impl Encoder {
                     let (mut ch_energy, mut cpl_energy) =
                         (energy[blk][ch][band], energy[blk][CPL][band]);
                     next = blk + 1;
-                    while next < BLOCKS && !self.new_coordinates[next][ch] {
+                    while next < BLOCKS && self.new_coordinates[next][ch] == 0 {
                         ch_energy += energy[next][ch][band];
                         cpl_energy += energy[next][CPL][band];
                         next += 1;
@@ -667,7 +759,7 @@ impl Encoder {
                     fixed[band] = to_fixed24(coords[blk][ch][band]);
                     exp[band] = exponent(fixed[band]);
                 }
-                if !self.new_coordinates[blk][ch] {
+                if self.new_coordinates[blk][ch] == 0 {
                     continue;
                 }
                 let bands = &exp[..c.bands];
@@ -804,6 +896,19 @@ impl Encoder {
             let strategy = &mut self.strategy[self.channels];
             strategy[0] = EXP_D15;
             strategy[1..].fill(EXP_REUSE);
+        }
+        if self.eac3 {
+            // One five-bit code a channel for the frame, where every channel's
+            // six strategies are one of the sets the code can name.
+            let mut codes = [0u8; MAX_CHANNELS];
+            let named = (first..=self.fbw).all(|ch| {
+                FRAME_EXP_STRATEGIES
+                    .iter()
+                    .position(|set| *set == self.strategy[ch])
+                    .map(|code| codes[ch] = code as u8)
+                    .is_some()
+            });
+            self.frame_exp = named.then_some(codes);
         }
 
         // Encode: the exponents the decoder will see, in the first block of
@@ -1034,8 +1139,24 @@ impl Encoder {
     }
 
     fn count_frame_bits_fixed(&self) -> usize {
-        const MODE_BITS: [usize; 8] = [0, 0, 2, 2, 2, 4, 2, 4];
         let fbw = self.fbw;
+        if self.eac3 {
+            // FFmpeg's count, which assumes per-block exponent strategies:
+            // a frame that takes the frame-level code spends less than this,
+            // and the allocation is conservative by the difference.
+            let mut bits = 16 + 35 + 1 + 1 + 1; // sync, BSI, metadata flags, addbsie
+            bits += 2 + 10; // exponent strategy syntax, AHT, the frame's flags
+            bits += BLOCKS * 2 * fbw; // exponent strategies
+            if self.lfe {
+                bits += BLOCKS;
+            }
+            bits += fbw * 5; // converter exponent strategies
+            bits += 10; // SNR offsets
+            bits += 1; // block start information
+            bits += BLOCKS * (1 + 1 + 1); // dynamic range, spectral extension, SNR
+            return bits + 1 + 1 + 16;
+        }
+        const MODE_BITS: [usize; 8] = [0, 0, 2, 2, 2, 4, 2, 4];
         let mut bits = 16 + 49 + MODE_BITS[self.mode as usize];
         for blk in 0..BLOCKS {
             bits += fbw + fbw; // block switch and dither flags
@@ -1053,30 +1174,68 @@ impl Encoder {
         bits + 1 + 1 + 16 // auxiliary data, CRC reserved bit, CRC
     }
 
+    /// What the fixed count overstates by this frame: the per-block exponent
+    /// strategies it assumed, where the frame-level code was written.
+    fn fixed_overcount(&self) -> usize {
+        match self.frame_exp {
+            Some(_) => (2 * BLOCKS - 5) * self.fbw,
+            None => 0,
+        }
+    }
+
     fn count_frame_bits(&self) -> usize {
         let cpl = self.coupling;
+        let eac3 = self.eac3;
         let mut bits = 0;
+        if eac3 {
+            if self.mode != ChannelMode::Mono {
+                bits += BLOCKS; // coupling in use, then strategy exists
+            }
+            if cpl.is_some() {
+                bits += if self.frame_exp.is_some() {
+                    5
+                } else {
+                    2 * BLOCKS
+                };
+            }
+            if self.skip_pending {
+                bits += BLOCKS + 9 + 8 * self.skip_field.len();
+            }
+        }
         for blk in 0..BLOCKS {
             if blk == 0 {
-                bits += 1; // coupling in use
+                if !eac3 {
+                    bits += 1; // coupling in use
+                }
                 if let Some(c) = &cpl {
-                    bits += self.fbw; // channels in coupling
+                    if eac3 {
+                        bits += 1; // enhanced coupling
+                    }
+                    if !eac3 || self.mode != ChannelMode::Stereo {
+                        bits += self.fbw; // channels in coupling
+                    }
                     if self.mode == ChannelMode::Stereo {
                         bits += 1; // phase flags in use
                     }
-                    bits += 4 + 4 + c.sub_bands - 1; // range and band structure
+                    bits += 4 + 4;
+                    bits += if eac3 { 1 } else { c.sub_bands - 1 }; // band structure
                 }
             }
             if let Some(c) = &cpl {
                 for ch in 1..=self.fbw {
-                    bits += 1;
-                    if self.new_coordinates[blk][ch] {
+                    let new = self.new_coordinates[blk][ch];
+                    if !eac3 || new != 2 {
+                        bits += 1;
+                    }
+                    if new != 0 {
                         bits += 2 + (4 + 4) * c.bands;
                     }
                 }
             }
             if self.mode == ChannelMode::Stereo {
-                bits += 1;
+                if !eac3 || blk > 0 {
+                    bits += 1;
+                }
                 if self.new_rematrix[blk] {
                     bits += self.rematrix_bands;
                 }
@@ -1089,15 +1248,20 @@ impl Encoder {
                     bits += 2; // gain range
                 }
             }
-            if cpl.is_some() {
-                bits += 2; // coupling exponent strategy
-            }
-            if blk == 0 {
-                bits += 6 + (self.channels + usize::from(cpl.is_some())) * (4 + 3);
-            }
-            if cpl.is_some() {
-                bits += 1; // coupling leak exists
+            if !eac3 {
+                if cpl.is_some() {
+                    bits += 2; // coupling exponent strategy
+                }
                 if blk == 0 {
+                    bits += 6 + (self.channels + usize::from(cpl.is_some())) * (4 + 3);
+                }
+            }
+            if cpl.is_some() {
+                let new = self.new_cpl_leak[blk];
+                if !eac3 || new != 2 {
+                    bits += 1; // coupling leak exists
+                }
+                if new != 0 {
                     bits += 3 + 3;
                 }
             }
@@ -1108,14 +1272,18 @@ impl Encoder {
     fn write(&mut self, out: &mut Vec<u8>) {
         let mut w = std::mem::take(&mut self.writer);
         w.clear();
-        self.write_header(&mut w);
+        if self.eac3 {
+            self.write_eac3_header(&mut w);
+        } else {
+            self.write_header(&mut w);
+        }
         for blk in 0..BLOCKS {
             self.write_block(&mut w, blk);
         }
         // Everything but the auxiliary data bit, the CRC's reserved bit and
         // the CRC, which sit in the frame's last eighteen bits.
         debug_assert_eq!(
-            w.bit_position() + 18,
+            w.bit_position() + 18 + self.fixed_overcount(),
             self.planned_bits,
             "the writer wrote what the allocation counted"
         );
@@ -1124,7 +1292,11 @@ impl Encoder {
         let start = out.len();
         out.extend_from_slice(w.bytes());
         out.resize(start + self.frame_size, 0);
-        self.finish_frame(&mut out[start..]);
+        if self.eac3 {
+            self.finish_eac3_frame(&mut out[start..]);
+        } else {
+            self.finish_frame(&mut out[start..]);
+        }
         self.writer = w;
     }
 
@@ -1161,23 +1333,105 @@ impl Encoder {
         w.put(1, 0); // no additional bitstream information
     }
 
-    fn write_block(&self, w: &mut BitWriter, blk: usize) {
-        for _ in 0..self.fbw {
-            w.put(1, 0); // no block switching
+    /// The E-AC-3 syncframe's header: the bitstream information of one
+    /// independent substream, and the audio frame's — the flags saying which
+    /// tools the blocks use, the coupling and exponent strategies, the SNR
+    /// offsets for the whole frame.
+    fn write_eac3_header(&self, w: &mut BitWriter) {
+        let m = &self.metadata;
+        w.put(16, 0x0b77);
+        w.put(2, 0); // independent
+        w.put(3, 0); // substream 0
+        w.put(11, (self.frame_size / 2 - 1) as u32);
+        w.put(2, self.sr_code as u32);
+        w.put(2, 3); // six blocks
+        w.put(3, self.mode as u32);
+        w.put_bit(self.lfe);
+        w.put(5, 16); // bsid
+        w.put(5, (-i32::from(m.dialnorm)) as u32);
+        w.put(1, 0); // no compression gain word
+        w.put(1, 0); // no mixing metadata
+        w.put(1, 0); // no informational metadata
+        w.put(1, 0); // no additional bitstream information
+
+        w.put_bit(self.frame_exp.is_none()); // exponent strategies per block
+        w.put(1, 0); // no adaptive hybrid transform
+        w.put(2, 0); // one SNR offset for the frame
+        w.put(1, 0); // no transient pre-noise processing
+        w.put(1, 0); // no block switching
+        w.put(1, 0); // no dither flags
+        w.put(1, 0); // default bit allocation model
+        w.put(1, 0); // default fast gain
+        w.put(1, 0); // no delta bit allocation
+        w.put_bit(self.skip_pending); // skip fields
+        w.put(1, 0); // no spectral extension attenuation
+        if self.mode != ChannelMode::Mono {
+            w.put_bit(self.coupling.is_some());
+            for _ in 1..BLOCKS {
+                w.put(1, 0); // the coupling strategy stands
+            }
         }
-        for _ in 0..self.fbw {
-            w.put(1, 1); // dither
+        match &self.frame_exp {
+            Some(codes) => {
+                for code in &codes[usize::from(self.coupling.is_none())..=self.fbw] {
+                    w.put(5, u32::from(*code));
+                }
+            }
+            None => {
+                for blk in 0..BLOCKS {
+                    for ch in usize::from(self.coupling.is_none())..=self.fbw {
+                        w.put(2, u32::from(self.strategy[ch][blk]));
+                    }
+                }
+            }
+        }
+        if self.lfe {
+            for blk in 0..BLOCKS {
+                w.put(1, u32::from(self.strategy[self.channels][blk]));
+            }
+        }
+        // What an E-AC-3 to AC-3 converter is to use, which is required with
+        // six blocks: the frame-level code where there is one.
+        for ch in 1..=self.fbw {
+            w.put(5, self.frame_exp.map_or(0, |codes| u32::from(codes[ch])));
+        }
+        w.put(6, self.coarse_snr as u32);
+        w.put(4, self.fine_snr as u32);
+        w.put(1, 0); // no block start information
+    }
+
+    fn write_block(&self, w: &mut BitWriter, blk: usize) {
+        let eac3 = self.eac3;
+        if !eac3 {
+            for _ in 0..self.fbw {
+                w.put(1, 0); // no block switching
+            }
+            for _ in 0..self.fbw {
+                w.put(1, 1); // dither
+            }
         }
         w.put(1, 0); // no dynamic range word
+        if eac3 {
+            w.put(1, 0); // no spectral extension
+        }
 
         // Coupling strategy, stated once: every full-bandwidth channel in,
         // over the band FFmpeg would choose, in the default banding.
-        w.put_bit(blk == 0);
+        if !eac3 {
+            w.put_bit(blk == 0);
+        }
         if blk == 0 {
-            w.put_bit(self.coupling.is_some());
+            if !eac3 {
+                w.put_bit(self.coupling.is_some());
+            }
             if let Some(c) = &self.coupling {
-                for _ in 0..self.fbw {
-                    w.put(1, 1);
+                if eac3 {
+                    w.put(1, 0); // not enhanced coupling
+                }
+                if !eac3 || self.mode != ChannelMode::Stereo {
+                    for _ in 0..self.fbw {
+                        w.put(1, 1);
+                    }
                 }
                 if self.mode == ChannelMode::Stereo {
                     w.put(1, 0); // no phase flags
@@ -1186,16 +1440,22 @@ impl Encoder {
                 let end = (c.end - 37) / 12;
                 w.put(4, start as u32);
                 w.put(4, (end - 3) as u32);
-                for sub in start + 1..end {
-                    w.put_bit(DEFAULT_CPL_BAND_STRUCT[sub]);
+                if eac3 {
+                    w.put(1, 0); // the default band structure
+                } else {
+                    for sub in start + 1..end {
+                        w.put_bit(DEFAULT_CPL_BAND_STRUCT[sub]);
+                    }
                 }
             }
         }
         if let Some(c) = &self.coupling {
             for ch in 1..=self.fbw {
                 let new = self.new_coordinates[blk][ch];
-                w.put_bit(new);
-                if new {
+                if !eac3 || new != 2 {
+                    w.put_bit(new != 0);
+                }
+                if new != 0 {
                     let coords = &self.coordinates[blk][ch];
                     w.put(2, u32::from(coords.master));
                     for band in 0..c.bands {
@@ -1207,18 +1467,22 @@ impl Encoder {
         }
 
         if self.mode == ChannelMode::Stereo {
-            w.put_bit(self.new_rematrix[blk]);
+            if !eac3 || blk > 0 {
+                w.put_bit(self.new_rematrix[blk]);
+            }
             if self.new_rematrix[blk] {
                 for flag in &self.rematrix[blk][..self.rematrix_bands] {
                     w.put_bit(*flag);
                 }
             }
         }
-        for ch in usize::from(self.coupling.is_none())..=self.fbw {
-            w.put(2, u32::from(self.strategy[ch][blk]));
-        }
-        if self.lfe {
-            w.put(1, u32::from(self.strategy[self.channels][blk]));
+        if !eac3 {
+            for ch in usize::from(self.coupling.is_none())..=self.fbw {
+                w.put(2, u32::from(self.strategy[ch][blk]));
+            }
+            if self.lfe {
+                w.put(1, u32::from(self.strategy[self.channels][blk]));
+            }
         }
         for ch in 1..=self.fbw {
             if self.strategy[ch][blk] != EXP_REUSE && !self.in_coupling(ch) {
@@ -1241,32 +1505,52 @@ impl Encoder {
                 w.put(2, 0); // gain range
             }
         }
-        w.put_bit(blk == 0); // bit allocation parameters
-        if blk == 0 {
-            let c = &self.codes;
-            w.put(2, u32::from(c.slow_decay));
-            w.put(2, u32::from(c.fast_decay));
-            w.put(2, u32::from(c.slow_gain));
-            w.put(2, u32::from(c.db_per_bit));
-            w.put(3, u32::from(c.floor));
-        }
-        w.put_bit(blk == 0); // SNR offsets
-        if blk == 0 {
-            w.put(6, self.coarse_snr as u32);
-            for _ in self.coded_channels() {
-                w.put(4, self.fine_snr as u32);
-                w.put(3, u32::from(self.fast_gain_code));
+        if eac3 {
+            w.put(1, 0); // no converter SNR offset
+        } else {
+            w.put_bit(blk == 0); // bit allocation parameters
+            if blk == 0 {
+                let c = &self.codes;
+                w.put(2, u32::from(c.slow_decay));
+                w.put(2, u32::from(c.fast_decay));
+                w.put(2, u32::from(c.slow_gain));
+                w.put(2, u32::from(c.db_per_bit));
+                w.put(3, u32::from(c.floor));
+            }
+            w.put_bit(blk == 0); // SNR offsets
+            if blk == 0 {
+                w.put(6, self.coarse_snr as u32);
+                for _ in self.coded_channels() {
+                    w.put(4, self.fine_snr as u32);
+                    w.put(3, u32::from(self.fast_gain_code));
+                }
             }
         }
         if self.coupling.is_some() {
-            w.put_bit(blk == 0); // coupling leak
-            if blk == 0 {
+            let new = self.new_cpl_leak[blk];
+            if !eac3 || new != 2 {
+                w.put_bit(new != 0); // coupling leak
+            }
+            if new != 0 {
                 w.put(3, self.params.cpl_fast_leak as u32);
                 w.put(3, self.params.cpl_slow_leak as u32);
             }
         }
-        w.put(1, 0); // no delta bit allocation
-        w.put(1, 0); // no skipped data
+        if !eac3 {
+            w.put(1, 0); // no delta bit allocation
+            w.put(1, 0); // no skipped data
+        } else if self.skip_pending {
+            // The one skip field, in block 2, where the reference streams
+            // carry theirs.
+            let here = blk == 2;
+            w.put_bit(here);
+            if here {
+                w.put(9, self.skip_field.len() as u32);
+                for byte in &self.skip_field {
+                    w.put(8, u32::from(*byte));
+                }
+            }
+        }
 
         for &ch in self.mantissa_order() {
             let bap = self.bap[self.best].at(ch, self.exp_ref[ch][blk]);
@@ -1286,6 +1570,17 @@ impl Encoder {
                 w.put(bits, (q as u32) & ((1u32 << bits) - 1));
             }
         }
+    }
+
+    /// E-AC-3 has one CRC, over the whole frame past the sync word.
+    fn finish_eac3_frame(&self, frame: &mut [u8]) {
+        let size = self.frame_size;
+        let mut crc2 = crc16(&frame[2..size - 2]);
+        if crc2 == 0x0b77 {
+            frame[size - 3] ^= 1;
+            crc2 ^= 0x8005;
+        }
+        frame[size - 2..].copy_from_slice(&crc2.to_be_bytes());
     }
 
     /// The two CRCs: the first over the first five-eighths of the frame, and
@@ -1576,6 +1871,7 @@ mod tests {
 
     fn config(sample_rate: u32, mode: ChannelMode, lfe: bool, kbps: u32, coupling: bool) -> Config {
         Config {
+            format: Format::Ac3,
             sample_rate,
             mode,
             lfe,
@@ -1630,6 +1926,74 @@ mod tests {
         assert!(!asked.coupled());
         let mono = Encoder::new(config(48_000, ChannelMode::Mono, false, 96, true)).unwrap();
         assert!(!mono.coupled());
+    }
+
+    /// E-AC-3 frames carry their one CRC, say their own size, come to the
+    /// rate asked for on average whatever it is, and carry a skip field where
+    /// they are given one — and in debug every frame holds the writer to the
+    /// allocation's count, which differs from AC-3's in nearly every field.
+    #[test]
+    fn eac3_frames_check_and_keep_the_rate() {
+        for (rate, mode, lfe, kbps, coupling, skip) in [
+            (48_000, ChannelMode::ThreeTwo, true, 768, true, true),
+            (48_000, ChannelMode::ThreeTwo, true, 384, true, true),
+            (48_000, ChannelMode::ThreeTwo, true, 640, false, false),
+            (48_000, ChannelMode::Stereo, false, 200, true, true),
+            (44_100, ChannelMode::Stereo, false, 192, true, false),
+            (32_000, ChannelMode::Mono, false, 64, true, true),
+        ] {
+            let mut encoder = Encoder::new(Config {
+                format: Format::Eac3,
+                ..config(rate, mode, lfe, kbps, coupling)
+            })
+            .unwrap();
+            let frames = 60;
+            let mut stream = Vec::new();
+            for f in 0..frames {
+                if skip {
+                    encoder.carry_skip_field(&[0x58, 0x38, 0, 2, 0xab, f as u8]);
+                }
+                let planes: Vec<Vec<f32>> = (0..encoder.channels())
+                    .map(|ch| sine(330.0 * (ch + 1) as f32, 0.3, f * FRAME_SAMPLES, rate as f32))
+                    .collect();
+                let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+                encoder.encode(&refs, &mut stream).unwrap();
+            }
+            let mut at = 0;
+            let mut count = 0;
+            while at < stream.len() {
+                assert_eq!(&stream[at..at + 2], &[0x0b, 0x77]);
+                let words =
+                    (usize::from(stream[at + 2] & 7) << 8 | usize::from(stream[at + 3])) + 1;
+                let frame = &stream[at..at + 2 * words];
+                assert_eq!(crc16(&frame[2..]), 0, "{rate} Hz {kbps} kb/s");
+                assert_eq!(frame[5] >> 3, 16, "bsid");
+                at += 2 * words;
+                count += 1;
+            }
+            assert_eq!(count, frames);
+            let seconds = (frames * FRAME_SAMPLES) as f64 / f64::from(rate);
+            let measured = stream.len() as f64 * 8.0 / seconds / 1000.0;
+            assert!(
+                (measured - f64::from(kbps)).abs() < 1.0,
+                "{measured} kb/s for {kbps}"
+            );
+        }
+    }
+
+    #[test]
+    fn eac3_rates_are_bounded_by_the_frame_size() {
+        let at = |kbps| {
+            Encoder::new(Config {
+                format: Format::Eac3,
+                ..config(48_000, ChannelMode::ThreeTwo, true, kbps, true)
+            })
+        };
+        assert!(at(1024).is_ok());
+        assert!(at(1025).is_err());
+        // Below, a frame is a word or two: 512 bit/s at 48 kHz.
+        assert!(at(1).is_ok());
+        assert!(at(0).is_err());
     }
 
     /// At 44.1 kHz the two sizes alternate so that the average is the rate.

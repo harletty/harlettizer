@@ -680,6 +680,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "eac3",
+ "hz-ac3",
  "hz-analysis",
  "hz-cluster",
  "hz-core",

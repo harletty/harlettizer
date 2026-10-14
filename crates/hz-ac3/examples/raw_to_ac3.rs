@@ -4,11 +4,12 @@
 //! cargo run --release -p hz-ac3 --example raw_to_ac3 -- in.f32 out.ac3 RATE CHANNELS KBPS
 //! ```
 //!
-//! Channels in WAV order; 1 to 6 of them, the sixth being LFE for 5.1. A
+//! Channels in WAV order; 1 to 6 of them, the sixth being LFE for 5.1.
+//! `FORMAT=eac3` writes E-AC-3 instead, at any rate in kb/s. A
 //! development aid for comparing against other encoders, not the command
 //! line's encoder.
 
-use hz_ac3::{ChannelMode, Config, DELAY, Encoder, FRAME_SAMPLES, Metadata};
+use hz_ac3::{ChannelMode, Config, DELAY, Encoder, FRAME_SAMPLES, Format, Metadata};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,6 +28,10 @@ fn main() {
         _ => panic!("1 to 6 channels"),
     };
     let mut encoder = Encoder::new(Config {
+        format: match std::env::var("FORMAT").as_deref() {
+            Ok("eac3") => Format::Eac3,
+            _ => Format::Ac3,
+        },
         sample_rate: rate.parse().unwrap(),
         mode,
         lfe,

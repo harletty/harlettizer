@@ -279,8 +279,8 @@ enum Command {
         #[arg(long, default_value = "5.1")]
         layout: String,
 
-        /// Kilobits a second, an AC-3 rate from 32 to 640; 448 for 5.1 and
-        /// 192 for stereo unless asked.
+        /// Kilobits a second, an AC-3 rate from 32 to 640 — or with `--eac3`
+        /// any rate up to 1024; 448 for 5.1 and 192 for stereo unless asked.
         #[arg(long, value_name = "KBPS")]
         bitrate: Option<u32>,
 
@@ -292,6 +292,11 @@ enum Command {
         /// Never couple the high band, even where the encoder would.
         #[arg(long)]
         no_coupling: bool,
+
+        /// Write one independent E-AC-3 substream instead, at any rate a
+        /// frame can carry (`--bitrate` in kb/s, up to 1024 at 48 kHz).
+        #[arg(long)]
+        eac3: bool,
 
         /// Report progress on standard error.
         #[arg(long)]
@@ -767,6 +772,7 @@ fn main() -> ExitCode {
             bitrate,
             dialnorm,
             no_coupling,
+            eac3,
             progress,
         } => {
             let layout = match layout.as_str() {
@@ -787,6 +793,7 @@ fn main() -> ExitCode {
                     bit_rate: bitrate,
                     dialnorm,
                     coupling: !no_coupling,
+                    eac3,
                     progress,
                 })
             })
