@@ -81,8 +81,9 @@ pub struct ExssHeader {
     pub asset_sizes: Vec<u32>,
     /// One descriptor per asset.
     pub assets: Vec<AssetDescriptor>,
-    /// Per asset: the backward-compatible core's substream and asset index,
-    /// when the asset has one.
+    /// Per audio presentation: the backward-compatible core's substream and
+    /// asset index, when the presentation has one. ETSI TS 102 114 codes
+    /// every presence flag first, then the indices of the present ones.
     pub backward_core: Vec<Option<(u8, u8)>>,
     /// Reserved bits and the byte alignment before the checksum.
     pub reserved: Bits,
@@ -486,11 +487,18 @@ impl ExssHeader {
         for _ in 0..asset_count {
             assets.push(AssetDescriptor::read(&mut r, statics.as_ref(), size_bits)?);
         }
-        let mut backward_core = Vec::with_capacity(asset_count);
-        for _ in 0..asset_count {
-            backward_core.push(get_option(&mut r, |r| {
-                Ok((r.get(2)? as u8, r.get(3)? as u8))
-            })?);
+        let presentations = statics.as_ref().map_or(1, |s| s.presentations.len());
+        let mut present = Vec::with_capacity(presentations);
+        for _ in 0..presentations {
+            present.push(r.get_bit()?);
+        }
+        let mut backward_core = Vec::with_capacity(presentations);
+        for present in present {
+            backward_core.push(if present {
+                Some((r.get(2)? as u8, r.get(3)? as u8))
+            } else {
+                None
+            });
         }
         let crc_at = header_size as usize * 8 - 16;
         let here = r.bit_position();
@@ -528,11 +536,22 @@ impl ExssHeader {
     /// Write the header, its checksum computed over what was written.
     ///
     /// Refuses a model whose fields do not fill [`Self::header_size`] or a
-    /// descriptor's size exactly, or that holds a value its field cannot —
+    /// descriptor's size exactly, whose substream does not hold its header
+    /// and assets, or that holds a value its field cannot —
     /// the sizes are what a decoder navigates by, so a mismatch is a stream
     /// it cannot read.
     pub fn write(&self) -> Result<Vec<u8>> {
         let mut out = Out::new();
+        // What the reader requires of the sizes: the substream holds the
+        // header and every asset after it, padding allowed.
+        let held = u64::from(self.header_size)
+            + self.asset_sizes.iter().map(|&a| u64::from(a)).sum::<u64>();
+        out.check(held <= u64::from(self.size), || {
+            format!(
+                "a {}-byte header and its assets, {held} bytes, in a {}-byte substream",
+                self.header_size, self.size
+            )
+        });
         self.write_fields(&mut out);
         out.bits(&self.reserved);
         let crc_at = (self.header_size as usize * 8).checked_sub(16);
@@ -557,11 +576,13 @@ impl ExssHeader {
             .as_ref()
             .map_or(1, |s| usize::from(s.asset_count));
         out.check(
-            self.asset_sizes.len() == assets
-                && self.assets.len() == assets
-                && self.backward_core.len() == assets,
+            self.asset_sizes.len() == assets && self.assets.len() == assets,
             || format!("{assets} assets declared, not described"),
         );
+        let presentations = self.statics.as_ref().map_or(1, |s| s.presentations.len());
+        out.check(self.backward_core.len() == presentations, || {
+            format!("{presentations} presentations, not one backward-compatible core entry each")
+        });
         out.field(32, SYNC, "the sync word");
         out.field(8, self.user_defined, "the user-defined bits");
         out.field(2, self.index, "the substream index");
@@ -576,10 +597,11 @@ impl ExssHeader {
             asset.write(out, self.statics.as_ref(), size_bits);
         }
         for core in &self.backward_core {
-            out.option(core, |out, &(substream, asset)| {
-                out.field(2, substream, "the backward-compatible core's substream");
-                out.field(3, asset, "the backward-compatible core's asset");
-            });
+            out.bit(core.is_some());
+        }
+        for &(substream, asset) in self.backward_core.iter().flatten() {
+            out.field(2, substream, "the backward-compatible core's substream");
+            out.field(3, asset, "the backward-compatible core's asset");
         }
     }
 
@@ -1511,6 +1533,73 @@ mod tests {
         let before = header.clone();
         assert!(header.fit().is_err());
         assert_eq!(header, before, "a refused fit leaves the model alone");
+    }
+
+    /// The fixture with two presentations over two assets.
+    fn two_presentations(backward_core: Vec<Option<(u8, u8)>>) -> ExssHeader {
+        let mut header = seven_one();
+        let statics = header.statics.as_mut().unwrap();
+        statics.asset_count = 2;
+        statics.presentations = vec![
+            Presentation {
+                active_substreams: 1,
+                active_assets: vec![1],
+            },
+            Presentation {
+                active_substreams: 1,
+                active_assets: vec![3],
+            },
+        ];
+        header.asset_sizes = vec![6000, 100];
+        let mut second = header.assets[0].clone();
+        second.index = 1;
+        header.assets.push(second);
+        header.backward_core = backward_core;
+        header.fit().unwrap();
+        header.size = header.header_size + 6100;
+        header
+    }
+
+    #[test]
+    fn backward_core_entries_go_per_presentation_flags_first() {
+        let header = two_presentations(vec![Some((0, 0)), Some((0, 1))]);
+        let bytes = header.write().unwrap();
+        assert_eq!(
+            ExssHeader::read(&bytes).unwrap().backward_core,
+            header.backward_core
+        );
+        // The twelve bits before the reserved ones: both flags, then the two
+        // index pairs — not each flag followed by its own pair.
+        let end = header.header_size as usize * 8 - 16 - header.reserved.len();
+        let mut r = BitReader::at_bit(&bytes, end - 12);
+        // 1 1 | 00 000 | 00 001
+        assert_eq!(r.get(12).unwrap(), 0b1100_0000_0001);
+        // One entry per presentation, whatever the asset count.
+        let mut shared = two_presentations(vec![Some((0, 0)), None]);
+        shared.statics.as_mut().unwrap().asset_count = 1;
+        shared.asset_sizes.truncate(1);
+        shared.assets.truncate(1);
+        shared.fit().unwrap();
+        shared.size = shared.header_size + 6000;
+        let bytes = shared.write().unwrap();
+        assert_eq!(
+            ExssHeader::read(&bytes).unwrap().backward_core,
+            shared.backward_core
+        );
+        shared.backward_core.push(None);
+        assert!(shared.write().is_err());
+    }
+
+    #[test]
+    fn a_substream_too_small_for_its_contents_is_refused() {
+        let mut header = seven_one();
+        header.size -= 1;
+        assert!(header.write().is_err());
+        header.size = 1;
+        assert!(header.write().is_err());
+        // Padding after the assets is allowed.
+        header.size = header.header_size + 6000 + 16;
+        assert!(header.write().is_ok());
     }
 
     #[test]
