@@ -347,28 +347,47 @@ impl Out {
         }
     }
 
+    /// Whether writing goes on. After the first refusal nothing more is
+    /// written: a later field's width can depend on the refused one, and
+    /// what would be written is going to be thrown away.
+    fn writing(&self) -> bool {
+        self.error.is_none()
+    }
+
     /// A field coded as it is.
     fn field(&mut self, bits: u32, value: impl Into<u64>, what: &str) {
         let value = value.into();
-        if bits < 64 && value >> bits != 0 {
-            self.refuse(|| format!("{what} = {value} does not fit in {bits} bits"));
+        if !self.writing() {
+            return;
         }
-        put_wide(&mut self.w, bits, value);
+        if bits > 64 {
+            self.refuse(|| format!("{what} cannot be {bits} bits wide"));
+        } else if bits < 64 && value >> bits != 0 {
+            self.refuse(|| format!("{what} = {value} does not fit in {bits} bits"));
+        } else {
+            put_wide(&mut self.w, bits, value);
+        }
     }
 
     /// A count or size coded as itself less one, so `1..=2^bits`.
     fn size(&mut self, bits: u32, value: impl Into<u64>, what: &str) {
         let value = value.into();
-        if value == 0 || value > 1u64 << bits {
+        if !self.writing() {
+            return;
+        }
+        if bits >= 64 {
+            self.refuse(|| format!("{what} cannot be {bits} bits wide"));
+        } else if value == 0 || value > 1u64 << bits {
             self.refuse(|| format!("{what} = {value} is outside 1..={}", 1u64 << bits));
-            put_wide(&mut self.w, bits, 0);
         } else {
             put_wide(&mut self.w, bits, value - 1);
         }
     }
 
     fn bit(&mut self, bit: bool) {
-        self.w.put_bit(bit);
+        if self.writing() {
+            self.w.put_bit(bit);
+        }
     }
 
     fn option<T>(&mut self, value: &Option<T>, write: impl FnOnce(&mut Self, &T)) {
@@ -379,7 +398,9 @@ impl Out {
     }
 
     fn bits(&mut self, bits: &Bits) {
-        bits.write(&mut self.w);
+        if self.writing() {
+            bits.write(&mut self.w);
+        }
     }
 
     fn position(&self) -> usize {
@@ -564,11 +585,23 @@ impl ExssHeader {
 
     /// Set every size from the content. Each descriptor keeps its tail, padded
     /// with zeroes to its next byte, and the reserved bits keep theirs, padded
-    /// to the byte before the checksum; fitting twice changes nothing. Moves
-    /// to the wide field widths when the narrow ones cannot hold a size.
-    /// `size`, the whole substream's, is the caller's to set.
+    /// to the byte before the checksum; fitting twice changes nothing. A
+    /// header the narrow field widths cannot describe — its own size, the
+    /// substream's, an asset's or a component's — is fitted with the wide
+    /// ones. `size`, the whole substream's, is the caller's to set. On a
+    /// refusal the model is left as it was.
     pub fn fit(&mut self) -> Result<()> {
-        let (_, size_bits) = widths(self.wide);
+        let original = self.clone();
+        if !self.wide && self.fit_at_width().is_ok() {
+            return Ok(());
+        }
+        *self = original.clone();
+        self.wide = true;
+        self.fit_at_width().inspect_err(|_| *self = original)
+    }
+
+    fn fit_at_width(&mut self) -> Result<()> {
+        let (header_bits, size_bits) = widths(self.wide);
         for asset in &mut self.assets {
             // The size field is nine bits whatever it holds; measure with one
             // that writes.
@@ -590,24 +623,18 @@ impl ExssHeader {
         self.write_fields(&mut out);
         self.size = size;
         let position = out.position();
-        let refused = out.finish().err();
+        out.finish()?;
         let bytes = (position + self.reserved.len()).div_ceil(8);
         self.reserved
             .pad(bytes * 8 - position - self.reserved.len());
         self.header_size = bytes as u32 + 2;
-        let narrow = !self.wide
-            && (self.header_size > 1 << 8
-                || self.size > 1 << 16
-                || self.asset_sizes.iter().any(|&a| a > 1 << 16));
-        if narrow {
-            self.wide = true;
-            return self.fit();
+        if self.header_size > 1 << header_bits {
+            return Err(Ran(format!(
+                "a {}-byte header does not fit in {header_bits} bits",
+                self.header_size
+            )));
         }
-        // A refusal unrelated to the widths stands.
-        match refused {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -1446,6 +1473,44 @@ mod tests {
             xll.size = (1 << 20) + 1;
         }
         assert!(header.write().is_err());
+    }
+
+    #[test]
+    fn a_large_asset_is_fitted_with_the_wide_widths() {
+        let mut header = seven_one();
+        header.wide = false;
+        header.fit().unwrap();
+        assert!(!header.wide, "a small header stays narrow");
+        header.asset_sizes[0] = 70_000;
+        if let Coding::Components { xll: Some(xll), .. } = &mut header.assets[0].coding {
+            xll.size = 70_000;
+        }
+        header.fit().unwrap();
+        assert!(header.wide);
+        header.size = header.header_size + 70_000;
+        let bytes = header.write().unwrap();
+        assert_eq!(ExssHeader::read(&bytes).unwrap().write().unwrap(), bytes);
+    }
+
+    #[test]
+    fn an_invalid_width_is_refused_not_panicked_on() {
+        let mut header = seven_one();
+        if let Coding::Components { xll: Some(xll), .. } = &mut header.assets[0].coding {
+            xll.sync.as_mut().unwrap().delay_bits = 65;
+        }
+        assert!(header.write().is_err());
+        let mut header = seven_one();
+        if let Some(AssetStatics {
+            mapping: ChannelMapping::OneToOne { speaker_mask, .. },
+            ..
+        }) = &mut header.assets[0].statics
+        {
+            *speaker_mask = Some((200, 0x084b));
+        }
+        assert!(header.write().is_err());
+        let before = header.clone();
+        assert!(header.fit().is_err());
+        assert_eq!(header, before, "a refused fit leaves the model alone");
     }
 
     #[test]

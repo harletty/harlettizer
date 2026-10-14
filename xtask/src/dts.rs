@@ -92,6 +92,7 @@ pub fn run(options: Options) -> Result<()> {
     for frame in split::frames(&bytes).take(limit) {
         let frame = frame.map_err(|e| Error::malformed(&options.input, e.0))?;
         tally.frames += 1;
+        let mut navigation = None;
         if let Some(core) = frame.core {
             let header = CoreHeader::read(core).map_err(|e| {
                 Error::malformed(&options.input, format!("core at {}: {}", frame.at, e.0))
@@ -131,13 +132,15 @@ pub fn run(options: Options) -> Result<()> {
                 }
                 _ => {}
             }
-            let navigation = navigate(&header, &mut tally);
-            #[cfg(feature = "dca-oracle")]
-            oracle.frame(frame.core, exss, navigation);
-            #[cfg(not(feature = "dca-oracle"))]
-            let _ = navigation;
+            navigation = navigate(&header, &mut tally);
             first_exss.get_or_insert(header);
         }
+        // Every frame goes through the decoder, a core without an extension
+        // substream as much as one with.
+        #[cfg(feature = "dca-oracle")]
+        oracle.frame(frame.core, frame.exss, navigation);
+        #[cfg(not(feature = "dca-oracle"))]
+        let _ = navigation;
     }
 
     println!("{}", options.input.display());
@@ -279,7 +282,7 @@ fn describe(header: &ExssHeader) {
 #[cfg(feature = "dca-oracle")]
 mod oracle {
     use super::unfold;
-    use dca::{FoldPlan, HdDecoder, XMetadata, XPresentation};
+    use dca::{FoldPlan, HdDecoder, HdError, PcmDecoder, XMetadata, XPresentation};
     use hz_dca::core::CoreHeader;
     use hz_dca::navigation::Navigation;
 
@@ -289,10 +292,15 @@ mod oracle {
         /// Built with `new`, not `Default`: the derived default leaves the
         /// lossless decoder without its buffers.
         decoder: HdDecoder,
+        /// For frames that are a core alone.
+        core_decoder: PcmDecoder,
         cores: usize,
         cores_agree: usize,
         decoded: usize,
         decode_errors: usize,
+        /// Frames the lossless decoder holds back while its peak-rate buffer
+        /// fills: not a refusal.
+        pending: usize,
         navigations: usize,
         navigations_agree: usize,
         /// Of those, located by the decoder's own reading of the word.
@@ -313,10 +321,12 @@ mod oracle {
         fn default() -> Self {
             Self {
                 decoder: HdDecoder::new(),
+                core_decoder: PcmDecoder::new(),
                 cores: 0,
                 cores_agree: 0,
                 decoded: 0,
                 decode_errors: 0,
+                pending: 0,
                 navigations: 0,
                 navigations_agree: 0,
                 navigations_by_word: 0,
@@ -347,10 +357,27 @@ mod oracle {
             }
         }
 
-        pub fn frame(&mut self, core: Option<&[u8]>, exss: &[u8], ours: Option<Navigation>) {
-            let core = core.unwrap_or(&[]);
-            let frame = match self.decoder.decode(core, exss) {
+        pub fn frame(
+            &mut self,
+            core: Option<&[u8]>,
+            exss: Option<&[u8]>,
+            ours: Option<Navigation>,
+        ) {
+            let Some(exss) = exss else {
+                // A core alone. The split only yields frames with at least
+                // one half.
+                match self.core_decoder.push_access_unit(core.unwrap_or(&[])) {
+                    Ok(_) => self.decoded += 1,
+                    Err(_) => self.decode_errors += 1,
+                }
+                return;
+            };
+            let frame = match self.decoder.decode(core.unwrap_or(&[]), exss) {
                 Ok(frame) => frame,
+                Err(HdError::Pending) => {
+                    self.pending += 1;
+                    return;
+                }
                 Err(_) => {
                     self.decode_errors += 1;
                     return;
@@ -467,8 +494,14 @@ mod oracle {
                 self.cores_agree, self.cores
             );
             println!(
-                "  oracle: decoded        {} frames, {} refused",
-                self.decoded, self.decode_errors
+                "  oracle: decoded        {} frames, {} refused{}",
+                self.decoded,
+                self.decode_errors,
+                if self.pending > 0 {
+                    format!(", {} held back by the peak-rate buffer", self.pending)
+                } else {
+                    String::new()
+                }
             );
             println!(
                 "  oracle: navigation     {}/{} point at the block dca located \
@@ -549,6 +582,60 @@ mod tests {
     }
 
     #[cfg(feature = "dca-oracle")]
+    fn run_on(name: &str, stream: &[u8]) -> hz_core::Result<()> {
+        let dir = std::env::temp_dir().join(format!("hz-dts-oracle-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stream.dts");
+        std::fs::write(&path, stream).unwrap();
+        let result = super::run(super::Options {
+            input: path,
+            frames: None,
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    #[cfg(feature = "dca-oracle")]
+    #[test]
+    fn a_core_the_oracle_refuses_fails_the_command() {
+        use hz_dca::core::CoreHeader;
+        let header = CoreHeader {
+            normal_frame: true,
+            crc_present: false,
+            pcm_blocks: 16,
+            frame_size: 2012,
+            audio_mode: 9,
+            sample_rate_code: 13,
+            bit_rate_code: 24,
+            drc_present: false,
+            timestamp_present: false,
+            aux_present: false,
+            hdcd_master: false,
+            ext_audio_type: 0,
+            ext_audio_present: false,
+            sync_ssf: true,
+            lfe: 2,
+            predictor_history: true,
+            header_crc: None,
+            filter_perfect: false,
+            encoder_revision: 7,
+            copy_history: 0,
+            pcm_resolution_code: 6,
+            sumdiff_front: false,
+            sumdiff_surround: false,
+            dialnorm_code: 0,
+        };
+        let mut w = hz_core::bits::BitWriter::new();
+        header.write(&mut w);
+        let mut stream = w.finish();
+        stream.resize(2012, 0);
+        let message = run_on("core", &stream)
+            .expect_err("a refused core must fail the command")
+            .to_string();
+        assert!(message.contains("dca refuses 1 frames"), "{message}");
+    }
+
+    #[cfg(feature = "dca-oracle")]
     #[test]
     fn a_frame_the_oracle_refuses_fails_the_command() {
         use hz_dca::exss::{AssetDescriptor, Coding, ExssHeader, Xll};
@@ -583,15 +670,7 @@ mod tests {
         header.size = header.header_size + 64;
         let mut stream = header.write().unwrap();
         stream.resize(header.size as usize, 0);
-        let dir = std::env::temp_dir().join(format!("hz-dts-oracle-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("refused.dts");
-        std::fs::write(&path, &stream).unwrap();
-        let result = super::run(super::Options {
-            input: path.clone(),
-            frames: None,
-        });
-        std::fs::remove_dir_all(&dir).unwrap();
+        let result = run_on("exss", &stream);
         let message = result
             .expect_err("a refused frame must fail the command")
             .to_string();
