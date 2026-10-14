@@ -317,10 +317,80 @@ fn get_option<T>(
     }
 }
 
-fn put_option<T>(w: &mut BitWriter, value: &Option<T>, write: impl FnOnce(&mut BitWriter, &T)) {
-    w.put_bit(value.is_some());
-    if let Some(value) = value {
-        write(w, value);
+/// A bit writer that refuses, rather than truncates, a value its field cannot
+/// hold. `BitWriter::put` keeps the low bits, which for a size field is a
+/// header that navigates somewhere else and still writes. The first refusal
+/// is kept and returned by [`Out::finish`], so the writing code can read like
+/// the grammar it writes.
+struct Out {
+    w: BitWriter,
+    error: Option<String>,
+}
+
+impl Out {
+    fn new() -> Self {
+        Self {
+            w: BitWriter::new(),
+            error: None,
+        }
+    }
+
+    fn refuse(&mut self, why: impl FnOnce() -> String) {
+        if self.error.is_none() {
+            self.error = Some(why());
+        }
+    }
+
+    fn check(&mut self, ok: bool, why: impl FnOnce() -> String) {
+        if !ok {
+            self.refuse(why);
+        }
+    }
+
+    /// A field coded as it is.
+    fn field(&mut self, bits: u32, value: impl Into<u64>, what: &str) {
+        let value = value.into();
+        if bits < 64 && value >> bits != 0 {
+            self.refuse(|| format!("{what} = {value} does not fit in {bits} bits"));
+        }
+        put_wide(&mut self.w, bits, value);
+    }
+
+    /// A count or size coded as itself less one, so `1..=2^bits`.
+    fn size(&mut self, bits: u32, value: impl Into<u64>, what: &str) {
+        let value = value.into();
+        if value == 0 || value > 1u64 << bits {
+            self.refuse(|| format!("{what} = {value} is outside 1..={}", 1u64 << bits));
+            put_wide(&mut self.w, bits, 0);
+        } else {
+            put_wide(&mut self.w, bits, value - 1);
+        }
+    }
+
+    fn bit(&mut self, bit: bool) {
+        self.w.put_bit(bit);
+    }
+
+    fn option<T>(&mut self, value: &Option<T>, write: impl FnOnce(&mut Self, &T)) {
+        self.bit(value.is_some());
+        if let Some(value) = value {
+            write(self, value);
+        }
+    }
+
+    fn bits(&mut self, bits: &Bits) {
+        bits.write(&mut self.w);
+    }
+
+    fn position(&self) -> usize {
+        self.w.bit_position()
+    }
+
+    fn finish(self) -> Result<BitWriter> {
+        match self.error {
+            Some(why) => Err(Ran(why)),
+            None => Ok(self.w),
+        }
     }
 }
 
@@ -359,17 +429,37 @@ impl ExssHeader {
         let (header_bits, size_bits) = widths(wide);
         let header_size = r.get(header_bits)? + 1;
         let size = r.get(size_bits)? + 1;
+        // The header has to hold the fields read so far and its checksum;
+        // everything after this subtracts from its length.
+        if (header_size as usize) * 8 < r.bit_position() + 1 + 16 {
+            return Err(Ran(format!(
+                "a {header_size}-byte header cannot hold its own fields"
+            )));
+        }
         if header_size as usize > substream.len() {
             return Err(Ran(format!(
                 "a {header_size}-byte header in {} bytes",
                 substream.len()
             )));
         }
+        if header_size > size {
+            return Err(Ran(format!(
+                "a {header_size}-byte header in a {size}-byte substream"
+            )));
+        }
         let statics = get_option(&mut r, |r| StaticFields::read(r, index))?;
         let asset_count = statics.as_ref().map_or(1, |s| usize::from(s.asset_count));
         let mut asset_sizes = Vec::with_capacity(asset_count);
+        let mut end = u64::from(header_size);
         for _ in 0..asset_count {
-            asset_sizes.push(r.get(size_bits)? + 1);
+            let asset = r.get(size_bits)? + 1;
+            end += u64::from(asset);
+            if end > u64::from(size) {
+                return Err(Ran(format!(
+                    "the assets run past the {size}-byte substream"
+                )));
+            }
+            asset_sizes.push(asset);
         }
         let mut assets = Vec::with_capacity(asset_count);
         for _ in 0..asset_count {
@@ -417,81 +507,107 @@ impl ExssHeader {
     /// Write the header, its checksum computed over what was written.
     ///
     /// Refuses a model whose fields do not fill [`Self::header_size`] or a
-    /// descriptor's size exactly — the sizes are what a decoder navigates
-    /// by, so a mismatch is a stream it cannot read.
+    /// descriptor's size exactly, or that holds a value its field cannot —
+    /// the sizes are what a decoder navigates by, so a mismatch is a stream
+    /// it cannot read.
     pub fn write(&self) -> Result<Vec<u8>> {
-        let (header_bits, size_bits) = widths(self.wide);
-        let assets = self
-            .statics
-            .as_ref()
-            .map_or(1, |s| usize::from(s.asset_count));
-        if self.asset_sizes.len() != assets
-            || self.assets.len() != assets
-            || self.backward_core.len() != assets
-        {
-            return Err(Ran(format!("{assets} assets declared, not described")));
-        }
-        let mut w = BitWriter::new();
-        w.put(32, SYNC);
-        w.put(8, u32::from(self.user_defined));
-        w.put(2, u32::from(self.index));
-        w.put_bit(self.wide);
-        w.put(header_bits, self.header_size - 1);
-        w.put(size_bits, self.size - 1);
-        put_option(&mut w, &self.statics, |w, s| s.write(w, self.index));
-        for &size in &self.asset_sizes {
-            w.put(size_bits, size - 1);
-        }
-        for asset in &self.assets {
-            asset.write(&mut w, self.statics.as_ref(), size_bits)?;
-        }
-        for core in &self.backward_core {
-            put_option(&mut w, core, |w, &(substream, asset)| {
-                w.put(2, u32::from(substream));
-                w.put(3, u32::from(asset));
-            });
-        }
-        self.reserved.write(&mut w);
-        let crc_at = self.header_size as usize * 8 - 16;
-        if w.bit_position() != crc_at {
-            return Err(Ran(format!(
-                "the fields end at bit {}, the checksum is at bit {crc_at}",
-                w.bit_position()
-            )));
-        }
+        let mut out = Out::new();
+        self.write_fields(&mut out);
+        out.bits(&self.reserved);
+        let crc_at = (self.header_size as usize * 8).checked_sub(16);
+        let at = out.position();
+        out.check(crc_at == Some(at), || {
+            format!(
+                "the fields end at bit {at}, a {}-byte header's checksum is elsewhere",
+                self.header_size
+            )
+        });
+        let mut w = out.finish()?;
         let crc = crc::crc16(&w.bytes()[5..]);
         w.put(16, u32::from(crc));
         Ok(w.finish())
     }
 
-    /// Set every size from the content: each descriptor's tail padded with
-    /// zeroes to its next byte, and the reserved bits to the byte before the
-    /// checksum. `size`, the whole substream's, is the caller's to set.
-    pub fn fit(&mut self) {
+    /// Everything up to the reserved bits.
+    fn write_fields(&self, out: &mut Out) {
         let (header_bits, size_bits) = widths(self.wide);
-        let mut position = 32 + 8 + 2 + 1 + header_bits as usize + size_bits as usize + 1;
-        if let Some(statics) = &self.statics {
-            position += statics.bits(self.index);
+        let assets = self
+            .statics
+            .as_ref()
+            .map_or(1, |s| usize::from(s.asset_count));
+        out.check(
+            self.asset_sizes.len() == assets
+                && self.assets.len() == assets
+                && self.backward_core.len() == assets,
+            || format!("{assets} assets declared, not described"),
+        );
+        out.field(32, SYNC, "the sync word");
+        out.field(8, self.user_defined, "the user-defined bits");
+        out.field(2, self.index, "the substream index");
+        out.bit(self.wide);
+        out.size(header_bits, self.header_size, "the header size");
+        out.size(size_bits, self.size, "the substream size");
+        out.option(&self.statics, |out, s| s.write(out, self.index));
+        for &size in &self.asset_sizes {
+            out.size(size_bits, size, "an asset size");
         }
-        position += self.asset_sizes.len() * size_bits as usize;
+        for asset in &self.assets {
+            asset.write(out, self.statics.as_ref(), size_bits);
+        }
+        for core in &self.backward_core {
+            out.option(core, |out, &(substream, asset)| {
+                out.field(2, substream, "the backward-compatible core's substream");
+                out.field(3, asset, "the backward-compatible core's asset");
+            });
+        }
+    }
+
+    /// Set every size from the content. Each descriptor keeps its tail, padded
+    /// with zeroes to its next byte, and the reserved bits keep theirs, padded
+    /// to the byte before the checksum; fitting twice changes nothing. Moves
+    /// to the wide field widths when the narrow ones cannot hold a size.
+    /// `size`, the whole substream's, is the caller's to set.
+    pub fn fit(&mut self) -> Result<()> {
+        let (_, size_bits) = widths(self.wide);
         for asset in &mut self.assets {
             // The size field is nine bits whatever it holds; measure with one
             // that writes.
             asset.size = 1;
-            let used = asset.bits_before_tail(self.statics.as_ref(), size_bits);
-            let bytes = used.div_ceil(8);
-            asset.tail = Bits::zeroes(bytes * 8 - used);
+            let mut out = Out::new();
+            asset.write_fields(&mut out, self.statics.as_ref(), size_bits);
+            let used = out.position();
+            out.finish()?;
+            let bytes = (used + asset.tail.len()).div_ceil(8);
+            asset.tail.pad(bytes * 8 - used - asset.tail.len());
             asset.size = bytes as u32;
-            position += bytes * 8;
         }
-        position += self
-            .backward_core
-            .iter()
-            .map(|core| if core.is_some() { 6 } else { 1 })
-            .sum::<usize>();
-        let bytes = position.div_ceil(8);
-        self.reserved = Bits::zeroes(bytes * 8 - position);
+        // Measure with sizes that write; the substream's is the caller's and
+        // may not be set yet.
+        self.header_size = 1;
+        let size = self.size;
+        self.size = self.size.max(1);
+        let mut out = Out::new();
+        self.write_fields(&mut out);
+        self.size = size;
+        let position = out.position();
+        let refused = out.finish().err();
+        let bytes = (position + self.reserved.len()).div_ceil(8);
+        self.reserved
+            .pad(bytes * 8 - position - self.reserved.len());
         self.header_size = bytes as u32 + 2;
+        let narrow = !self.wide
+            && (self.header_size > 1 << 8
+                || self.size > 1 << 16
+                || self.asset_sizes.iter().any(|&a| a > 1 << 16));
+        if narrow {
+            self.wide = true;
+            return self.fit();
+        }
+        // A refusal unrelated to the widths stands.
+        match refused {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -542,34 +658,36 @@ impl StaticFields {
         })
     }
 
-    fn write(&self, w: &mut BitWriter, index: u8) {
-        w.put(2, u32::from(self.reference_clock));
-        w.put(3, u32::from(self.frame_duration_code));
-        put_option(w, &self.timecode, |w, &t| put_wide(w, 36, t));
-        w.put(3, self.presentations.len() as u32 - 1);
-        w.put(3, u32::from(self.asset_count) - 1);
+    fn write(&self, out: &mut Out, index: u8) {
+        out.field(2, self.reference_clock, "the reference clock code");
+        out.field(3, self.frame_duration_code, "the frame duration code");
+        out.option(&self.timecode, |out, &t| out.field(36, t, "the timecode"));
+        out.size(3, self.presentations.len() as u64, "the presentation count");
+        out.size(3, self.asset_count, "the asset count");
         for p in &self.presentations {
-            w.put(u32::from(index) + 1, u32::from(p.active_substreams));
+            out.field(
+                u32::from(index) + 1,
+                p.active_substreams,
+                "an active substream mask",
+            );
         }
         for p in &self.presentations {
+            out.check(
+                p.active_assets.len() == p.active_substreams.count_ones() as usize,
+                || "one active asset mask per active substream".into(),
+            );
             for &mask in &p.active_assets {
-                w.put(8, u32::from(mask));
+                out.field(8, mask, "an active asset mask");
             }
         }
-        put_option(w, &self.mixing, |w, m| {
-            w.put(2, u32::from(m.adjustment_level));
-            w.put(2, u32::from(m.mask_width_code));
-            w.put(2, m.layouts.len() as u32 - 1);
+        out.option(&self.mixing, |out, m| {
+            out.field(2, m.adjustment_level, "the mixing adjustment level");
+            out.field(2, m.mask_width_code, "the mixing mask width code");
+            out.size(2, m.layouts.len() as u64, "the mixing configuration count");
             for &layout in &m.layouts {
-                w.put(m.mask_bits(), layout);
+                out.field(m.mask_bits(), layout, "a mixing output layout");
             }
         });
-    }
-
-    fn bits(&self, index: u8) -> usize {
-        let mut w = BitWriter::new();
-        self.write(&mut w, index);
-        w.bit_position()
     }
 }
 
@@ -631,85 +749,67 @@ impl AssetDescriptor {
         })
     }
 
-    fn write(
-        &self,
-        w: &mut BitWriter,
-        statics: Option<&StaticFields>,
-        size_bits: u32,
-    ) -> Result<()> {
-        let start = w.bit_position();
-        self.write_fields(w, statics, size_bits)?;
-        self.tail.write(w);
-        let written = w.bit_position() - start;
-        if written != self.size as usize * 8 {
-            return Err(Ran(format!(
+    fn write(&self, out: &mut Out, statics: Option<&StaticFields>, size_bits: u32) {
+        let start = out.position();
+        self.write_fields(out, statics, size_bits);
+        out.bits(&self.tail);
+        let written = out.position() - start;
+        out.check(written == self.size as usize * 8, || {
+            format!(
                 "a {}-byte asset descriptor written in {written} bits",
                 self.size
-            )));
-        }
-        Ok(())
+            )
+        });
     }
 
-    fn write_fields(
-        &self,
-        w: &mut BitWriter,
-        statics: Option<&StaticFields>,
-        size_bits: u32,
-    ) -> Result<()> {
-        if statics.is_some() != self.statics.is_some() {
-            return Err(Ran(
-                "an asset's static metadata come and go with the header's".into(),
-            ));
-        }
-        w.put(9, self.size - 1);
-        w.put(3, u32::from(self.index));
+    fn write_fields(&self, out: &mut Out, statics: Option<&StaticFields>, size_bits: u32) {
+        out.check(statics.is_some() == self.statics.is_some(), || {
+            "an asset's static metadata come and go with the header's".into()
+        });
+        out.size(9, self.size, "an asset descriptor's size");
+        out.field(3, self.index, "the asset index");
         if let Some(s) = &self.statics {
-            s.write(w);
+            s.write(out);
         }
-        w.put_bit(self.drc_code.is_some());
-        if let Some(code) = self.drc_code {
-            w.put(8, u32::from(code));
-        }
-        put_option(w, &self.dialnorm_code, |w, &c| w.put(5, u32::from(c)));
+        out.option(&self.drc_code, |out, &c| out.field(8, c, "the DRC code"));
+        out.option(&self.dialnorm_code, |out, &c| {
+            out.field(5, c, "the dialogue normalisation code")
+        });
         let embedded_stereo = self
             .statics
             .as_ref()
             .is_some_and(AssetStatics::embedded_stereo);
-        if self.stereo_drc_code.is_some() != (self.drc_code.is_some() && embedded_stereo) {
-            return Err(Ran(
-                "a stereo downmix DRC code is coded exactly when DRC is and the asset embeds stereo"
-                    .into(),
-            ));
-        }
+        out.check(
+            self.stereo_drc_code.is_some() == (self.drc_code.is_some() && embedded_stereo),
+            || {
+                "a stereo downmix DRC code is coded exactly when DRC is and the asset \
+                 embeds stereo"
+                    .into()
+            },
+        );
         if let Some(code) = self.stereo_drc_code {
-            w.put(8, u32::from(code));
+            out.field(8, code, "the stereo downmix DRC code");
         }
         match statics.and_then(|s| s.mixing.as_ref()) {
-            Some(config) => put_option(w, &self.mixing, |w, m| m.write(w, config)),
-            None if self.mixing.is_some() => {
-                return Err(Ran("mixing metadata without a mixing configuration".into()));
+            Some(config) => {
+                let channels = self
+                    .statics
+                    .as_ref()
+                    .map_or(0, AssetStatics::downmix_channels);
+                out.option(&self.mixing, |out, m| m.write(out, config, channels));
             }
-            None => {}
+            None => out.check(self.mixing.is_none(), || {
+                "mixing metadata without a mixing configuration".into()
+            }),
         }
-        self.coding.write(w, size_bits)?;
-        if self.hd_stream_id.is_some() != self.coding.xll().is_some() {
-            return Err(Ran(
-                "the DTS-HD stream identifier is coded exactly when the asset is lossless".into(),
-            ));
-        }
+        self.coding.write(out, size_bits);
+        out.check(
+            self.hd_stream_id.is_some() == self.coding.xll().is_some(),
+            || "the DTS-HD stream identifier is coded exactly when the asset is lossless".into(),
+        );
         if let Some(id) = self.hd_stream_id {
-            w.put(3, u32::from(id));
+            out.field(3, id, "the DTS-HD stream identifier");
         }
-        Ok(())
-    }
-
-    /// Bits up to the tail, which is what [`ExssHeader::fit`] sizes from.
-    fn bits_before_tail(&self, statics: Option<&StaticFields>, size_bits: u32) -> usize {
-        let mut w = BitWriter::new();
-        // `fit` is for a model built in code; one this refuses to write has
-        // no size, and writing it is where the refusal will say why.
-        let _ = self.write_fields(&mut w, statics, size_bits);
-        w.bit_position()
     }
 }
 
@@ -808,18 +908,20 @@ impl AssetStatics {
         })
     }
 
-    fn write(&self, w: &mut BitWriter) {
-        put_option(w, &self.asset_type, |w, &t| w.put(4, u32::from(t)));
-        put_option(w, &self.language, |w, &l| w.put(24, l));
-        put_option(w, &self.text, |w, text| {
-            w.put(10, text.len() as u32 - 1);
+    fn write(&self, out: &mut Out) {
+        out.option(&self.asset_type, |out, &t| {
+            out.field(4, t, "the asset type")
+        });
+        out.option(&self.language, |out, &l| out.field(24, l, "the language"));
+        out.option(&self.text, |out, text| {
+            out.size(10, text.len() as u64, "the text length");
             for &byte in text {
-                w.put(8, u32::from(byte));
+                out.field(8, byte, "a text byte");
             }
         });
-        w.put(5, u32::from(self.pcm_bit_res) - 1);
-        w.put(4, u32::from(self.max_sample_rate_code));
-        w.put(8, u32::from(self.channels) - 1);
+        out.size(5, self.pcm_bit_res, "the bit resolution");
+        out.field(4, self.max_sample_rate_code, "the sample rate code");
+        out.size(8, self.channels, "the channel count");
         match &self.mapping {
             ChannelMapping::OneToOne {
                 embedded_stereo,
@@ -827,35 +929,53 @@ impl AssetStatics {
                 speaker_mask,
                 remaps,
             } => {
-                w.put_bit(true);
+                out.bit(true);
                 if self.channels > 2 {
-                    w.put_bit(*embedded_stereo);
+                    out.bit(*embedded_stereo);
+                } else {
+                    out.check(!embedded_stereo, || {
+                        "an embedded stereo downmix of two channels or fewer".into()
+                    });
                 }
                 if self.channels > 6 {
-                    w.put_bit(*embedded_6ch);
+                    out.bit(*embedded_6ch);
+                } else {
+                    out.check(!embedded_6ch, || {
+                        "an embedded six-channel downmix of six channels or fewer".into()
+                    });
                 }
-                put_option(w, speaker_mask, |w, &(code, mask)| {
-                    w.put(2, u32::from(code));
-                    w.put((u32::from(code) + 1) * 4, mask);
+                out.option(speaker_mask, |out, &(code, mask)| {
+                    out.field(2, code, "the speaker mask width code");
+                    out.field((u32::from(code) + 1) * 4, mask, "the speaker mask");
                 });
                 let mask_bits = speaker_mask.map_or(0, |(code, _)| (u32::from(code) + 1) * 4);
-                w.put(3, remaps.len() as u32);
+                out.field(3, remaps.len() as u64, "the remapping set count");
+                out.check(remaps.is_empty() || mask_bits > 0, || {
+                    "speaker remapping without a speaker mask".into()
+                });
                 for remap in remaps {
-                    w.put(mask_bits, remap.layout);
+                    out.field(mask_bits, remap.layout, "a remapping layout");
                 }
                 for remap in remaps {
-                    w.put(5, u32::from(remap.decoded_channels) - 1);
+                    out.size(5, remap.decoded_channels, "a remapping's decoded channels");
+                    out.check(
+                        remap.speakers.len() == channels_for_mask(remap.layout) as usize,
+                        || "one remapping entry per speaker of its layout".into(),
+                    );
                     for (mask, codes) in &remap.speakers {
-                        w.put(u32::from(remap.decoded_channels), *mask);
+                        out.field(u32::from(remap.decoded_channels), *mask, "a remapping mask");
+                        out.check(codes.len() == mask.count_ones() as usize, || {
+                            "one remapping code per channel of its mask".into()
+                        });
                         for &code in codes {
-                            w.put(5, u32::from(code));
+                            out.field(5, code, "a remapping code");
                         }
                     }
                 }
             }
             ChannelMapping::Representation(kind) => {
-                w.put_bit(false);
-                w.put(3, u32::from(*kind));
+                out.bit(false);
+                out.field(3, *kind, "the representation type");
             }
         }
     }
@@ -909,24 +1029,44 @@ impl AssetMixing {
         })
     }
 
-    fn write(&self, w: &mut BitWriter, config: &MixingConfig) {
-        w.put_bit(self.external);
-        w.put(6, u32::from(self.post_gain));
-        w.put(2, u32::from(self.drc_prior_mode));
-        w.put(
+    fn write(&self, out: &mut Out, config: &MixingConfig, channels: usize) {
+        out.bit(self.external);
+        out.field(6, self.post_gain, "the post-mix gain");
+        out.field(2, self.drc_prior_mode, "the mixer DRC mode");
+        out.field(
             if self.drc_prior_mode == 3 { 8 } else { 3 },
-            u32::from(self.drc_prior_value),
+            self.drc_prior_value,
+            "the mixer DRC value",
         );
-        w.put_bit(self.per_channel_scaling);
+        out.bit(self.per_channel_scaling);
+        let outputs: Vec<u32> = config
+            .layouts
+            .iter()
+            .map(|&l| channels_for_mask(l))
+            .collect();
+        let codes = if self.per_channel_scaling {
+            outputs.iter().sum::<u32>() as usize
+        } else {
+            outputs.len()
+        };
+        out.check(self.scaling.len() == codes, || {
+            format!("{codes} scaling codes, not {}", self.scaling.len())
+        });
         for &code in &self.scaling {
-            w.put(6, u32::from(code));
+            out.field(6, code, "a scaling code");
         }
-        for (layout, config_maps) in config.layouts.iter().zip(&self.maps) {
-            let out = channels_for_mask(*layout);
+        out.check(
+            self.maps.len() == outputs.len() && self.maps.iter().all(|m| m.len() == channels),
+            || format!("one mixing map per configuration and per each of {channels} channels"),
+        );
+        for (&width, config_maps) in outputs.iter().zip(&self.maps) {
             for (mask, coefficients) in config_maps {
-                w.put(out, *mask);
+                out.field(width, *mask, "a mixing map");
+                out.check(coefficients.len() == mask.count_ones() as usize, || {
+                    "one mixing coefficient per output of its map".into()
+                });
                 for &c in coefficients {
-                    w.put(6, u32::from(c));
+                    out.field(6, c, "a mixing coefficient");
                 }
             }
         }
@@ -1007,7 +1147,7 @@ impl Coding {
         })
     }
 
-    fn write(&self, w: &mut BitWriter, size_bits: u32) -> Result<()> {
+    fn write(&self, out: &mut Out, size_bits: u32) {
         match self {
             Coding::Components {
                 mask,
@@ -1032,58 +1172,59 @@ impl Coding {
                 ];
                 if let Some((bit, _)) = named.iter().find(|&&(bit, some)| (mask & bit != 0) != some)
                 {
-                    return Err(Ran(format!(
-                        "extension mask {mask:#05x} and component {bit:#05x} disagree"
-                    )));
+                    out.refuse(|| {
+                        format!("extension mask {mask:#05x} and component {bit:#05x} disagree")
+                    });
                 }
-                w.put(2, 0);
-                w.put(12, u32::from(*mask));
+                out.field(2, 0u8, "the coding mode");
+                out.field(12, *mask, "the extension mask");
                 if let Some((size, sync)) = core {
-                    w.put(14, size - 1);
-                    put_option(w, sync, |w, &d| w.put(2, u32::from(d)));
+                    out.size(14, *size, "the core size");
+                    out.option(sync, |out, &d| out.field(2, d, "the core sync distance"));
                 }
                 if let Some(size) = xbr {
-                    w.put(14, size - 1);
+                    out.size(14, *size, "the XBR size");
                 }
                 if let Some(size) = xxch {
-                    w.put(14, size - 1);
+                    out.size(14, *size, "the XXCH size");
                 }
                 if let Some(size) = x96 {
-                    w.put(12, size - 1);
+                    out.size(12, *size, "the X96 size");
                 }
                 if let Some(lbr) = lbr {
-                    lbr.write(w);
+                    lbr.write(out);
                 }
                 if let Some(xll) = xll {
-                    xll.write(w, size_bits);
+                    xll.write(out, size_bits);
                 }
                 if let Some(v) = rsv1 {
-                    w.put(16, u32::from(*v));
+                    out.field(16, *v, "the first reserved component");
                 }
                 if let Some(v) = rsv2 {
-                    w.put(16, u32::from(*v));
+                    out.field(16, *v, "the second reserved component");
                 }
             }
             Coding::Lossless(xll) => {
-                w.put(2, 1);
-                xll.write(w, size_bits);
+                out.field(2, 1u8, "the coding mode");
+                xll.write(out, size_bits);
             }
             Coding::LowBitRate(lbr) => {
-                w.put(2, 2);
-                lbr.write(w);
+                out.field(2, 2u8, "the coding mode");
+                lbr.write(out);
             }
             Coding::Auxiliary {
                 size,
                 codec,
                 sync_distance,
             } => {
-                w.put(2, 3);
-                w.put(14, u32::from(*size));
-                w.put(8, u32::from(*codec));
-                put_option(w, sync_distance, |w, &d| w.put(3, u32::from(d)));
+                out.field(2, 3u8, "the coding mode");
+                out.field(14, *size, "the auxiliary size");
+                out.field(8, *codec, "the auxiliary codec");
+                out.option(sync_distance, |out, &d| {
+                    out.field(3, d, "the auxiliary sync distance")
+                });
             }
         }
-        Ok(())
     }
 }
 
@@ -1097,9 +1238,11 @@ impl Lbr {
         })
     }
 
-    fn write(&self, w: &mut BitWriter) {
-        w.put(14, self.size - 1);
-        put_option(w, &self.sync_distance, |w, &d| w.put(2, u32::from(d)));
+    fn write(&self, out: &mut Out) {
+        out.size(14, self.size, "the LBR size");
+        out.option(&self.sync_distance, |out, &d| {
+            out.field(2, d, "the LBR sync distance")
+        });
     }
 }
 
@@ -1121,13 +1264,13 @@ impl Xll {
         Ok(Self { size, sync })
     }
 
-    fn write(&self, w: &mut BitWriter, size_bits: u32) {
-        w.put(size_bits, self.size - 1);
-        put_option(w, &self.sync, |w, s| {
-            w.put(4, u32::from(s.peak_buffer_code));
-            w.put(5, u32::from(s.delay_bits) - 1);
-            w.put(u32::from(s.delay_bits), s.delay_frames);
-            w.put(size_bits, s.sync_offset);
+    fn write(&self, out: &mut Out, size_bits: u32) {
+        out.size(size_bits, self.size, "the XLL size");
+        out.option(&self.sync, |out, s| {
+            out.field(4, s.peak_buffer_code, "the peak buffer code");
+            out.size(5, s.delay_bits, "the delay width");
+            out.field(u32::from(s.delay_bits), s.delay_frames, "the initial delay");
+            out.field(size_bits, s.sync_offset, "the XLL sync offset");
         });
     }
 }
@@ -1216,7 +1359,7 @@ mod tests {
             reserved: Bits::new(),
             crc: 0,
         };
-        header.fit();
+        header.fit().unwrap();
         header.size = header.header_size + 6000;
         header
     }
@@ -1239,26 +1382,97 @@ mod tests {
         assert_eq!(substream_size(&bytes).unwrap(), header.size as usize);
     }
 
-    #[test]
-    fn a_descriptor_tail_is_carried_and_its_size_enforced() {
+    /// The fixture with a navigation word appended to its descriptor tail,
+    /// refitted.
+    fn with_navigation_word() -> (ExssHeader, u64) {
         let mut header = seven_one();
-        // A tail of whole bytes after the padding `fit` chose.
-        let mut tail = BitWriter::new();
-        tail.put_bits(header.assets[0].tail.bytes(), header.assets[0].tail.len());
-        tail.put(32, 0x1800_2000);
-        tail.put(32, 0x8a28_1000);
-        let len = tail.bit_position();
-        let bytes = tail.finish();
-        let mut r = BitReader::new(&bytes);
-        header.assets[0].tail = Bits::read(&mut r, len).unwrap();
-        header.assets[0].size += 8;
-        header.header_size += 8;
+        let word = crate::navigation::Navigation {
+            offset: 6428,
+            size: 4128,
+        }
+        .word()
+        .unwrap();
+        let mut w = BitWriter::new();
+        w.put(2, 0);
+        w.put(32, (word >> 32) as u32);
+        w.put(32, word as u32);
+        let bytes = w.finish();
+        header.assets[0].tail = Bits::read(&mut BitReader::new(&bytes), 66).unwrap();
+        header.fit().unwrap();
+        header.size = header.header_size + 6000;
+        (header, word)
+    }
+
+    #[test]
+    fn fitting_keeps_the_descriptor_tail() {
+        let (header, word) = with_navigation_word();
+        assert_eq!(header.assets[0].tail.word64(2), Some(word));
         let bytes = header.write().unwrap();
         let back = ExssHeader::read(&bytes).unwrap();
         assert_eq!(back.assets[0].tail, header.assets[0].tail);
+        // Fitting twice changes nothing.
+        let mut again = header.clone();
+        again.fit().unwrap();
+        assert_eq!(again, header);
+    }
 
+    #[test]
+    fn a_descriptor_size_that_disagrees_with_its_content_is_refused() {
+        let (mut header, _) = with_navigation_word();
         header.assets[0].size -= 1;
         assert!(header.write().is_err());
+    }
+
+    #[test]
+    fn a_value_too_wide_for_its_field_is_refused_not_truncated() {
+        // 300 bytes of text push a narrow header past 256 bytes: written
+        // as is, its eight-bit size would say 77.
+        let mut header = seven_one();
+        header.wide = false;
+        if let Some(s) = &mut header.assets[0].statics {
+            s.text = Some(vec![b'x'; 300]);
+        }
+        header.header_size = 333;
+        header.assets[0].size = 1;
+        assert!(header.write().is_err());
+        // Fitting moves it to the wide widths instead.
+        header.fit().unwrap();
+        assert!(header.wide);
+        header.size = header.header_size + 6000;
+        let bytes = header.write().unwrap();
+        assert_eq!(ExssHeader::read(&bytes).unwrap().write().unwrap(), bytes);
+        // A component bigger than its field can say is refused.
+        if let Coding::Components { xll: Some(xll), .. } = &mut header.assets[0].coding {
+            xll.size = (1 << 20) + 1;
+        }
+        assert!(header.write().is_err());
+    }
+
+    #[test]
+    fn no_damage_to_a_header_makes_the_reader_panic() {
+        let bytes = seven_one().write().unwrap();
+        for len in 0..bytes.len() {
+            let _ = ExssHeader::read(&bytes[..len]);
+        }
+        for bit in 0..bytes.len() * 8 {
+            let mut damaged = bytes.clone();
+            damaged[bit / 8] ^= 0x80 >> (bit % 8);
+            if let Ok(header) = ExssHeader::read(&damaged) {
+                let _ = header.write();
+            }
+        }
+        // The case reported: the wide header-size field, bits 43..55,
+        // cleared, so the header claims to be one byte long.
+        let mut r = BitReader::new(&bytes);
+        let head = Bits::read(&mut r, 43).unwrap();
+        r.skip(12).unwrap();
+        let rest = Bits::read(&mut r, bytes.len() * 8 - 55).unwrap();
+        let mut w = BitWriter::new();
+        head.write(&mut w);
+        w.put(12, 0);
+        rest.write(&mut w);
+        let damaged = w.finish();
+        assert!(ExssHeader::read(&damaged).is_err());
     }
 
     #[test]

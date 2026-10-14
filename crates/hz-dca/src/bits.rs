@@ -44,6 +44,12 @@ impl Bits {
         Ok(Self { bytes, len })
     }
 
+    /// Append `count` zero bits.
+    pub fn pad(&mut self, count: usize) {
+        self.len += count;
+        self.bytes.resize(self.len.div_ceil(8), 0);
+    }
+
     pub fn write(&self, w: &mut BitWriter) {
         w.put_bits(&self.bytes, self.len);
     }

@@ -199,19 +199,22 @@ pub fn run(options: Options) -> Result<()> {
             );
         }
     }
+    let mut failures = Vec::new();
+    if tally.cores_identical != tally.cores || tally.substreams_identical != tally.substreams {
+        failures.push("headers that do not rewrite byte for byte".to_string());
+    }
+    if tally.checksums_valid != tally.substreams {
+        failures.push("substream checksums that do not hold".to_string());
+    }
     #[cfg(feature = "dca-oracle")]
-    oracle.report();
-
-    let all = tally.cores_identical == tally.cores
-        && tally.substreams_identical == tally.substreams
-        && tally.checksums_valid == tally.substreams;
-    if all {
+    {
+        oracle.report();
+        failures.extend(oracle.failures());
+    }
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(Error::refused(
-            &options.input,
-            "headers that do not rewrite byte for byte, or checksums that do not hold",
-        ))
+        Err(Error::refused(&options.input, failures.join("; ")))
     }
 }
 
@@ -332,6 +335,7 @@ mod oracle {
     impl Oracle {
         pub fn core(&mut self, ours: &CoreHeader, core: &[u8]) {
             self.cores += 1;
+            // A header dca refuses is a disagreement too.
             if let Ok(theirs) = dca::parse_header(core) {
                 let agree = theirs.frame_size == ours.frame_size as usize
                     && theirs.npcmblocks == ours.pcm_blocks
@@ -428,6 +432,35 @@ mod oracle {
             self.float_worst = self.float_worst.max(worst);
         }
 
+        /// What the oracle saw that should not be: a frame it refuses, or a
+        /// field where it and we disagree. The floating-point helper's
+        /// rounding is measured, not judged, and is not among them.
+        pub fn failures(&self) -> Vec<String> {
+            let mut failures = Vec::new();
+            if self.decode_errors > 0 {
+                failures.push(format!("dca refuses {} frames", self.decode_errors));
+            }
+            if self.cores_agree != self.cores {
+                failures.push(format!(
+                    "{} core headers where dca and we disagree",
+                    self.cores - self.cores_agree
+                ));
+            }
+            if self.navigations_agree != self.navigations {
+                failures.push(format!(
+                    "{} navigation words that miss the block dca located",
+                    self.navigations - self.navigations_agree
+                ));
+            }
+            if self.metadata_refused > 0 {
+                failures.push(format!(
+                    "{} height frames whose fold matrix dca refuses",
+                    self.metadata_refused
+                ));
+            }
+            failures
+        }
+
         pub fn report(&self) {
             println!(
                 "  oracle: core headers   {}/{} agree with dca",
@@ -513,5 +546,55 @@ mod tests {
         let composite = fold(bed, height, MINUS_3_DB);
         assert_eq!(composite, -716_969);
         assert_eq!(unfold(composite, height, MINUS_3_DB), bed);
+    }
+
+    #[cfg(feature = "dca-oracle")]
+    #[test]
+    fn a_frame_the_oracle_refuses_fails_the_command() {
+        use hz_dca::exss::{AssetDescriptor, Coding, ExssHeader, Xll};
+        let mut header = ExssHeader {
+            user_defined: 0,
+            index: 0,
+            wide: false,
+            header_size: 0,
+            size: 0,
+            statics: None,
+            asset_sizes: vec![64],
+            assets: vec![AssetDescriptor {
+                size: 0,
+                index: 0,
+                statics: None,
+                drc_code: None,
+                dialnorm_code: None,
+                stereo_drc_code: None,
+                mixing: None,
+                coding: Coding::Lossless(Xll {
+                    size: 64,
+                    sync: None,
+                }),
+                hd_stream_id: Some(0),
+                tail: Default::default(),
+            }],
+            backward_core: vec![None],
+            reserved: Default::default(),
+            crc: 0,
+        };
+        header.fit().unwrap();
+        header.size = header.header_size + 64;
+        let mut stream = header.write().unwrap();
+        stream.resize(header.size as usize, 0);
+        let dir = std::env::temp_dir().join(format!("hz-dts-oracle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("refused.dts");
+        std::fs::write(&path, &stream).unwrap();
+        let result = super::run(super::Options {
+            input: path.clone(),
+            frames: None,
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        let message = result
+            .expect_err("a refused frame must fail the command")
+            .to_string();
+        assert!(message.contains("dca refuses 1 frames"), "{message}");
     }
 }
