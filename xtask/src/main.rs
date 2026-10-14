@@ -16,6 +16,8 @@ mod drc;
 #[cfg(feature = "eac3-oracle")]
 mod eac3;
 mod ffmpeg_check;
+#[cfg(feature = "eac3-oracle")]
+mod graft;
 mod loudness;
 mod make_master;
 mod mlp;
@@ -451,7 +453,7 @@ enum Command {
         against: Option<String>,
     },
 
-    /// Decode an AC-3 stream through the `eac3` crate's AC-3 path, and with
+    /// Decode an AC-3 or E-AC-3 stream through the `eac3` crate, and with
     /// `--reference` compare it with the PCM it was made from. Needs
     /// `--features eac3-oracle`.
     Ac3 {
@@ -465,6 +467,22 @@ enum Command {
         /// Write the decoded PCM here, interleaved, in WAV order.
         #[arg(long, value_name = "PATH")]
         pcm: Option<PathBuf>,
+    },
+
+    /// Re-encode a reference E-AC-3 stream's 5.1 core with `hz-ac3`, carry
+    /// each frame's Evolution frame across in block 2's skip field, and
+    /// compare the objects the workspace decoder rebuilds from both. Needs
+    /// `--features eac3-oracle`.
+    Graft {
+        reference: PathBuf,
+
+        /// Write the grafted stream here.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Kilobits a second; the reference's own unless asked.
+        #[arg(long, value_name = "KBPS")]
+        bitrate: Option<u32>,
     },
 
     /// Read E-AC-3 streams through the `eac3` oracle: their substreams, the
@@ -781,6 +799,22 @@ fn main() -> ExitCode {
             substream,
             tau,
             against,
+        }),
+        #[cfg(feature = "eac3-oracle")]
+        Command::Graft {
+            reference,
+            out,
+            bitrate,
+        } => graft::run(graft::Options {
+            reference,
+            out,
+            bit_rate: bitrate,
+        }),
+        #[cfg(not(feature = "eac3-oracle"))]
+        Command::Graft { .. } => Err(hz_core::Error::Unsupported {
+            path: PathBuf::new(),
+            detail: "built without the E-AC-3 oracle: run `cargo run -p xtask --features eac3-oracle -- graft …`"
+                .into(),
         }),
         #[cfg(feature = "eac3-oracle")]
         Command::Ac3 {

@@ -670,7 +670,23 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   what the reference engine writes for the same job.
 - **Size**: 2–3 weeks. **Risk**: low.
 
-#### Phase B2 — E-AC-3
+#### Phase B2 — E-AC-3 — **an independent substream, carrying objects; the dependent substream left**
+
+- `hz-ac3` writes one independent E-AC-3 substream at any rate up to 1024 kb/s
+  (`harlettizer ac3 --eac3`), within 0.11 dB SNR of `ffmpeg -c:a eac3` at every
+  rate tried, and decoding strictly in FFmpeg and through the `eac3` crate
+  ([docs/eac3.md](docs/eac3.md)).
+- Every reference stream carries its Evolution frame in block 2's skip field;
+  the encoder puts one there (`Encoder::carry_skip_field`).
+- **The graft** (`cargo xtask graft`): a reference stream's core coded again by
+  `hz-ac3`, its Evolution frames carried across byte for byte. Every frame of
+  four reference streams rebuilds its objects in the workspace decoder, as
+  close to the reference's objects as the core is to its core (35 to 41 dB) —
+  so the frames, the skip field and the alignment are right, and B3 can start.
+- Left: the dependent substream (7.1, seven-channel downmixes), spectral
+  extension and the other low-rate tools, the metadata fields; and the
+  receiver test the graft makes possible.
+
 
 - Substreams, 5.1 and 7.1, the enhanced coupling and transform tools that
   matter at delivery bitrates, dependent-substream pairing for >5.1.

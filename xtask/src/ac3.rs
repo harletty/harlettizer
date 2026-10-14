@@ -1,5 +1,5 @@
-//! Decode an AC-3 stream through the workspace's own decoder and hold it to
-//! the PCM it was made from.
+//! Decode an AC-3 or E-AC-3 stream through the workspace's own decoder and
+//! hold it to the PCM it was made from.
 //!
 //! ```text
 //! cargo run -p xtask --features eac3-oracle -- ac3 stream.ac3 [--reference in.f32] [--pcm out.f32]
@@ -62,8 +62,13 @@ pub fn run(options: Options) -> Result<()> {
                 ));
             }
         };
-        let pushed = decoder
-            .push_legacy_ac3_access_unit(frame.as_bytes())
+        // AC-3 through the legacy path, E-AC-3 through the main one.
+        let pushed = if frame.info().bitstream_id <= 10 {
+            decoder.push_legacy_ac3_access_unit(frame.as_bytes())
+        } else {
+            decoder.push_access_unit(frame.as_bytes())
+        };
+        let pushed = pushed
             .map_err(|e| Error::malformed(&options.input, format!("syncframe {frames}: {e}")))?;
         let pcm = pushed.pcm;
         let mut planes: Vec<(usize, &[f32])> = pcm
