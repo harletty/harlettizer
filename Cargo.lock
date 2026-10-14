@@ -197,14 +197,14 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hz-analysis"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
 ]
 
 [[package]]
 name = "hz-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "hz-analysis",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "hz-cluster"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-analysis",
  "hz-core",
@@ -230,11 +230,11 @@ dependencies = [
 
 [[package]]
 name = "hz-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "hz-iamf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
  "pkg-config",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "hz-io"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
  "quick-xml",
@@ -254,14 +254,14 @@ dependencies = [
 
 [[package]]
 name = "hz-meta"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
 ]
 
 [[package]]
 name = "hz-mlp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
  "rayon",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "hz-programme"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-cluster",
  "hz-core",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "hz-render"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hz-core",
 ]
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "hz-analysis",
