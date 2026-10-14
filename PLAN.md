@@ -648,7 +648,7 @@ The engine's conversion job types, and the foundation for everything else.
   - downmix configurations 0 and 3, five downmix channels, 11 or 15 objects
     (12 or 16 elements with the LFE).
 
-#### Phase B1 — AC-3 encoder — **encoder done; metadata and the oracle decode left**
+#### Phase B1 — AC-3 encoder — **encoder done; the dynamic range words left**
 
 The warm-up that builds the MDCT / exponent / bit-allocation machinery
 E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
@@ -658,10 +658,11 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   transform written from A/52; `harlettizer ac3` renders a master to 7.1,
   folds it to 5.1 or stereo and codes it. Against `ffmpeg -c:a ac3` at the same
   settings, decoded by FFmpeg, the SNR agrees to 0.01 dB at every rate and
-  layout tried ([docs/ac3.md](docs/ac3.md)).
+  layout tried ([docs/ac3.md](docs/ac3.md)); every frame also decodes through
+  the workspace `eac3` crate's AC-3 path (`cargo xtask ac3`, behind
+  `eac3-oracle`), with the same agreement.
 - Left: the dynamic range words and the dialnorm set from the measured
-  dialogue level (the stream carries no DRC yet); decoding through the
-  workspace `eac3` crate's AC-3 path in the harness; listening.
+  dialogue level (the stream carries no DRC yet); listening.
 
 - **Accept when**: output decodes cleanly in FFmpeg and in the workspace
   decoder; quality at parity with `ffmpeg -c:a ac3` at equal bitrate on

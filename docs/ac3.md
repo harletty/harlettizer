@@ -84,6 +84,16 @@ allocation — but close: at 44.1 kHz in stereo, 417 of 744 802 bytes differ.
 SNR is not a perceptual measure; what it shows here is that the two encoders
 make the same decisions.
 
+The same streams decode through the workspace's own decoder too — the `eac3`
+crate's AC-3 path, written independently of FFmpeg and the one that decodes
+the legacy core of a dual-core E-AC-3 stream — every syncframe of every
+configuration above, with the same agreement: 36.91 dB against FFmpeg's
+stream's 36.92 at 640 kb/s, 29.64 against 29.64 at 448.
+
+```bash
+cargo run --release -p xtask --features eac3-oracle -- ac3 out.ac3 --reference in.f32
+```
+
 Speed: the 30-second 5.1 excerpt codes in 0.21 s, about 140 times real
 time, against FFmpeg's 0.13 s with its assembly; nothing here is vectorised by
 hand yet, and the allocation search reruns the pointer computation at every
