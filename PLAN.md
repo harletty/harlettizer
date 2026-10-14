@@ -687,6 +687,12 @@ played on hardware.**
 - `hz-dca`: bit writer, CRC16, the core frame header and the EXSS writers.
   The `dca` decoder is an optional harness dependency (`dca-oracle`), like
   `truehd` and `eac3`, never a dependency of the crate itself.
+- The harness undoes the height fold in integers itself:
+  `bed − ((h · 23170 + 2^14) >> 15)` per channel, the inverse of the rounded
+  Q15 fold C3 writes, compared with the integer reference taken before the
+  fold. The decoder's presentation helper (`FoldPlan::clean`) subtracts in
+  floating point and comes out one LSB off on a correctly folded sample, so
+  it is not the oracle for C3.
 - LEGAL.md: rows for ETSI TS 102 114 V1.6.1 (core, EXSS, XLL) and for
   `dcaenc.c`; the DTS:X layer is taken from stream measurements recorded with
   the decoder, and from nothing else; no SDK from the format owner. The
@@ -733,14 +739,31 @@ played on hardware.**
   bed does), fold each height into its lower corner at code 55, and write the
   bare four-channel set, the 22-byte prefix from its fields (not as a pasted
   constant) and the EXSS navigation word.
+- 🔴 **Navigation bounds.** As it is read today, the navigation word gives the
+  block's offset in 11 bits of four bytes (8,188 bytes at most) and its size
+  in 10 bits of four bytes plus 24 (4,116 bytes at most). Four full-coded
+  heights at 24 bits are 6,144 bytes of raw PCM a frame, and a full-coded
+  bed alone can pass the offset range, so incompressible input does not fit
+  the observed form — and peak-bitrate smoothing (C4) does not shrink the
+  logical frame. First check, on the largest blocks of the reference
+  streams, whether either field is wider than the masks the reader applies
+  (an older probe of the whole payload saw up to 4,556 bytes, which may
+  include padding). Then either a navigation form that holds larger blocks,
+  or a stated domain: a frame that cannot be navigated is rejected with an
+  error naming it, never truncated or re-quantised. The bed uses the C2b
+  residual coding here, not C2a's full-coded form.
 - 🔴 **Headroom.** Bed plus 0.707 × height can pass 24-bit full scale. The
   fold needs the limiter (`Headroom::Limit`) or a margin before it, or the
   lossless bed clips.
 - **Accept when**: (a) `dca` presents the stream as the standard height
-  profile and returns all twelve channels bit-exactly; (b) FFmpeg returns the
-  7.1 bed bit-exactly and reports the DTS:X profile; (c) it plays as DTS:X on
-  a licensed receiver over HDMI passthrough, with the heights where they
-  belong; (d) listening.
+  profile and returns the composite bed and the four height waveforms
+  bit-exactly, and the harness's integer unfold (C0) turns them back into
+  the twelve pre-fold channels bit-exactly; (b) FFmpeg returns the 7.1 bed
+  bit-exactly and reports the DTS:X profile; (c) it plays as DTS:X on a
+  licensed receiver over HDMI passthrough, with the heights where they
+  belong; (d) listening; (e) a synthetic 24-bit white-noise master either
+  encodes losslessly or is rejected by the navigation check, as the domain
+  chosen above says.
 - 🔴 The fields pinned to observed values satisfy our own decoders by
   construction. Only (c) shows that a licensed decoder accepts them.
 - **Size**: 1–2 weeks for the bitstream. **Risk**: medium, all of it in (c).
