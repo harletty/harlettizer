@@ -4,6 +4,8 @@
 //! Everything here is a development tool: it is never shipped, and it is the
 //! only place in the workspace allowed to know about local test material.
 
+#[cfg(feature = "eac3-oracle")]
+mod ac3;
 mod adm;
 mod bench;
 mod cluster;
@@ -461,6 +463,22 @@ enum Command {
         frames: Option<usize>,
     },
 
+    /// Decode an AC-3 stream through the `eac3` crate's AC-3 path, and with
+    /// `--reference` compare it with the PCM it was made from. Needs
+    /// `--features eac3-oracle`.
+    Ac3 {
+        input: PathBuf,
+
+        /// Raw interleaved 32-bit float PCM in WAV order, what the stream was
+        /// encoded from.
+        #[arg(long, value_name = "PATH")]
+        reference: Option<PathBuf>,
+
+        /// Write the decoded PCM here, interleaved, in WAV order.
+        #[arg(long, value_name = "PATH")]
+        pcm: Option<PathBuf>,
+    },
+
     /// Read E-AC-3 streams through the `eac3` oracle: their substreams, the
     /// payloads their Evolution frames carry, and whether our reader and
     /// writer of that frame agree with them. Needs `--features eac3-oracle`.
@@ -777,6 +795,22 @@ fn main() -> ExitCode {
             against,
         }),
         Command::Dts { input, frames } => dts::run(dts::Options { input, frames }),
+        #[cfg(feature = "eac3-oracle")]
+        Command::Ac3 {
+            input,
+            reference,
+            pcm,
+        } => ac3::run(ac3::Options {
+            input,
+            reference,
+            pcm,
+        }),
+        #[cfg(not(feature = "eac3-oracle"))]
+        Command::Ac3 { .. } => Err(hz_core::Error::Unsupported {
+            path: PathBuf::new(),
+            detail: "built without the E-AC-3 oracle: run `cargo run -p xtask --features eac3-oracle -- ac3 …`"
+                .into(),
+        }),
         #[cfg(feature = "eac3-oracle")]
         Command::Eac3 {
             inputs,

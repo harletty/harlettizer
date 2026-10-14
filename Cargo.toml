@@ -9,6 +9,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/hz-ac3",
     "crates/hz-analysis",
     "crates/hz-cli",
     "crates/hz-cluster",
@@ -32,6 +33,7 @@ repository = "https://github.com/harletty/harlettizer"
 authors = ["harletty"]
 
 [workspace.dependencies]
+hz-ac3 = { path = "crates/hz-ac3" }
 hz-cluster = { path = "crates/hz-cluster" }
 hz-core = { path = "crates/hz-core" }
 hz-dca = { path = "crates/hz-dca" }
