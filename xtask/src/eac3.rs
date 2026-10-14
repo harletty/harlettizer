@@ -111,6 +111,12 @@ struct Report {
     /// Evolution frames, and where the oracle found them.
     frames: usize,
     frames_by_source: BTreeMap<String, usize>,
+    /// Where the auxiliary data is carried: the skip fields of which blocks,
+    /// how many bytes each; and the frame's trailing auxiliary data.
+    skip_fields: BTreeMap<String, usize>,
+    /// Which blocks carry a skip field, whatever its size.
+    skip_blocks: BTreeMap<String, usize>,
+    trailing_aux: BTreeMap<usize, usize>,
     /// Payload identifier → (count, total bytes, carrying a sample offset).
     payloads: BTreeMap<u32, (usize, usize, usize)>,
     /// Payload identifier → each configuration it was written with → count.
@@ -207,6 +213,40 @@ fn survey(input: &Path, dump: Option<&Path>, frames: Option<usize>) -> Result<Re
             .entry((independent, info.substreamid))
             .or_insert((info.channel_mode, info.lfe_on, header.bitrate() / 1000, 0));
         shape.3 += 1;
+
+        let fields = info
+            .skip_fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "block {} {} B",
+                    field.block_index.map_or("?".to_string(), |b| b.to_string()),
+                    field.bytes.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        if !fields.is_empty() {
+            *report.skip_fields.entry(fields).or_default() += 1;
+        }
+        let blocks = info
+            .skip_fields
+            .iter()
+            .map(|field| field.block_index.map_or("?".to_string(), |b| b.to_string()))
+            .collect::<Vec<_>>()
+            .join("+");
+        *report
+            .skip_blocks
+            .entry(if blocks.is_empty() {
+                "none".into()
+            } else {
+                blocks
+            })
+            .or_default() += 1;
+        *report
+            .trailing_aux
+            .entry(info.trailing_aux_data.len())
+            .or_default() += 1;
 
         // Where the oracle's sync offsets count from.
         let carrier: &[u8] = match info.emdf_source {
@@ -423,6 +463,23 @@ impl Report {
             self.frames,
             histogram(&self.frames_by_source)
         );
+        if !self.skip_fields.is_empty() {
+            // The most common layouts only: payload sizes vary frame to frame.
+            let mut layouts: Vec<_> = self.skip_fields.iter().collect();
+            layouts.sort_by(|a, b| b.1.cmp(a.1));
+            println!("  skip blocks  {}", histogram(&self.skip_blocks));
+            println!(
+                "  skip fields  {} layouts; most common {}",
+                layouts.len(),
+                layouts
+                    .iter()
+                    .take(3)
+                    .map(|(layout, count)| format!("[{layout}] ×{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        println!("  trailing aux {} bytes", histogram(&self.trailing_aux));
         for (id, (count, bytes, offsets)) in &self.payloads {
             println!(
                 "  payload {id:>3}  {} ×{count}, {:.1} bytes each, {offsets} with a sample offset{}",
