@@ -7,10 +7,11 @@ harlettizer iamf programme.atmos --out programme.iamf --objects      # IAMF v2.0
 harlettizer iamf programme.atmos --out programme.mka                 # the same, in Matroska
 ```
 
-Takes a master set or an ADM BW64 file, renders it to a 7.1.4 bed, and writes
-the bed as an [IAMF](https://aomediacodec.github.io/iamf/) sequence — the
-Alliance for Open Media's immersive audio format, the one YouTube and Chrome
-call Eclipsa Audio.
+Takes a master set or an ADM BW64 file and writes it as an
+[IAMF](https://aomediacodec.github.io/iamf/) sequence — the Alliance for Open
+Media's immersive audio format, the one YouTube and Chrome call Eclipsa Audio:
+by default rendered to a 7.1.4 bed, or with `--objects` its objects carried as
+IAMF v2.0 objects beside its bed (see [Objects](#objects-iamf-v20)).
 
 ## Why a bed, and why v1.1
 
@@ -186,6 +187,36 @@ under 120 Hz says); iamf-rs renders it, and FFmpeg's `ebur128` reads its
 stereo at −23.2 LUFS and −2.0 dBTP against the stated −23.1 and −2.1. How it
 *sounds* is not something any of that checks.
 
+## Checked against: the bed
+
+Nothing here is checked against itself:
+
+- **FFmpeg** (9.0) demuxes the sequence without a warning, reads both
+  loudness blocks back to the value, and decodes all seven FLAC substreams to
+  exactly the samples the LPCM encode of the same programme carries — and to
+  exactly the programme's length, so the trim is honoured.
+- **libFLAC** (1.5) `flac -t` passes every frame, CRC-8 and CRC-16 included.
+- **iamf-rs** (`iamfdec`) renders the FLAC and LPCM sequences to identical
+  output. Its 7.1.4 render matches the bed channel for channel to half a
+  16-bit LSB (its output is 16-bit), so the substream order is right, and its
+  stereo render matches the fold the stereo loudness was measured through to
+  the same half LSB. FFmpeg's `ebur128` on that stereo render reads the
+  integrated loudness and true peak the stream states.
+- **In the test suite**, symphonia decodes FLAC frames of every depth and
+  shape back to the samples given, and the sequence's OBU layout, trims and
+  patched loudness are read back field by field.
+
+Not checked: a browser. Chrome decodes IAMF from 153 and the one to hand was
+152; and whether Chromium's IAMF path takes FLAC substreams at all, rather
+than only Opus and AAC, is untested. The Opus sequence is the one to try
+first.
+
+Found on the way: the pure-Rust `opus-decoder` crate (0.1.1), which iamf-rs
+uses when it is built without libopus, overflows a shift building its
+anti-collapse mask (`1u8 << i` with `i` past seven) on packets libopus writes
+for an ordinary tone — a panic in a debug build and the wrong mask bit in a
+release one. The tests here decode with libopus instead.
+
 ## Objects (IAMF v2.0)
 
 ```bash
@@ -201,8 +232,9 @@ and animated by parameter blocks. Beside the objects, the master's **bed**
 travels as one channel-based element (see [The bed element](#the-bed-element)).
 
 An IA sequence carries at most twenty-eight channels. The header says which
-profile the sequence needs: base-advanced for objects alone, advanced-1 up to
-eighteen elements and channels, advanced-2 up to twenty-eight.
+profile the sequence needs: up to eighteen elements and channels,
+base-advanced when every element is an object and advanced-1 otherwise;
+advanced-2 up to twenty-eight, whatever the elements are.
 
 ### The bed element
 
@@ -227,8 +259,10 @@ surround at `M+110` is the side surround a 7.1 calls `M+090`, and 5.1.4's top
 back pair at `U±110` is the top rear pair a 7.1.4 has at `U±135` (one alias
 each in `hz_core::speakers`). IAMF also has expanded layouts for side, rear
 and height pairs, 3.0 and 9.1.6 — the last of which has the top sides and the
-wides — and they are **not** used, because no decoder to hand renders them:
-iamf-rs takes layouts 0 to 8 and, in the fork, the expanded LFE. Every
+wides — and they are **not** used yet. They were left out because no decoder
+to hand rendered them; the `harletty/iamf-rs` fork now renders all twenty
+(`29e4793`), and `harletty` decodes through it, so what stands in the way is
+only that harlettizer does not write them: see [Not done](#not-done). Every
 layout's substream order is the reference decoder's decoding map, and its
 stereo row the reference decoder's down-mix (libiamf `m2m_rdr.c` as iamf-rs
 tabulates it); both are pinned in `hz_iamf::layout`'s tests.
@@ -322,8 +356,8 @@ every speaker the room pans it onto on 7.1.4 — what this workspace renders and
 measures on — is one of its own, under the same label; then the voices
 rendered into it and played on 7.1.4 are the voices rendered on 7.1.4, and the
 smaller layout loses nothing. A voice at the centre is mono; the front three
-are 5.1 (IAMF's 3.0 would hold them in three channels, and is an expanded
-layout no decoder to hand renders); the seven places of a 7.1 are 7.1 — not
+are 5.1 (IAMF's 3.0 would hold them in three channels; it is an expanded
+layout, which harlettizer does not write yet); the seven places of a 7.1 are 7.1 — not
 5.1, whose surrounds stand at ±110°, between 7.1.4's; a front height is 3.1.2,
 or 7.1.2 beside the side surrounds; anything else is 7.1.4. A dub's voices are
 the channels of the track they came from, placed once at the original's
@@ -451,10 +485,12 @@ stream's, so this is the measurement of one rendering, not of every one.
 
 Nothing decodes IAMF v2.0 objects here except the iamf-rs fork's object
 passthrough (`harletty/iamf-rs`, the v2.0 parser and position animation),
-which hands out each object's samples and its position every 256 samples.
-It had no expanded layouts, so the LFE element was checked with a local
-patch to it — expanded layout 0 rendered as 7.1.4 with every other channel
-empty, as IAMF §7.3.2.1 says. `HZ_IAMF_TRACE=<dir>` makes the encode write what
+which hands out each object's samples and its position every 256 samples;
+`harletty` reads v2.0 through the same fork. It had no expanded layouts, so
+the LFE element was first checked with a patch to it — expanded layout 0
+rendered as 7.1.4 with every other channel empty, as IAMF §7.3.2.1 says —
+which is now on the fork's `main` (`59228e9`), followed by every other
+expanded layout. `HZ_IAMF_TRACE=<dir>` makes the encode write what
 it meant — every element's samples, every object's position at the same
 offsets — and the decoder's output is compared with it:
 
@@ -486,36 +522,6 @@ sequence: FFmpeg 9 skips the object elements as a type it does not know, then
 stops at the mix presentation that names them (`Invalid Audio Element with id
 2 referenced by Mix Parameters 2`), and a decoder that honours the header's
 profile stops sooner.
-
-## Checked against
-
-Nothing here is checked against itself:
-
-- **FFmpeg** (9.0) demuxes the sequence without a warning, reads both
-  loudness blocks back to the value, and decodes all seven FLAC substreams to
-  exactly the samples the LPCM encode of the same programme carries — and to
-  exactly the programme's length, so the trim is honoured.
-- **libFLAC** (1.5) `flac -t` passes every frame, CRC-8 and CRC-16 included.
-- **iamf-rs** (`iamfdec`) renders the FLAC and LPCM sequences to identical
-  output. Its 7.1.4 render matches the bed channel for channel to half a
-  16-bit LSB (its output is 16-bit), so the substream order is right, and its
-  stereo render matches the fold the stereo loudness was measured through to
-  the same half LSB. FFmpeg's `ebur128` on that stereo render reads the
-  integrated loudness and true peak the stream states.
-- **In the test suite**, symphonia decodes FLAC frames of every depth and
-  shape back to the samples given, and the sequence's OBU layout, trims and
-  patched loudness are read back field by field.
-
-Not checked: a browser. Chrome decodes IAMF from 153 and the one to hand was
-152; and whether Chromium's IAMF path takes FLAC substreams at all, rather
-than only Opus and AAC, is untested. The Opus sequence is the one to try
-first.
-
-Found on the way: the pure-Rust `opus-decoder` crate (0.1.1), which iamf-rs
-uses when it is built without libopus, overflows a shift building its
-anti-collapse mask (`1u8 << i` with `i` past seven) on packets libopus writes
-for an ordinary tone — a panic in a debug build and the wrong mask bit in a
-release one. The tests here decode with libopus instead.
 
 ## Into Matroska
 
@@ -565,7 +571,8 @@ mapping's reference reader is Omniphony's mpv fork.
 
 ## Into MP4
 
-The output is a standalone OBU stream. FFmpeg puts it into an MP4 with one
+The output is a standalone OBU stream. For the bed — a v1.1 sequence; FFmpeg 9
+refuses the v2.0 ones `--objects` writes — FFmpeg puts it into an MP4 with one
 IAMF track (`iamf` sample entry, `iacb`, an edit list for the trim) — but only
 if it is told to carry the two stream groups and to keep the substream ids:
 
@@ -596,7 +603,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--mono-prefix <PREFIX>` | | As for `encode` |
 | `--objects` | off | Carry the objects as IAMF v2.0 objects rather than rendering a bed |
 | `--positions <CODING>` | `cart16` | With `--objects`: `cart16`, `cart8` or `polar` |
-| `--elements <N>` | what the bed element leaves of 28 | With `--objects`: the most object elements; more objects than that are folded into them |
+| `--elements <N>` | what the bed and dialogue elements leave of 28 | With `--objects`: the most object elements; more objects than that are folded into them |
 | `--overlay <K>` | | With `--objects`: keep the master's elements and pan its last K objects onto them, as `encode --overlay` |
 | `--voices-to-bed <K>` | | With `--objects`: render the last K objects into a dialogue element of their own — labelled, ±12 dB for a listener, the loudness anchored on it — and carry the rest as `--objects` does |
 | `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | as `encode` | With `--overlay`: as for `encode` |
@@ -610,8 +617,10 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
   rendered bed, for decoders that do not read v2.0 — which would cost the bed's
   channels on top of the objects'.
 - **The expanded layouts** other than the LFE — 9.1.6 would hold an authored
-  7.1.2 bed's top sides and a 9.1.6 bed's wides in the bed element — until a
-  decoder renders them.
+  7.1.2 bed's top sides and a 9.1.6 bed's wides in the bed element, rather
+  than as still objects beside a 7.1, and 3.0 a dialogue at the front three in
+  three channels rather than a 5.1's six. The `harletty/iamf-rs` fork renders
+  them now; nothing else to hand does.
 - **Two objects to a substream**, which v2.0 allows and Opus would code
   jointly.
 - **Scalable layers** (a stereo or 5.1 core with 7.1.4 on top), which need
