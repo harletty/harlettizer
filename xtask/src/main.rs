@@ -13,6 +13,7 @@ mod container;
 mod coords;
 mod corpus;
 mod drc;
+mod dts;
 #[cfg(feature = "eac3-oracle")]
 mod eac3;
 mod ffmpeg_check;
@@ -453,6 +454,17 @@ enum Command {
         against: Option<String>,
     },
 
+    /// Read a DTS stream's headers, write them back byte for byte, and look
+    /// for the DTS:X navigation word. With `--features dca-oracle`, also
+    /// compare against the workspace decoder and measure the height unfold.
+    Dts {
+        input: PathBuf,
+
+        /// Stop after this many frames.
+        #[arg(long, value_name = "N")]
+        frames: Option<usize>,
+    },
+
     /// Decode an AC-3 or E-AC-3 stream through the `eac3` crate, and with
     /// `--reference` compare it with the PCM it was made from. Needs
     /// `--features eac3-oracle`.
@@ -800,6 +812,7 @@ fn main() -> ExitCode {
             tau,
             against,
         }),
+        Command::Dts { input, frames } => dts::run(dts::Options { input, frames }),
         #[cfg(feature = "eac3-oracle")]
         Command::Graft {
             reference,
