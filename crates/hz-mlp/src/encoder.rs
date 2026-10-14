@@ -3840,6 +3840,7 @@ impl Writer {
                 id: self.evolution_id,
                 bytes: self.evolution.as_slice(),
                 sample_offset: self.evolution_offset,
+                config: Default::default(),
             }),
             protection: self.protection.as_ref(),
             dynamic_range,

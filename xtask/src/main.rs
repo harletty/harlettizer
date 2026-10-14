@@ -12,6 +12,8 @@ mod coords;
 mod corpus;
 mod drc;
 mod dts;
+#[cfg(feature = "eac3-oracle")]
+mod eac3;
 mod ffmpeg_check;
 mod loudness;
 mod make_master;
@@ -459,6 +461,22 @@ enum Command {
         frames: Option<usize>,
     },
 
+    /// Read E-AC-3 streams through the `eac3` oracle: their substreams, the
+    /// payloads their Evolution frames carry, and whether our reader and
+    /// writer of that frame agree with them. Needs `--features eac3-oracle`.
+    Eac3 {
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+
+        /// Write each stream's payloads to `<stem>.emdf` in this directory.
+        #[arg(long, value_name = "DIR")]
+        dump: Option<PathBuf>,
+
+        /// Stop after this many syncframes per stream.
+        #[arg(long, value_name = "N")]
+        frames: Option<usize>,
+    },
+
     /// Read a TrueHD stream's structure and check its integrity.
     Thd {
         input: PathBuf,
@@ -759,6 +777,22 @@ fn main() -> ExitCode {
             against,
         }),
         Command::Dts { input, frames } => dts::run(dts::Options { input, frames }),
+        #[cfg(feature = "eac3-oracle")]
+        Command::Eac3 {
+            inputs,
+            dump,
+            frames,
+        } => eac3::run(eac3::Options {
+            inputs,
+            dump,
+            frames,
+        }),
+        #[cfg(not(feature = "eac3-oracle"))]
+        Command::Eac3 { .. } => Err(hz_core::Error::Unsupported {
+            path: PathBuf::new(),
+            detail: "built without the E-AC-3 oracle: run `cargo run -p xtask --features eac3-oracle -- eac3 …`"
+                .into(),
+        }),
         Command::Thd {
             input,
             units,

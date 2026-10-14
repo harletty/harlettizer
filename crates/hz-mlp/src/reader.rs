@@ -205,15 +205,9 @@ pub struct ExtraData {
     pub frame_ok: bool,
 }
 
-/// One Evolution payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Payload {
-    /// What it is. Eleven is object audio metadata.
-    pub id: u32,
-    /// Where in the access unit it takes effect, when it says.
-    pub sample_offset: Option<u32>,
-    pub bytes: Vec<u8>,
-}
+/// One Evolution payload. The frame is the one E-AC-3 carries too, so it is
+/// read by [`hz_meta::emdf`].
+pub use hz_meta::emdf::ReadPayload as Payload;
 
 /// Read one access unit from the front of `stream`.
 ///
@@ -330,8 +324,8 @@ fn extra_data(bytes: &[u8]) -> Result<ExtraData> {
     reader.skip(4)?; // reserved
     let declared_bytes = reader.get(12)? as usize;
 
-    let mut payloads = Vec::new();
-    let parsed = frame(&mut reader, &mut payloads);
+    let frame_at = reader.bit_position();
+    let parsed = hz_meta::emdf::read(&mut reader);
     let frame_ok = parsed.is_some();
     let frame = parsed.unwrap_or_default();
 
@@ -342,69 +336,11 @@ fn extra_data(bytes: &[u8]) -> Result<ExtraData> {
         declared_bytes,
         version: frame.version,
         key: frame.key,
-        payloads,
+        payloads: frame.payloads,
         protection: frame.protection,
         protection_bytes: frame.protection_bytes,
-        protection_at: frame.protection_at,
+        protection_at: frame_at + frame.protection_at,
         frame_ok,
-    })
-}
-
-/// An Evolution frame's header and its closing protection fields.
-#[derive(Default)]
-struct Frame {
-    version: u32,
-    key: u32,
-    protection: (u32, u32),
-    protection_bytes: Vec<u8>,
-    protection_at: usize,
-}
-
-/// Bits a protection field's two-bit length code stands for.
-///
-/// Zero is reserved for the primary field and means an empty secondary one;
-/// reading it as no bits either way is what lets a frame that says the
-/// reserved thing still parse to its end.
-const PROTECTION_BITS: [u32; 4] = [0, 8, 32, 128];
-
-/// The Evolution frame's own header, its payloads, and the protection fields
-/// after them.
-///
-/// Returns what parsed rather than failing the access unit: a corrupt extra
-/// data block does not make the audio beside it unreadable, and saying so is
-/// more useful than abandoning the unit.
-fn frame(reader: &mut BitReader<'_>, payloads: &mut Vec<Payload>) -> Option<Frame> {
-    let version = reader.get(2).ok()?;
-    // A version or key that escapes into its extension field is one nothing
-    // here reads, and guessing at the bits after it would be worse than not.
-    if version == 3 {
-        return None;
-    }
-    let key = reader.get(3).ok()?;
-    if key == 7 {
-        return None;
-    }
-    loop {
-        let id = reader.get(5).ok()?;
-        if id == 0 {
-            break;
-        }
-        payloads.push(payload(reader, id).ok()?);
-    }
-    let primary = PROTECTION_BITS[reader.get(2).ok()? as usize];
-    let secondary = PROTECTION_BITS[reader.get(2).ok()? as usize];
-    let protection_at = reader.bit_position();
-    let mut protection_bytes = Vec::with_capacity((primary / 8) as usize);
-    for _ in 0..primary / 8 {
-        protection_bytes.push(reader.get(8).ok()? as u8);
-    }
-    reader.skip(secondary as usize).ok()?;
-    Some(Frame {
-        version,
-        key,
-        protection: (primary, secondary),
-        protection_bytes,
-        protection_at,
     })
 }
 
@@ -438,60 +374,6 @@ impl AccessUnit {
         );
         Some(digest[..extra.protection_bytes.len()] == extra.protection_bytes[..])
     }
-}
-
-/// One payload: what it is, when it takes effect, and its bytes.
-fn payload(reader: &mut BitReader<'_>, id: u32) -> Result<Payload> {
-    let sample_offset = reader
-        .get_bit()?
-        .then(|| variable_bits(reader, 11, 2))
-        .transpose()?;
-    if reader.get_bit()? {
-        variable_bits(reader, 11, 2)?; // duration
-    }
-    if reader.get_bit()? {
-        variable_bits(reader, 2, 16)?; // group
-    }
-    if reader.get_bit()? {
-        reader.skip(8)?; // coded data
-    }
-    // The bit says a decoder that does not know this payload should discard
-    // it, and setting it ends the configuration there.
-    if !reader.get_bit()? {
-        let frame_aligned = sample_offset.is_none() && reader.get_bit()?;
-        if frame_aligned {
-            reader.skip(2)?; // create and remove duplicate
-        }
-        if sample_offset.is_some() || frame_aligned {
-            reader.skip(7)?; // priority and what processing is allowed
-        }
-    }
-
-    let size = variable_bits(reader, 8, 4)? as usize;
-    let mut bytes = Vec::with_capacity(size);
-    for _ in 0..size {
-        bytes.push(reader.get(8)? as u8);
-    }
-    Ok(Payload {
-        id,
-        sample_offset,
-        bytes,
-    })
-}
-
-/// A value in groups of `n` bits, each followed by a bit saying whether
-/// another group follows — and a continuation means the value so far was one
-/// short of the group's span.
-fn variable_bits(reader: &mut BitReader<'_>, n: u32, groups: u32) -> Result<u32> {
-    let mut value = 0u32;
-    for _ in 0..groups {
-        value += reader.get(n)?;
-        if !reader.get_bit()? {
-            return Ok(value);
-        }
-        value = (value + 1) << n;
-    }
-    Ok(value)
 }
 
 fn read_be24(bytes: &[u8], at: usize) -> u32 {
