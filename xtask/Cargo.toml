@@ -13,6 +13,7 @@ publish = false
 hz-analysis.workspace = true
 hz-cluster.workspace = true
 hz-core.workspace = true
+hz-dca.workspace = true
 hz-io.workspace = true
 hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
@@ -32,6 +33,11 @@ truehd = { version = "0.7.1", optional = true }
 # default like the one above, so the harness builds without it:
 # `cargo run -p xtask --features eac3-oracle -- eac3 …`.
 eac3 = { git = "https://github.com/harletty/harletty-bridge", tag = "v0.9.0", optional = true }
+# An independent DTS decoder: core, extension substream, lossless extension and
+# the DTS:X extension — used as an oracle for the DTS track and nothing else.
+# Off by default, so the harness builds without it:
+# `cargo run -p xtask --features dca-oracle -- dts …`.
+dca = { git = "https://github.com/harletty/harletty-bridge", tag = "v0.9.0", optional = true }
 serde.workspace = true
 serde_yaml_ng.workspace = true
 serde_json.workspace = true
@@ -42,3 +48,5 @@ clap.workspace = true
 oracle = ["dep:truehd"]
 # An independent E-AC-3 decoder. See above.
 eac3-oracle = ["dep:eac3"]
+# An independent DTS decoder. See above.
+dca-oracle = ["dep:dca"]

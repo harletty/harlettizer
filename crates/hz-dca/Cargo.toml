@@ -1,0 +1,15 @@
+[package]
+name = "hz-dca"
+description = "DTS Coherent Acoustics bitstream writing for harlettizer: core, extension substream, lossless extension"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Dependency-free apart from the shared bit reader and writer, for the same
+# reason as the other codec crates: nothing to trust inside a hot loop, nothing
+# to audit for the embedded target.
+[dependencies]
+hz-core.workspace = true

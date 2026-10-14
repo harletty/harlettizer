@@ -702,7 +702,7 @@ nothing with Tracks A and B beyond `hz-programme` and `hz-render`.
 
 What the decoding side already knows, and why the track is possible:
 
-- The `dca` crate (harletty-bridge, GPL-3.0) decodes the core, the extension
+- The `dca` crate (harletty-bridge) decodes the core, the extension
   substream (EXSS), the lossless extension (XLL) and the DTS:X extension —
   bit-exactly against FFmpeg wherever FFmpeg decodes at all. It is the oracle
   for every phase below, as `truehd` was for Track A.
@@ -721,26 +721,42 @@ What the decoding side already knows, and why the track is possible:
 **Order: C0 → C1 → C2 → C3, then C4 and C5. C6 starts only once C3 has
 played on hardware.**
 
-#### Phase C0 — Groundwork
+#### Phase C0 — Groundwork — **done**
 
-- `hz-dca`: bit writer, CRC16, the core frame header and the EXSS writers.
-  The `dca` decoder is an optional harness dependency (`dca-oracle`), like
-  `truehd` and `eac3`, never a dependency of the crate itself.
-- The harness undoes the height fold in integers itself:
-  `bed − ((h · 23170 + 2^14) >> 15)` per channel, the inverse of the rounded
-  Q15 fold C3 writes, compared with the integer reference taken before the
-  fold. The decoder's presentation helper (`FoldPlan::clean`) subtracts in
-  floating point and comes out one LSB off on a correctly folded sample, so
-  it is not the oracle for C3.
-- LEGAL.md: rows for ETSI TS 102 114 V1.6.1 (core, EXSS, XLL) and for
-  `dcaenc.c`; the DTS:X layer is taken from stream measurements recorded with
-  the decoder, and from nothing else; no SDK from the format owner. The
-  patent notice is extended to the lossless and DTS:X layers — a posture
-  for the maintainer to decide, as for the rest.
+- ✅ **`hz-dca`**: CRC16, the core frame header, the extension substream
+  header and its asset descriptors, the DTS:X navigation word, and a stream
+  cut into frames — each a model that keeps every field as coded, a reader,
+  and a writer. Descriptor tails and the reserved bits before the header
+  checksum are carried as raw bits; `ExssHeader::fit` sizes a header written
+  from scratch, and the checksum is always computed, never copied.
+- ✅ **`cargo xtask dts`** reads every header of a stream and writes it back.
+  On 42 local streams of every shape to hand — plain core, lossless 5.1 and
+  7.1, the standard DTS:X profile, the alternate profiles, a lossy carrier —
+  every core header and every substream header comes back byte for byte,
+  with every checksum valid — 416,543 core and 415,792 substream headers.
+  With `--features dca-oracle` (an optional harness dependency, like
+  `truehd`), the `dca` decoder reads the same frames: it decodes every one,
+  and its core header fields agree with ours on every one.
+- ✅ **The navigation word's size field is eleven bits, not ten.** Blocks
+  over 4,116 bytes carry the eleventh bit in what had been read as the last
+  bit of a `0x8a28` marker. On the four standard-profile streams to hand,
+  21 % of one stream's frames have a block that large (up to 5,056 bytes);
+  read with eleven bits, the word is found in every frame of all four and
+  points at exactly the block the decoder locates — 34,311 of 34,311. The
+  decoder's own reader takes the ten-bit form and finds those blocks by its
+  fallback instead. The alternate profiles carry no navigation word at all
+  (367,405 frames with an extension block, none with a word).
+- ✅ **The integer unfold** is in the harness: `bed − ((h · 23170 + 2^14) >>
+  15)` per corner, the oracle C3 is held to. Measured on the same four
+  streams, the decoder's floating-point presentation helper (`FoldPlan::clean`)
+  differs from it on 1.1–1.8 % of corner samples, by one LSB each time — so
+  that helper is not the oracle for C3, as expected.
+- ✅ LEGAL.md: ETSI TS 102 114 V1.6.1, the FFmpeg DTS files and the `dca`
+  oracle are listed in §2, with the rule that the DTS:X extension comes from
+  stream measurements and from nothing the format owner distributes. §5's
+  patent notice already speaks of the formats implemented in general terms;
+  whether DTS wants more than that is still the maintainer's to decide.
 - Fixtures synthetic, as everywhere else.
-- **Accept when**: `cargo xtask dts` reads a reference stream's headers and
-  rewrites them field for field, checksums included.
-- **Size**: days. **Risk**: low.
 
 #### Phase C1 — Core encoder (5.1, lossy)
 
@@ -778,19 +794,18 @@ played on hardware.**
   bed does), fold each height into its lower corner at code 55, and write the
   bare four-channel set, the 22-byte prefix from its fields (not as a pasted
   constant) and the EXSS navigation word.
-- 🔴 **Navigation bounds.** As it is read today, the navigation word gives the
-  block's offset in 11 bits of four bytes (8,188 bytes at most) and its size
-  in 10 bits of four bytes plus 24 (4,116 bytes at most). Four full-coded
-  heights at 24 bits are 6,144 bytes of raw PCM a frame, and a full-coded
-  bed alone can pass the offset range, so incompressible input does not fit
-  the observed form — and peak-bitrate smoothing (C4) does not shrink the
-  logical frame. First check, on the largest blocks of the reference
-  streams, whether either field is wider than the masks the reader applies
-  (an older probe of the whole payload saw up to 4,556 bytes, which may
-  include padding). Then either a navigation form that holds larger blocks,
-  or a stated domain: a frame that cannot be navigated is rejected with an
-  error naming it, never truncated or re-quantised. The bed uses the C2b
-  residual coding here, not C2a's full-coded form.
+- 🔴 **Navigation bounds.** The navigation word gives the block's offset in
+  11 bits of four bytes (8,188 bytes at most) and, as C0 established, its
+  size in 11 bits of four bytes plus 24 (8,212 bytes at most). Four
+  full-coded 24-bit heights — 6,144 bytes of raw PCM a frame — therefore
+  fit; the binding limit is the **offset**, which a full-coded bed alone can
+  pass, and peak-bitrate smoothing (C4) does not shrink the logical frame.
+  No offset over 7,884 bytes has been seen, so whether that field too is
+  wider is open. Either a navigation form that reaches further, or a stated
+  domain: a frame that cannot be navigated is rejected with an error naming
+  it, never truncated or re-quantised (`Navigation::word` already refuses
+  it). The bed uses the C2b residual coding here, not C2a's full-coded
+  form.
 - 🔴 **Headroom.** Bed plus 0.707 × height can pass 24-bit full scale. The
   fold needs the limiter (`Headroom::Limit`) or a margin before it, or the
   lossless bed clips.
