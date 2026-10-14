@@ -5,9 +5,10 @@ An open encoding engine for immersive audio, and the encoder counterpart to
 *decodes* immersive bitstreams into masters, harlettizer *encodes* masters into
 bitstreams — today a **lossless TrueHD/MLP stream carrying object audio
 metadata**, written from an object master and checked bit for bit through
-decoders that share no code with it — and an **IAMF** 7.1.4 bed, rendered from
-the same master and coded losslessly, for the players that read the open
-format.
+decoders that share no code with it — and **IAMF**, the open format: the same
+master rendered to a 7.1.4 bed that today's IAMF players decode, or carried as
+IAMF v2.0 objects, coded as FLAC, LPCM or Opus, as a standalone stream or in
+Matroska.
 
 Pure Rust, headless, GPL-3.0-or-later.
 
@@ -26,7 +27,7 @@ Three commands, each taking a master file set (`.atmos` + `.atmos.audio` +
 |---|---|
 | `convert` | One container to the other, either direction |
 | `encode` | The programme as a TrueHD stream: its elements coded losslessly, its object metadata carried in the access units, its objects clustered into the twelve to sixteen elements a delivery stream holds, and — on request — real 2.0, 5.1 and 7.1 folds inside the stream for decoders that stop early |
-| `iamf` | The programme as IAMF: by default rendered to a 7.1.4 bed — its objects panned on the room's cube — and written as an IAMF v1.1 sequence — FLAC or LPCM, or Opus in a build with the `opus` feature — with the loudness a decoder normalises by measured on 7.1.4 and on the stereo pair it folds to; with `--objects`, its objects carried as IAMF v2.0 objects instead and its bed as one channel-based element, the objects folded by the clustering when there are more than IAMF carries — or, for a re-voiced programme, the master's elements kept and its last objects panned onto them (`--overlay`, the computation `encode --overlay` makes) or given a dialogue element of their own (`--voices-to-bed`); as a standalone stream, or as the one track of an `.mka`; see [docs/iamf.md](docs/iamf.md) |
+| `iamf` | The programme as an IAMF sequence: by default rendered to a 7.1.4 bed under IAMF v1.1, what browsers and televisions decode; with `--objects`, its objects carried as IAMF v2.0 objects beside its bed. FLAC, LPCM or Opus; a standalone stream, or the one track of an `.mka`. See [`iamf`](#iamf) below |
 
 **Everything an encode writes is decoded back and compared, not inspected.**
 The test suite decodes every presentation of every stream it writes through a
@@ -35,6 +36,11 @@ header carries. The development harness does the same through `harletty` (the
 `truehd` crate) and, up to eight channels, through FFmpeg. On a real programme
 the twelve elements come back with a largest difference of zero, and every
 object comes back where the master put it, at the sample the master named.
+
+The IAMF sequences are held to decoders the same way: FFmpeg and libFLAC
+decode the bed to exactly the samples written, iamf-rs renders it to 7.1.4
+and stereo as the stream says, and `harletty` decodes a lossless v2.0
+sequence back to the master's own channels, bit for bit.
 
 ### Where it stands
 
@@ -54,9 +60,22 @@ object comes back where the master put it, at the sample the master named.
 - **Speed** — about 3 ms per channel-second of audio at full effort on a
   desktop machine: four minutes of a twelve-element programme in 17 s on
   sixteen cores.
+- **IAMF beds** — a 7.1.4 bed under the v1.1 simple profile, with its own
+  FLAC encoder within a third of a per cent of `flac -8 --no-mid-side` (IAMF
+  forbids mid/side), and the loudness stated on 7.1.4 and on stereo what
+  FFmpeg's meter reads on a decoder's render. Opus at 96 kbit/s a channel by
+  default, about 1.08 Mbit/s for 7.1.4.
+- **IAMF objects** — up to twenty-eight channels: the bed as one element,
+  every object its own element with its path as position blocks, a master with
+  more objects than that folded by the same clustering `encode` uses; a
+  re-voiced programme kept element for element (`--overlay`) or with its voices
+  as a labelled dialogue element (`--voices-to-bed`). Few decoders read v2.0
+  yet: the `harletty/iamf-rs` fork and `harletty` do; FFmpeg 9 does not.
 - **Not there yet** — E-AC-3 with joint object coding, AC-3 and AC-4 are in
-  [PLAN.md](PLAN.md) and nothing of them is written. There is no release; build
-  from source.
+  [PLAN.md](PLAN.md) and nothing of them is written. For IAMF: no AAC, no
+  v1.1 bed beside the v2.0 objects for older decoders, no scalable layers, and
+  no browser has been tried; [docs/iamf.md](docs/iamf.md#not-done) has the
+  list.
 
 ## Building
 
@@ -120,8 +139,12 @@ elements, at the default depth and with no signing key configured:
 | `--out <FILE>` | required | Write the stream here |
 | `--cluster <ELEMENTS>` | | Fold the master's objects into this many elements — twelve, fourteen or sixteen — rather than giving each object one of its own. Without it the stream is one element per object, which needs a master that has already been clustered. The LFE is a bed, takes the first element untouched, and is not clustered |
 | `--fold-depth <BITS>` | `20` | Round the folded elements to this many bits. A mix is a sum over real weights, so its low bits are the noise of the multiplication, and a lossless coder carries them anyway; twenty is worth about a third of the stream against twenty-four and puts the rounding near −120 dBFS. Seventeen is the floor. Match it to the source master. Only means anything with `--cluster` |
+| `--overlay <SOURCES>` | | For a programme being re-voiced: keep the master's elements exactly as they are — metadata element for element, samples copied where nothing is added — and pan its last this-many objects, the new sources, onto them. Guarded: an encode that would put a source too far from where it asked to be, or make a still voice wander, is refused. Mutually exclusive with `--cluster`; see [docs/encode.md](docs/encode.md#--overlay-keeping-a-scene-and-adding-to-it) |
+| `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | | The guards of `--overlay`, whether a source may take a spare element, and the per-block account of what it did; each is documented in `harlettizer encode --help` and [docs/encode.md](docs/encode.md) |
 | `--fold-search <PASSES>` | `4` | Passes of the search that places each element where the fold's own cost is lowest. Zero declines it. Worth about a fifth of what the fold costs and a twentieth of the stream. Only means anything with `--cluster` |
 | `--beds <RULE>` | `auto` | What a fold does with a bed channel other than the LFE: `pinned`, an element of its own at its speaker's place; `free`, an object of the bed class sharing the elements with the rest; or `auto`, pinned while every object can still have an element beside the bed and free otherwise. Only means anything with `--cluster`; without it a bed other than the LFE is refused |
+| `--fold-hold <FRACTION>` | `0.25` | How much better somewhere else has to be, as a fraction of what staying costs, before an element moves there. It takes an element's wobble — leaving a place and coming back within two tenths of a second — from 3.63 % of the windows it is heard in to 0.84 % on a programme folded one element short, for an error that does not move. Nought turns it off. Only means anything with `--cluster` |
+| `--smooth-behind <N>` | `0` | Blocks behind the one being placed whose energies steady it, beside the two ahead that are always taken. Two of them take better than a third off an element's out-and-back excursions on a real contested fold, at no cost in mean error; nought until a listening settles it. Only means anything with `--cluster` |
 | `--dialnorm <DB>` | `-31` | The programme's dialnorm, which sets the floor under what an object has to carry to be heard at the playback level: full scale at 105 dB SPL less the gain a decoder applies to bring the dialogue to −31, and the threshold of hearing under that — −102.6 dBFS at the reference. Below it an object seeds nothing and sets no worst case. Only means anything with `--cluster` |
 | `--headroom <RULE>` | `limit` | How the fold keeps its elements inside the codec's domain: `limit`, a limiter with one gain for every element, ahead of the peak; `bound`, the fit bounding an element's coherent peak, which costs error and does not take every clip; `both`; or `off`, which clamps and counts the clips as it did. Only means anything with `--cluster` |
 | `--loudness <RULE>` | `flat` | How a block's power is weighed before it steers the fold: `flat`, the plain power a meter reads; `kweighted`, through the K filter of BS.1770; or `perceptual`, what each object adds to the loudness of the scene, band by band, with what is near it masking it. Flat is what every measurement in `docs/clustering.md` was made under, and the perceptual rule did not beat it on the metric; it is there to be listened to, at about a third more encoding time. Only means anything with `--cluster` |
@@ -193,6 +216,56 @@ mid-stream say where in the programme it is.
 [docs/mlp-state.md](docs/mlp-state.md) lists every constant and decision in
 force; [docs/mlp.md](docs/mlp.md) is the notebook of how they were arrived at.
 
+### `iamf`
+
+```bash
+harlettizer iamf programme.atmos --out programme.iamf                   # a 7.1.4 bed, FLAC
+harlettizer iamf programme.atmos --out programme.iamf --codec opus      # the same, Opus, for distribution
+harlettizer iamf programme.atmos --out programme.mka --objects          # IAMF v2.0 objects, in Matroska
+harlettizer iamf vf.atmos --out vf.iamf --objects --voices-to-bed 7     # a dub's voices as a dialogue element
+```
+
+Two ways to carry a programme, and the format's two generations:
+
+- **A bed** (default) — the bed channels routed to their speakers and the
+  objects panned on the room's cube into one 7.1.4 channel-based element,
+  under the IAMF v1.1 simple profile, the one browsers, televisions and
+  FFmpeg read today. The objects do not survive as objects.
+- **Objects** (`--objects`) — IAMF v2.0: the master's bed as one
+  channel-based element on the smallest IAMF layout that holds it, and every
+  object an element of its own, its path through the room written as position
+  parameter blocks (`--positions cart16`, `cart8` or `polar`), every temporal
+  unit a key frame so a seek lands on the right place. Up to twenty-eight
+  channels; a master with more objects than that is folded by the clustering
+  `encode --cluster` uses (`--elements N` sets the most). For a re-voiced
+  programme, `--overlay K` keeps the master's elements and pans its last K
+  objects onto them, the computation `encode --overlay` makes, and
+  `--voices-to-bed K` renders the last K into a dialogue element of their own
+  — labelled, with ±12 dB a player may offer, and a loudness anchored on it.
+
+Either way the mix presentation states the loudness measured on 7.1.4 and on
+the stereo pair a decoder folds to. FLAC (default) and LPCM are lossless, at
+16 or 24 bits (32 for LPCM); Opus (`--codec opus`, `--bitrate`, in kbit/s a
+channel, 96 by default) needs a build with the `opus` feature, which the
+release binaries have. An `--out` ending in `.mka` or `.mkv` writes the
+sequence as the one `A_IAMF` track of a Matroska file, following the draft
+mapping proposed to the CELLAR working group; anything else is a standalone
+IAMF stream, which FFmpeg puts in MP4 with the line in
+[docs/iamf.md](docs/iamf.md#into-mp4). The summary says what the programme
+became, the loudness and peaks on both layouts, and any sample the render
+clipped.
+
+The options, what each mode was checked against and what is not done are in
+[docs/iamf.md](docs/iamf.md).
+
+To look at what was written:
+
+```bash
+harletty info programme.iamf                                      # what the sequence declares
+harletty decode programme.iamf --output-path programme_back       # back to a master set: the bed, or the objects with their paths
+mkvinfo programme.mka                                             # the Matroska track
+```
+
 ## Development
 
 ```bash
@@ -211,6 +284,8 @@ real material or an external decoder:
 |---|---|
 | `mlp` | Encode a file losslessly and check a decoder gets it back exactly — through FFmpeg up to eight channels, and through `harletty`, found on the `PATH` or named by `HARLETTY` |
 | `thd` | Read a TrueHD stream's structure and check its integrity |
+| `ffmpeg-check` | Check streams are ones every player can open: each substream's matrices counted against what a decoder reads, and the whole stream decoded by FFmpeg, failing on any line it prints |
+| `overlay-check` | The invariant an `--overlay` encode rests on, checked against another decoder's output (`truehdd`, on the `PATH`) rather than against this project's own reader |
 | `cluster` | Fold a master set's objects into the elements a bitstream carries, and say what it cost |
 | `bench` | Render a master and each rule's fold of it on 7.1.4 as blinded stimuli for a listening session, and score a filled-in sheet into a ranking |
 | `drc` | What gain a shipped stream states, and when it changes it |
@@ -236,7 +311,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | | |
 |---|---|
 | [docs/encode.md](docs/encode.md) | The `encode` command: what a real programme did, the progress protocol, what `--fast` costs |
-| [docs/iamf.md](docs/iamf.md) | The `iamf` command: the sequence it writes, the render, the loudness, the FLAC encoder, and what checked them |
+| [docs/iamf.md](docs/iamf.md) | The `iamf` command: the bed and the v2.0 objects, the render, the loudness, the FLAC encoder, Opus, Matroska and MP4, the options, what checked each, and what is not done |
 | [docs/mlp-state.md](docs/mlp-state.md) | What the MLP encoder writes today — every constant and decision in force |
 | [docs/mlp.md](docs/mlp.md) | The lossless encoder's notebook: what was tried, what it measured, what was put down |
 | [docs/clustering.md](docs/clustering.md) | Clustering objects into elements, and the metric that judges a clustering |
@@ -253,9 +328,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **GPL-3.0-or-later.** That choice is what lets FFmpeg's LGPL-2.1 encoders be
 ported here; what was taken from FFmpeg, from the `truehd` crate (Apache-2.0)
-and from the EBU ADM Renderer (BSD-3-Clause) is recorded file by file in
+and from the EBU ADM Renderer (BSD-3-Clause) — and, for IAMF, the stereo
+rendering table of iamf-rs and libiamf and the v2.0 object syntax read from
+libiamf's test vectors (BSD-3-Clause-Clear), and the Matroska mapping drafted
+in Omniphony (GPL-3.0) — is recorded file by file in
 [docs/provenance.md](docs/provenance.md), and [LEGAL.md](LEGAL.md) says which
-sources are open to this project and which are closed.
+sources are open to this project and which are closed. libopus (BSD-3-Clause)
+is linked, not ported, and only in a build with the `opus` feature; the
+release binaries carry its licence beside the others.
 
 **Patents.** The formats implemented here are covered by patents held by their
 format owners. Writing and distributing an independent implementation is

@@ -367,7 +367,6 @@ pass it as before. The summary's `voices` line is now a `dialogue` line, and an
 `anchored` line follows the loudness.
 
 ### Positions
-### Positions
 
 A master moves an object by updates — be here, this loud, take this long — so
 its path through the room is piecewise linear, and IAMF's position blocks are
@@ -617,6 +616,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
   jointly.
 - **Scalable layers** (a stereo or 5.1 core with 7.1.4 on top), which need
   demixing parameters and, for lossy codecs, recon gains.
-- **Anchored loudness** (dialogue), which `hz-analysis`'s speech gate could
-  give.
+- **Anchored loudness** (dialogue) where the dialogue is mixed in — the bed,
+  or objects without `--voices-to-bed`, which states it from its dialogue
+  element alone. `hz-analysis`'s speech gate could find it in the mix.
 - **An MP4 writer** of its own.
