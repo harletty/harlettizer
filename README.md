@@ -71,7 +71,10 @@ sequence back to the master's own channels, bit for bit.
   re-voiced programme kept element for element (`--overlay`) or with its voices
   as a labelled dialogue element (`--voices-to-bed`). Few decoders read v2.0
   yet: the `harletty/iamf-rs` fork and `harletty` do; FFmpeg 9 does not.
-- **Not there yet** — E-AC-3 with joint object coding, AC-3 and AC-4 are in
+- **AC-3** — 5.1 or stereo, rendered from the master and coded by a port of
+  FFmpeg's encoder, coupling included, which it matches to 0.01 dB SNR at
+  every rate tried; no dynamic range words yet. See [docs/ac3.md](docs/ac3.md).
+- **Not there yet** — E-AC-3 with joint object coding and AC-4 are in
   [PLAN.md](PLAN.md) and nothing of them is written. For IAMF: no AAC, no
   v1.1 bed beside the v2.0 objects for older decoders, no scalable layers, and
   no browser has been tried; [docs/iamf.md](docs/iamf.md#not-done) has the
@@ -266,6 +269,20 @@ harletty decode programme.iamf --output-path programme_back       # back to a ma
 mkvinfo programme.mka                                             # the Matroska track
 ```
 
+### `ac3`
+
+```bash
+harlettizer ac3 programme.atmos --out programme.ac3                    # 5.1 at 448 kb/s
+harlettizer ac3 programme.atmos --out programme.ac3 --layout 2.0       # stereo at 192 kb/s
+```
+
+Renders the programme to 7.1 on the room's cube, folds it to 5.1 or stereo
+the way the TrueHD presentations fold, and codes it as an AC-3 elementary
+stream at `--bitrate` (32 to 640 kb/s), stating `--dialnorm`. The summary
+reports the loudness measured on the render beside it. The encoder, how it
+compares with FFmpeg's and what it does not do yet are in
+[docs/ac3.md](docs/ac3.md).
+
 ## Development
 
 ```bash
@@ -311,6 +328,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | | |
 |---|---|
 | [docs/encode.md](docs/encode.md) | The `encode` command: what a real programme did, the progress protocol, what `--fast` costs |
+| [docs/ac3.md](docs/ac3.md) | The `ac3` command: the render and fold, the encoder ported from FFmpeg, how it compares, and what is not done |
 | [docs/iamf.md](docs/iamf.md) | The `iamf` command: the bed and the v2.0 objects, the render, the loudness, the FLAC encoder, Opus, Matroska and MP4, the options, what checked each, and what is not done |
 | [docs/mlp-state.md](docs/mlp-state.md) | What the MLP encoder writes today — every constant and decision in force |
 | [docs/mlp.md](docs/mlp.md) | The lossless encoder's notebook: what was tried, what it measured, what was put down |

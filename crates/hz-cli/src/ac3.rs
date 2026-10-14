@@ -1,0 +1,288 @@
+//! `harlettizer ac3`: a programme rendered to 5.1 or stereo and coded as AC-3.
+//!
+//! The objects do not survive as objects — AC-3 has none — so the master is
+//! rendered as `iamf` renders it, its bed channels routed to their speakers
+//! and its objects panned on the room's cube, onto 7.1; and 7.1 is folded to
+//! the layout asked for by the fold measured off shipped TrueHD streams
+//! ([`hz_render::fold::presentation_matrix`]), the one this project's own
+//! TrueHD presentations carry. The cube has no place for a 5.1 surround at
+//! ±110°, and the fold is what a 5.1 listener of the same master hears from
+//! the lossless stream. The loudness is measured on what is coded, before the
+//! codec, and reported beside the dialnorm the stream states.
+
+use hz_ac3::{ChannelMode, DELAY, Encoder, FRAME_SAMPLES};
+use hz_analysis::loudness::{ChannelWeight, Meter};
+use hz_core::{Error, Result};
+use hz_io::container::SampleFormat;
+use hz_programme::follow::Following;
+use hz_programme::progress::Progress;
+use hz_programme::source::Source;
+use hz_programme::{Part, parts_of};
+use hz_render::fold::{FoldMode, presentation_matrix};
+use hz_render::{Keyframe, Layout, Mixdown};
+use std::io::Write;
+use std::path::PathBuf;
+
+/// What `ac3` was asked to do.
+pub struct Config {
+    pub input: PathBuf,
+    pub out: PathBuf,
+    pub frames: Option<u64>,
+    pub mono_prefix: Option<PathBuf>,
+    /// `5.1` or `2.0`.
+    pub layout: Layout,
+    /// kb/s; the encoder's default for the channel count when not given.
+    pub bit_rate: Option<u32>,
+    pub dialnorm: i8,
+    pub coupling: bool,
+    pub progress: bool,
+}
+
+pub fn run(config: Config) -> Result<()> {
+    let path = config.input.as_path();
+    let mut source = Source::open(path, config.mono_prefix.as_deref())?;
+    let format = *source.pcm_format();
+    if format.sample_format == SampleFormat::Float {
+        return Err(Error::unsupported(
+            path,
+            "floating-point audio; the master formats this reads are integer PCM",
+        ));
+    }
+    let input_scale = 1.0 / f64::from(1u32 << (format.bits_per_channel - 1));
+    let sample_rate = source.sample_rate();
+    let stride = source.channels();
+
+    let layout = &config.layout;
+    let width = layout.channels();
+    let rendered = Layout::surround_7_1();
+    let rendered_width = rendered.channels();
+    let fold = presentation_matrix(layout, FoldMode::default())
+        .map_err(|e| Error::unsupported(path, e.to_string()))?
+        .expect("5.1 and 2.0 are not 7.1");
+    let (mode, lfe) = match layout.name {
+        "5.1" => (ChannelMode::ThreeTwo, true),
+        "2.0" => (ChannelMode::Stereo, false),
+        other => {
+            return Err(Error::unsupported(
+                path,
+                format!("AC-3 to {other}; 5.1 or 2.0"),
+            ));
+        }
+    };
+    let lfe_speaker = rendered.index_of("LFE1");
+
+    // Every track to a source of the mixdown, as `iamf` routes them.
+    let mut following = Following::new(Mixdown::new(&rendered)?);
+    let (mut routed, mut placed, mut objects, mut dropped) = (0usize, 0, 0, 0);
+    for part in parts_of(path, &source)? {
+        match part {
+            Part::Lfe { channel } => {
+                following
+                    .mixdown()
+                    .speaker(channel, lfe_speaker.expect("7.1 has an LFE"));
+                routed += 1;
+                // Stereo has no LFE, and the fold leaves it out, as a decoder
+                // folding 5.1 to stereo does.
+                dropped += usize::from(!layout.has("LFE1"));
+            }
+            Part::Bed {
+                channel,
+                name,
+                position,
+            } => {
+                let label = hz_core::speakers::by_master_name(name).map_or(name, |s| s.label);
+                let mixdown = following.mixdown();
+                if let Some(speaker) = rendered.index_of(label) {
+                    mixdown.speaker(channel, speaker);
+                    routed += 1;
+                } else {
+                    let index = mixdown.object(channel);
+                    mixdown.update(
+                        index,
+                        &Keyframe {
+                            position,
+                            ..Keyframe::default()
+                        },
+                    );
+                    placed += 1;
+                }
+            }
+            Part::Object { channel, keyframes } => {
+                following.object(channel, &keyframes);
+                objects += 1;
+            }
+        }
+    }
+    if routed + placed + objects == 0 {
+        return Err(Error::unsupported(path, "nothing in it to render"));
+    }
+
+    let mut encoder = Encoder::new(hz_ac3::Config {
+        sample_rate,
+        mode,
+        lfe,
+        bit_rate: config.bit_rate,
+        coupling: config.coupling,
+        metadata: hz_ac3::Metadata {
+            dialnorm: config.dialnorm,
+            ..hz_ac3::Metadata::default()
+        },
+    })
+    .map_err(|e| Error::unsupported(&config.out, e.0))?;
+    let out_file = std::fs::File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
+    let mut out = std::io::BufWriter::new(out_file);
+
+    let total = config
+        .frames
+        .map_or(source.frames(), |limit| limit.min(source.frames()));
+    let mut progress = Progress::new(config.progress, total);
+
+    let weights: Vec<ChannelWeight> = layout
+        .speakers
+        .iter()
+        .map(|label| ChannelWeight::for_speaker_label(label))
+        .collect();
+    let mut meter = Meter::new(sample_rate, &weights);
+
+    let mut raw = vec![0i32; FRAME_SAMPLES * stride];
+    let mut input = vec![0f32; FRAME_SAMPLES * stride];
+    let mut mixed = vec![0f64; FRAME_SAMPLES * rendered_width];
+    let mut interleaved = vec![0f32; FRAME_SAMPLES * width];
+    let mut planar = vec![vec![0f32; FRAME_SAMPLES]; width];
+    let mut frame = Vec::new();
+    let (mut clipped, mut peak) = (0u64, 0f64);
+
+    let mut at = 0u64;
+    let mut syncframes = 0u64;
+    loop {
+        let want = (total - at).min(FRAME_SAMPLES as u64) as usize;
+        let got = if want == 0 {
+            0
+        } else {
+            source.fill(&mut raw, want)?
+        };
+        for (x, &r) in input[..got * stride].iter_mut().zip(&raw[..got * stride]) {
+            *x = (f64::from(r) * input_scale) as f32;
+        }
+        mixed.fill(0.0);
+        if got > 0 {
+            following.render(
+                &input[..got * stride],
+                stride,
+                got,
+                at,
+                &mut mixed[..got * rendered_width],
+            );
+        }
+        for (frame, out) in mixed
+            .chunks_exact(rendered_width)
+            .zip(interleaved.chunks_exact_mut(width))
+        {
+            for (target, f) in out.iter_mut().enumerate() {
+                let m: f64 = frame
+                    .iter()
+                    .zip(&fold)
+                    .map(|(x, row)| x * row[target])
+                    .sum();
+                peak = peak.max(m.abs());
+                if m.abs() > 1.0 {
+                    clipped += 1;
+                }
+                *f = m.clamp(-1.0, 1.0) as f32;
+            }
+        }
+        meter.push(&interleaved[..got * width]);
+        for (ch, plane) in planar.iter_mut().enumerate() {
+            for (n, v) in plane.iter_mut().enumerate() {
+                *v = interleaved[n * width + ch];
+            }
+        }
+
+        frame.clear();
+        let mut refs: [&[f32]; 6] = [&[]; 6];
+        for (r, plane) in refs.iter_mut().zip(&planar) {
+            *r = plane;
+        }
+        encoder
+            .encode(&refs[..width], &mut frame)
+            .map_err(|e| Error::refused(&config.out, e.0))?;
+        out.write_all(&frame)
+            .map_err(|e| Error::io(&config.out, e))?;
+        syncframes += 1;
+
+        at += got as u64;
+        if let Some(progress) = progress.as_mut() {
+            progress.at(at);
+        }
+        // Past the input's end, the frames keep coming until the decoder's
+        // output has caught up with it: its last samples are DELAY behind,
+        // and a final frame that is nearly full has not that much silence
+        // in it to carry them out.
+        let ended = got < FRAME_SAMPLES;
+        if ended && syncframes * FRAME_SAMPLES as u64 >= at + DELAY as u64 {
+            break;
+        }
+    }
+    out.flush().map_err(|e| Error::io(&config.out, e))?;
+    if at == 0 {
+        return Err(Error::unsupported(path, "no audio to encode"));
+    }
+    meter.flush();
+
+    let mut parts = Vec::new();
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    if objects > 0 {
+        parts.push(plural(objects, "object", "objects"));
+    }
+    if routed > 0 {
+        parts.push(format!(
+            "{} routed to their speakers",
+            plural(routed, "bed channel", "bed channels")
+        ));
+    }
+    if placed > 0 {
+        parts.push(format!(
+            "{} placed where 7.1 has no speaker",
+            plural(placed, "bed channel", "bed channels")
+        ));
+    }
+    if dropped > 0 {
+        parts.push("the LFE left out".to_string());
+    }
+    println!(
+        "  programme    {}, rendered to 7.1 on the room's cube and folded to {}",
+        parts.join(", "),
+        layout.name
+    );
+    println!(
+        "  encoded      {syncframes} syncframes, {at} samples, AC-3 at {} kb/s{}",
+        encoder.bit_rate(),
+        if encoder.coupled() {
+            ", high band coupled"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  loudness     {} on {}, the stream stating a dialnorm of {}",
+        crate::iamf::lkfs(meter.integrated()),
+        layout.name,
+        config.dialnorm
+    );
+    println!(
+        "  headroom     {clipped} samples clipped, the render peaking at {peak:.2} of full scale"
+    );
+    if clipped > 0 {
+        eprintln!(
+            "warning: the render clipped {clipped} samples; the master's objects sum past full \
+             scale on {}",
+            layout.name
+        );
+    }
+    let bytes = std::fs::metadata(&config.out)
+        .map_err(|e| Error::io(&config.out, e))?
+        .len();
+    println!("  wrote        {}, {bytes} bytes", config.out.display());
+    Ok(())
+}

@@ -1,5 +1,6 @@
 //! The `harlettizer` command line.
 
+mod ac3;
 mod convert;
 mod encode;
 mod iamf;
@@ -245,6 +246,54 @@ enum Command {
         /// changes, so at most a hundred of them however long the programme
         /// is. For a caller driving a progress bar; the summary still goes to
         /// standard output and says nothing about it.
+        #[arg(long)]
+        progress: bool,
+    },
+
+    /// Render a programme to 5.1 or stereo and code it as AC-3.
+    ///
+    /// The master's bed channels are routed to their speakers and its objects
+    /// panned on the room's cube, as `iamf` renders them, onto the layout
+    /// asked for; the render is coded as an AC-3 elementary stream, with the
+    /// channel coupling, exponent strategy and bit allocation of FFmpeg's
+    /// encoder. A decoder's output lags the input by 256 samples. See
+    /// `docs/ac3.md`.
+    Ac3 {
+        /// A master set's `.atmos` config, or an ADM BW64 file.
+        input: PathBuf,
+
+        /// Write the elementary stream here.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Stop after this many frames of audio.
+        #[arg(long)]
+        frames: Option<u64>,
+
+        /// Read the master's audio from one mono WAV per waveform; see
+        /// `encode --mono-prefix`.
+        #[arg(long, value_name = "PREFIX")]
+        mono_prefix: Option<PathBuf>,
+
+        /// `5.1` or `2.0`.
+        #[arg(long, default_value = "5.1")]
+        layout: String,
+
+        /// Kilobits a second, an AC-3 rate from 32 to 640; 448 for 5.1 and
+        /// 192 for stereo unless asked.
+        #[arg(long, value_name = "KBPS")]
+        bitrate: Option<u32>,
+
+        /// The dialogue level the stream states, −31 to −1. The loudness
+        /// measured on the render is reported beside it.
+        #[arg(long, value_name = "DB", default_value_t = -31, allow_hyphen_values = true)]
+        dialnorm: i8,
+
+        /// Never couple the high band, even where the encoder would.
+        #[arg(long)]
+        no_coupling: bool,
+
+        /// Report progress on standard error.
         #[arg(long)]
         progress: bool,
     },
@@ -706,6 +755,39 @@ fn main() -> ExitCode {
                     presentations,
                     progress,
                     settings: settings?,
+                })
+            })
+        }
+        Command::Ac3 {
+            input,
+            out,
+            frames,
+            mono_prefix,
+            layout,
+            bitrate,
+            dialnorm,
+            no_coupling,
+            progress,
+        } => {
+            let layout = match layout.as_str() {
+                "5.1" => Ok(hz_render::Layout::surround_5_1()),
+                "2.0" | "stereo" => Ok(hz_render::Layout::stereo()),
+                other => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("`{other}` for the layout; 5.1 or 2.0"),
+                )),
+            };
+            layout.and_then(|layout| {
+                ac3::run(ac3::Config {
+                    input,
+                    out,
+                    frames,
+                    mono_prefix,
+                    layout,
+                    bit_rate: bitrate,
+                    dialnorm,
+                    coupling: !no_coupling,
+                    progress,
                 })
             })
         }
