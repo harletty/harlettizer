@@ -37,6 +37,7 @@ specifications.
 | Joint object coding on E-AC-3 | ETSI TS 103 420 |
 | AC-4 | ETSI TS 103 190-1 / -2 |
 | Loudness | ITU-R BS.1770-4, EBU R 128 / Tech 3341 |
+| DTS Coherent Acoustics: the core, the extension substream, the lossless extension | ETSI TS 102 114 V1.6.1 |
 | ADM | ITU-R BS.2076, EBU Tech 3285 Supplement 6 (BW64) |
 | Master file layout | The publicly published master-file specification |
 
@@ -44,12 +45,20 @@ specifications.
 
 | Source | License | Use |
 |---|---|---|
-| FFmpeg `libavcodec` (`mlpenc.c`, `ac3enc*.c`, `eac3enc.c`) | LGPL-2.1-or-later | Port to Rust; keep per-file attribution |
+| FFmpeg `libavcodec` (`mlpenc.c`, `ac3enc*.c`, `eac3enc.c`, `dca.c`, `dca_exss.c`, `dcaenc.c`) | LGPL-2.1-or-later | Port to Rust; keep per-file attribution |
 | `truehd` crate (Rainbaby / truehdd) | Apache-2.0 | Bitstream structures, bit IO, CRC — and the decoder used as the test oracle |
 | `oxideav-ac4` | MIT | AC-4 framing and channel-based encoding |
 | `damf` crate (harletty-bridge) | Apache-2.0 | Master-file metadata model and writers |
+| `dca` crate (harletty-bridge) | Apache-2.0 | The DTS decoder used as the test oracle, behind the harness's `dca-oracle` feature; nothing ported from it |
 | EBU ADM Renderer (`ear`) | BSD-3-Clause | The BS.2094 common-definition speaker positions, and the reference implementation both directions of the ADM support are checked against |
 | libopus (Xiph.Org) | BSD-3-Clause, with royalty-free patent licences | **Linked**, not ported: the Opus encoder behind `hz-iamf`'s `opus` feature, statically in the released binaries |
+
+**The DTS:X extension** has no published specification. What this project
+writes of it comes from measurements of streams, recorded alongside the `dca`
+decoder that reads them, and from nothing else — in particular from no
+library, SDK or tool distributed by the format owner. A field whose meaning
+those measurements do not establish is written at the value the streams carry
+and documented as such, never filled in from elsewhere.
 
 Ported code must carry the original copyright line and license notice in
 the file header, and the port must be recorded in `docs/provenance.md`

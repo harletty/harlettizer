@@ -13,6 +13,7 @@ publish = false
 hz-analysis.workspace = true
 hz-cluster.workspace = true
 hz-core.workspace = true
+hz-dca.workspace = true
 hz-io.workspace = true
 hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
@@ -26,6 +27,11 @@ hz-render.workspace = true
 # machine is not something a job's parallelism can be tuned around. Turn it on
 # where there is room: `cargo xtask --features oracle`.
 truehd = { version = "0.7.1", optional = true }
+# An independent DTS decoder: core, extension substream, lossless extension and
+# the DTS:X extension — used as an oracle for the DTS track and nothing else.
+# Off by default, so the harness builds without it:
+# `cargo run -p xtask --features dca-oracle -- dts …`.
+dca = { git = "https://github.com/harletty/harletty-bridge", tag = "v0.9.0", optional = true }
 serde.workspace = true
 serde_yaml_ng.workspace = true
 serde_json.workspace = true
@@ -34,3 +40,5 @@ clap.workspace = true
 [features]
 # An independent reader for the object metadata payload. See above for the cost.
 oracle = ["dep:truehd"]
+# An independent DTS decoder. See above.
+dca-oracle = ["dep:dca"]

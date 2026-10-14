@@ -11,6 +11,7 @@ mod container;
 mod coords;
 mod corpus;
 mod drc;
+mod dts;
 mod ffmpeg_check;
 mod loudness;
 mod make_master;
@@ -447,6 +448,17 @@ enum Command {
         against: Option<String>,
     },
 
+    /// Read a DTS stream's headers, write them back byte for byte, and look
+    /// for the DTS:X navigation word. With `--features dca-oracle`, also
+    /// compare against the workspace decoder and measure the height unfold.
+    Dts {
+        input: PathBuf,
+
+        /// Stop after this many frames.
+        #[arg(long, value_name = "N")]
+        frames: Option<usize>,
+    },
+
     /// Read a TrueHD stream's structure and check its integrity.
     Thd {
         input: PathBuf,
@@ -746,6 +758,7 @@ fn main() -> ExitCode {
             tau,
             against,
         }),
+        Command::Dts { input, frames } => dts::run(dts::Options { input, frames }),
         Command::Thd {
             input,
             units,
