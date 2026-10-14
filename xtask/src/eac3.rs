@@ -35,7 +35,7 @@ use hz_core::bits::BitWriter;
 use hz_core::{Error, Result};
 use hz_meta::emdf;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub struct Options {
@@ -47,12 +47,13 @@ pub struct Options {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    let dumps = dump_paths(&options)?;
     if let Some(dir) = &options.dump {
         std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
     let mut failed = None;
-    for input in &options.inputs {
-        let report = survey(input, &options)?;
+    for (input, dump) in options.inputs.iter().zip(&dumps) {
+        let report = survey(input, dump.as_deref(), options.frames)?;
         report.print(input);
         if report.read_mismatches > 0 && failed.is_none() {
             failed = Some(input.clone());
@@ -65,6 +66,33 @@ pub fn run(options: Options) -> Result<()> {
         }),
         None => Ok(()),
     }
+}
+
+/// Where each input's payloads go, refused up front when two inputs would
+/// share a file — `a/film.ec3` and `b/film.ec3` both name `film.emdf`, and
+/// the second would silently replace the first.
+fn dump_paths(options: &Options) -> Result<Vec<Option<PathBuf>>> {
+    let Some(dir) = &options.dump else {
+        return Ok(vec![None; options.inputs.len()]);
+    };
+    let mut claimed: BTreeMap<PathBuf, &Path> = BTreeMap::new();
+    let mut paths = Vec::with_capacity(options.inputs.len());
+    for input in &options.inputs {
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+        let path = dir.join(format!("{stem}.emdf"));
+        if let Some(earlier) = claimed.insert(path.clone(), input) {
+            return Err(Error::Refused {
+                path,
+                detail: format!(
+                    "both {} and {} would dump here; rename one, or dump them separately",
+                    earlier.display(),
+                    input.display()
+                ),
+            });
+        }
+        paths.push(Some(path));
+    }
+    Ok(paths)
 }
 
 /// What one stream holds.
@@ -106,13 +134,22 @@ struct Report {
     oamd_objects: BTreeMap<usize, usize>,
 }
 
-fn survey(input: &Path, options: &Options) -> Result<Report> {
-    let bytes = std::fs::read(input).map_err(|e| Error::io(input, e))?;
-    let limit = options.frames.unwrap_or(usize::MAX);
-    let mut dump = match &options.dump {
-        Some(dir) => {
-            let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-            let path = dir.join(format!("{stem}.emdf"));
+/// Bytes read from a stream at a time.
+///
+/// The stream is fed to the extractor in pieces and drained between them,
+/// never whole: the extractor compacts its buffer by moving what is left to
+/// the front, and with a whole film behind the cursor that is the whole film
+/// moved again every few frames.
+const CHUNK: usize = 8 * 1024;
+
+fn survey(input: &Path, dump: Option<&Path>, frames: Option<usize>) -> Result<Report> {
+    let mut source = std::fs::File::open(input).map_err(|e| Error::io(input, e))?;
+    let mut chunk = vec![0u8; CHUNK];
+    let mut eof = false;
+    let limit = frames.unwrap_or(usize::MAX);
+    let mut dump = match dump {
+        Some(path) => {
+            let path = path.to_path_buf();
             let mut file = std::io::BufWriter::new(
                 std::fs::File::create(&path).map_err(|e| Error::io(&path, e))?,
             );
@@ -125,12 +162,13 @@ fn survey(input: &Path, options: &Options) -> Result<Report> {
 
     let mut report = Report::default();
     let mut extractor = Extractor::default();
-    extractor.push_bytes(&bytes);
     let mut decoder = Decoder::new();
     let mut index = 0usize;
 
     while index < limit {
-        let frame = match extractor.next_frame() {
+        let next = next_frame(&mut extractor, &mut source, &mut chunk, &mut eof)
+            .map_err(|e| Error::io(input, e))?;
+        let frame = match next {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
@@ -216,6 +254,29 @@ fn survey(input: &Path, options: &Options) -> Result<Report> {
         file.flush().map_err(|e| Error::io(&path, e))?;
     }
     Ok(report)
+}
+
+/// The next whole syncframe, reading the stream one chunk at a time until the
+/// extractor has one or the stream ends.
+fn next_frame(
+    extractor: &mut Extractor,
+    source: &mut impl Read,
+    chunk: &mut [u8],
+    eof: &mut bool,
+) -> std::io::Result<std::result::Result<Option<eac3::Frame>, eac3::ExtractError>> {
+    loop {
+        match extractor.next_frame() {
+            Ok(None) if !*eof => {
+                let read = source.read(chunk)?;
+                if read == 0 {
+                    *eof = true;
+                } else {
+                    extractor.push_bytes(&chunk[..read]);
+                }
+            }
+            other => return Ok(other),
+        }
+    }
 }
 
 /// Read the frame at the oracle's sync offset ourselves, compare, and rewrite.

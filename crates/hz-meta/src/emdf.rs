@@ -70,15 +70,42 @@ pub struct Payload<'a> {
 /// more, and a writer that is to reproduce them has to be able to say it too.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Config {
-    /// How many samples the payload stands for.
+    /// How many samples the payload stands for, at most [`MAX_DURATION`].
     pub duration: Option<u32>,
     /// The group the payload belongs to: payloads of one group go together.
+    /// At most [`MAX_GROUP`].
     pub group: Option<u32>,
     /// The eight reserved bits of codec-specific data, when present.
     pub codec_data: Option<u8>,
     /// What a decoder that does not know the payload is to do with it —
     /// `None` is the bit that says discard it, which ends the configuration.
     pub retain: Option<Retain>,
+}
+
+/// Groups of eleven bits a duration may take: two, the specification says
+/// (TS 102 366 H.2.2.3.4), the second with its continuation bit clear.
+const DURATION_GROUPS: u32 = 2;
+/// The longest duration two groups hold.
+pub const MAX_DURATION: u32 = max_variable(11, DURATION_GROUPS);
+
+/// Groups of two bits a group identifier may take. The specification sets no
+/// bound; this one is ours, far above anything a stream uses — every
+/// reference stream says group nought — and low enough that a run of
+/// continuation bits cannot carry the value out of its word.
+const GROUP_GROUPS: u32 = 8;
+/// The largest group identifier eight groups hold.
+pub const MAX_GROUP: u32 = max_variable(2, GROUP_GROUPS);
+
+/// The largest value `groups` groups of `n` bits hold.
+const fn max_variable(n: u32, groups: u32) -> u32 {
+    let span = 1u32 << n;
+    let mut value = span - 1;
+    let mut group = 1;
+    while group < groups {
+        value = (value + 1) * span + span - 1;
+        group += 1;
+    }
+    value
 }
 
 /// The rest of the configuration of a payload a decoder is not to discard.
@@ -160,6 +187,10 @@ pub const PROTECTION_BYTE: u8 = 0x5a;
 /// sample offset, present only when it is not nought, in eleven bits and a
 /// reserved one, then the rest of [`Config`] — its size and its bytes.
 ///
+/// # Panics
+/// If a payload's duration exceeds [`MAX_DURATION`] or its group
+/// [`MAX_GROUP`]: the field has no way to say it.
+///
 /// Returns where the protection fields start; they hold
 /// [`PROTECTION_BYTE`] until the wrapping overwrites them.
 pub fn write(
@@ -206,11 +237,11 @@ pub fn write(
 fn write_config(writer: &mut BitWriter, offset: bool, config: &Config) {
     writer.put_bit(config.duration.is_some());
     if let Some(duration) = config.duration {
-        writer.put_variable(11, 4, duration);
+        writer.put_variable(11, DURATION_GROUPS, duration);
     }
     writer.put_bit(config.group.is_some());
     if let Some(group) = config.group {
-        writer.put_variable(2, 16, group);
+        writer.put_variable(2, GROUP_GROUPS, group);
     }
     writer.put_bit(config.codec_data.is_some());
     if let Some(data) = config.codec_data {
@@ -398,10 +429,10 @@ fn payload(reader: &mut BitReader<'_>, id: u32) -> Result<ReadPayload, Ran> {
     };
     let mut config = Config::default();
     if reader.get_bit()? {
-        config.duration = Some(read_variable(reader, 11, 4)?);
+        config.duration = Some(read_variable(reader, 11, DURATION_GROUPS)?);
     }
     if reader.get_bit()? {
-        config.group = Some(read_variable(reader, 2, 16)?);
+        config.group = Some(read_variable(reader, 2, GROUP_GROUPS)?);
     }
     if reader.get_bit()? {
         config.codec_data = Some(reader.get(8)? as u8);
@@ -440,16 +471,26 @@ fn read_bytes(reader: &mut BitReader<'_>, count: usize) -> Result<Vec<u8>, Ran> 
 /// A value in groups of `n` bits, each followed by a bit saying whether
 /// another group follows — and a continuation means the value so far was one
 /// short of the group's span.
+///
+/// At most `groups` groups: a last group that still asks for another is a
+/// malformed field and refused, as is a value its word cannot hold — rather
+/// than read on into the bits after it, or carried out of the word.
 fn read_variable(reader: &mut BitReader<'_>, n: u32, groups: u32) -> Result<u32, Ran> {
-    let mut value = 0u32;
-    for _ in 0..groups {
-        value += reader.get(n)?;
+    let mut value = 0u64;
+    for group in 1..=groups {
+        value += u64::from(reader.get(n)?);
         if !reader.get_bit()? {
-            return Ok(value);
+            return u32::try_from(value)
+                .map_err(|_| Ran(format!("a variable-width field of {value} overflows")));
+        }
+        if group == groups {
+            break;
         }
         value = (value + 1) << n;
     }
-    Ok(value)
+    Err(Ran(format!(
+        "a variable-width field asks for more than {groups} groups of {n} bits"
+    )))
 }
 
 #[cfg(test)]
@@ -550,6 +591,77 @@ mod tests {
                     .map(|_| at.primary + protection.primary.bits())
             );
         }
+    }
+
+    /// The bounds the configuration's variable fields take: the largest
+    /// duration and group the syntax allows come back, and a field that asks
+    /// for one group more is refused rather than read on or overflowed.
+    #[test]
+    fn variable_fields_are_held_to_their_groups() {
+        assert_eq!(MAX_DURATION, 4_196_351);
+        assert_eq!(MAX_GROUP, 87_379);
+        let payloads = [Payload {
+            id: LOUDNESS,
+            bytes: &[1, 2],
+            sample_offset: 0,
+            config: Config {
+                duration: Some(MAX_DURATION),
+                group: Some(MAX_GROUP),
+                ..Config::default()
+            },
+        }];
+        let (bytes, length, _) = written(&payloads, Protection::EAC3);
+        assert_eq!(length, bits(&payloads, Protection::EAC3));
+        let frame = read(&mut BitReader::new(&bytes)).expect("parses");
+        assert_eq!(frame.payloads[0].config, payloads[0].config);
+
+        // Version, key, payload one, no offset, a duration whose groups all
+        // ask for another: refused, not a panic.
+        let mut writer = BitWriter::new();
+        writer.put(10, 1);
+        writer.put(1, 0);
+        writer.put(1, 1);
+        for group in [1022, 2046, 2047] {
+            writer.put(11, group);
+            writer.put(1, 1);
+        }
+        writer.put_zeroes(16);
+        assert!(read(&mut BitReader::new(&writer.finish())).is_none());
+
+        // A group identifier that runs past its eight groups.
+        let mut writer = BitWriter::new();
+        writer.put(10, 1);
+        writer.put(2, 0b01); // no offset, no duration, a group
+        for _ in 0..GROUP_GROUPS {
+            writer.put(3, 0b111);
+        }
+        writer.put_zeroes(16);
+        assert!(read(&mut BitReader::new(&writer.finish())).is_none());
+
+        // A payload size whose four groups of eight carry it past 32 bits.
+        let mut writer = BitWriter::new();
+        writer.put(10, 1);
+        writer.put(5, 0b00001); // nothing stated, discard if unknown
+        for group in 0..4 {
+            writer.put(8, 0xff);
+            writer.put(1, u32::from(group < 3));
+        }
+        writer.put_zeroes(16);
+        assert!(read(&mut BitReader::new(&writer.finish())).is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_duration_the_field_cannot_hold_is_not_written() {
+        let payloads = [Payload {
+            id: LOUDNESS,
+            config: Config {
+                duration: Some(MAX_DURATION + 1),
+                ..Config::default()
+            },
+            ..Payload::default()
+        }];
+        written(&payloads, Protection::EAC3);
     }
 
     /// Behind its sync word and length, a frame reads the same, and the next
