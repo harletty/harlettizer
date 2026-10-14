@@ -306,6 +306,12 @@ pub struct Encoder {
     /// Bits the allocation said the frame would take, the two closing fields
     /// included, for the writer to be held to.
     planned_bits: usize,
+    /// The order mantissas are quantised and written in: the coded channels,
+    /// the coupling channel spliced in after the first coupled one.
+    order: [usize; MAX_CHANNELS],
+    order_len: usize,
+    /// The frame being written, its buffer kept from one frame to the next.
+    writer: BitWriter,
 }
 
 impl Encoder {
@@ -453,8 +459,19 @@ impl Encoder {
             rematrix_bands,
             new_rematrix: [false; BLOCKS],
             planned_bits: 0,
+            order: [0; MAX_CHANNELS],
+            order_len: 0,
+            writer: BitWriter::with_capacity(2 * usize::from(FRAME_WORDS[37][2])),
         };
         encoder.frame_bits_fixed = encoder.count_frame_bits_fixed();
+        for ch in 1..=channels {
+            encoder.order[encoder.order_len] = ch;
+            encoder.order_len += 1;
+            if ch == 1 && encoder.coupling.is_some() {
+                encoder.order[encoder.order_len] = CPL;
+                encoder.order_len += 1;
+            }
+        }
         Ok(encoder)
     }
 
@@ -476,15 +493,9 @@ impl Encoder {
         self.coupling.is_some()
     }
 
-    /// The first channel (counting from one) and the channels after it, the
-    /// coupling channel spliced in after the first coupled one — the order
-    /// mantissas are quantised and written in.
-    fn mantissa_order(&self) -> impl Iterator<Item = usize> + '_ {
-        let cpl = self.coupling.is_some();
-        (1..=self.channels).flat_map(move |ch| {
-            let after = cpl && ch == 1;
-            std::iter::once(ch).chain(after.then_some(CPL))
-        })
+    /// The order mantissas are quantised and written in.
+    fn mantissa_order(&self) -> &[usize] {
+        &self.order[..self.order_len]
     }
 
     /// The channels whose exponents, strategies and offsets the stream
@@ -989,10 +1000,9 @@ impl Encoder {
     }
 
     fn quantize(&mut self) {
-        let order: Vec<usize> = self.mantissa_order().collect();
         for blk in 0..BLOCKS {
             let mut groups = Groups::default();
-            for &ch in &order {
+            for &ch in &self.order[..self.order_len] {
                 let reference = self.exp_ref[ch][blk];
                 let exp = *self.exp.at(ch, reference);
                 let bap = *self.bap[self.best].at(ch, reference);
@@ -1096,7 +1106,8 @@ impl Encoder {
     }
 
     fn write(&mut self, out: &mut Vec<u8>) {
-        let mut w = BitWriter::with_capacity(self.frame_size);
+        let mut w = std::mem::take(&mut self.writer);
+        w.clear();
         self.write_header(&mut w);
         for blk in 0..BLOCKS {
             self.write_block(&mut w, blk);
@@ -1109,10 +1120,12 @@ impl Encoder {
             "the writer wrote what the allocation counted"
         );
         debug_assert!(self.planned_bits <= 8 * self.frame_size);
-        let mut frame = w.finish();
-        frame.resize(self.frame_size, 0);
-        self.finish_frame(&mut frame);
-        out.extend_from_slice(&frame);
+        w.align_to(8);
+        let start = out.len();
+        out.extend_from_slice(w.bytes());
+        out.resize(start + self.frame_size, 0);
+        self.finish_frame(&mut out[start..]);
+        self.writer = w;
     }
 
     fn write_header(&self, w: &mut BitWriter) {
@@ -1255,7 +1268,7 @@ impl Encoder {
         w.put(1, 0); // no delta bit allocation
         w.put(1, 0); // no skipped data
 
-        for ch in self.mantissa_order() {
+        for &ch in self.mantissa_order() {
             let bap = self.bap[self.best].at(ch, self.exp_ref[ch][blk]);
             let qmant = self.qmant.at(ch, blk);
             for bin in self.start_freq[ch]..self.end_freq[ch] {

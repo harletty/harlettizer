@@ -10,7 +10,7 @@
 //! the lossless stream. The loudness is measured on what is coded, before the
 //! codec, and reported beside the dialnorm the stream states.
 
-use hz_ac3::{ChannelMode, Encoder, FRAME_SAMPLES};
+use hz_ac3::{ChannelMode, DELAY, Encoder, FRAME_SAMPLES};
 use hz_analysis::loudness::{ChannelWeight, Meter};
 use hz_core::{Error, Result};
 use hz_io::container::SampleFormat;
@@ -199,9 +199,12 @@ pub fn run(config: Config) -> Result<()> {
         }
 
         frame.clear();
-        let refs: Vec<&[f32]> = planar.iter().map(Vec::as_slice).collect();
+        let mut refs: [&[f32]; 6] = [&[]; 6];
+        for (r, plane) in refs.iter_mut().zip(&planar) {
+            *r = plane;
+        }
         encoder
-            .encode(&refs, &mut frame)
+            .encode(&refs[..width], &mut frame)
             .map_err(|e| Error::refused(&config.out, e.0))?;
         out.write_all(&frame)
             .map_err(|e| Error::io(&config.out, e))?;
@@ -211,9 +214,12 @@ pub fn run(config: Config) -> Result<()> {
         if let Some(progress) = progress.as_mut() {
             progress.at(at);
         }
-        // One syncframe past the input's end carries the last block's
-        // overlap out.
-        if got < FRAME_SAMPLES {
+        // Past the input's end, the frames keep coming until the decoder's
+        // output has caught up with it: its last samples are DELAY behind,
+        // and a final frame that is nearly full has not that much silence
+        // in it to carry them out.
+        let ended = got < FRAME_SAMPLES;
+        if ended && syncframes * FRAME_SAMPLES as u64 >= at + DELAY as u64 {
             break;
         }
     }

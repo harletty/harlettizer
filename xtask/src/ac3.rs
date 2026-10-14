@@ -96,6 +96,18 @@ pub fn run(options: Options) -> Result<()> {
         }
         frames += 1;
     }
+    // The extractor says "nothing more" both at the end and when it is
+    // waiting for the rest of a frame; the whole file is in, so anything it
+    // still holds is a frame cut short.
+    if extractor.buffered_len() > 0 {
+        return Err(Error::malformed(
+            &options.input,
+            format!(
+                "{} bytes after syncframe {frames} are not a whole syncframe",
+                extractor.buffered_len()
+            ),
+        ));
+    }
     if frames == 0 {
         return Err(Error::malformed(&options.input, "no AC-3 syncframe in it"));
     }
@@ -118,7 +130,20 @@ pub fn run(options: Options) -> Result<()> {
             .collect();
         let frames_ref = reference.len() / channels;
         let frames_dec = decoded.len() / channels;
-        let usable = frames_ref.min(frames_dec.saturating_sub(DELAY));
+        // The stream has to carry the whole reference out past the delay; a
+        // shorter one lost its end, which a comparison over the common part
+        // would not see.
+        if frames_dec < frames_ref + DELAY {
+            return Err(Error::malformed(
+                &options.input,
+                format!(
+                    "decodes to {frames_dec} samples, short of the {} the reference and the \
+                     {DELAY}-sample delay need",
+                    frames_ref + DELAY
+                ),
+            ));
+        }
+        let usable = frames_ref;
         let (mut signal, mut noise) = (vec![0f64; channels], vec![0f64; channels]);
         for n in 0..usable {
             for ch in 0..channels {

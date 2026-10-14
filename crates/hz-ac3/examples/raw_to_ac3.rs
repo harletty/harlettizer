@@ -8,7 +8,7 @@
 //! development aid for comparing against other encoders, not the command
 //! line's encoder.
 
-use hz_ac3::{ChannelMode, Config, Encoder, FRAME_SAMPLES, Metadata};
+use hz_ac3::{ChannelMode, Config, DELAY, Encoder, FRAME_SAMPLES, Metadata};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,10 +41,12 @@ fn main() {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let frames = samples.len() / channels / FRAME_SAMPLES;
+    // Enough frames that the decoder's output, DELAY behind, reaches the end
+    // of the input.
+    let frames = (samples.len() / channels + DELAY).div_ceil(FRAME_SAMPLES);
     let mut planar = vec![vec![0f32; FRAME_SAMPLES]; channels];
     let mut out = Vec::new();
-    for f in 0..=frames {
+    for f in 0..frames {
         for (ch, plane) in planar.iter_mut().enumerate() {
             for (n, v) in plane.iter_mut().enumerate() {
                 let i = (f * FRAME_SAMPLES + n) * channels + ch;
