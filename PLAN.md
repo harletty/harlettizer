@@ -70,6 +70,7 @@ crates/
   hz-ac3        AC-3 and E-AC-3 encoders
   hz-joc        joint object coding analysis + payload (TS 103 420)
   hz-mlp        MLP / TrueHD lossless encoder + immersive extension
+  hz-dca        DTS core, EXSS and XLL writers + the DTS:X extension
   hz-ac4        AC-4, built on oxideav-ac4
   hz-iamf       IAMF sequences: OBUs, layouts, FLAC / LPCM / Opus, Matroska
   hz-programme  what every writer does before its own format: the master's
@@ -80,14 +81,14 @@ crates/
 xtask/          development harness, differential runs, report generation
 ```
 
-Dependency rule: `hz-ac3`, `hz-mlp`, `hz-ac4` never depend on each other;
+Dependency rule: `hz-ac3`, `hz-mlp`, `hz-dca`, `hz-ac4` never depend on each other;
 they all depend on `hz-core`, `hz-analysis`, `hz-render`. `hz-programme`
 holds what the writers share and depends on no codec crate. `hz-cli` is the
 only crate allowed to know about all of them.
 
 ---
 
-## 3. Two independent tracks
+## 3. Three independent tracks
 
 After the shared phases 1–2, the lossless and lossy work share almost
 nothing — MLP is prediction + entropy coding, AC-3/E-AC-3 is MDCT +
@@ -97,6 +98,7 @@ bit allocation. They can be developed in either order or in parallel.
   Phase 1  I/O + conversion  ─┬─► Track A: Phase A1 MLP lossless ─► A2 immersive TrueHD
   Phase 2  analysis + presentations ─┴─► Track B: Phase B1 AC-3 ─► B2 E-AC-3 ─► B3 joint object coding
                                                                      └─► Phase 6 AC-4
+                              └─► Track C: C1 DTS core ─► C2 lossless (XLL) ─► C3 DTS:X 7.1.4 ─► C6 objects
   Phase 7  job layer  (needs whichever track is finished)
 ```
 
@@ -106,6 +108,9 @@ strongest objective success criterion in the whole project: a lossless
 codec either round-trips bit-exactly through an existing decoder or it
 does not. Track B has the wider audience (streaming delivery is E-AC-3
 with joint object coding) but the fuzziest pass/fail.
+
+Track C (DTS) shares nothing with Track B and can run beside it; its
+pass/fail is as sharp as Track A's, except for the receiver test of C3.
 
 ---
 
@@ -649,6 +654,156 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   reference engine's output at the same bitrate.
 - **Size**: 4–8 weeks. **Risk**: high — this is genuine DSP research.
 
+### Track C — DTS
+
+DTS-HD Master Audio with the DTS:X extension. Like Track A it is lossless
+where it matters, so it has the same decisive pass/fail: the lossless layers
+round-trip bit-exactly through an existing decoder or they do not. It shares
+nothing with Tracks A and B beyond `hz-programme` and `hz-render`.
+
+What the decoding side already knows, and why the track is possible:
+
+- The `dca` crate (harletty-bridge, GPL-3.0) decodes the core, the extension
+  substream (EXSS), the lossless extension (XLL) and the DTS:X extension —
+  bit-exactly against FFmpeg wherever FFmpeg decodes at all. It is the oracle
+  for every phase below, as `truehd` was for Track A.
+- **The standard DTS:X profile, a fixed 7.1.4, is read completely**: a
+  lossless 7.1 bed into which each height is folded at −3 dB
+  (`rmul15(h, 23170)` into L, R, Lb and Rb), then, at the end of the XLL
+  frame, a 22-byte prefix (a sparse type-2 fold matrix under a CRC16) and a
+  bare four-channel XLL channel set carrying TFL, TFR, TBL and TBR, each
+  full-coded. A 64-bit word in the EXSS asset descriptor locates the block.
+- The profiles that carry objects are read only in part — declarations,
+  positions, stated fold rows — and several of their fields are pinned to
+  the values observed rather than understood.
+- No open DTS encoder exists beyond FFmpeg's `dcaenc.c` (LGPL-2.1-or-later),
+  which writes the core only, six channels at most.
+
+**Order: C0 → C1 → C2 → C3, then C4 and C5. C6 starts only once C3 has
+played on hardware.**
+
+#### Phase C0 — Groundwork
+
+- `hz-dca`: bit writer, CRC16, the core frame header and the EXSS writers.
+  The `dca` decoder is an optional harness dependency (`dca-oracle`), like
+  `truehd` and `eac3`, never a dependency of the crate itself.
+- The harness undoes the height fold in integers itself:
+  `bed − ((h · 23170 + 2^14) >> 15)` per channel, the inverse of the rounded
+  Q15 fold C3 writes, compared with the integer reference taken before the
+  fold. The decoder's presentation helper (`FoldPlan::clean`) subtracts in
+  floating point and comes out one LSB off on a correctly folded sample, so
+  it is not the oracle for C3.
+- LEGAL.md: rows for ETSI TS 102 114 V1.6.1 (core, EXSS, XLL) and for
+  `dcaenc.c`; the DTS:X layer is taken from stream measurements recorded with
+  the decoder, and from nothing else; no SDK from the format owner. The
+  patent notice is extended to the lossless and DTS:X layers — a posture
+  for the maintainer to decide, as for the rest.
+- Fixtures synthetic, as everywhere else.
+- **Accept when**: `cargo xtask dts` reads a reference stream's headers and
+  rewrites them field for field, checksums included.
+- **Size**: days. **Risk**: low.
+
+#### Phase C1 — Core encoder (5.1, lossy)
+
+- Port `dcaenc.c`: 48 kHz, 512-sample frames, 1509 kb/s, 5.1. This is the
+  backward-compatible layer every legacy decoder and receiver plays.
+- The core carries the 5.1 fold of the 7.1 bed — the rears folded into the
+  side surrounds at the coefficient the XLL layer declares — which is what
+  the reference streams carry.
+- **Accept when**: it decodes cleanly in FFmpeg and in `dca`, and matches
+  `ffmpeg -c:a dca` at the same bitrate (the same encoder, so this checks
+  the port). `dcaenc`'s quality is modest; a better core is a separate job,
+  after C3.
+- **Size**: 1–2 weeks. **Risk**: low.
+
+#### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1
+
+- The channel-set hierarchy the reference streams use: a six-channel set and
+  a two-channel set whose downmix is embedded in the first (7.1 → 5.1);
+  adaptive prediction, pairwise decorrelation, Rice coding, segments and the
+  navigation table; one frequency band, 48 kHz.
+- **C2a**: every channel full-coded, independent of the core. Lossless
+  whatever the core does, so C1 and C2 do not wait on each other.
+- **C2b**: residual against the core, for bitrate. The encoder then has to
+  reconstruct the core exactly as the decoder does — its fixed-point path —
+  so a core decode runs inside the encoder loop.
+- **Accept when**: bit-exact through `dca` and FFmpeg on every frame and
+  every channel, at 16 and 24 bits. A 7.1 DTS-HD Master Audio stream from a
+  master is useful on its own.
+- **Size**: 3–5 weeks. **Risk**: medium — no encoder to read from, only the
+  specification and the decoder.
+
+#### Phase C3 — The DTS:X extension, fixed 7.1.4
+
+- Render the master to 7.1.4 (`hz-programme`, `hz-render::Room`, as the IAMF
+  bed does), fold each height into its lower corner at code 55, and write the
+  bare four-channel set, the 22-byte prefix from its fields (not as a pasted
+  constant) and the EXSS navigation word.
+- 🔴 **Navigation bounds.** As it is read today, the navigation word gives the
+  block's offset in 11 bits of four bytes (8,188 bytes at most) and its size
+  in 10 bits of four bytes plus 24 (4,116 bytes at most). Four full-coded
+  heights at 24 bits are 6,144 bytes of raw PCM a frame, and a full-coded
+  bed alone can pass the offset range, so incompressible input does not fit
+  the observed form — and peak-bitrate smoothing (C4) does not shrink the
+  logical frame. First check, on the largest blocks of the reference
+  streams, whether either field is wider than the masks the reader applies
+  (an older probe of the whole payload saw up to 4,556 bytes, which may
+  include padding). Then either a navigation form that holds larger blocks,
+  or a stated domain: a frame that cannot be navigated is rejected with an
+  error naming it, never truncated or re-quantised. The bed uses the C2b
+  residual coding here, not C2a's full-coded form.
+- 🔴 **Headroom.** Bed plus 0.707 × height can pass 24-bit full scale. The
+  fold needs the limiter (`Headroom::Limit`) or a margin before it, or the
+  lossless bed clips.
+- **Accept when**: (a) `dca` presents the stream as the standard height
+  profile and returns the composite bed and the four height waveforms
+  bit-exactly, and the harness's integer unfold (C0) turns them back into
+  the twelve pre-fold channels bit-exactly; (b) FFmpeg returns the 7.1 bed
+  bit-exactly and reports the DTS:X profile; (c) it plays as DTS:X on a
+  licensed receiver over HDMI passthrough, with the heights where they
+  belong; (d) listening; (e) a synthetic 24-bit white-noise master either
+  encodes losslessly or is rejected by the navigation check, as the domain
+  chosen above says.
+- 🔴 The fields pinned to observed values satisfy our own decoders by
+  construction. Only (c) shows that a licensed decoder accepts them.
+- **Size**: 1–2 weeks for the bitstream. **Risk**: medium, all of it in (c).
+
+#### Phase C4 — Peak bitrate
+
+- Peak-bitrate smoothing as the reference streams do it (their XLL frames
+  vary widely in size from one frame to the next), under the optical-disc
+  ceiling of 24.5 Mb/s with the core included; dialnorm in the core header.
+  No dynamic range control to start with.
+- **Accept when**: a whole title stays under the ceiling in the decoder's
+  buffer model and stays bit-exact.
+- **Size**: about a week. **Risk**: low to medium.
+
+#### Phase C5 — Command line and containers
+
+- `harlettizer dts` (or `encode --codec dts`) with the usual progress lines;
+  raw `.dts` (core + EXSS) and Matroska (`A_DTS`), by generalising the IAMF
+  Matroska writer.
+- **Size**: about a week. **Risk**: low.
+
+#### Phase C6 — Objects (research)
+
+- The alternate profiles, which carry one to five objects beside the four
+  heights. **Mode 1 only**: each object states its fold rows into the bed,
+  so every decoder removes exactly what was added. The stated rows of the
+  reference streams follow the point-source renderer of ETSI TS 103 584,
+  quantised (it reproduces 3,994 of the 3,995 distinct positions observed),
+  and a stated fold is exact integer arithmetic, `(x·Q15 + 2^14) >> 15`.
+- **Mode 0 is never written.** In mode 0 the stream gives positions without
+  rows, and the receiver re-derives each fold with its own renderer. No
+  public document fixes that renderer, so a receiver whose law differs from
+  ours would leave a ghost of every object in the bed, and no offline check
+  would show it — to save a few bytes a frame.
+- Clustering to the profile's object count through `hz-cluster`.
+- **Accept when**: as C3, plus the objects at their positions on the
+  receiver.
+- **Size**: open-ended. **Risk**: high — the object grammar still has
+  fields that are only pinned, and acceptance is a hardware question.
+
 ### Phase 6 — AC-4
 
 - Build on `oxideav-ac4` (MIT, already in the workspace as a reference
@@ -705,6 +860,8 @@ in the table rather than as a surprise months later.
 | Patent exposure | Legal, not technical | Publish the notice, take the posture of comparable projects |
 | Scope drift into container/muxing/IMF work | Never finishes | Out of scope: use FFmpeg/mkvmerge for muxing. This project produces elementary streams and master files only |
 | A measurement taken from an unlicensed run of the reference engine | Fatal, project-ending | Written rule in LEGAL.md §3.1; nothing enters the repository from one |
+| DTS:X fields pinned to the values observed (the prefix wrapper, the navigation markers, the object grammar) | Every offline check passes and a licensed receiver refuses or ignores the extension | Play C3 on hardware before C6 is built on it; never vary a field that is not read |
+| A DTS core ported from `dcaenc` is modest at 1.5 Mb/s | Legacy playback sounds worse than a reference stream's | The core is the compatibility layer, not the product; a better one is a separate job after C3 |
 
 ---
 
