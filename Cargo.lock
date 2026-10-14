@@ -230,6 +230,7 @@ name = "hz-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hz-ac3",
  "hz-analysis",
  "hz-cluster",
  "hz-core",
