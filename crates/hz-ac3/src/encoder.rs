@@ -8,20 +8,26 @@
 //   libavcodec/ac3dsp.c — Copyright (c) 2011 Justin Ruggles
 // What was taken and what was changed is recorded in docs/provenance.md.
 
-//! One syncframe at a time: transform, exponents, allocation, mantissas,
-//! bitstream.
+//! One syncframe at a time: transform, coupling, exponents, allocation,
+//! mantissas, bitstream.
 //!
 //! The pipeline is FFmpeg's encoder's, ported: the decisions it makes — when
-//! to send new exponents and how coarsely, how far to raise the SNR offset —
-//! are the ones a stream a decoder has accepted for twenty years was made
-//! with, and the first thing this crate has to do is make the same stream.
-//! What is not here yet is channel coupling, which FFmpeg turns on below
-//! 576 kb/s for five channels; without it a stream is valid at every rate and
-//! simply spends more bits on the high band.
+//! to couple and from which band, when to send new exponents and how
+//! coarsely, how far to raise the SNR offset — are the ones a stream decoders
+//! have accepted for twenty years was made with, and the first thing this
+//! crate has to do is make the same stream. Its own decisions come after, and
+//! are measured against this.
+//!
+//! Channels are indexed as FFmpeg indexes them, because the port is easier to
+//! hold against its source that way: nought is the coupling channel, then the
+//! coded channels in their coded order, the LFE last.
 
 use crate::bitalloc::{self, BANDS, COEFS, Codes, Parameters};
 use crate::mdct::{BLOCK, Mdct, WINDOW, kbd_window};
-use crate::tables::{BANDWIDTH, BIT_RATES, FRAME_WORDS, REMATRIX_BANDS, SAMPLE_RATES};
+use crate::tables::{
+    BANDWIDTH, BIT_RATES, CPL_START, DEFAULT_CPL_BAND_STRUCT, FAST_GAIN, FRAME_WORDS,
+    REMATRIX_BANDS, SAMPLE_RATES,
+};
 use hz_core::bits::BitWriter;
 
 /// Blocks in a syncframe.
@@ -32,7 +38,11 @@ pub const FRAME_SAMPLES: usize = BLOCKS * BLOCK;
 /// transformed against a block of silence before it.
 pub const DELAY: usize = BLOCK;
 
-const MAX_CHANNELS: usize = 6;
+/// The coupling channel's index.
+const CPL: usize = 0;
+/// The coupling channel and up to six coded channels.
+const MAX_CHANNELS: usize = 7;
+const MAX_CPL_BANDS: usize = 18;
 
 /// The speaker arrangement of the full-bandwidth channels (`acmod`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +143,9 @@ pub struct Config {
     /// kb/s, one of [`BIT_RATES`]. `None` takes FFmpeg's default for the
     /// channel count.
     pub bit_rate: Option<u32>,
+    /// Couple the high band where FFmpeg's encoder would, at the band it
+    /// would start from. Off never couples.
+    pub coupling: bool,
     pub metadata: Metadata,
 }
 
@@ -163,15 +176,25 @@ const EXP_DIFF_THRESHOLD: u32 = 500;
 /// less one: the longer the exponents stand, the more they are worth.
 const EXP_STRATEGY_BY_RUN: [u8; 6] = [EXP_D45, EXP_D25, EXP_D25, EXP_D15, EXP_D15, EXP_D15];
 
-/// Exponent groups a strategy takes to cover `coefs` bins, the DC exponent
-/// apart.
-fn exponent_groups(strategy: u8, coefs: usize) -> usize {
-    if coefs == 7 {
-        // The LFE channel's seven bins, which only D15 codes.
-        return 2;
-    }
+/// A block's coupling coordinates are sent again when they moved by more
+/// than this on average over the bands.
+const NEW_CPL_COORD_THRESHOLD: f32 = 0.03;
+
+/// The largest coefficient 24-bit fixed point holds.
+const COEF_MAX: f32 = 16_777_215.0 / 16_777_216.0;
+
+/// Exponent groups a strategy takes to cover `coefs` bins — the coupling
+/// channel's in whole groups, everyone else's with the DC exponent apart.
+fn exponent_groups(cpl: bool, strategy: u8, coefs: usize) -> usize {
     let size = 3usize << (strategy - 1);
-    (coefs + size - 4) / size
+    if cpl {
+        coefs / size
+    } else if coefs == 7 {
+        // The LFE channel's seven bins, which only D15 codes.
+        2
+    } else {
+        (coefs + size - 4) / size
+    }
 }
 
 /// A block-and-channel indexed buffer of `N` values each.
@@ -186,18 +209,49 @@ impl<T: Copy + Default, const N: usize> Planes<T, N> {
         }
     }
 
+    fn index(ch: usize, blk: usize) -> usize {
+        ch * BLOCKS + blk
+    }
+
     fn at(&self, ch: usize, blk: usize) -> &[T; N] {
-        &self.data[ch * BLOCKS + blk]
+        &self.data[Self::index(ch, blk)]
     }
 
     fn at_mut(&mut self, ch: usize, blk: usize) -> &mut [T; N] {
-        &mut self.data[ch * BLOCKS + blk]
+        &mut self.data[Self::index(ch, blk)]
     }
+}
+
+/// How the high band is coupled, fixed for the stream.
+#[derive(Debug, Clone, Copy, Default)]
+struct Coupling {
+    /// First bin of the coupling channel.
+    start: usize,
+    /// One past its last.
+    end: usize,
+    sub_bands: usize,
+    bands: usize,
+    band_sizes: [usize; MAX_CPL_BANDS],
+    /// The range the coupling channel's coefficients are summed over: the
+    /// coupled bins and some either side, as FFmpeg lays it out — which
+    /// matters because the exponent strategy reads every bin of the channel.
+    sum_start: usize,
+    sum_len: usize,
+}
+
+/// One block's coupling coordinates for one channel, as the stream carries
+/// them.
+#[derive(Debug, Clone, Copy, Default)]
+struct Coordinates {
+    master: u8,
+    exp: [u8; MAX_CPL_BANDS],
+    mant: [u8; MAX_CPL_BANDS],
 }
 
 pub struct Encoder {
     mode: ChannelMode,
     lfe: bool,
+    /// Coded channels, the LFE included.
     channels: usize,
     fbw: usize,
     map: &'static [usize],
@@ -215,7 +269,9 @@ pub struct Encoder {
     crc_inv: [u32; 2],
 
     bandwidth_code: u8,
+    start_freq: [usize; MAX_CHANNELS],
     end_freq: [usize; MAX_CHANNELS],
+    coupling: Option<Coupling>,
     codes: Codes,
     params: Parameters,
     fast_gain_code: u8,
@@ -242,7 +298,10 @@ pub struct Encoder {
     bap: [Planes<u8, COEFS>; 2],
     best: usize,
     qmant: Planes<i16, COEFS>,
+    coordinates: [[Coordinates; MAX_CHANNELS]; BLOCKS],
+    new_coordinates: [[bool; MAX_CHANNELS]; BLOCKS],
     rematrix: [[bool; 4]; BLOCKS],
+    rematrix_bands: usize,
     new_rematrix: [bool; BLOCKS],
     /// Bits the allocation said the frame would take, the two closing fields
     /// included, for the writer to be held to.
@@ -294,15 +353,58 @@ impl Encoder {
         }
 
         let bandwidth_code = BANDWIDTH[fbw - 1][sr_code][rate_index];
+        let full_end = usize::from(bandwidth_code) * 3 + 73;
+        let mut start_freq = [0usize; MAX_CHANNELS];
         let mut end_freq = [0usize; MAX_CHANNELS];
-        for end in end_freq.iter_mut().take(fbw) {
-            *end = usize::from(bandwidth_code) * 3 + 73;
+        for end in end_freq.iter_mut().skip(1).take(fbw) {
+            *end = full_end;
         }
         if config.lfe {
-            end_freq[fbw] = 7;
+            end_freq[fbw + 1] = 7;
         }
 
+        let cpl_start = (config.coupling && config.mode as usize >= ChannelMode::Stereo as usize)
+            .then(|| CPL_START[config.mode as usize - 2][sr_code][rate_index])
+            .filter(|start| *start >= 0);
+        let coupling = cpl_start.map(|start| {
+            let end_band = usize::from(bandwidth_code) / 4 + 3;
+            let start_band = (start as usize).min((end_band - 1).min(15));
+            let mut c = Coupling {
+                start: start_band * 12 + 37,
+                end: end_band * 12 + 37,
+                sub_bands: end_band - start_band,
+                bands: 1,
+                ..Coupling::default()
+            };
+            c.band_sizes[0] = 12;
+            for sub in start_band + 1..end_band {
+                if DEFAULT_CPL_BAND_STRUCT[sub] {
+                    c.band_sizes[c.bands - 1] += 12;
+                } else {
+                    c.band_sizes[c.bands] = 12;
+                    c.bands += 1;
+                }
+            }
+            // FFmpeg aligns the summed range for its vector code: one bin
+            // early, a multiple of 32 long, and inside the block.
+            c.sum_len = (c.sub_bands * 12 + 1).next_multiple_of(32);
+            c.sum_start = (c.start - 1 + c.sum_len).min(COEFS) - c.sum_len;
+            c
+        });
+        if let Some(c) = &coupling {
+            start_freq[CPL] = c.start;
+            end_freq[CPL] = c.end;
+            for end in end_freq.iter_mut().skip(1).take(fbw) {
+                *end = c.start;
+            }
+        }
+        let rematrix_bands = match &coupling {
+            Some(c) => 4 - usize::from(c.start <= 61) - usize::from(c.start == 37),
+            None => 4,
+        };
+
         let codes = Codes::DEFAULT;
+        let planes = channels + 1;
         let mut encoder = Self {
             mode: config.mode,
             lfe: config.lfe,
@@ -320,7 +422,9 @@ impl Encoder {
             samples_written: 0,
             crc_inv,
             bandwidth_code,
+            start_freq,
             end_freq,
+            coupling,
             codes,
             params: codes.parameters(sr_code),
             fast_gain_code: 4,
@@ -331,19 +435,22 @@ impl Encoder {
             mdct: Mdct::new(),
             previous: vec![[0.0; BLOCK]; channels],
             windowed: [0.0; WINDOW],
-            coef: Planes::new(channels),
-            fixed: Planes::new(channels),
-            exp: Planes::new(channels),
+            coef: Planes::new(planes),
+            fixed: Planes::new(planes),
+            exp: Planes::new(planes),
             strategy: [[EXP_REUSE; BLOCKS]; MAX_CHANNELS],
             exp_ref: [[0; BLOCKS]; MAX_CHANNELS],
-            grouped: Planes::new(channels),
-            psd: Planes::new(channels),
-            band_psd: Planes::new(channels),
-            mask: Planes::new(channels),
-            bap: [Planes::new(channels), Planes::new(channels)],
+            grouped: Planes::new(planes),
+            psd: Planes::new(planes),
+            band_psd: Planes::new(planes),
+            mask: Planes::new(planes),
+            bap: [Planes::new(planes), Planes::new(planes)],
             best: 0,
-            qmant: Planes::new(channels),
+            qmant: Planes::new(planes),
+            coordinates: [[Coordinates::default(); MAX_CHANNELS]; BLOCKS],
+            new_coordinates: [[false; MAX_CHANNELS]; BLOCKS],
             rematrix: [[false; 4]; BLOCKS],
+            rematrix_bands,
             new_rematrix: [false; BLOCKS],
             planned_bits: 0,
         };
@@ -364,6 +471,32 @@ impl Encoder {
         self.sample_rate
     }
 
+    /// Whether the stream couples its high band.
+    pub fn coupled(&self) -> bool {
+        self.coupling.is_some()
+    }
+
+    /// The first channel (counting from one) and the channels after it, the
+    /// coupling channel spliced in after the first coupled one — the order
+    /// mantissas are quantised and written in.
+    fn mantissa_order(&self) -> impl Iterator<Item = usize> + '_ {
+        let cpl = self.coupling.is_some();
+        (1..=self.channels).flat_map(move |ch| {
+            let after = cpl && ch == 1;
+            std::iter::once(ch).chain(after.then_some(CPL))
+        })
+    }
+
+    /// The channels whose exponents, strategies and offsets the stream
+    /// carries, the coupling channel first when there is one.
+    fn coded_channels(&self) -> std::ops::RangeInclusive<usize> {
+        usize::from(self.coupling.is_none())..=self.channels
+    }
+
+    fn in_coupling(&self, ch: usize) -> bool {
+        self.coupling.is_some() && (1..=self.fbw).contains(&ch)
+    }
+
     /// Encode one syncframe from [`FRAME_SAMPLES`] samples of each channel,
     /// planar, in WAV order, full scale ±1; append it to `out`.
     ///
@@ -377,6 +510,9 @@ impl Encoder {
             self.adjust_frame_size();
         }
         self.transform(input);
+        if self.coupling.is_some() {
+            self.couple();
+        }
         self.compute_rematrixing();
         self.scale_coefficients();
         self.apply_rematrixing();
@@ -404,12 +540,12 @@ impl Encoder {
     }
 
     fn transform(&mut self, input: &[&[f32]]) {
-        for ch in 0..self.channels {
-            let source = input[self.map[ch]];
+        for ch in 1..=self.channels {
+            let source = input[self.map[ch - 1]];
             for blk in 0..BLOCKS {
                 let current = &source[blk * BLOCK..(blk + 1) * BLOCK];
                 let previous: &[f32; BLOCK] = if blk == 0 {
-                    &self.previous[ch]
+                    &self.previous[ch - 1]
                 } else {
                     source[(blk - 1) * BLOCK..blk * BLOCK].try_into().unwrap()
                 };
@@ -420,7 +556,129 @@ impl Encoder {
                 let out = self.coef.at_mut(ch, blk);
                 self.mdct.forward(&self.windowed, out);
             }
-            self.previous[ch].copy_from_slice(&source[(BLOCKS - 1) * BLOCK..]);
+            self.previous[ch - 1].copy_from_slice(&source[(BLOCKS - 1) * BLOCK..]);
+        }
+    }
+
+    /// The coupling channel — the sum of the coupled channels over the high
+    /// band — and each channel's coordinates: the square root of its energy
+    /// over the sum's, per band, an eighth of it as the stream scales it.
+    fn couple(&mut self) {
+        let c = self.coupling.expect("coupling");
+        for blk in 0..BLOCKS {
+            let mut sum = [0f32; COEFS];
+            for ch in 1..=self.fbw {
+                let coef = self.coef.at(ch, blk);
+                for i in c.sum_start..c.sum_start + c.sum_len {
+                    sum[i] += coef[i];
+                }
+            }
+            let cpl = self.coef.at_mut(CPL, blk);
+            for i in c.sum_start..c.sum_start + c.sum_len {
+                cpl[i] = sum[i].clamp(-COEF_MAX, COEF_MAX);
+            }
+        }
+
+        let mut energy = [[[0f32; MAX_CPL_BANDS]; MAX_CHANNELS]; BLOCKS];
+        let mut bin = c.start;
+        for band in 0..c.bands {
+            let size = c.band_sizes[band];
+            for ch in CPL..=self.fbw {
+                for (blk, energy) in energy.iter_mut().enumerate() {
+                    let coef = self.coef.at(ch, blk);
+                    energy[ch][band] = coef[bin..bin + size].iter().map(|v| v * v).sum();
+                }
+            }
+            bin += size;
+        }
+
+        let coordinate = |ch: f32, cpl: f32| {
+            let mut coord = 0.125;
+            if cpl > 0.0 {
+                coord *= (ch / cpl).sqrt();
+            }
+            f32::min(coord, COEF_MAX)
+        };
+        let mut coords = [[[0f32; MAX_CPL_BANDS]; MAX_CHANNELS]; BLOCKS];
+        for blk in 0..BLOCKS {
+            for ch in 1..=self.fbw {
+                for band in 0..c.bands {
+                    coords[blk][ch][band] =
+                        coordinate(energy[blk][ch][band], energy[blk][CPL][band]);
+                }
+            }
+        }
+
+        // New coordinates where they moved.
+        for blk in 0..BLOCKS {
+            self.new_coordinates[blk] = [false; MAX_CHANNELS];
+            for ch in 1..=self.fbw {
+                self.new_coordinates[blk][ch] = blk == 0 || {
+                    let moved: f32 = (0..c.bands)
+                        .map(|band| (coords[blk - 1][ch][band] - coords[blk][ch][band]).abs())
+                        .sum();
+                    moved / c.bands as f32 > NEW_CPL_COORD_THRESHOLD
+                };
+            }
+        }
+
+        // Coordinates that stand for several blocks are those blocks'
+        // energies taken together. FFmpeg steps from run to run by the *last*
+        // channel's runs, so another channel's run that starts elsewhere keeps
+        // its first block's own coordinate; kept, so that the streams agree,
+        // and a thing to measure when this encoder starts deciding for itself.
+        for band in 0..c.bands {
+            let mut blk = 0;
+            while blk < BLOCKS {
+                let mut next = blk + 1;
+                for ch in 1..=self.fbw {
+                    let (mut ch_energy, mut cpl_energy) =
+                        (energy[blk][ch][band], energy[blk][CPL][band]);
+                    next = blk + 1;
+                    while next < BLOCKS && !self.new_coordinates[next][ch] {
+                        ch_energy += energy[next][ch][band];
+                        cpl_energy += energy[next][CPL][band];
+                        next += 1;
+                    }
+                    coords[blk][ch][band] = coordinate(ch_energy, cpl_energy);
+                }
+                blk = next;
+            }
+        }
+
+        // To the stream's exponents and mantissas: a master exponent per
+        // channel, three steps of it, and four bits of each.
+        for blk in 0..BLOCKS {
+            for ch in 1..=self.fbw {
+                let mut fixed = [0i32; MAX_CPL_BANDS];
+                let mut exp = [0i32; MAX_CPL_BANDS];
+                for band in 0..c.bands {
+                    fixed[band] = to_fixed24(coords[blk][ch][band]);
+                    exp[band] = exponent(fixed[band]);
+                }
+                if !self.new_coordinates[blk][ch] {
+                    continue;
+                }
+                let bands = &exp[..c.bands];
+                let (min, max) = (*bands.iter().min().unwrap(), *bands.iter().max().unwrap());
+                let mut master = (((max - 15) + 2) / 3).max(0);
+                while min < master * 3 {
+                    master -= 1;
+                }
+                let out = &mut self.coordinates[blk][ch];
+                out.master = master as u8;
+                for band in 0..c.bands {
+                    let e = (exp[band] - master * 3).clamp(0, 15);
+                    out.exp[band] = e as u8;
+                    let mut mant = (fixed[band] << (5 + e + master * 3)) >> 24;
+                    if e == 15 {
+                        mant >>= 1;
+                    } else {
+                        mant -= 16;
+                    }
+                    out.mant[band] = mant as u8;
+                }
+            }
         }
     }
 
@@ -430,11 +688,11 @@ impl Encoder {
         if self.mode != ChannelMode::Stereo {
             return;
         }
-        let coefs = self.end_freq[0].min(self.end_freq[1]);
+        let coefs = self.end_freq[1].min(self.end_freq[2]);
         for blk in 0..BLOCKS {
             self.new_rematrix[blk] = blk == 0;
-            let (left, right) = (self.coef.at(0, blk), self.coef.at(1, blk));
-            for band in 0..4 {
+            let (left, right) = (self.coef.at(1, blk), self.coef.at(2, blk));
+            for band in 0..self.rematrix_bands {
                 let start = REMATRIX_BANDS[band];
                 let end = coefs.min(REMATRIX_BANDS[band + 1]);
                 let mut sum = [0f32; 4];
@@ -456,17 +714,11 @@ impl Encoder {
 
     /// To 24-bit fixed point, which everything after the transform is in.
     fn scale_coefficients(&mut self) {
-        const LIMIT: f32 = 16_777_215.0;
-        for ch in 0..self.channels {
+        for ch in self.coded_channels() {
             for blk in 0..BLOCKS {
-                let (coef, fixed) = (
-                    self.coef.at(ch, blk),
-                    &mut self.fixed.data[ch * BLOCKS + blk],
-                );
-                for (f, c) in fixed.iter_mut().zip(coef) {
-                    // Clamped where FFmpeg is not: a coefficient at full
-                    // scale has no exponent to say it with.
-                    *f = (c * 16_777_216.0).round_ties_even().clamp(-LIMIT, LIMIT) as i32;
+                let i = Planes::<f32, COEFS>::index(ch, blk);
+                for (f, c) in self.fixed.data[i].iter_mut().zip(&self.coef.data[i]) {
+                    *f = to_fixed24(*c);
                 }
             }
         }
@@ -476,19 +728,19 @@ impl Encoder {
         if self.mode != ChannelMode::Stereo {
             return;
         }
-        let coefs = self.end_freq[0].min(self.end_freq[1]);
+        let coefs = self.end_freq[1].min(self.end_freq[2]);
         for blk in 0..BLOCKS {
-            for band in 0..4 {
+            for band in 0..self.rematrix_bands {
                 if !self.rematrix[blk][band] {
                     continue;
                 }
                 let start = REMATRIX_BANDS[band];
                 let end = coefs.min(REMATRIX_BANDS[band + 1]);
                 for i in start..end {
-                    let l = self.fixed.at(0, blk)[i];
-                    let r = self.fixed.at(1, blk)[i];
-                    self.fixed.at_mut(0, blk)[i] = (l + r) >> 1;
-                    self.fixed.at_mut(1, blk)[i] = (l - r) >> 1;
+                    let l = self.fixed.at(1, blk)[i];
+                    let r = self.fixed.at(2, blk)[i];
+                    self.fixed.at_mut(1, blk)[i] = (l + r) >> 1;
+                    self.fixed.at_mut(2, blk)[i] = (l - r) >> 1;
                 }
             }
         }
@@ -496,20 +748,25 @@ impl Encoder {
 
     fn process_exponents(&mut self) {
         // Extract.
-        for ch in 0..self.channels {
+        for ch in self.coded_channels() {
             for blk in 0..BLOCKS {
-                let fixed = self.fixed.at(ch, blk);
-                let exp = &mut self.exp.data[ch * BLOCKS + blk];
-                for (e, c) in exp.iter_mut().zip(fixed) {
-                    let v = c.unsigned_abs();
-                    *e = if v == 0 { 24 } else { (23 - v.ilog2()) as u8 };
+                let i = Planes::<u8, COEFS>::index(ch, blk);
+                for (e, c) in self.exp.data[i].iter_mut().zip(&self.fixed.data[i]) {
+                    *e = exponent(*c) as u8;
                 }
             }
         }
 
         // Strategy: new exponents where they moved, then a coarser grid the
         // longer they are kept.
-        for ch in 0..self.fbw {
+        let first = usize::from(self.coupling.is_none());
+        for ch in first..=self.fbw {
+            let threshold = if ch == CPL {
+                EXP_DIFF_THRESHOLD * (self.end_freq[CPL] - self.start_freq[CPL]) as u32
+                    / COEFS as u32
+            } else {
+                EXP_DIFF_THRESHOLD
+            };
             let strategy = &mut self.strategy[ch];
             strategy[0] = EXP_NEW;
             for blk in 1..BLOCKS {
@@ -520,11 +777,7 @@ impl Encoder {
                     .zip(self.exp.at(ch, blk - 1))
                     .map(|(a, b)| u32::from(a.abs_diff(*b)))
                     .sum();
-                strategy[blk] = if diff > EXP_DIFF_THRESHOLD {
-                    EXP_NEW
-                } else {
-                    EXP_REUSE
-                };
+                strategy[blk] = if diff > threshold { EXP_NEW } else { EXP_REUSE };
             }
             let mut blk = 0;
             while blk < BLOCKS {
@@ -537,14 +790,14 @@ impl Encoder {
             }
         }
         if self.lfe {
-            let strategy = &mut self.strategy[self.fbw];
+            let strategy = &mut self.strategy[self.channels];
             strategy[0] = EXP_D15;
             strategy[1..].fill(EXP_REUSE);
         }
 
         // Encode: the exponents the decoder will see, in the first block of
         // each run.
-        for ch in 0..self.channels {
+        for ch in self.coded_channels() {
             let mut blk = 0;
             while blk < BLOCKS {
                 let mut next = blk + 1;
@@ -560,8 +813,13 @@ impl Encoder {
                     }
                 }
                 let strategy = self.strategy[ch][blk];
-                let coefs = self.end_freq[ch];
-                encode_exponents(self.exp.at_mut(ch, blk), coefs, strategy);
+                let (start, end) = (self.start_freq[ch], self.end_freq[ch]);
+                let exp = self.exp.at_mut(ch, blk);
+                if ch == CPL {
+                    encode_cpl_exponents(exp, start, end - start, strategy);
+                } else {
+                    encode_exponents(exp, end, strategy);
+                }
                 blk = next;
             }
         }
@@ -571,25 +829,26 @@ impl Encoder {
         let frame_bits = self.frame_bits_fixed + self.count_frame_bits();
         let mut exponent_bits = 0;
         for blk in 0..BLOCKS {
-            for ch in 0..self.channels {
+            for ch in self.coded_channels() {
                 let strategy = self.strategy[ch][blk];
                 if strategy != EXP_REUSE {
-                    exponent_bits += 4 + 7 * exponent_groups(strategy, self.end_freq[ch]);
+                    let coefs = self.end_freq[ch] - self.start_freq[ch];
+                    exponent_bits += 4 + 7 * exponent_groups(ch == CPL, strategy, coefs);
                 }
             }
         }
 
         // Masking curves, once: they do not depend on the SNR offset.
         for blk in 0..BLOCKS {
-            for ch in 0..self.channels {
+            for ch in self.coded_channels() {
                 if self.strategy[ch][blk] == EXP_REUSE {
                     continue;
                 }
-                let end = self.end_freq[ch];
-                let i = ch * BLOCKS + blk;
+                let (start, end) = (self.start_freq[ch], self.end_freq[ch]);
+                let i = Planes::<u8, COEFS>::index(ch, blk);
                 bitalloc::psd(
                     &self.exp.data[i],
-                    0,
+                    start,
                     end,
                     &mut self.psd.data[i],
                     &mut self.band_psd.data[i],
@@ -597,10 +856,10 @@ impl Encoder {
                 bitalloc::mask(
                     &self.params,
                     &self.band_psd.data[i],
-                    0,
+                    start,
                     end,
-                    crate::tables::FAST_GAIN[usize::from(self.fast_gain_code)],
-                    self.lfe && ch == self.fbw,
+                    FAST_GAIN[usize::from(self.fast_gain_code)],
+                    self.lfe && ch == self.channels,
                     &mut self.mask.data[i],
                 );
             }
@@ -614,9 +873,8 @@ impl Encoder {
             )));
         }
         let bits_left = bits_left as usize;
-        let trial = 1 - self.best;
-
         let fixed_bits = frame_bits + exponent_bits;
+        let trial = 1 - self.best;
 
         let mut snr = self.coarse_snr << 4;
         if (snr | self.fine_snr) == 1023 {
@@ -666,15 +924,15 @@ impl Encoder {
     fn bit_alloc(&mut self, set: usize, snr: i32) -> usize {
         let offset = (snr - 240) * 4;
         for blk in 0..BLOCKS {
-            for ch in 0..self.channels {
+            for ch in self.coded_channels() {
                 if self.strategy[ch][blk] == EXP_REUSE {
                     continue;
                 }
-                let i = ch * BLOCKS + blk;
+                let i = Planes::<u8, COEFS>::index(ch, blk);
                 bitalloc::bap(
                     &self.mask.data[i],
                     &self.psd.data[i],
-                    0,
+                    self.start_freq[ch],
                     self.end_freq[ch],
                     offset,
                     self.params.floor,
@@ -685,9 +943,9 @@ impl Encoder {
         let mut bits = 0;
         for blk in 0..BLOCKS {
             let mut counts = bitalloc::primed_counts();
-            for ch in 0..self.channels {
+            for ch in self.coded_channels() {
                 let bap = self.bap[set].at(ch, self.exp_ref[ch][blk]);
-                for value in &bap[..self.end_freq[ch]] {
+                for value in &bap[self.start_freq[ch]..self.end_freq[ch]] {
                     counts[usize::from(*value)] += 1;
                 }
             }
@@ -698,23 +956,30 @@ impl Encoder {
 
     fn group_exponents(&mut self) {
         for blk in 0..BLOCKS {
-            for ch in 0..self.channels {
+            for ch in self.coded_channels() {
                 let strategy = self.strategy[ch][blk];
                 if strategy == EXP_REUSE {
                     continue;
                 }
+                let cpl = ch == CPL;
                 let size = usize::from(strategy + u8::from(strategy == EXP_D45));
-                let groups = exponent_groups(strategy, self.end_freq[ch]);
+                let (start, end) = (self.start_freq[ch], self.end_freq[ch]);
+                let groups = exponent_groups(cpl, strategy, end - start);
                 let exp = *self.exp.at(ch, blk);
                 let grouped = self.grouped.at_mut(ch, blk);
-                grouped[0] = exp[0];
-                let mut at = 0usize;
+                // The coupling channel's reference exponent sits in the bin
+                // before its first.
+                let mut at = start - usize::from(cpl);
+                let mut previous = exp[at];
+                grouped[0] = previous;
+                at += 1;
                 for group in grouped.iter_mut().skip(1).take(groups) {
                     let mut code = 0u8;
                     for _ in 0..3 {
-                        let delta = i16::from(exp[at + size]) - i16::from(exp[at]) + 2;
-                        debug_assert!((0..=4).contains(&delta));
+                        let delta = i16::from(exp[at]) - i16::from(previous) + 2;
+                        debug_assert!((0..=4).contains(&delta), "{delta}");
                         code = code * 5 + delta as u8;
+                        previous = exp[at];
                         at += size;
                     }
                     *group = code;
@@ -724,15 +989,16 @@ impl Encoder {
     }
 
     fn quantize(&mut self) {
+        let order: Vec<usize> = self.mantissa_order().collect();
         for blk in 0..BLOCKS {
             let mut groups = Groups::default();
-            for ch in 0..self.channels {
+            for &ch in &order {
                 let reference = self.exp_ref[ch][blk];
                 let exp = *self.exp.at(ch, reference);
                 let bap = *self.bap[self.best].at(ch, reference);
                 let fixed = *self.fixed.at(ch, blk);
-                let i = ch * BLOCKS + blk;
-                for bin in 0..self.end_freq[ch] {
+                let i = Planes::<u8, COEFS>::index(ch, blk);
+                for bin in self.start_freq[ch]..self.end_freq[ch] {
                     let (c, e) = (fixed[bin], i32::from(exp[bin]));
                     let v = match bap[bin] {
                         0 => 0,
@@ -778,24 +1044,52 @@ impl Encoder {
     }
 
     fn count_frame_bits(&self) -> usize {
+        let cpl = self.coupling;
         let mut bits = 0;
         for blk in 0..BLOCKS {
             if blk == 0 {
                 bits += 1; // coupling in use
+                if let Some(c) = &cpl {
+                    bits += self.fbw; // channels in coupling
+                    if self.mode == ChannelMode::Stereo {
+                        bits += 1; // phase flags in use
+                    }
+                    bits += 4 + 4 + c.sub_bands - 1; // range and band structure
+                }
+            }
+            if let Some(c) = &cpl {
+                for ch in 1..=self.fbw {
+                    bits += 1;
+                    if self.new_coordinates[blk][ch] {
+                        bits += 2 + (4 + 4) * c.bands;
+                    }
+                }
             }
             if self.mode == ChannelMode::Stereo {
                 bits += 1;
                 if self.new_rematrix[blk] {
-                    bits += 4;
+                    bits += self.rematrix_bands;
                 }
             }
-            for ch in 0..self.fbw {
+            for ch in 1..=self.fbw {
                 if self.strategy[ch][blk] != EXP_REUSE {
-                    bits += 6 + 2; // bandwidth and gain range
+                    if !self.in_coupling(ch) {
+                        bits += 6; // bandwidth
+                    }
+                    bits += 2; // gain range
                 }
+            }
+            if cpl.is_some() {
+                bits += 2; // coupling exponent strategy
             }
             if blk == 0 {
-                bits += 6 + self.channels * (4 + 3);
+                bits += 6 + (self.channels + usize::from(cpl.is_some())) * (4 + 3);
+            }
+            if cpl.is_some() {
+                bits += 1; // coupling leak exists
+                if blk == 0 {
+                    bits += 3 + 3;
+                }
             }
         }
         bits
@@ -862,40 +1156,75 @@ impl Encoder {
             w.put(1, 1); // dither
         }
         w.put(1, 0); // no dynamic range word
-        w.put_bit(blk == 0); // a coupling strategy follows
+
+        // Coupling strategy, stated once: every full-bandwidth channel in,
+        // over the band FFmpeg would choose, in the default banding.
+        w.put_bit(blk == 0);
         if blk == 0 {
-            w.put(1, 0); // and it is: no coupling
-        }
-        if self.mode == ChannelMode::Stereo {
-            w.put_bit(self.new_rematrix[blk]);
-            if self.new_rematrix[blk] {
-                for flag in self.rematrix[blk] {
-                    w.put_bit(flag);
+            w.put_bit(self.coupling.is_some());
+            if let Some(c) = &self.coupling {
+                for _ in 0..self.fbw {
+                    w.put(1, 1);
+                }
+                if self.mode == ChannelMode::Stereo {
+                    w.put(1, 0); // no phase flags
+                }
+                let start = (c.start - 37) / 12;
+                let end = (c.end - 37) / 12;
+                w.put(4, start as u32);
+                w.put(4, (end - 3) as u32);
+                for sub in start + 1..end {
+                    w.put_bit(DEFAULT_CPL_BAND_STRUCT[sub]);
                 }
             }
         }
-        for ch in 0..self.fbw {
+        if let Some(c) = &self.coupling {
+            for ch in 1..=self.fbw {
+                let new = self.new_coordinates[blk][ch];
+                w.put_bit(new);
+                if new {
+                    let coords = &self.coordinates[blk][ch];
+                    w.put(2, u32::from(coords.master));
+                    for band in 0..c.bands {
+                        w.put(4, u32::from(coords.exp[band]));
+                        w.put(4, u32::from(coords.mant[band]));
+                    }
+                }
+            }
+        }
+
+        if self.mode == ChannelMode::Stereo {
+            w.put_bit(self.new_rematrix[blk]);
+            if self.new_rematrix[blk] {
+                for flag in &self.rematrix[blk][..self.rematrix_bands] {
+                    w.put_bit(*flag);
+                }
+            }
+        }
+        for ch in usize::from(self.coupling.is_none())..=self.fbw {
             w.put(2, u32::from(self.strategy[ch][blk]));
         }
         if self.lfe {
-            w.put(1, u32::from(self.strategy[self.fbw][blk]));
+            w.put(1, u32::from(self.strategy[self.channels][blk]));
         }
-        for ch in 0..self.fbw {
-            if self.strategy[ch][blk] != EXP_REUSE {
+        for ch in 1..=self.fbw {
+            if self.strategy[ch][blk] != EXP_REUSE && !self.in_coupling(ch) {
                 w.put(6, u32::from(self.bandwidth_code));
             }
         }
-        for ch in 0..self.channels {
+        for ch in self.coded_channels() {
             let strategy = self.strategy[ch][blk];
             if strategy == EXP_REUSE {
                 continue;
             }
+            let cpl = ch == CPL;
             let grouped = self.grouped.at(ch, blk);
-            w.put(4, u32::from(grouped[0]));
-            for group in &grouped[1..=exponent_groups(strategy, self.end_freq[ch])] {
+            w.put(4, u32::from(grouped[0] >> u8::from(cpl)));
+            let coefs = self.end_freq[ch] - self.start_freq[ch];
+            for group in &grouped[1..=exponent_groups(cpl, strategy, coefs)] {
                 w.put(7, u32::from(*group));
             }
-            if ch < self.fbw {
+            if (1..=self.fbw).contains(&ch) {
                 w.put(2, 0); // gain range
             }
         }
@@ -911,18 +1240,25 @@ impl Encoder {
         w.put_bit(blk == 0); // SNR offsets
         if blk == 0 {
             w.put(6, self.coarse_snr as u32);
-            for _ in 0..self.channels {
+            for _ in self.coded_channels() {
                 w.put(4, self.fine_snr as u32);
                 w.put(3, u32::from(self.fast_gain_code));
+            }
+        }
+        if self.coupling.is_some() {
+            w.put_bit(blk == 0); // coupling leak
+            if blk == 0 {
+                w.put(3, self.params.cpl_fast_leak as u32);
+                w.put(3, self.params.cpl_slow_leak as u32);
             }
         }
         w.put(1, 0); // no delta bit allocation
         w.put(1, 0); // no skipped data
 
-        for ch in 0..self.channels {
+        for ch in self.mantissa_order() {
             let bap = self.bap[self.best].at(ch, self.exp_ref[ch][blk]);
             let qmant = self.qmant.at(ch, blk);
-            for bin in 0..self.end_freq[ch] {
+            for bin in self.start_freq[ch]..self.end_freq[ch] {
                 let q = qmant[bin];
                 let bits = match bap[bin] {
                     0 => continue,
@@ -960,6 +1296,23 @@ impl Encoder {
         }
         frame[size - 2..].copy_from_slice(&crc2.to_be_bytes());
     }
+}
+
+/// A coefficient in 24-bit fixed point, rounded to nearest even as FFmpeg's
+/// `lrintf` rounds, and clamped where FFmpeg does not clamp: a coefficient at
+/// full scale has no exponent to be said with.
+fn to_fixed24(value: f32) -> i32 {
+    const LIMIT: f32 = 16_777_215.0;
+    (value * 16_777_216.0)
+        .round_ties_even()
+        .clamp(-LIMIT, LIMIT) as i32
+}
+
+/// A fixed-point value's exponent: its leading zeros below bit 23, 24 for
+/// nought.
+fn exponent(value: i32) -> i32 {
+    let v = value.unsigned_abs();
+    if v == 0 { 24 } else { 23 - v.ilog2() as i32 }
 }
 
 /// What stands in the place of a mantissa whose value went into an earlier
@@ -1022,7 +1375,7 @@ fn asym_quant(c: i32, e: i32, bits: i32) -> i32 {
 /// The exponents a decoder will reconstruct, from the minimum over each
 /// group, the DC exponent capped, and every step held to ±2.
 fn encode_exponents(exp: &mut [u8; COEFS], coefs: usize, strategy: u8) {
-    let groups = exponent_groups(strategy, coefs) * 3;
+    let groups = exponent_groups(false, strategy, coefs) * 3;
     match strategy {
         EXP_D25 => {
             for i in 1..=groups {
@@ -1039,12 +1392,7 @@ fn encode_exponents(exp: &mut [u8; COEFS], coefs: usize, strategy: u8) {
         _ => {}
     }
     exp[0] = exp[0].min(15);
-    for i in 1..=groups {
-        exp[i] = exp[i].min(exp[i - 1] + 2);
-    }
-    for i in (0..groups).rev() {
-        exp[i] = exp[i].min(exp[i + 1] + 2);
-    }
+    limit_steps(exp, 0, groups);
     match strategy {
         EXP_D25 => {
             for i in (1..=groups).rev() {
@@ -1060,6 +1408,63 @@ fn encode_exponents(exp: &mut [u8; COEFS], coefs: usize, strategy: u8) {
             }
         }
         _ => {}
+    }
+}
+
+/// The same for the coupling channel, whose exponents start at `start` and
+/// whose reference exponent — even, and the first group's — sits in the bin
+/// before.
+fn encode_cpl_exponents(exp: &mut [u8; COEFS], start: usize, coefs: usize, strategy: u8) {
+    let groups = exponent_groups(true, strategy, coefs) * 3;
+    let at = |i: usize| start + i;
+    match strategy {
+        EXP_D25 => {
+            for i in 1..=groups {
+                let k = 2 * (i - 1);
+                exp[at(i - 1)] = exp[at(k)].min(exp[at(k + 1)]);
+            }
+        }
+        EXP_D45 => {
+            for i in 1..=groups {
+                let k = 4 * (i - 1);
+                exp[at(i - 1)] = exp[at(k)]
+                    .min(exp[at(k + 1)])
+                    .min(exp[at(k + 2)])
+                    .min(exp[at(k + 3)]);
+            }
+        }
+        _ => {}
+    }
+    // FFmpeg's steps run over one value past the groups, which is the bin
+    // after the channel's last; kept, so that the streams agree.
+    limit_steps(exp, start, groups);
+    exp[start - 1] = exp[start] & !1;
+    match strategy {
+        EXP_D25 => {
+            for i in (1..=groups).rev() {
+                let v = exp[at(i - 1)];
+                exp[at(2 * i - 1)] = v;
+                exp[at(2 * i - 2)] = v;
+            }
+        }
+        EXP_D45 => {
+            for i in (1..=groups).rev() {
+                let v = exp[at(i - 1)];
+                exp[at(4 * i - 4)..=at(4 * i - 1)].fill(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Hold every step between `exp[base]` and `exp[base + groups]` to ±2, up
+/// then down.
+fn limit_steps(exp: &mut [u8; COEFS], base: usize, groups: usize) {
+    for i in base + 1..=base + groups {
+        exp[i] = exp[i].min(exp[i - 1] + 2);
+    }
+    for i in (base..base + groups).rev() {
+        exp[i] = exp[i].min(exp[i + 1] + 2);
     }
 }
 
@@ -1129,12 +1534,25 @@ mod tests {
         for f in 0..frames {
             let channels: Vec<Vec<f32>> = (0..encoder.channels())
                 .map(|ch| {
-                    sine(
+                    let mut s = sine(
                         220.0 * (ch + 1) as f32,
                         0.3,
                         f * FRAME_SAMPLES,
                         config.sample_rate as f32,
+                    );
+                    // And something in the high band, for coupling to carry.
+                    for (n, v) in sine(
+                        9000.0 + 500.0 * ch as f32,
+                        0.05,
+                        f * FRAME_SAMPLES,
+                        config.sample_rate as f32,
                     )
+                    .iter()
+                    .enumerate()
+                    {
+                        s[n] += v;
+                    }
+                    s
                 })
                 .collect();
             let refs: Vec<&[f32]> = channels.iter().map(Vec::as_slice).collect();
@@ -1143,24 +1561,32 @@ mod tests {
         out
     }
 
+    fn config(sample_rate: u32, mode: ChannelMode, lfe: bool, kbps: u32, coupling: bool) -> Config {
+        Config {
+            sample_rate,
+            mode,
+            lfe,
+            bit_rate: Some(kbps),
+            coupling,
+            metadata: Metadata::default(),
+        }
+    }
+
     /// Both CRCs check the way a decoder checks them: the first five-eighths
-    /// past the sync word sum to nought, and so does the whole frame.
+    /// past the sync word sum to nought, and so does the whole frame. In
+    /// debug, every frame also holds the writer to the allocation's count.
     #[test]
     fn every_frame_carries_both_crcs() {
-        for (rate, mode, lfe, kbps) in [
-            (48_000, ChannelMode::ThreeTwo, true, 640),
-            (48_000, ChannelMode::Stereo, false, 192),
-            (44_100, ChannelMode::ThreeTwo, true, 448),
-            (32_000, ChannelMode::Mono, false, 96),
+        for (rate, mode, lfe, kbps, coupling) in [
+            (48_000, ChannelMode::ThreeTwo, true, 640, true),
+            (48_000, ChannelMode::ThreeTwo, true, 384, true),
+            (48_000, ChannelMode::Stereo, false, 192, true),
+            (48_000, ChannelMode::Stereo, false, 192, false),
+            (44_100, ChannelMode::ThreeTwo, true, 448, true),
+            (44_100, ChannelMode::TwoOne, false, 320, true),
+            (32_000, ChannelMode::Mono, false, 96, true),
         ] {
-            let config = Config {
-                sample_rate: rate,
-                mode,
-                lfe,
-                bit_rate: Some(kbps),
-                metadata: Metadata::default(),
-            };
-            let stream = encode(config, 8);
+            let stream = encode(config(rate, mode, lfe, kbps, coupling), 8);
             let mut at = 0;
             let mut frames = 0;
             while at < stream.len() {
@@ -1179,35 +1605,30 @@ mod tests {
         }
     }
 
+    /// Coupling is FFmpeg's choice: on for five channels at 448 kb/s, off at
+    /// 640, off when asked.
+    #[test]
+    fn coupling_follows_the_rate() {
+        let on = Encoder::new(config(48_000, ChannelMode::ThreeTwo, true, 448, true)).unwrap();
+        assert!(on.coupled());
+        let off = Encoder::new(config(48_000, ChannelMode::ThreeTwo, true, 640, true)).unwrap();
+        assert!(!off.coupled());
+        let asked = Encoder::new(config(48_000, ChannelMode::ThreeTwo, true, 448, false)).unwrap();
+        assert!(!asked.coupled());
+        let mono = Encoder::new(config(48_000, ChannelMode::Mono, false, 96, true)).unwrap();
+        assert!(!mono.coupled());
+    }
+
     /// At 44.1 kHz the two sizes alternate so that the average is the rate.
     #[test]
     fn the_average_rate_holds_at_44_1() {
-        let config = Config {
-            sample_rate: 44_100,
-            mode: ChannelMode::Stereo,
-            lfe: false,
-            bit_rate: Some(192),
-            metadata: Metadata::default(),
-        };
         let frames = 200;
-        let stream = encode(config, frames);
+        let stream = encode(
+            config(44_100, ChannelMode::Stereo, false, 192, true),
+            frames,
+        );
         let seconds = (frames * FRAME_SAMPLES) as f64 / 44_100.0;
         let rate = stream.len() as f64 * 8.0 / seconds;
         assert!((rate - 192_000.0).abs() < 200.0, "{rate}");
-    }
-
-    #[test]
-    fn grouped_exponents_decode_to_the_encoded_ones() {
-        for strategy in [EXP_D15, EXP_D25, EXP_D45] {
-            let mut exp = [0u8; COEFS];
-            for (i, e) in exp.iter_mut().enumerate() {
-                *e = ((i * 7) % 19) as u8;
-            }
-            encode_exponents(&mut exp, 253, strategy);
-            let size = usize::from(strategy + u8::from(strategy == EXP_D45));
-            for i in 1..253 {
-                assert!(exp[i].abs_diff(exp[i - 1]) <= 2 || (i - 1) % size != 0 || size == 1);
-            }
-        }
     }
 }

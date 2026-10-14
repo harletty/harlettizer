@@ -31,6 +31,7 @@ fn main() {
         mode,
         lfe,
         bit_rate: Some(kbps.parse().unwrap()),
+        coupling: std::env::var_os("NO_COUPLING").is_none(),
         metadata: Metadata::default(),
     })
     .unwrap();
