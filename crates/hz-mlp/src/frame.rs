@@ -433,7 +433,7 @@ fn write_extra_data(writer: &mut BitWriter, evolution: &Evolution<'_>) -> ExtraD
     debug_assert!(writer.is_aligned());
     let start = writer.byte_position();
 
-    let frame_bits = evolution_bits(evolution.bytes.len(), evolution.sample_offset);
+    let frame_bits = evolution_bits(evolution);
     // The evolution header and the parity byte, then whatever it takes to
     // reach a whole word.
     let need = 24 + frame_bits;
@@ -478,117 +478,37 @@ fn check_nibble(words: u32) -> u32 {
 }
 
 /// An Evolution payload: what it is, its bytes, and when in the unit it takes
-/// effect.
-#[derive(Debug, Clone, Copy)]
-pub struct Evolution<'a> {
-    /// Eleven is object audio metadata.
-    pub id: u32,
-    pub bytes: &'a [u8],
-    /// The sample of the access unit the payload takes effect at, from nought
-    /// to one short of the unit's length. Nought is written as no offset at
-    /// all, which is what a payload taking effect at the start of the unit is
-    /// — and what every payload was, before the master's own moment inside
-    /// the unit was carried.
-    pub sample_offset: u32,
-}
+/// effect. The frame it goes in is the one E-AC-3 carries too, so it is
+/// written by [`hz_meta::emdf`]; what is TrueHD's is the block around it.
+pub type Evolution<'a> = hz_meta::emdf::Payload<'a>;
 
-/// One Evolution frame carrying one payload.
+/// One Evolution frame carrying one payload, closed the way every reference
+/// stream closes it: an eight-bit primary protection field and no secondary
+/// one.
 ///
-/// Version zero, key identifier zero — a payload identifier, the shortest
-/// configuration the syntax allows, the bytes, the zero identifier that ends
-/// the list, and an eight-bit primary protection field with nothing behind it.
-///
-/// The configuration says when the payload takes effect: a sample offset,
-/// present only when it is not nought, in the same variable-width field the
-/// reference writes its own in — a reference stream puts every payload five
-/// samples into its unit, and its object metadata on top of that. What the
-/// decoders read is the sum, so the offset a master states inside a unit is
-/// carried here whole and nothing is left for the payload's own offset code.
-///
-/// The protection field holds a keyed digest whose computation the format
-/// leaves to the implementation, which no public decoder checks and which a
-/// decoder is told it may ignore. It cannot be written here: the digest covers
-/// the unit's header, which is patched in last, so this writes a constant and
+/// The field holds a keyed digest whose computation the format leaves to the
+/// implementation, which no public decoder checks and which a decoder is told
+/// it may ignore. It cannot be written here: the digest covers the unit's
+/// header, which is patched in last, so the frame carries a constant and
 /// [`sign_extra_data`] overwrites it once the unit is final — when there is a
-/// key. What is not free either way is the field's length code: zero is
-/// reserved for the primary field, and the reference always says eight bits.
+/// key.
 ///
 /// Returns the bit at which the field's own bits begin.
 fn write_evolution(writer: &mut BitWriter, evolution: &Evolution<'_>) -> usize {
-    writer.put(2, 0); // evolution version
-    writer.put(3, 0); // key identifier
-
-    writer.put(5, evolution.id);
-    // The sample offset, where there is one; then three fields the payload
-    // does not state — duration, group and coded data — and the bit that says
-    // a decoder which does not know this payload should discard it, which
-    // ends the configuration.
-    if evolution.sample_offset > 0 {
-        writer.put(1, 1);
-        write_variable_bits(writer, 11, evolution.sample_offset);
-    } else {
-        writer.put(1, 0);
-    }
-    writer.put(3, 0);
-    writer.put(1, 1);
-    write_variable_bits(writer, 8, evolution.bytes.len() as u32);
-    for byte in evolution.bytes {
-        writer.put(8, u32::from(*byte));
-    }
-
-    writer.put(5, 0); // no further payload
-    writer.put(2, 1); // an eight-bit primary protection field
-    writer.put(2, 0); // and no secondary one
-    let field_at = writer.bit_position();
-    writer.put(8, u32::from(PROTECTION_BYTE));
-    field_at
+    hz_meta::emdf::write(
+        writer,
+        std::slice::from_ref(evolution),
+        hz_meta::emdf::Protection::TRUEHD,
+    )
+    .primary
 }
 
-/// What stands in the protection field of a stream written without a key.
-///
-/// Not zero: a reader that skipped the field would take it for the padding
-/// after the frame and say so, where zeroes would let that pass unseen.
-const PROTECTION_BYTE: u8 = 0x5a;
-
-/// Bits one Evolution frame carrying one payload of `bytes` bytes occupies,
-/// taking effect `sample_offset` samples into the unit.
-fn evolution_bits(bytes: usize, sample_offset: u32) -> usize {
-    // Version, key, identifier, configuration and the offset it may carry,
-    // the size, the payload, the terminating identifier, the two protection
-    // lengths and the eight-bit protection field.
-    let offset = if sample_offset > 0 {
-        variable_bits_width(11, sample_offset)
-    } else {
-        0
-    };
-    2 + 3 + 5 + 5 + offset + variable_bits_width(8, bytes as u32) + 8 * bytes + 5 + 4 + 8
-}
-
-/// A value in groups of `n` bits, each followed by a bit saying whether
-/// another group follows.
-///
-/// A group holds `n` bits and the next one is worth `2^n` more than it looks,
-/// because a continuation means the value so far was one short of the group's
-/// span. Nothing here writes more than one group, but the width has to be
-/// right for the sizes that need two.
-fn write_variable_bits<S: BitSink>(writer: &mut S, n: u32, value: u32) {
-    let span = 1u32 << n;
-    if value < span {
-        writer.put(n, value);
-        writer.put(1, 0);
-        return;
-    }
-    let high = value / span - 1;
-    debug_assert!(high < span, "two groups are as many as anything here needs");
-    writer.put(n, high);
-    writer.put(1, 1);
-    writer.put(n, value % span);
-    writer.put(1, 0);
-}
-
-fn variable_bits_width(n: u32, value: u32) -> usize {
-    let groups = if value < (1u32 << n) { 1 } else { 2 };
-    groups * (n as usize + 1)
+/// Bits one Evolution frame carrying `evolution` occupies.
+fn evolution_bits(evolution: &Evolution<'_>) -> usize {
+    hz_meta::emdf::bits(
+        std::slice::from_ref(evolution),
+        hz_meta::emdf::Protection::TRUEHD,
+    )
 }
 
 /// One substream, written into its own buffer.
@@ -1204,32 +1124,6 @@ mod tests {
             let low = words as u8;
             let fold = high ^ low;
             assert_eq!((fold ^ (fold >> 4)) & 0xf, 0xf, "{words} words");
-        }
-    }
-
-    /// A payload's own length is written in groups of eight bits, and a second
-    /// group is worth 256 more than it looks because a continuation means the
-    /// value so far was one short of the group's span. Sizes on both sides of
-    /// that boundary have to survive it.
-    #[test]
-    fn a_length_that_needs_two_groups_reads_back_as_itself() {
-        for value in [0u32, 1, 254, 255, 256, 257, 511, 512, 65_000] {
-            let mut writer = BitWriter::with_capacity(16);
-            write_variable_bits(&mut writer, 8, value);
-            let written = writer.bit_position();
-            assert_eq!(written, variable_bits_width(8, value), "{value}");
-
-            let bytes = writer.finish();
-            let mut reader = hz_core::bits_read::BitReader::new(&bytes);
-            let mut read = 0u32;
-            for _ in 0..2 {
-                read += reader.get(8).unwrap();
-                if !reader.get_bit().unwrap() {
-                    break;
-                }
-                read = (read + 1) << 8;
-            }
-            assert_eq!(read, value);
         }
     }
 }
