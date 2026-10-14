@@ -1,0 +1,12 @@
+[package]
+name = "hz-ac3"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AC-3 encoding, the base the E-AC-3 and joint object coding writers build on"
+
+[dependencies]
+hz-core.workspace = true
