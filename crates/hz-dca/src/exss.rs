@@ -1214,7 +1214,7 @@ mod tests {
     use super::*;
     use hz_core::bits::BitWriter;
 
-    /// One lossless 7.1 asset behind a core, the shape of a disc's.
+    /// One lossless 7.1 asset behind a core, the reference streams' shape.
     pub(crate) fn seven_one() -> ExssHeader {
         let mut header = ExssHeader {
             user_defined: 0,

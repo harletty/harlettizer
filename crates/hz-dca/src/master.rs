@@ -45,7 +45,7 @@ impl Config {
             lossless: lossless::Config::reference(layout, bits),
             core: encoder::Config {
                 pcm_resolution_code: if bits > 16 { 6 } else { 0 },
-                ..encoder::Config::disc_five_one()
+                ..encoder::Config::reference_five_one()
             },
         }
     }

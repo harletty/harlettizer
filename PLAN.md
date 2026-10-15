@@ -797,8 +797,8 @@ played on hardware.**
   (`dcaadpcm.c`) — with the fixed-point MDCT `av_tx` gives it
   (`hz_dca::mdct`, from `libavutil/tx_template.c`). Everything FFmpeg's encoder
   takes: mono, stereo, 2.2, 5.0 and 5.1, 8 to 48 kHz, 32 to 3840 kb/s.
-  `Config::disc_five_one()` is the disc's frame: 5.1 at 48 kHz, 1509 kb/s,
-  2012-byte frames, rate code 24 (1536 kb/s). The header is written through
+  `Config::reference_five_one()` is the reference streams' frame: 5.1 at
+  48 kHz, 1509 kb/s, 2012-byte frames, rate code 24 (1536 kb/s). The header is written through
   `CoreHeader`. No allocation per frame; ten seconds of 5.1 encode in 0.25 s,
   2.0 s with ADPCM — FFmpeg's own times are 0.23 s and 2.2 s.
 - ✅ **It is FFmpeg's stream, byte for byte.** Against `ffmpeg -c:a dca`
@@ -847,10 +847,10 @@ played on hardware.**
   which is what limits the LFE above (54 dB once that response is taken out);
   noise-like material sits at 14–24 dB; one subframe of two subsubframes,
   every subband active, no joint intensity, no VQ, no transient modes.
-- **Header fields discs set differently**, measured on the 32 local streams
-  with a 2012-byte core: they carry `aspf` 1 (FFmpeg: 0) and, from a 24-bit
-  source, `pcmr` 6 (FFmpeg: 0; two discs carry 0). The word length is
-  `Config::pcm_resolution_code`; `aspf` 1 means a DSYNC after each
+- **Header fields the reference streams set differently**, measured on the
+  32 local streams with a 2012-byte core: they carry `aspf` 1 (FFmpeg: 0) and,
+  from a 24-bit source, `pcmr` 6 (FFmpeg: 0; two of them carry 0). The word
+  length is `Config::pcm_resolution_code`; `aspf` 1 means a DSYNC after each
   subsubframe, sixteen bits FFmpeg's layout does not spend, and is left as
   FFmpeg has it.
 - ✅ **Not in this phase, done in C2a: the 5.1 fold of the 7.1 bed.** The
@@ -1006,8 +1006,8 @@ What C2a did:
 #### Phase C4 — Peak bitrate
 
 - Peak-bitrate smoothing as the reference streams do it (their XLL frames
-  vary widely in size from one frame to the next), under the optical-disc
-  ceiling of 24.5 Mb/s with the core included; dialnorm in the core header.
+  vary widely in size from one frame to the next), under a ceiling of
+  24.5 Mb/s with the core included; dialnorm in the core header.
   No dynamic range control to start with.
 - **Accept when**: a whole title stays under the ceiling in the decoder's
   buffer model and stays bit-exact.
