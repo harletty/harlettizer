@@ -24,7 +24,7 @@ pub fn aliases(input: &Path, out: &Path) -> Result<bool> {
     if out.exists() {
         // Volume and file identity, which a hard link shares and its path
         // does not.
-        return same_file::is_same_file(input, out).map_err(|e| Error::io(out, e));
+        return one_file(input, out);
     }
     let parent = match out.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -34,6 +34,29 @@ pub fn aliases(input: &Path, out: &Path) -> Result<bool> {
         (Ok(dir), Some(name)) => dir.join(name) == input_at,
         _ => false,
     })
+}
+
+/// Whether two existing paths are one file, asked without opening either:
+/// an output may be a FIFO a reader is waiting on, which another open would
+/// block on, or a file its owner may write and not read.
+#[cfg(unix)]
+fn one_file(input: &Path, out: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    // `metadata` follows symbolic links, as the identity must.
+    let identity = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|meta| (meta.dev(), meta.ino()))
+            .map_err(|e| Error::io(path, e))
+    };
+    Ok(identity(input)? == identity(out)?)
+}
+
+/// Whether two existing paths are one file: the volume serial and file
+/// index, which `same-file` reads through a handle opened with no access
+/// rights, so a file that cannot be read is still compared.
+#[cfg(not(unix))]
+fn one_file(input: &Path, out: &Path) -> Result<bool> {
+    same_file::is_same_file(input, out).map_err(|e| Error::io(out, e))
 }
 
 /// Refuse `out` when it is any of `inputs` by any name ([`aliases`]):
@@ -177,5 +200,42 @@ mod tests {
         let other = scratch.file("out.ec3");
         refuse_inputs(&inputs, &other).unwrap();
         refuse_inputs(&inputs, &scratch.0.join("new.ec3")).unwrap();
+    }
+
+    /// An output that is a FIFO is a stream to a reader, never an input; it
+    /// is told apart without being opened, which would block until a writer
+    /// came.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_output_is_not_opened() {
+        let scratch = Scratch::new("refuse-fifo");
+        let inputs = master(&scratch);
+        let fifo = scratch.0.join("out.ac3");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sent.send(refuse_inputs(&inputs, &fifo).is_ok()));
+        let answered = received.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(answered, Ok(true), "the check blocked on the FIFO");
+    }
+
+    /// An output its owner may write and not read is still compared, and an
+    /// unrelated one is let through.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_only_output_is_compared() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("refuse-write-only");
+        let inputs = master(&scratch);
+        let other = scratch.file("out.ec3");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o200)).unwrap();
+        refuse_inputs(&inputs, &other).unwrap();
+        std::fs::set_permissions(&inputs[2], std::fs::Permissions::from_mode(0o200)).unwrap();
+        let link = scratch.0.join("out.ac3");
+        std::fs::hard_link(&inputs[2], &link).unwrap();
+        assert!(refuse_inputs(&inputs, &link).is_err());
     }
 }
