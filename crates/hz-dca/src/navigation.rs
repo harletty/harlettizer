@@ -14,7 +14,7 @@
 //! marker. That was established on the standard-profile streams to hand,
 //! whose blocks run to 5,056 bytes (`cargo xtask dts`, every frame matching
 //! the block the decoder locates). Whether either field is wider still is
-//! not established — no offset over 7,588 bytes and no block over 5,056 has
+//! not established — no offset over 7,884 bytes and no block over 5,056 has
 //! been seen — so, **as it is read today**, the word cannot point past
 //! [`MAX_OFFSET`] nor describe a block over [`MAX_SIZE`], and
 //! [`Navigation::word`] refuses what does not fit rather than truncate it: a

@@ -49,7 +49,7 @@ specifications.
 | `truehd` crate (Rainbaby / truehdd) | Apache-2.0 | Bitstream structures, bit IO, CRC — and the decoder used as the test oracle |
 | `oxideav-ac4` | MIT | AC-4 framing and channel-based encoding |
 | `damf` crate (harletty-bridge) | Apache-2.0 | Master-file metadata model and writers |
-| `dca` crate (harletty-bridge) | Apache-2.0 | The DTS decoder used as the test oracle, behind the harness's `dca-oracle` feature; nothing ported from it |
+| `dca` crate (harletty-bridge) | Apache-2.0 | The DTS decoder used as the test oracle, behind the harness's `dca-oracle` feature; nothing ported from it. Its measurement notes, and the order in which its reader takes the DTS:X extension's fields, are where `hz-dca` read that extension's layouts from — the navigation word, the fold matrix, the height set — each checked against the reference streams and recorded in `docs/provenance.md` |
 | EBU ADM Renderer (`ear`) | BSD-3-Clause | The BS.2094 common-definition speaker positions, and the reference implementation both directions of the ADM support are checked against |
 | libopus (Xiph.Org) | BSD-3-Clause, with royalty-free patent licences | **Linked**, not ported: the Opus encoder behind `hz-iamf`'s `opus` feature, statically in the released binaries |
 

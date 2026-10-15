@@ -3,9 +3,11 @@
 //! ```text
 //! cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 6 --out out.dts
 //! cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 8 --lossless 24 --out out.dts
+//! cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 12 --lossless 24 --out out.dts
 //! ```
 //!
-//! Phase C1's round trip, and with `--lossless` phase C2's. The input is raw
+//! Phase C1's round trip, with `--lossless` phase C2's, and with twelve
+//! channels — a 7.1.4, the heights last — phase C3's. The input is raw
 //! interleaved 32-bit PCM in WAV order, what `ffmpeg -f s32le` writes; the
 //! last frame is padded with silence, as FFmpeg pads it. The stream is then
 //! put through everything `cargo xtask dts` does — each header read and
@@ -19,6 +21,13 @@
 //! the same way. FFmpeg reports nothing on a healthy stream, so any line it
 //! prints fails the run; so does a profile other than DTS-HD MA, which would
 //! mean it decoded the core instead.
+//!
+//! A 7.1.4 is the standard DTS:X profile. Through `dca`, the 7.1 it presents
+//! has to be the composite — each height folded into its corner as the
+//! encoder folds it — the four heights the input's, and the integer unfold
+//! of the two ([`dts::unfold`]) the input's 7.1, all bit for bit. Through
+//! FFmpeg, which decodes the bed, the 7.1 has to be the composite and the
+//! profile DTS-HD MA + DTS:X.
 //!
 //! `--ffmpeg-lfe` reproduces FFmpeg's LFE history defect, which is what makes
 //! a core byte-identical to `ffmpeg -c:a dca -b:a <rate>` on the same samples
@@ -105,6 +114,7 @@ pub fn run(options: Options) -> Result<()> {
         input: options.out.clone(),
         frames: None,
         reference: Some(reference),
+        unfold: None,
     })
 }
 
@@ -112,10 +122,11 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
     let layout = match options.channels {
         6 => lossless::Layout::FivePointOne,
         8 => lossless::Layout::SevenPointOne,
+        12 => lossless::Layout::SevenPointOneFour,
         n => {
             return Err(Error::refused(
                 &options.input,
-                format!("{n} channels: the lossless encoder takes 6 or 8"),
+                format!("{n} channels: the lossless encoder takes 6, 8 or 12"),
             ));
         }
     };
@@ -149,12 +160,12 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
         frame[chunk.len()..].fill(0);
         encoder
             .encode(&frame, &mut stream)
-            .map_err(|e| Error::refused(&options.input, format!("frame {frames}: {e}")))?;
+            .map_err(|e| refused(&options.input, frames, e))?;
         frames += 1;
     }
     encoder
         .finish(&mut stream)
-        .map_err(|e| Error::refused(&options.input, format!("frame {frames}: {e}")))?;
+        .map_err(|e| refused(&options.input, frames, e))?;
     let took = started.elapsed().as_secs_f64();
     std::fs::write(&options.out, &stream).map_err(|e| Error::io(&options.out, e))?;
     let pcm_bytes = reference.pcm.len() * usize::from(bits) / 8;
@@ -166,11 +177,7 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
         encoder.core_frame_size(),
         frames as f64 * FRAME_SAMPLES as f64 / 48000.0 / took
     );
-    let core_channels = if options.channels == 8 {
-        6
-    } else {
-        options.channels
-    };
+    let core_channels = 6;
     println!(
         "  lossless layer         {} bytes, {:.1} % of the PCM, {:.0} kb/s; {:.2} of {core_channels} \
          channels a frame coded against the core",
@@ -186,15 +193,33 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
             pcm: reference.pcm.clone(),
             channels: reference.channels,
         }),
+        unfold: None,
     });
-    let ffmpeg = through_ffmpeg(&options.out, &reference);
+    // FFmpeg decodes the bed, and of a 7.1.4 that is the composite.
+    let ffmpeg = if options.channels == 12 {
+        let [composite, _, _] = dts::split_7_1_4(&reference);
+        through_ffmpeg(&options.out, &composite, "DTS-HD MA + DTS:X,")
+    } else {
+        through_ffmpeg(&options.out, &reference, "DTS-HD MA,")
+    };
     decoded?;
     ffmpeg
 }
 
+/// A refusal of the encoder's as an error naming the input. A refusal of the
+/// resolution names the sample within the frame, so the frame — `frames`
+/// sent before it — is added; the others name it themselves.
+fn refused(input: &Path, frames: usize, e: master::Refused) -> Error {
+    match e {
+        master::Refused::Resolution { .. } => Error::refused(input, format!("frame {frames}: {e}")),
+        _ => Error::refused(input, e.to_string()),
+    }
+}
+
 /// Decode `stream` through FFmpeg, its checksums checked, and compare it with
-/// `reference` sample for sample. Skipped, and said so, without FFmpeg.
-fn through_ffmpeg(stream: &Path, reference: &Reference) -> Result<()> {
+/// `reference` sample for sample; the profile FFmpeg reports has to start
+/// with `profile`. Skipped, and said so, without FFmpeg.
+fn through_ffmpeg(stream: &Path, reference: &Reference, expected: &str) -> Result<()> {
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -244,8 +269,11 @@ fn through_ffmpeg(stream: &Path, reference: &Reference) -> Result<()> {
         );
         failures.push("FFmpeg reports errors".to_string());
     }
-    if !profile.starts_with("DTS-HD MA,") {
-        failures.push(format!("FFmpeg sees {profile:?}, not DTS-HD MA"));
+    if !profile.starts_with(expected) {
+        failures.push(format!(
+            "FFmpeg sees {profile:?}, not {}",
+            expected.trim_end_matches(',')
+        ));
     }
     if !exact.is_exact() {
         failures.push(format!(
@@ -355,6 +383,83 @@ mod tests {
             std::fs::remove_dir_all(&dir).unwrap();
             result.unwrap_or_else(|e| panic!("{what}: {e}"));
         }
+    }
+
+    /// Encode `pcm` as `run` would from a file, in a directory of its own.
+    fn encode_file(name: &str, pcm: &[i32], channels: usize, adpcm: bool) -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("hz-dts-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.s32");
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(&input, bytes).unwrap();
+        let result = run(Options {
+            input,
+            channels,
+            lossless: Some(24),
+            sample_rate: 48000,
+            bit_rate: 1_509_000,
+            adpcm,
+            ffmpeg_lfe: false,
+            segments_log2: None,
+            lsb_split: None,
+            full_coded: false,
+            out: dir.join("out.dts"),
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    /// Phase C3's acceptance (a) and (b) on synthetic 7.1.4: through `dca`,
+    /// the composite bed, the heights and their unfold bit for bit (with the
+    /// `dca-oracle` feature); through FFmpeg, the composite and the DTS:X
+    /// profile (where it is installed); every header, the extension block's
+    /// included, rewriting byte for byte. The 7.1 is `signal`'s at half
+    /// scale, so that its full-scale square in the sides cannot pass 24
+    /// bits with a height in it; the heights are its first four channels
+    /// again, at half scale.
+    #[test]
+    fn the_standard_dtsx_profile_comes_back_bit_for_bit() {
+        let bed = signal(8, 24);
+        let mut pcm = Vec::with_capacity(bed.len() / 8 * 12);
+        for frame in bed.chunks_exact(8) {
+            pcm.extend(frame.iter().map(|&s| s >> 9 << 8));
+            pcm.extend(frame[..4].iter().map(|&s| s >> 9 << 8));
+        }
+        for adpcm in [false, true] {
+            encode_file(&format!("dtsx-{adpcm}"), &pcm, 12, adpcm)
+                .unwrap_or_else(|e| panic!("adpcm {adpcm}: {e}"));
+        }
+    }
+
+    /// Phase C3's acceptance (e): white noise in all twelve channels, 24-bit
+    /// at half scale so that no fold passes 24 bits, is refused by the
+    /// navigation check at its first frame, as the domain says: the bed
+    /// alone passes the furthest offset the word can name. At an eighth of
+    /// full scale it is still refused; at a 4096th the stream is lossless.
+    #[test]
+    fn white_noise_is_refused_by_the_navigation_check_or_comes_back() {
+        let noise = |shift: u32| {
+            let mut state = 0x2545_f491u32;
+            (0..48000 * 12)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state as i32) >> shift << 8
+                })
+                .collect::<Vec<i32>>()
+        };
+        for shift in [9, 11] {
+            let e = encode_file(&format!("noise-{shift}"), &noise(shift), 12, false)
+                .expect_err("white noise past the navigation word's reach");
+            let message = e.to_string();
+            assert!(
+                message.contains("frame 0 (from sample 0)")
+                    && message.contains("cannot be navigated"),
+                "{message}"
+            );
+        }
+        encode_file("noise-20", &noise(20), 12, false).unwrap();
     }
 
     #[test]

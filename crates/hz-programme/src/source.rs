@@ -17,7 +17,7 @@ use hz_io::container::wav::WavReader;
 use hz_io::master::MasterSet;
 use hz_io::project;
 use hz_render::{Keyframe, Mode};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What both kinds of input boil down to: an ADM description and a reader.
 pub struct Described {
@@ -35,6 +35,8 @@ pub struct Source {
     reader: Box<dyn FrameSource>,
     described: Described,
     format: PcmFormat,
+    /// Every file the input is read from.
+    files: Vec<PathBuf>,
 }
 
 impl Source {
@@ -45,6 +47,12 @@ impl Source {
         if path.extension().and_then(|e| e.to_str()) == Some("atmos") {
             let set = MasterSet::open(path)?;
             let events = set.read_events(0)?;
+            let mut files = vec![path.to_path_buf()];
+            for components in &set.components {
+                for component in [&components.metadata, &components.audio] {
+                    files.extend(component.path().map(Path::to_path_buf));
+                }
+            }
             let reader: Box<dyn FrameSource> =
                 match mono_prefix {
                     Some(prefix) => {
@@ -57,6 +65,7 @@ impl Source {
                             .map(|bed| bed.channels.len())
                             .sum::<usize>()
                             + presentation.objects.len();
+                        files.extend((0..waveforms).map(|n| MonoSet::path(prefix, n)));
                         Box::new(MonoSet::open(prefix, waveforms)?)
                     }
                     None => {
@@ -92,6 +101,7 @@ impl Source {
                     sample_rate: events.sample_rate.unwrap_or(48_000),
                 },
                 format,
+                files,
             })
         } else {
             if mono_prefix.is_some() {
@@ -112,8 +122,17 @@ impl Source {
                     sample_rate: format.sample_rate_hz(),
                 },
                 format,
+                files: vec![path.to_path_buf()],
             })
         }
+    }
+
+    /// Every file the input is read from: a master set's config and every
+    /// component it resolved, its waveforms' files with a mono prefix, or
+    /// the BW64 file. What an output must not be, since writing it would
+    /// truncate what is still being read ([`hz_io::paths::aliases`]).
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
     }
 
     pub fn adm(&self) -> &Described {

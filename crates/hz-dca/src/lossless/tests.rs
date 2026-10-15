@@ -1,5 +1,6 @@
 use super::*;
 use crate::xll::{Headers, unzigzag};
+use crate::{dtsx, navigation};
 use hz_core::bits_read::BitReader;
 
 /// Samples of every speaker of a frame, by DTS speaker mask bit.
@@ -48,58 +49,20 @@ fn decode(frame: &[u8], core: Option<&CoreDecoder>) -> Decoded {
         }
     }
     assert_eq!(at, headers.len() * 8 + headers.band_data_len() * 8);
+    // The DTS:X extension block, when the frame has one: at the next 32-bit
+    // word, to the frame's end.
+    let bed_end = (at / 8).next_multiple_of(4);
     assert!(
-        frame[at / 8..].iter().all(|&b| b == 0),
+        frame[at / 8..bed_end].iter().all(|&b| b == 0),
+        "the bed is padded to the word"
+    );
+    let heights = (bed_end < frame.len()).then(|| decode_heights(&frame[bed_end..], common));
+    assert!(
+        heights.is_some() || frame[at / 8..].iter().all(|&b| b == 0),
         "the frame's tail is padding"
     );
-    // Inverse prediction, then pairs, then the original order.
     for (set, channels) in sets.iter().zip(&mut buffers) {
-        let band = &set.bands[0];
-        for (ch, buf) in channels.iter_mut().enumerate() {
-            let order = usize::from(band.adaptive_orders[ch]);
-            if order > 0 {
-                let mut coeff = [0i32; MAX_ORDER];
-                for j in 0..order {
-                    let k = band.reflection[ch][j];
-                    let magnitude = i32::from(REFLECTION_COEFFS[usize::from(k.unsigned_abs())]);
-                    let rc = if k < 0 { -magnitude } else { magnitude };
-                    for m in 0..j.div_ceil(2) {
-                        let (t1, t2) = (coeff[m], coeff[j - m - 1]);
-                        coeff[m] = t1 + mul(rc, t2, 16);
-                        coeff[j - m - 1] = t2 + mul(rc, t1, 16);
-                    }
-                    coeff[j] = rc;
-                }
-                for j in 0..frame_samples - order {
-                    let mut err = 0i64;
-                    for k in 0..order {
-                        err += i64::from(buf[j + k]) * i64::from(coeff[order - k - 1]);
-                    }
-                    let prediction = ((err + (1 << 15)) >> 16) as i32;
-                    buf[j + order] = buf[j + order].wrapping_sub(clip23(prediction));
-                }
-            } else {
-                for _ in 0..band.fixed_orders[ch] {
-                    for k in 1..frame_samples {
-                        buf[k] = buf[k].wrapping_add(buf[k - 1]);
-                    }
-                }
-            }
-        }
-        if let Some(d) = &band.decorrelation {
-            for (pair, c) in d.coefficients.iter().enumerate() {
-                if let Some(c) = *c {
-                    let (first, second) = channels.split_at_mut(2 * pair + 1);
-                    for (v, &u) in second[0].iter_mut().zip(&first[2 * pair]) {
-                        *v = v.wrapping_add(u.wrapping_mul(i32::from(c)).wrapping_add(4) >> 3);
-                    }
-                }
-            }
-            let coded = channels.clone();
-            for (i, &original) in d.order.iter().enumerate() {
-                channels[usize::from(original)] = coded[i].clone();
-            }
-        }
+        reconstruct(set, channels, frame_samples);
     }
     // Add the core to the residual channels (`combine_residual_frame`), the
     // core brought back up from the scale of the next downmix below it.
@@ -190,8 +153,120 @@ fn decode(frame: &[u8], core: Option<&CoreDecoder>) -> Decoded {
             out.push((bit, samples));
         }
     }
+    // The heights, as speakers past any mask's: TFL, TFR, TBL, TBR.
+    for (k, samples) in heights.into_iter().flatten().enumerate() {
+        out.push((HEIGHT_BIT + k as u32, samples));
+    }
     out.sort_by_key(|(bit, _)| *bit);
     out
+}
+
+/// Where [`decode`] puts the heights among the speaker bits.
+const HEIGHT_BIT: u32 = 100;
+
+/// The DTS:X extension block at the start of `block`, which runs to the
+/// lossless frame's end, decoded as `dca` decodes it: its matrix and the
+/// height set's sub-header and table read and checked, the set's data read
+/// in the frame's segments, the trailer and the padding zero.
+fn decode_heights(block: &[u8], common: &CommonHeader) -> Vec<Vec<i32>> {
+    assert_eq!(
+        u32::from_be_bytes(block[..4].try_into().unwrap()),
+        dtsx::SYNC
+    );
+    let headers = dtsx::Block::read(block, common).unwrap();
+    assert!(headers.checksums(block, common), "a block checksum fails");
+    assert_eq!(headers.write(common).unwrap(), block[..headers.len(common)]);
+    assert_eq!(headers.matrix, {
+        let mut m = FoldMatrix::standard();
+        m.fit();
+        FoldMatrix {
+            crc: headers.matrix.crc,
+            ..m
+        }
+    });
+    let set = &headers.heights.set;
+    assert_eq!((set.channels, set.residual_encode), (4, 0xf));
+    let samples = common.frame_samples();
+    let mut channels = vec![vec![0i32; samples]; 4];
+    let mut state = Parameters::default();
+    let mut at = headers.len(common) * 8;
+    for (segment, &size) in headers.heights.navigation.sizes.iter().enumerate() {
+        let end = at + size as usize * 8;
+        let mut r = BitReader::at_bit(block, at);
+        read_segment(
+            &mut r,
+            set,
+            segment,
+            common.segment_samples(),
+            5,
+            &mut state,
+            &mut channels,
+        );
+        assert!(end - r.bit_position() < 8, "a height segment ends early");
+        at = end;
+    }
+    assert_eq!(
+        block.len(),
+        headers.size(common, headers.heights.data_len()),
+        "the block is its headers, its data, the trailer and the padding"
+    );
+    assert!(
+        block[at / 8..].iter().all(|&b| b == 0),
+        "the trailer and the padding are zeroes"
+    );
+    reconstruct(set, &mut channels, samples);
+    channels
+}
+
+/// Undo a set's prediction, then its pairs, then put its channels back in
+/// their original order.
+fn reconstruct(set: &ChannelSet, channels: &mut [Vec<i32>], frame_samples: usize) {
+    let band = &set.bands[0];
+    for (ch, buf) in channels.iter_mut().enumerate() {
+        let order = usize::from(band.adaptive_orders[ch]);
+        if order > 0 {
+            let mut coeff = [0i32; MAX_ORDER];
+            for j in 0..order {
+                let k = band.reflection[ch][j];
+                let magnitude = i32::from(REFLECTION_COEFFS[usize::from(k.unsigned_abs())]);
+                let rc = if k < 0 { -magnitude } else { magnitude };
+                for m in 0..j.div_ceil(2) {
+                    let (t1, t2) = (coeff[m], coeff[j - m - 1]);
+                    coeff[m] = t1 + mul(rc, t2, 16);
+                    coeff[j - m - 1] = t2 + mul(rc, t1, 16);
+                }
+                coeff[j] = rc;
+            }
+            for j in 0..frame_samples - order {
+                let mut err = 0i64;
+                for k in 0..order {
+                    err += i64::from(buf[j + k]) * i64::from(coeff[order - k - 1]);
+                }
+                let prediction = ((err + (1 << 15)) >> 16) as i32;
+                buf[j + order] = buf[j + order].wrapping_sub(clip23(prediction));
+            }
+        } else {
+            for _ in 0..band.fixed_orders[ch] {
+                for k in 1..frame_samples {
+                    buf[k] = buf[k].wrapping_add(buf[k - 1]);
+                }
+            }
+        }
+    }
+    if let Some(d) = &band.decorrelation {
+        for (pair, c) in d.coefficients.iter().enumerate() {
+            if let Some(c) = *c {
+                let (first, second) = channels.split_at_mut(2 * pair + 1);
+                for (v, &u) in second[0].iter_mut().zip(&first[2 * pair]) {
+                    *v = v.wrapping_add(u.wrapping_mul(i32::from(c)).wrapping_add(4) >> 3);
+                }
+            }
+        }
+        let coded = channels.to_vec();
+        for (i, &original) in d.order.iter().enumerate() {
+            channels[usize::from(original)] = coded[i].clone();
+        }
+    }
 }
 
 /// The core channel, in WAV 5.1 order, a speaker bit is coded against
@@ -281,34 +356,43 @@ fn signal(layout: Layout, bits: u8, frames: usize) -> Vec<i32> {
     };
     let full = f64::from(1u32 << (bits - 1)) - 1.0;
     let mut pcm = Vec::with_capacity(frames * FRAME_SAMPLES * channels);
+    // A 7.1.4's heights repeat the 7.1's first characters, and everything
+    // is at half scale, so that a corner with its height folded in stays
+    // inside 24 bits.
+    let level = if layout == Layout::SevenPointOneFour {
+        0.5
+    } else {
+        1.0
+    };
     for n in 0..frames * FRAME_SAMPLES {
         let t = n as f64 / 48000.0;
         for ch in 0..channels {
-            let v = match ch {
-                // A tone and its correlated twin.
-                0 => 0.6 * (std::f64::consts::TAU * 440.0 * t).sin(),
-                1 => 0.5 * (std::f64::consts::TAU * 440.0 * t + 0.3).sin(),
-                // Full-scale square.
-                2 => {
-                    if (n / 50) % 2 == 0 {
-                        1.0
-                    } else {
-                        -1.0
+            let v = level
+                * match ch % 8 {
+                    // A tone and its correlated twin.
+                    0 => 0.6 * (std::f64::consts::TAU * 440.0 * t).sin(),
+                    1 => 0.5 * (std::f64::consts::TAU * 440.0 * t + 0.3).sin(),
+                    // Full-scale square.
+                    2 => {
+                        if (n / 50) % 2 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
                     }
-                }
-                // Silence.
-                3 => 0.0,
-                // White noise at full scale.
-                4 => f64::from(noise()) / f64::from(i32::MAX),
-                // A chirp.
-                5 => 0.9 * (std::f64::consts::TAU * (100.0 + 4000.0 * t) * t).sin(),
-                // Low noise, then a burst.
-                6 => {
-                    f64::from(noise() >> 12) / f64::from(i32::MAX)
-                        * if n > 700 { 4000.0 } else { 1.0 }
-                }
-                _ => -0.99,
-            };
+                    // Silence.
+                    3 => 0.0,
+                    // White noise at full scale.
+                    4 => f64::from(noise()) / f64::from(i32::MAX),
+                    // A chirp.
+                    5 => 0.9 * (std::f64::consts::TAU * (100.0 + 4000.0 * t) * t).sin(),
+                    // Low noise, then a burst.
+                    6 => {
+                        f64::from(noise() >> 12) / f64::from(i32::MAX)
+                            * if n > 700 { 4000.0 } else { 1.0 }
+                    }
+                    _ => -0.99,
+                };
             let v = (v * full).round().clamp(-full - 1.0, full) as i32;
             pcm.push(v << (32 - bits));
         }
@@ -323,6 +407,24 @@ fn speakers(layout: Layout) -> Vec<u32> {
         Layout::FivePointOne => vec![1, 2, 0, 5, 3, 4],
         // L R C LFE Lsr Rsr Lss Rss.
         Layout::SevenPointOne => vec![1, 2, 0, 5, 7, 8, 9, 10],
+        // And the heights.
+        Layout::SevenPointOneFour => vec![1, 2, 0, 5, 7, 8, 9, 10, 100, 101, 102, 103],
+    }
+}
+
+/// What a decoder presents of input channel `input` at sample `n` of
+/// `frame`: the channel, or for a corner of a 7.1.4 the composite its height
+/// is folded into.
+fn presented(layout: Layout, frame: &[i32], n: usize, input: usize, bits: u8) -> i32 {
+    let channels = layout.channels();
+    let x = frame[n * channels + input] >> (32 - bits);
+    if layout != Layout::SevenPointOneFour {
+        return x;
+    }
+    // L, R, Lsr and Rsr take TFL, TFR, TBL and TBR.
+    match [0, 1, 4, 5].iter().position(|&c| c == input) {
+        Some(h) => x + dtsx::fold(frame[n * channels + 8 + h] >> 8, 23170),
+        None => x,
     }
 }
 
@@ -373,7 +475,7 @@ fn round_trip_with(config: Config, pcm: &[i32], against_core: bool) -> (usize, u
             for (n, &s) in samples.iter().enumerate() {
                 assert_eq!(
                     s,
-                    frame[n * channels + input] >> (32 - bits),
+                    presented(layout, frame, n, input, bits),
                     "frame {k}, speaker {bit}, sample {n}"
                 );
             }
@@ -555,4 +657,98 @@ fn rice_costs_are_what_is_written() {
     for other in 0..31 {
         assert!(rice_bits(&codes, other) >= bits, "{other} beats {k}");
     }
+}
+
+/// The standard DTS:X profile: the bed decodes to the composite, the
+/// heights to themselves, every frame — coded alone and against the core.
+#[test]
+fn seven_one_four_comes_back_bit_for_bit() {
+    let pcm = signal(Layout::SevenPointOneFour, 24, 6);
+    let config = || Config::reference(Layout::SevenPointOneFour, 24);
+    let (alone, _) = round_trip_with(config(), &pcm, false);
+    let (against, residual) = round_trip_with(config(), &pcm, true);
+    assert!(residual > 0 && against < alone, "{against} against {alone}");
+    // Silence: the smallest block there is.
+    round_trip(config(), &vec![0; FRAME_SAMPLES * 12 * 2]);
+}
+
+/// Only 24 bits: a height's share of a corner does not fit fewer.
+#[test]
+fn seven_one_four_is_24_bits_only() {
+    assert!(Encoder::new(Config::reference(Layout::SevenPointOneFour, 16)).is_err());
+}
+
+/// The block is located by the word: its offset is the bed's size rounded
+/// to the word, its size the rest of the frame.
+#[test]
+fn the_block_ends_the_frame_where_the_word_points() {
+    let pcm = signal(Layout::SevenPointOneFour, 24, 2);
+    let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOneFour, 24)).unwrap();
+    for frame in pcm.chunks(FRAME_SAMPLES * 12) {
+        let coded = encoder.encode(frame, None).unwrap().to_vec();
+        let nav = encoder.extension().unwrap();
+        assert_eq!(nav.offset + nav.size, coded.len());
+        assert_eq!(
+            u32::from_be_bytes(coded[nav.offset..nav.offset + 4].try_into().unwrap()),
+            dtsx::SYNC
+        );
+        let headers = Headers::read(&coded, true).unwrap();
+        assert_eq!(
+            nav.offset,
+            (headers.len() + headers.band_data_len()).next_multiple_of(4)
+        );
+        assert!(nav.word().is_ok());
+    }
+    assert_eq!(encoder.frames(), 2);
+}
+
+/// A corner its height takes past 24 bits is refused, named, before
+/// anything is coded.
+#[test]
+fn a_fold_past_24_bits_is_refused() {
+    let mut pcm = vec![0i32; FRAME_SAMPLES * 12];
+    let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOneFour, 24)).unwrap();
+    encoder.encode(&pcm, None).unwrap();
+    // Rsr at 0.8 of full scale and TBR at full scale: 0.8 + 0.707.
+    pcm[300 * 12 + 5] = ((0.8 * f64::from(1 << 23)) as i32) << 8;
+    pcm[300 * 12 + 11] = ((1 << 23) - 1) << 8;
+    assert_eq!(
+        encoder.encode(&pcm, None),
+        Err(Refused::Fold {
+            frame: 1,
+            channel: 5,
+            sample: 300,
+            value: 6_710_886 + 5_931_519,
+        })
+    );
+    assert_eq!(encoder.frames(), 1);
+    // The same at −3 dB fits.
+    pcm[300 * 12 + 11] = ((1 << 22) - 1) << 8;
+    pcm[300 * 12 + 5] = ((0.6 * f64::from(1 << 23)) as i32) << 8;
+    encoder.encode(&pcm, None).unwrap();
+}
+
+/// White noise at 24 bits codes to more than the word can point past: the
+/// frame is refused by the navigation check, named, rather than written
+/// short. The bed alone passes the furthest offset the word can name.
+#[test]
+fn white_noise_is_refused_by_the_navigation_check() {
+    let mut state = 0x1234_5678u32;
+    let mut noise = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        // Half scale, so that no fold passes 24 bits.
+        (state as i32) >> 9 << 8
+    };
+    let pcm: Vec<i32> = (0..FRAME_SAMPLES * 12).map(|_| noise()).collect();
+    let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOneFour, 24)).unwrap();
+    match encoder.encode(&pcm, None) {
+        Err(Refused::Navigation {
+            frame: 0,
+            cause: navigation::OutOfRange::Offset(offset),
+        }) => assert!(offset > navigation::MAX_OFFSET),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(encoder.frames(), 0);
 }

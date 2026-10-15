@@ -27,6 +27,11 @@
 //! them out again. A decoder of the first set alone gets the 5.1 that fold
 //! makes, and so does the core ([`Encoder::core_input`]).
 //!
+//! A 7.1.4 is the DTS:X extension's standard profile ([`crate::dtsx`]): the
+//! 7.1 above, of the composite each height is folded into, and a fourth set
+//! of the four heights outside the hierarchy, every channel coded as itself,
+//! in a block of its own at the end of the frame.
+//!
 //! Each set, each frame:
 //!
 //! 1. **The embedded downmix** (7.1, first set): each channel plus its share
@@ -53,9 +58,11 @@
 
 use crate::bits::Bits;
 use crate::core_decode::CoreDecoder;
+use crate::dtsx::{self, FoldMatrix};
 use crate::encoder::FRAME_SAMPLES;
+use crate::navigation::{self, OutOfRange};
 use crate::xll::{
-    self, Band, ChannelSet, CommonHeader, Decorrelation, Downmix, Headers, Lsb, Mapping,
+    self, Band, BareSet, ChannelSet, CommonHeader, Decorrelation, Downmix, Headers, Lsb, Mapping,
     Navigation, Positions, REFLECTION_COEFFS, Speakers, zigzag,
 };
 use hz_core::bits::BitWriter;
@@ -78,13 +85,30 @@ pub enum Layout {
     /// L, R, C, LFE, Lsr, Rsr, Lss, Rss: WAV's order for 7.1, the rears
     /// before the sides.
     SevenPointOne,
+    /// The 7.1, then the heights TFL, TFR, TBL, TBR: WAV's order for 7.1.4.
+    /// The DTS:X extension's standard profile ([`crate::dtsx`]): the heights
+    /// folded into the 7.1's corners, and carried beside it in a block of
+    /// their own. 24 bits only — a height's share of a corner is a 24-bit
+    /// quantity, so a bed of fewer bits could not hold it exactly.
+    SevenPointOneFour,
 }
 
 impl Layout {
+    /// Channels of the input.
     pub fn channels(self) -> usize {
         match self {
             Layout::FivePointOne => 6,
             Layout::SevenPointOne => 8,
+            Layout::SevenPointOneFour => 12,
+        }
+    }
+
+    /// Channels of the bed: what a decoder of the lossless layer alone
+    /// presents.
+    pub fn bed_channels(self) -> usize {
+        match self {
+            Layout::SevenPointOneFour => 8,
+            other => other.channels(),
         }
     }
 }
@@ -137,7 +161,7 @@ pub struct Config {
     /// 24-bit reference streams, sixteen bits and four a channel more than
     /// leaving it off, which the 16-bit one does.
     pub scalable_lsbs: bool,
-    /// The fold of a 7.1; unused for 5.1.
+    /// The fold of a 7.1's rears; unused for 5.1.
     pub fold: Fold,
     /// Code a channel the core carries as its difference from the core's
     /// reconstruction, where that costs less — as the reference streams do —
@@ -183,6 +207,27 @@ pub enum Refused {
         value: i32,
         bits: u8,
     },
+    /// A 7.1.4 corner that, with its height folded in, passes 24 bits: a
+    /// decoder would clip the composite, and the height could not be taken
+    /// back out of it exactly. The master needs headroom before the fold.
+    Fold {
+        /// The input frame, counted from 0.
+        frame: u64,
+        /// The corner, as an input channel.
+        channel: usize,
+        sample: usize,
+        /// The composite, in 24-bit units.
+        value: i32,
+    },
+    /// A 7.1.4 frame whose extension block the navigation word cannot
+    /// point at: the bed before it is too large, or the block itself is.
+    /// The frame is not cut or coded coarser to make it fit; the stream
+    /// ends here.
+    Navigation {
+        /// The input frame, counted from 0.
+        frame: u64,
+        cause: OutOfRange,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -198,7 +243,35 @@ impl std::fmt::Display for Refused {
                 "channel {channel}, sample {sample}: {value:#010x} has bits below the \
                  {bits}-bit resolution, which a lossless layer of {bits} bits would drop"
             ),
+            Refused::Fold {
+                frame,
+                channel,
+                sample,
+                value,
+            } => write!(
+                f,
+                "frame {frame}, channel {channel}, sample {sample}: the corner with its height \
+                 folded in at −3 dB is {value}, past 24 bits; the master needs headroom before \
+                 the fold"
+            ),
+            Refused::Navigation { frame, cause } => write!(
+                f,
+                "frame {frame} (from sample {}): {cause}, so the DTS:X extension cannot be \
+                 located; not cut to fit",
+                frame * FRAME_SAMPLES as u64
+            ),
         }
+    }
+}
+
+impl Refused {
+    /// The same refusal, of input frame `at`: for a caller that counts its
+    /// input otherwise than the frames this encoder has coded.
+    pub fn of_frame(mut self, at: u64) -> Self {
+        if let Refused::Fold { frame, .. } | Refused::Navigation { frame, .. } = &mut self {
+            *frame = at;
+        }
+        self
     }
 }
 
@@ -300,6 +373,121 @@ pub struct Encoder {
     data: BitWriter,
     frame: Vec<u8>,
     search: Search,
+    /// The DTS:X extension of a 7.1.4.
+    heights: Option<Heights>,
+    /// Frames encoded.
+    frames: u64,
+}
+
+/// The DTS:X extension's standard profile: the heights, the block they go
+/// out in, and the composite bed they are folded into.
+struct Heights {
+    /// TFL, TFR, TBL, TBR, every channel coded as itself.
+    set: Set,
+    /// The block's headers: the fold matrix, which the fold below is read
+    /// from, and the height set's sub-header and navigation table.
+    block: dtsx::Block,
+    /// `[height][bed column]`: the Q15 gain a height goes into a column at.
+    gains: Vec<[i32; 8]>,
+    /// The bed column each of the 7.1's input channels is (WAV's L R C LFE
+    /// Lsr Rsr Lss Rss in the bed's C L R LFE Lsr Rsr Lss Rss).
+    columns: [usize; 8],
+    /// The 7.1 with the heights in it, interleaved in WAV order, 32-bit:
+    /// what the bed encodes and the core is made from.
+    composite: Vec<i32>,
+    /// The coding parameters the last segment left.
+    previous: Parameters,
+    /// One frame's height data.
+    data: BitWriter,
+    /// Where the frame last encoded put the block.
+    navigation: navigation::Navigation,
+}
+
+impl Heights {
+    fn new(scalable: bool) -> Self {
+        let mut matrix = FoldMatrix::standard();
+        matrix.fit();
+        let gains = matrix
+            .gains()
+            .expect("the standard matrix's gains are known");
+        let set = Set::new(vec![8, 9, 10, 11], 0, vec![None; 4], None, scalable);
+        let header = ChannelSet {
+            size: 0,
+            channels: 4,
+            residual_encode: 0xf,
+            pcm_bit_res: 24,
+            storage_bit_res: 24,
+            frequency_code: RATE_48K,
+            interpolation: 0,
+            replacement: None,
+            mapping: Mapping::Unmapped,
+            extra_bands: None,
+            bands: vec![set.band.clone()],
+            reserved: Bits::new(),
+            crc: 0,
+        };
+        Self {
+            set,
+            block: dtsx::Block {
+                matrix,
+                heights: BareSet {
+                    set: header,
+                    navigation: Navigation {
+                        sizes: Vec::new(),
+                        padding: Bits::new(),
+                        crc: 0,
+                    },
+                },
+            },
+            gains,
+            columns: [1, 2, 0, 3, 4, 5, 6, 7],
+            composite: vec![0; FRAME_SAMPLES * 8],
+            previous: Parameters::default(),
+            data: BitWriter::with_capacity(FRAME_SAMPLES * 4 * 4),
+            navigation: navigation::Navigation { offset: 0, size: 0 },
+        }
+    }
+
+    /// The composite sample of bed input channel `ch` at sample `n` of
+    /// `pcm`, in 24-bit units: the channel, and each height's share.
+    fn composite(&self, pcm: &[i32], n: usize, ch: usize) -> i64 {
+        let column = self.columns[ch];
+        let mut x = i64::from(pcm[n * 12 + ch] >> 8);
+        for (h, gains) in self.gains.iter().enumerate() {
+            if gains[column] != 0 {
+                x += i64::from(dtsx::fold(pcm[n * 12 + 8 + h] >> 8, gains[column]));
+            }
+        }
+        x
+    }
+
+    /// Fold `pcm`, a 7.1.4 frame whose corners [`Heights::check`] has
+    /// found room for, into the composite 7.1.
+    fn fold(&mut self, pcm: &[i32]) {
+        for n in 0..FRAME_SAMPLES {
+            for ch in 0..8 {
+                self.composite[n * 8 + ch] = (self.composite(pcm, n, ch) as i32) << 8;
+            }
+        }
+    }
+
+    /// The first corner of `pcm` that its heights take past 24 bits.
+    fn check(&self, pcm: &[i32], frame: u64) -> Result<(), Refused> {
+        for n in 0..FRAME_SAMPLES {
+            for ch in 0..8 {
+                let x = self.composite(pcm, n, ch);
+                if !(-(1 << 23)..1 << 23).contains(&x) {
+                    return Err(Refused::Fold {
+                        frame,
+                        channel: ch,
+                        sample: n,
+                        value: x as i32,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One row of the fold as the decoder holds it.
@@ -358,8 +546,16 @@ impl Encoder {
                 )],
                 6,
             ),
-            // WAV: L R C LFE Lsr Rsr Lss Rss.
-            Layout::SevenPointOne => {
+            // WAV: L R C LFE Lsr Rsr Lss Rss; for a 7.1.4, of the composite
+            // the heights are folded into.
+            Layout::SevenPointOne | Layout::SevenPointOneFour => {
+                if config.layout == Layout::SevenPointOneFour && config.bits != 24 {
+                    return Err(Unsupported(format!(
+                        "7.1.4 at {} bits: the DTS:X extension folds its heights into a \
+                         24-bit bed",
+                        config.bits
+                    )));
+                }
                 let fold = config.fold;
                 if xll::scale(fold.scale).is_none() || xll::coefficient(fold.rear).is_none() {
                     return Err(Unsupported(format!(
@@ -481,7 +677,11 @@ impl Encoder {
                 crc: 0,
             },
         };
+        let heights = (config.layout == Layout::SevenPointOneFour)
+            .then(|| Heights::new(config.scalable_lsbs));
         Ok(Self {
+            heights,
+            frames: 0,
             core: vec![0; FRAME_SAMPLES * 6],
             previous: vec![Parameters::default(); sets.len()],
             sets,
@@ -516,16 +716,25 @@ impl Encoder {
         match self.config.layout {
             // C, L/R, Ls/Rs, LFE.
             Layout::FivePointOne => (0, 0x00f),
-            // C, L/R, LFE, Lsr/Rsr, Lss/Rss.
-            Layout::SevenPointOne => (2, 0x84b),
+            // C, L/R, LFE, Lsr/Rsr, Lss/Rss: the heights are not the
+            // bed's.
+            Layout::SevenPointOne | Layout::SevenPointOneFour => (2, 0x84b),
         }
+    }
+
+    /// Where the DTS:X extension block of the frame last encoded sits in
+    /// it, for the navigation word: a 7.1.4's, `None` for any other layout.
+    pub fn extension(&self) -> Option<navigation::Navigation> {
+        self.heights.as_ref().map(|h| h.navigation)
     }
 
     /// The 5.1 a decoder of the first channel set alone presents for `pcm`,
     /// interleaved in WAV order — L, R, C, LFE, Ls, Rs — as 32-bit samples:
     /// what the core is to be encoded from. For a 5.1 it is the input itself;
     /// for a 7.1, the first set as [`Encoder::encode`] folds it, scaled as a
-    /// decoder of that set alone scales it.
+    /// decoder of that set alone scales it; for a 7.1.4, the same of the
+    /// composite 7.1 the heights are folded into. A 7.1.4 frame
+    /// [`Encoder::check`] refuses gives its corners clipped.
     ///
     /// # Panics
     /// If `pcm` is not exactly one frame.
@@ -536,9 +745,32 @@ impl Encoder {
             FRAME_SAMPLES * channels,
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
-        let [front, rears] = &self.sets[..] else {
-            self.core.copy_from_slice(pcm);
+        let Some(heights) = &mut self.heights else {
+            self.make_core_input(pcm, channels);
             return &self.core;
+        };
+        for n in 0..FRAME_SAMPLES {
+            for ch in 0..8 {
+                let x = heights
+                    .composite(pcm, n, ch)
+                    .clamp(-(1 << 23), (1 << 23) - 1);
+                heights.composite[n * 8 + ch] = (x as i32) << 8;
+            }
+        }
+        let composite = std::mem::take(&mut heights.composite);
+        self.make_core_input(&composite, 8);
+        self.heights.as_mut().expect("a 7.1.4").composite = composite;
+        &self.core
+    }
+
+    /// [`Encoder::core_input`] of a 5.1 or a 7.1, `channels` wide.
+    fn make_core_input(&mut self, pcm: &[i32], channels: usize) {
+        let (front, rears) = match &self.sets[..] {
+            [front, rears] => (front, rears),
+            _ => {
+                self.core.copy_from_slice(pcm);
+                return;
+            }
         };
         let shift = 32 - u32::from(self.config.bits);
         let (low, high) = (-(1i32 << (31 - shift)), (1i32 << (31 - shift)) - 1);
@@ -555,7 +787,6 @@ impl Encoder {
                 self.core[n * 6 + slot] = mul(x, row.scale, 15).clamp(low, high) << shift;
             }
         }
-        &self.core
     }
 
     /// The lossless frame last encoded.
@@ -571,19 +802,30 @@ impl Encoder {
             .sum()
     }
 
-    /// Refuse a frame the configured resolution cannot carry.
+    /// Refuse a frame the configured resolution cannot carry, or — a 7.1.4
+    /// — whose heights take a corner past 24 bits, naming it as the next
+    /// frame this encoder would code. The navigation word's limits are only
+    /// known once the frame is coded, so [`Encoder::encode`] checks them.
     pub fn check(&self, pcm: &[i32]) -> Result<(), Refused> {
         let channels = self.config.layout.channels();
         let shift = 32 - u32::from(self.config.bits);
-        match pcm.iter().position(|&s| s & ((1 << shift) - 1) != 0) {
-            Some(at) => Err(Refused::Resolution {
+        if let Some(at) = pcm.iter().position(|&s| s & ((1 << shift) - 1) != 0) {
+            return Err(Refused::Resolution {
                 channel: at % channels,
                 sample: at / channels,
                 value: pcm[at],
                 bits: self.config.bits,
-            }),
+            });
+        }
+        match &self.heights {
+            Some(heights) => heights.check(pcm, self.frames),
             None => Ok(()),
         }
+    }
+
+    /// Frames encoded so far: the index of the next.
+    pub fn frames(&self) -> u64 {
+        self.frames
     }
 
     /// Encode one frame — [`FRAME_SAMPLES`] samples of every channel,
@@ -598,6 +840,13 @@ impl Encoder {
     /// against it where that is cheaper; without it, every channel is coded
     /// as itself.
     ///
+    /// A 7.1.4's heights are folded into the 7.1 first, and everything else
+    /// is done to that composite; the heights go out as they came in, in
+    /// the DTS:X extension block at the end of the frame. A frame whose
+    /// block the navigation word cannot locate is refused
+    /// ([`Refused::Navigation`]): the frame is coded, but there is no
+    /// stream to put it in.
+    ///
     /// # Panics
     /// If `pcm` is not exactly one frame.
     pub fn encode(&mut self, pcm: &[i32], core: Option<&CoreDecoder>) -> Result<&[u8], Refused> {
@@ -608,28 +857,52 @@ impl Encoder {
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
         self.check(pcm)?;
-        let shift = 32 - u32::from(self.config.bits);
-        for set in &mut self.sets {
-            for (plane, &input) in set.samples.iter_mut().zip(&set.inputs) {
-                for (n, sample) in plane.iter_mut().enumerate() {
-                    *sample = pcm[n * channels + input] >> shift;
+        let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
+        let parameter_bits = self.parameter_bits;
+        match &mut self.heights {
+            Some(heights) => {
+                heights.fold(pcm);
+                load(&mut heights.set, pcm, channels, 8);
+                decorrelate(
+                    &mut heights.set,
+                    parameter_bits,
+                    segment_samples,
+                    &mut self.search,
+                );
+                for ch in 0..4 {
+                    predict(
+                        &mut heights.set,
+                        ch,
+                        parameter_bits,
+                        segment_samples,
+                        &mut self.search,
+                    );
+                }
+                let composite = std::mem::take(&mut heights.composite);
+                for set in &mut self.sets {
+                    load(set, &composite, 8, 8);
+                }
+                self.heights.as_mut().expect("a 7.1.4").composite = composite;
+            }
+            None => {
+                let shift = 32 - u32::from(self.config.bits);
+                for set in &mut self.sets {
+                    load(set, pcm, channels, shift);
                 }
             }
-            set.full = (1 << set.channels()) - 1;
         }
         self.fold_rears();
         if let Some(core) = core.filter(|_| self.config.residual) {
             self.subtract_core(core);
         }
-        let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
-        let parameter_bits = self.parameter_bits;
         for set in &mut self.sets {
             decorrelate(set, parameter_bits, segment_samples, &mut self.search);
             for ch in 0..set.channels() {
                 predict(set, ch, parameter_bits, segment_samples, &mut self.search);
             }
         }
-        self.assemble();
+        self.assemble()?;
+        self.frames += 1;
         Ok(&self.frame)
     }
 
@@ -697,8 +970,9 @@ impl Encoder {
     }
 
     /// Lay the frame out: headers sized to the band data, the data, and
-    /// zeroes to the next 32-bit word.
-    fn assemble(&mut self) {
+    /// zeroes to the next 32-bit word — then, for a 7.1.4, the extension
+    /// block, which ends the frame.
+    fn assemble(&mut self) -> Result<(), Refused> {
         let segments = 1usize << self.config.segments_log2;
         let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
         let parameter_bits = self.parameter_bits;
@@ -723,6 +997,30 @@ impl Encoder {
                 sizes.push((self.data.byte_position() - start) as u32);
             }
         }
+        let mut largest = sizes.iter().copied().max().unwrap_or(1);
+        // The height set's segments, which its own table sizes in the
+        // frame's width.
+        if let Some(heights) = &mut self.heights {
+            heights.data.clear();
+            heights.previous = Parameters::default();
+            let sizes = &mut heights.block.heights.navigation.sizes;
+            sizes.clear();
+            for segment in 0..segments {
+                let start = heights.data.byte_position();
+                write_segment(
+                    &mut heights.data,
+                    &heights.set,
+                    segment,
+                    segment_samples,
+                    parameter_bits,
+                    &mut heights.previous,
+                    &mut self.search.runs,
+                );
+                heights.data.align_to(8);
+                sizes.push((heights.data.byte_position() - start) as u32);
+            }
+            largest = largest.max(sizes.iter().copied().max().unwrap_or(1));
+        }
         for (header, set) in self.headers.channel_sets.iter_mut().zip(&self.sets) {
             header.residual_encode = set.full as u16;
             header.bands[0].clone_from(&set.band);
@@ -730,25 +1028,39 @@ impl Encoder {
         }
         let common = &mut self.headers.common;
         common.reserved = Bits::new();
-        let largest = sizes.iter().copied().max().unwrap_or(1);
         common.segment_size_bits = bits_for(largest - 1).max(1) as u8;
+        let block = match &mut self.heights {
+            Some(heights) => {
+                let header = &mut heights.block.heights.set;
+                header.bands[0].clone_from(&heights.set.band);
+                header.reserved = Bits::new();
+                heights
+                    .block
+                    .heights
+                    .fit(common)
+                    .expect("the encoder's own height set fits");
+                heights.block.size(common, heights.data.byte_position())
+            }
+            None => 0,
+        };
         // The frame size's width moves the header, which moves the frame
         // size: settle it.
         let data = self.data.byte_position();
-        loop {
+        let bed = loop {
             self.headers
                 .fit(true)
                 .expect("the encoder's own headers fit");
-            let size = (self.headers.len() + data).next_multiple_of(4) as u32;
+            let bed = (self.headers.len() + data).next_multiple_of(4);
+            let size = (bed + block) as u32;
             let width = bits_for(size - 1).max(1) as u8;
             let settled = self.headers.common.frame_size == size
                 && self.headers.common.frame_size_bits == width;
             self.headers.common.frame_size = size;
             self.headers.common.frame_size_bits = width;
             if settled {
-                break;
+                break bed;
             }
-        }
+        };
         self.frame.clear();
         self.frame.extend(
             self.headers
@@ -756,9 +1068,43 @@ impl Encoder {
                 .expect("the encoder's own headers write"),
         );
         self.frame.extend_from_slice(self.data.bytes());
-        self.frame
-            .resize(self.headers.common.frame_size as usize, 0);
+        self.frame.resize(bed, 0);
+        if let Some(heights) = &mut self.heights {
+            self.frame.extend(
+                heights
+                    .block
+                    .write(&self.headers.common)
+                    .expect("the encoder's own block writes"),
+            );
+            self.frame.extend_from_slice(heights.data.bytes());
+            // The trailer and the padding: zeroes to the frame's end.
+            self.frame
+                .resize(self.headers.common.frame_size as usize, 0);
+            heights.navigation = navigation::Navigation {
+                offset: bed,
+                size: block,
+            };
+            if let Err(cause) = heights.navigation.word() {
+                return Err(Refused::Navigation {
+                    frame: self.frames,
+                    cause,
+                });
+            }
+        }
+        Ok(())
     }
+}
+
+/// Take `set`'s channels of `pcm`, `channels` wide and `shift` bits above
+/// the set's resolution, every channel coded as itself until the core says
+/// otherwise.
+fn load(set: &mut Set, pcm: &[i32], channels: usize, shift: u32) {
+    for (plane, &input) in set.samples.iter_mut().zip(&set.inputs) {
+        for (n, sample) in plane.iter_mut().enumerate() {
+            *sample = pcm[n * channels + input] >> shift;
+        }
+    }
+    set.full = (1 << set.channels()) - 1;
 }
 
 /// Bits that hold `value`.

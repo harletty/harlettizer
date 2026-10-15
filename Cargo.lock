@@ -244,6 +244,7 @@ dependencies = [
  "hz-analysis",
  "hz-cluster",
  "hz-core",
+ "hz-dca",
  "hz-iamf",
  "hz-io",
  "hz-meta",
@@ -289,6 +290,7 @@ version = "0.1.0"
 dependencies = [
  "hz-core",
  "quick-xml",
+ "same-file",
  "serde",
  "serde_yaml_ng",
 ]
@@ -733,7 +735,6 @@ dependencies = [
  "hz-meta",
  "hz-mlp",
  "hz-render",
- "same-file",
  "serde",
  "serde_json",
  "serde_yaml_ng",

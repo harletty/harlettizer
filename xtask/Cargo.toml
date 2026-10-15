@@ -44,10 +44,6 @@ serde.workspace = true
 serde_yaml_ng.workspace = true
 serde_json.workspace = true
 clap.workspace = true
-# Whether two paths are one file, hard links included: device and inode on
-# Unix, volume and file index on Windows, which the standard library only
-# offers on Unix.
-same-file = "1"
 
 [features]
 # An independent reader for the object metadata payload. See above for the cost.

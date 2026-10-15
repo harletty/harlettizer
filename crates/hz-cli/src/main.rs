@@ -2,6 +2,7 @@
 
 mod ac3;
 mod convert;
+mod dts;
 mod encode;
 mod iamf;
 mod iamf_objects;
@@ -297,6 +298,43 @@ enum Command {
         /// frame can carry (`--bitrate` in kb/s, up to 1024 at 48 kHz).
         #[arg(long)]
         eac3: bool,
+
+        /// Report progress on standard error.
+        #[arg(long)]
+        progress: bool,
+    },
+
+    /// Render a programme to 7.1.4 and write it as DTS-HD Master Audio with
+    /// the DTS:X extension's standard profile.
+    ///
+    /// Takes a master set or an ADM BW64 file at 48 kHz. Its bed channels are
+    /// routed to their speakers and its objects panned on the room's cube, as
+    /// `iamf` renders them; each height is folded into the corner below it
+    /// at −3 dB, the 7.1 that makes coded losslessly at 24 bits beside a 5.1
+    /// core, and the heights carried losslessly in the extension. A limiter
+    /// keeps every corner with its height in it under full scale. Writes a
+    /// raw elementary stream. See `docs/dts.md`.
+    Dts {
+        /// A master set's `.atmos` config, or an ADM BW64 file.
+        input: PathBuf,
+
+        /// Write the elementary stream here.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Stop after this many frames of audio.
+        #[arg(long)]
+        frames: Option<u64>,
+
+        /// Read the master's audio from one mono WAV per waveform; see
+        /// `encode --mono-prefix`.
+        #[arg(long, value_name = "PREFIX")]
+        mono_prefix: Option<PathBuf>,
+
+        /// Code the core's subbands with prediction (ADPCM). The lossless
+        /// layers are the same either way.
+        #[arg(long)]
+        adpcm: bool,
 
         /// Report progress on standard error.
         #[arg(long)]
@@ -798,6 +836,21 @@ fn main() -> ExitCode {
                 })
             })
         }
+        Command::Dts {
+            input,
+            out,
+            frames,
+            mono_prefix,
+            adpcm,
+            progress,
+        } => dts::run(dts::Config {
+            input,
+            out,
+            frames,
+            mono_prefix,
+            adpcm,
+            progress,
+        }),
         Command::Iamf {
             input,
             out,

@@ -564,7 +564,7 @@ pub fn run(options: Options) -> Result<()> {
     // Written before the reference is decoded a second time for the
     // comparison, an output that is the reference would replace it and the
     // graft would be compared with itself.
-    if crate::paths::aliases(&options.reference, &options.out)? {
+    if hz_io::paths::aliases(&options.reference, &options.out)? {
         return Err(Error::refused(
             &options.out,
             "the output is the reference: writing it would replace what the graft is compared with",

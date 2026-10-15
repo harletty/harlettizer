@@ -1073,13 +1073,13 @@ What C2b did:
   over the four beds, against 9108 full-coded — which matters to C3, whose
   navigation word cannot point past 8188 bytes.
 
-#### Phase C3 — The DTS:X extension, fixed 7.1.4
+#### Phase C3 — The DTS:X extension, fixed 7.1.4 — **bitstream done: (a), (b) and (e) hold; (c) receiver and (d) listening left**
 
 - Render the master to 7.1.4 (`hz-programme`, `hz-render::Room`, as the IAMF
   bed does), fold each height into its lower corner at code 55, and write the
   bare four-channel set, the 22-byte prefix from its fields (not as a pasted
   constant) and the EXSS navigation word.
-- 🔴 **Navigation bounds.** The navigation word gives the block's offset in
+- ✅ **Navigation bounds** — the stated domain, below. The navigation word gives the block's offset in
   11 bits of four bytes (8,188 bytes at most) and, as C0 established, its
   size in 11 bits of four bytes plus 24 (8,212 bytes at most). Four
   full-coded 24-bit heights — 6,144 bytes of raw PCM a frame — therefore
@@ -1092,7 +1092,7 @@ What C2b did:
   it). The bed uses the C2b residual coding here, not C2a's full-coded
   form: on the four standard-profile streams' beds its largest frame is
   7,572 bytes, under the bound, where full coding reaches 9,108.
-- 🔴 **Headroom.** Bed plus 0.707 × height can pass 24-bit full scale. The
+- ✅ **Headroom** — a limiter on the composite, below. Bed plus 0.707 × height can pass 24-bit full scale. The
   fold needs the limiter (`Headroom::Limit`) or a margin before it, or the
   lossless bed clips.
 - **Accept when**: (a) `dca` presents the stream as the standard height
@@ -1107,6 +1107,107 @@ What C2b did:
 - 🔴 The fields pinned to observed values satisfy our own decoders by
   construction. Only (c) shows that a licensed decoder accepts them.
 - **Size**: 1–2 weeks for the bitstream. **Risk**: medium, all of it in (c).
+
+What C3 did:
+
+- ✅ **`hz_dca::dtsx`**: the extension block as a model with a reader and a
+  writer. The fold matrix is a type-2 layout element: the bed's speakers
+  (`0x84b`) and the output's (`0x886b`), unity level and scale, then one row
+  per height of six-bit gain codes over the bed's eight columns, a byte
+  alignment, a CRC16, and one byte more. The height set is a bare channel set
+  (`xll::BareSet`): a sub-header in the non-one-to-one form, and a navigation
+  table of its own in the frame's segments and segment-size width. After its
+  data come two zero bytes, then zeroes to the 32-bit word. The fields the
+  streams never vary are constants, written as the streams carry them and
+  refused by the reader at any other value. **`FoldMatrix::standard()`,
+  written from its fields, is the 22 bytes every reference frame carries**,
+  checksum included, and its first four are the `0x02000850` decoders find
+  the block by. A gain code's value is the downmix table's at `4 · code − 3`
+  (55 is 23170, 61 is unity), as the `dca` crate's notes measured.
+- ✅ **The reference streams through the new reader**, with `cargo xtask dts`:
+  all 34,311 blocks of the four standard-profile streams read, rewrite byte
+  for byte with every checksum valid, and are laid out exactly as the
+  writer lays them out. That is the two-byte trailer, the padding, and the
+  block ending the frame, at the first word after the bed's band data. Every
+  navigation word points at the block found there. The matrix is the same
+  22 bytes in every frame. The height sets are 24-bit, except 384 frames
+  where the reference encoder declares 22.
+- ✅ **What else a DTS:X frame carries, measured.** The asset descriptor is
+  the 7.1's (eight channels, `0x84b`, the embedded 5.1), its tail two zero
+  bits, the navigation word, and the padding to the byte (69 bits), on every
+  frame of the four. And every substream header ends on a 32-bit word: all
+  483,656 of the 64 local streams that have one, 28 to 44 bytes. C2's
+  writer did not pad there, so the lossless data started off the word. It
+  does now, for every layout, with reserved zeroes, so that our header is the
+  reference's field for field.
+- ✅ **`lossless::Layout::SevenPointOneFour`**, 24 bits only, because a
+  height's share of a corner is a 24-bit quantity. The heights are folded
+  into the composite 7.1 at the matrix's gains, `(h · 23170 + 2^14) >> 15`,
+  before anything else, and everything C2 does is done to the composite:
+  the rears' embedded downmix, the core made from it, the residual against
+  that core. The heights are coded by the same search as any set, every
+  channel as itself. The frame is laid out as before, then the block. The
+  common header's segment-size width covers the bed's segments and the
+  heights' both, since a decoder reads both tables with it. `master` writes
+  the navigation word into the descriptor's tail at bit 2.
+- ✅ **Headroom.** The encoder refuses a corner its height takes past 24 bits
+  (`Refused::Fold`, naming frame, channel and sample): a decoder would clip
+  the composite, and the unfold would no longer be exact. `harlettizer dts`
+  limits before it quantises: one gain for all twelve channels, the
+  `hz_cluster` limiter an element's mix has, watching the eight composite
+  channels as well as the twelve, a few steps under full scale. A synthetic
+  40-object scene peaked at 3.11 of full scale in the composite and was held;
+  an 11-object master peaked at 0.56 and the limiter never acted.
+- ✅ **The navigation domain: the word as it is read, and nothing wider.**
+  The bed — the block's offset — cannot pass 8,188 bytes a frame, about
+  6.1 Mb/s for the lossless 7.1. A frame past it is refused with
+  `Refused::Navigation`, which names the frame and its first sample, and the
+  stream ends there. It is never cut or coded coarser. No stream has shown a
+  wider field, so none is assumed. What fills the bed is what the core
+  cannot predict:
+  - programme material fits. The four reference streams' 7.1.4 reaches 7,572
+    bytes, and the reference encoder's own beds of it 7,884. A rendered
+    11-object master reaches 7,716, so the margin is real but not wide;
+  - **(e)**: uniform white noise in all twelve channels at 24 bits is refused
+    at its first frame from a peak of 2⁻⁸ of full scale (−48 dBFS) up, the
+    bed 8,600 bytes there and 9,112 at −42 dBFS. At 2⁻⁹ (−54 dBFS) and below
+    it encodes losslessly, the bed 8,088 bytes at most. A test holds both
+    sides: refused at −6 and −18 dBFS, lossless at −72.
+- ✅ **(a) and (b) on real 7.1.4.** `cargo xtask dts --unfold` writes a
+  standard-profile stream's twelve pre-fold channels: the oracle's composite
+  and heights, through the integer unfold. The four reference streams'
+  7.1.4, 34,311 frames and 6 min 6 s, went back through `dts-encode
+  --channels 12`. `dca` presents the height profile on every frame. The
+  composite 7.1 is the fold of the input, the four heights are the input's,
+  and the unfold is the input's 7.1, all bit for bit. FFmpeg (n9.0.2,
+  `-err_detect crccheck`) reports `DTS-HD MA + DTS:X` and returns the
+  composite bit for bit. Every header, the block's included, rewrites byte
+  for byte. The same on synthetic 7.1.4 with a plain and an ADPCM core
+  (`the_standard_dtsx_profile_comes_back_bit_for_bit`), and in the crate's
+  own tests through its FFmpeg-mirror reader, which now reads the block too.
+- **What it costs, against the reference encoder on the same 7.1.4** (mean /
+  largest bytes a frame):
+
+  | Reference stream's 7.1.4 | bed, ours | bed, reference | heights, ours | heights, reference |
+  |---|---|---|---|---|
+  | stream 1 | 4,597 / 7,572 | 4,825 / 7,884 | 2,881 / 4,996 | 2,896 / 5,056 |
+  | stream 2 | 4,151 / 6,024 | 4,376 / 6,300 | 2,815 / 3,628 | 2,824 / 3,636 |
+  | stream 3 | 3,547 / 6,912 | 3,753 / 7,136 | 2,391 / 4,376 | 2,457 / 4,432 |
+  | stream 4 | 4,829 / 7,448 | 5,067 / 7,776 | 3,118 / 4,540 | 3,150 / 4,524 |
+
+  The bed is 4.7–5.5 % smaller, as C2b found on the 7.1 alone. The heights
+  are 0.3–2.7 % smaller: the same coder with nothing to subtract. The whole
+  stream is 43–54 % of the 24-bit PCM with the core, encoded at 6–7× real
+  time.
+- ✅ **`harlettizer dts`**: the master rendered as `iamf` renders it, onto
+  7.1.4, limited as above, and written as a raw `.dts`, with `--adpcm` for the
+  core. On an 11-object master (6,643 frames) and a 40-object scene, `dca`
+  presents the height profile on every frame, every block rewrites, and
+  FFmpeg reports DTS:X. Matroska and progress lines are C5. `docs/dts.md`
+  has the command, the checks, the domain and the receiver recipe.
+- 🔴 **(c) and (d)** need a receiver and a listener. `docs/dts.md` has the
+  recipe: re-encode a reference stream's own 7.1.4 and play the two side by
+  side, so that any difference is ours.
 
 #### Phase C4 — Peak bitrate
 

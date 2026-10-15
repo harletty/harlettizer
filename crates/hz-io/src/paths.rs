@@ -1,9 +1,11 @@
 //! Whether two paths name one file.
 //!
-//! Kept out of the commands that use it so that it is compiled, and its tests
-//! run, in every build — the harness's oracle commands are behind features no
-//! CI job turns on, and the case that matters most here is the one only a
-//! Windows runner can see.
+//! A command that writes its output while it still reads its input has to
+//! refuse an output that is the input under another name, or it truncates
+//! what it is reading. Here rather than beside the commands so that every
+//! one of them — the command line's and the harness's — asks the same
+//! question the same way, and the tests run in every build: the case that
+//! matters most is one only a Windows runner can see.
 
 use hz_core::{Error, Result};
 use std::path::Path;
@@ -17,7 +19,6 @@ use std::path::Path;
 /// `input` must exist; `out` need not, and an `out` that does not exist is
 /// still caught when its directory, through links, is `input`'s and its name
 /// is `input`'s name.
-#[cfg_attr(not(feature = "eac3-oracle"), allow(dead_code))]
 pub fn aliases(input: &Path, out: &Path) -> Result<bool> {
     let input_at = std::fs::canonicalize(input).map_err(|e| Error::io(input, e))?;
     if out.exists() {
@@ -46,7 +47,7 @@ mod tests {
     impl Scratch {
         fn new(name: &str) -> Self {
             let dir =
-                std::env::temp_dir().join(format!("hz-xtask-paths-{name}-{}", std::process::id()));
+                std::env::temp_dir().join(format!("hz-io-paths-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)

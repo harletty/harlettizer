@@ -26,6 +26,14 @@
 //! smoothing buffer stated as none: every lossless frame sits whole in its
 //! own substream, so the substreams vary in size frame to frame. Smoothing
 //! that peak is phase C4.
+//!
+//! A 7.1.4 is the DTS:X extension's standard profile ([`crate::dtsx`]): the
+//! stream above, its 7.1 the composite the heights are folded into, and at
+//! the end of each lossless frame the block that carries the heights. The
+//! asset still states the 7.1; its descriptor's tail carries the navigation
+//! word that locates the block. A frame the word cannot locate is refused
+//! with [`Refused::Navigation`], naming it, and the stream ends there: the
+//! frame is not cut to fit, and the stream cannot go on without it.
 
 use crate::bits::Bits;
 use crate::core_decode::CoreDecoder;
@@ -83,6 +91,8 @@ pub struct Encoder {
     /// were coded against the core.
     lossless_bytes: u64,
     against_core: u64,
+    /// The furthest offset and the largest DTS:X block navigated so far.
+    reach: Option<(usize, usize)>,
 }
 
 impl Encoder {
@@ -125,10 +135,10 @@ impl Encoder {
                     text: None,
                     pcm_bit_res: bits,
                     max_sample_rate_code: 12,
-                    channels: layout.channels() as u16,
+                    channels: layout.bed_channels() as u16,
                     mapping: ChannelMapping::OneToOne {
                         embedded_stereo: false,
-                        embedded_6ch: layout == Layout::SevenPointOne,
+                        embedded_6ch: layout != Layout::FivePointOne,
                         speaker_mask: Some(lossless.speaker_activity()),
                         remaps: vec![],
                     },
@@ -171,6 +181,7 @@ impl Encoder {
             frames: 0,
             lossless_bytes: 0,
             against_core: 0,
+            reach: None,
             decoder: CoreDecoder::new(),
             core,
             lossless,
@@ -192,8 +203,11 @@ impl Encoder {
             self.pending.len(),
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
-        // Refused before anything moves on.
-        self.lossless.check(pcm)?;
+        // Refused before anything moves on, naming the input frame: the
+        // lossless layer has coded the frames sent, not the one waiting.
+        self.lossless
+            .check(pcm)
+            .map_err(|e| e.of_frame(self.frames + u64::from(self.waiting)))?;
         self.core_frame.clear();
         self.core
             .encode(self.lossless.core_input(pcm), &mut self.core_frame);
@@ -235,19 +249,39 @@ impl Encoder {
         // after a seek). A first frame that codes every channel as itself
         // has nothing to recover, so the stream decodes losslessly from its
         // first sample.
-        let several_sets = self.lossless.config().layout == Layout::SevenPointOne;
+        let several_sets = self.lossless.config().layout != Layout::FivePointOne;
         let core = (self.frames > 0 || !several_sets).then_some(&self.decoder);
         let size = self.lossless.encode(&self.pending, core)?.len() as u32;
         self.exss.asset_sizes[0] = size;
         if let Coding::Components { xll: Some(x), .. } = &mut self.exss.assets[0].coding {
             x.size = size;
         }
+        if let Some(navigation) = self.lossless.extension() {
+            let (offset, size) = self.reach.unwrap_or_default();
+            self.reach = Some((offset.max(navigation.offset), size.max(navigation.size)));
+            self.exss.assets[0].tail = tail(
+                navigation
+                    .word()
+                    .expect("the lossless encoder refuses a block it cannot navigate"),
+            );
+        }
         // Narrow fields where the whole substream fits them, wide otherwise.
         self.exss.wide = false;
         let header = loop {
+            self.exss.reserved = Bits::new();
             self.exss
                 .fit()
                 .expect("a lossless frame fits a substream's wide fields");
+            // Every reference stream's header ends on a 32-bit word — 28 to
+            // 44 bytes, never between — so that what follows starts on one:
+            // zeroes in the reserved bits to get there.
+            let short = (4 - self.exss.header_size % 4) % 4;
+            if short > 0 {
+                self.exss.reserved.pad(8 * short as usize);
+                self.exss
+                    .fit()
+                    .expect("a lossless frame fits a substream's wide fields");
+            }
             self.exss.size = self.exss.header_size + size;
             match self.exss.write() {
                 Ok(header) => break header,
@@ -275,10 +309,31 @@ impl Encoder {
         self.against_core
     }
 
+    /// For a 7.1.4, the furthest the navigation word has had to point and
+    /// the largest block it has had to describe, in bytes: how close the
+    /// stream has come to [`crate::navigation::MAX_OFFSET`] and
+    /// [`crate::navigation::MAX_SIZE`].
+    pub fn extension_reach(&self) -> Option<(usize, usize)> {
+        self.reach
+    }
+
     /// Bytes of the core in every frame.
     pub fn core_frame_size(&self) -> usize {
         self.core.frame_size()
     }
+}
+
+/// The lossless asset descriptor's tail when the asset carries the DTS:X
+/// extension: two zero bits and the navigation word, as every frame of the
+/// standard-profile reference streams has it. What the two bits are is not
+/// established. [`ExssHeader::fit`] pads it to the descriptor's byte.
+fn tail(word: u64) -> Bits {
+    let mut w = hz_core::bits::BitWriter::new();
+    w.put(2, 0);
+    w.put(32, (word >> 32) as u32);
+    w.put(32, word as u32);
+    let bytes = w.padded();
+    Bits::read(&mut hz_core::bits_read::BitReader::new(&bytes), 66).expect("66 bits were written")
 }
 
 #[cfg(test)]
@@ -375,5 +430,83 @@ mod tests {
         encoder.encode(&pcm, &mut stream).unwrap();
         encoder.finish(&mut stream).unwrap();
         assert_eq!(residual_masks(&stream).len(), 2);
+    }
+
+    /// A 7.1.4 is the standard DTS:X profile: the asset states the 7.1, its
+    /// descriptor's tail is two zero bits, the navigation word and the
+    /// padding to the byte, and the word points at the block that ends the
+    /// lossless frame. Every substream header ends on a 32-bit word, as the
+    /// reference streams' do.
+    #[test]
+    fn a_7_1_4_carries_the_word_that_locates_its_heights() {
+        for layout in [
+            Layout::FivePointOne,
+            Layout::SevenPointOne,
+            Layout::SevenPointOneFour,
+        ] {
+            let channels = layout.channels();
+            let mut encoder = Encoder::new(Config::reference(layout, 24)).unwrap();
+            let mut stream = Vec::new();
+            let pcm: Vec<i32> = tones(channels, 4).iter().map(|&s| s >> 1 & !0xff).collect();
+            for frame in pcm.chunks(FRAME_SAMPLES * channels) {
+                encoder.encode(frame, &mut stream).unwrap();
+            }
+            encoder.finish(&mut stream).unwrap();
+            let mut frames = 0;
+            for frame in split::frames(&stream) {
+                let exss = frame.unwrap().exss.unwrap();
+                let header = ExssHeader::read(exss).unwrap();
+                assert_eq!(header.header_size % 4, 0, "{layout:?}");
+                let asset = &header.assets[0];
+                let statics = asset.statics.as_ref().unwrap();
+                assert_eq!(statics.channels, 8.min(channels as u16));
+                let tail = &asset.tail;
+                if layout != Layout::SevenPointOneFour {
+                    // The padding to the descriptor's byte, and nothing else.
+                    assert!(tail.len() < 8 && tail.is_zero(), "{layout:?}");
+                    continue;
+                }
+                assert_eq!((tail.len(), tail.bytes()[0] >> 6), (69, 0));
+                let nav = crate::navigation::Navigation::read(tail.word64(2).unwrap()).unwrap();
+                let at = header.header_size as usize;
+                let xll = &exss[at..at + header.asset_sizes[0] as usize];
+                assert_eq!(nav.offset + nav.size, xll.len());
+                assert_eq!(
+                    u32::from_be_bytes(xll[nav.offset..nav.offset + 4].try_into().unwrap()),
+                    crate::dtsx::SYNC
+                );
+                frames += 1;
+            }
+            if layout == Layout::SevenPointOneFour {
+                assert_eq!(frames, 4);
+                let (offset, size) = encoder.extension_reach().unwrap();
+                assert!(offset <= crate::navigation::MAX_OFFSET && size > 22);
+            }
+        }
+    }
+
+    /// A corner its height takes past 24 bits is refused, naming the input
+    /// frame it is in — not the frame the lossless layer last coded, which
+    /// is the one before, still waiting for its core.
+    #[test]
+    fn a_fold_past_24_bits_names_its_input_frame() {
+        let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOneFour, 24)).unwrap();
+        let mut stream = Vec::new();
+        let mut pcm = vec![0i32; FRAME_SAMPLES * 12];
+        for _ in 0..2 {
+            encoder.encode(&pcm, &mut stream).unwrap();
+        }
+        // L at full scale and TFL at full scale: 1.707.
+        pcm[7 * 12] = ((1 << 23) - 1) << 8;
+        pcm[7 * 12 + 8] = ((1 << 23) - 1) << 8;
+        match encoder.encode(&pcm, &mut stream) {
+            Err(Refused::Fold {
+                frame: 2,
+                channel: 0,
+                sample: 7,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
     }
 }

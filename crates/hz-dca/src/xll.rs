@@ -785,21 +785,11 @@ impl Headers {
             channel_sets.push(set);
         }
         let entries = navigation_entries(&common, &channel_sets);
-        let mut sizes = Vec::with_capacity(entries);
-        for _ in 0..entries {
-            sizes.push(get_wide(&mut r, u32::from(common.segment_size_bits))? as u32 + 1);
-        }
-        let align = (8 - r.bit_position() % 8) % 8;
-        let padding = Bits::read(&mut r, align)?;
-        let crc = r.get(16)? as u16;
+        let navigation = Navigation::read(&mut r, entries, common.segment_size_bits)?;
         Ok(Self {
             common,
             channel_sets,
-            navigation: Navigation {
-                sizes,
-                padding,
-                crc,
-            },
+            navigation,
         })
     }
 
@@ -820,9 +810,7 @@ impl Headers {
     }
 
     fn navigation_len(&self) -> usize {
-        let bits = self.navigation.sizes.len() * usize::from(self.common.segment_size_bits)
-            + self.navigation.padding.len();
-        bits / 8 + 2
+        self.navigation.len(self.common.segment_size_bits)
     }
 
     /// Frequency bands in the frame: the most any set has.
@@ -886,23 +874,10 @@ impl Headers {
             bytes.extend(seal(out, 0, set.size, "a channel set sub-header")?);
         }
         let entries = navigation_entries(&self.common, &self.channel_sets);
-        let mut out = Out::new();
-        out.check(self.navigation.sizes.len() == entries, || {
-            format!(
-                "{} navigation entries where the frame has {entries}",
-                self.navigation.sizes.len()
-            )
-        });
-        for &size in &self.navigation.sizes {
-            out.size(
-                u32::from(self.common.segment_size_bits),
-                size,
-                "a navigation entry",
-            );
-        }
-        out.bits(&self.navigation.padding);
-        let size = (out.position() / 8 + 2) as u32;
-        bytes.extend(seal(out, 0, size, "the navigation table")?);
+        bytes.extend(
+            self.navigation
+                .write(entries, self.common.segment_size_bits)?,
+        );
         Ok(bytes)
     }
 
@@ -952,8 +927,141 @@ impl Headers {
                 )));
             }
         }
-        let used = self.navigation.sizes.len() * usize::from(self.common.segment_size_bits);
-        self.navigation.padding = Bits::zeroes((8 - used % 8) % 8);
+        self.navigation.fit(self.common.segment_size_bits);
+        Ok(())
+    }
+}
+
+impl Navigation {
+    /// Read a table of `entries` sizes, each `bits` wide.
+    fn read(r: &mut BitReader, entries: usize, bits: u8) -> Result<Self> {
+        let mut sizes = Vec::with_capacity(entries);
+        for _ in 0..entries {
+            sizes.push(get_wide(r, u32::from(bits))? as u32 + 1);
+        }
+        let align = (8 - r.bit_position() % 8) % 8;
+        let padding = Bits::read(r, align)?;
+        let crc = r.get(16)? as u16;
+        Ok(Self {
+            sizes,
+            padding,
+            crc,
+        })
+    }
+
+    /// Bytes in the table, its checksum included, when each size is `bits`
+    /// wide.
+    fn len(&self, bits: u8) -> usize {
+        (self.sizes.len() * usize::from(bits) + self.padding.len()) / 8 + 2
+    }
+
+    /// Write the table, which has to have `entries` sizes, each `bits` wide.
+    fn write(&self, entries: usize, bits: u8) -> Result<Vec<u8>> {
+        let mut out = Out::new();
+        out.check(self.sizes.len() == entries, || {
+            format!(
+                "{} navigation entries where the frame has {entries}",
+                self.sizes.len()
+            )
+        });
+        for &size in &self.sizes {
+            out.size(u32::from(bits), size, "a navigation entry");
+        }
+        out.bits(&self.padding);
+        let size = (out.position() / 8 + 2) as u32;
+        seal(out, 0, size, "the navigation table")
+    }
+
+    /// Pad the table to the byte before its checksum.
+    fn fit(&mut self, bits: u8) {
+        let used = self.sizes.len() * usize::from(bits);
+        self.padding = Bits::zeroes((8 - used % 8) % 8);
+    }
+}
+
+/// A channel set outside the frame's hierarchy, with a navigation table of
+/// its own: how the DTS:X extension carries its heights
+/// ([`crate::dtsx`]). Its sub-header has no speaker mapping — the
+/// `bOne2OneMapChannels2Speakers` form whatever the asset says — and it is
+/// read in the frame's context, as a decoder reads it: the frame's segments,
+/// the width of a segment's size (in the table and in an LSB section's
+/// size), and whether band 0 carries the LSB fields all come from the
+/// common header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BareSet {
+    pub set: ChannelSet,
+    /// One size per segment per band of the set.
+    pub navigation: Navigation,
+}
+
+impl BareSet {
+    /// Read the set at the start of `bytes`, in the frame `common` heads.
+    pub fn read(bytes: &[u8], common: &CommonHeader) -> Result<Self> {
+        let mut r = BitReader::new(bytes);
+        let set = ChannelSet::read(&mut r, common.context(false, &[]))?;
+        let entries = common.segments() * set.band_count();
+        let navigation = Navigation::read(&mut r, entries, common.segment_size_bits)?;
+        Ok(Self { set, navigation })
+    }
+
+    /// Bytes of the sub-header and the table, checksums included: where the
+    /// set's data starts.
+    pub fn len(&self, common: &CommonHeader) -> usize {
+        self.set.size as usize + self.navigation.len(common.segment_size_bits)
+    }
+
+    /// Never empty; for the lint.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Bytes of data the table describes.
+    pub fn data_len(&self) -> usize {
+        self.navigation.sizes.iter().map(|&s| s as usize).sum()
+    }
+
+    /// Whether both checksums stored in `bytes`, whose set this is, hold.
+    pub fn checksums(&self, bytes: &[u8], common: &CommonHeader) -> bool {
+        let header = self.set.size as usize;
+        bytes.get(..header).is_some_and(crc::check)
+            && bytes.get(header..self.len(common)).is_some_and(crc::check)
+    }
+
+    /// Write the sub-header and the table, both checksums computed.
+    pub fn write(&self, common: &CommonHeader) -> Result<Vec<u8>> {
+        let mut out = Out::new();
+        self.set.write_fields(&mut out, common.context(false, &[]));
+        out.bits(&self.set.reserved);
+        let mut bytes = seal(out, 0, self.set.size, "a channel set sub-header")?;
+        let entries = common.segments() * self.set.band_count();
+        bytes.extend(self.navigation.write(entries, common.segment_size_bits)?);
+        Ok(bytes)
+    }
+
+    /// Size the sub-header and pad the table from the content, as
+    /// [`Headers::fit`] does. On a refusal the set is left as it was.
+    pub fn fit(&mut self, common: &CommonHeader) -> Result<()> {
+        let context = common.context(false, &[]);
+        let mut out = Out::new();
+        let size = self.set.size;
+        self.set.size = 1;
+        self.set.write_fields(&mut out, context);
+        let used = out.position();
+        if let Err(e) = out.finish() {
+            self.set.size = size;
+            return Err(e);
+        }
+        let mut reserved = self.set.reserved.clone();
+        let bytes = pad_to_byte(&mut reserved, used) + 2;
+        if bytes > 1024 {
+            self.set.size = size;
+            return Err(Ran(format!(
+                "a {bytes}-byte channel set sub-header does not fit its size field"
+            )));
+        }
+        self.set.reserved = reserved;
+        self.set.size = bytes;
+        self.navigation.fit(common.segment_size_bits);
         Ok(())
     }
 }
