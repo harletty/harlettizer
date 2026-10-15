@@ -101,10 +101,27 @@ fn read_reference(path: &Path) -> Result<Reference> {
     let mut core: Vec<Vec<f32>> = vec![Vec::new(); 6];
     let mut emdf = Vec::new();
     let (mut frame_bytes, mut sample_rate) = (0, 0);
+    let mut sequence: Option<u16> = None;
     for (index, frame) in frames(path)?.iter().enumerate() {
-        let pushed = decoder
-            .push_access_unit(frame)
-            .map_err(|e| Error::malformed(path, format!("syncframe {index}: {e}")))?;
+        let decode = |decoder: &mut PcmDecoder| {
+            decoder
+                .push_access_unit(frame)
+                .map_err(|e| Error::malformed(path, format!("syncframe {index}: {e}")))
+        };
+        let mut pushed = decode(&mut decoder)?;
+        // Where the joint object coding count breaks, the object decoder
+        // starts over and decodes the frame again from nothing, core
+        // included; the core the fit reads has to come from the same history
+        // as the objects it is fitted to, so it starts over here too.
+        if let Some(count) = pushed.info.first_joc_payload().map(|j| j.sequence_counter) {
+            let continues = sequence
+                .is_some_and(|last| count != 0 && count == hz_joc::estimate::next_sequence(last));
+            if !continues && sequence.is_some() {
+                decoder.reset();
+                pushed = decode(&mut decoder)?;
+            }
+            sequence = Some(count);
+        }
         let (info, pcm) = (pushed.info, pushed.pcm);
         if info.channel_mode != 7 || !info.lfe_on {
             return Err(Error::unsupported(
@@ -804,5 +821,105 @@ mod tests {
         let (frame, end) = hz_meta::emdf::read_synced(&padded, 0).unwrap();
         assert_eq!(end, padded.len());
         assert_eq!(frame.payloads[0].bytes, joc(1));
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+    use hz_joc::estimate::Fit;
+
+    /// Four frames of 5.1 E-AC-3, coded by an encoder of their own, each
+    /// carrying a payload that rebuilds one object as the front left channel,
+    /// numbered from nought as a fresh stream is.
+    fn segment(seed: u32, level: f32) -> Vec<u8> {
+        let mut encoder = Encoder::new(Config {
+            format: Format::Eac3,
+            sample_rate: 48_000,
+            mode: ChannelMode::ThreeTwo,
+            lfe: true,
+            bit_rate: Some(768),
+            coupling: true,
+            metadata: Metadata::default(),
+        })
+        .unwrap();
+        let mut seed = seed;
+        let mut stream = Vec::new();
+        for count in 0..4u16 {
+            let mut codes = vec![vec![0u16; 12]; 5];
+            codes[0][0] = 10; // a gain of one, the rest of the chain unchanged
+            let joc = hz_joc::Joc {
+                downmix_config: 0,
+                clip_gain: (4, 0),
+                sequence: count,
+                objects: vec![Some(hz_joc::Object {
+                    bands_index: 5,
+                    fine: true,
+                    steep: false,
+                    offsets: vec![],
+                    data: hz_joc::Data::Dense(vec![codes]),
+                })],
+                unflagged_tail: 0,
+                padding: 0,
+                trailing: vec![],
+            }
+            .to_bytes();
+            let mut container = hz_core::bits::BitWriter::new();
+            hz_meta::emdf::write(
+                &mut container,
+                &[hz_meta::emdf::Payload {
+                    id: hz_meta::emdf::JOC,
+                    bytes: &joc,
+                    ..Default::default()
+                }],
+                hz_meta::emdf::Protection::EAC3,
+            );
+            let container = container.finish();
+            let mut synced = hz_meta::emdf::SYNC_WORD.to_be_bytes().to_vec();
+            synced.extend_from_slice(&(container.len() as u16).to_be_bytes());
+            synced.extend_from_slice(&container);
+            encoder.carry_skip_field(&synced);
+
+            let planes: Vec<Vec<f32>> = (0..6)
+                .map(|_| {
+                    (0..FRAME_SAMPLES)
+                        .map(|_| {
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * level
+                        })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+            encoder.encode(&refs, &mut stream).unwrap();
+        }
+        stream
+    }
+
+    /// The payloads a ramp fit writes for a stream — the fit the review saw
+    /// go wrong, since it leans on what the decoder holds.
+    fn refitted(name: &str, stream: &[u8]) -> Vec<Vec<u8>> {
+        let path =
+            std::env::temp_dir().join(format!("hz-xtask-graft-{name}-{}.ec3", std::process::id()));
+        std::fs::write(&path, stream).unwrap();
+        let reference = read_reference(&path).unwrap();
+        let theirs = decode_objects(&path).unwrap();
+        let (emdf, _) = refit(&path, &reference, &theirs, Fit::Ramp, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+        emdf
+    }
+
+    /// The review's case: a segment fitted after a splice is fitted exactly
+    /// as it is alone — its core decoded from nothing, as its objects are.
+    #[test]
+    fn a_segment_after_a_splice_fits_as_it_does_alone() {
+        let first = segment(1, 0.5);
+        let second = segment(2, 0.15);
+        let alone = refitted("alone", &second);
+        let mut spliced_stream = first;
+        spliced_stream.extend_from_slice(&second);
+        let spliced = refitted("spliced", &spliced_stream);
+        assert_eq!(spliced.len(), 8);
+        assert_eq!(&spliced[4..], &alone[..], "the second segment's payloads");
     }
 }

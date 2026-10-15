@@ -121,7 +121,10 @@ past its last field, TS 102 366 H.2.2.1.2), and the command refuses to report
 unless the two decoded cores are identical. And where the reference's sequence
 count breaks — a splice, after which its decoder starts over — the fit starts
 over too: each unspliced run of frames is fitted by an estimator of its own,
-numbered from the reference's count, its window never reaching across the cut.
+numbered from the reference's count, its window never reaching across the cut,
+and the core it reads is decoded again from nothing at the cut, as the
+reference's objects are — a test fits a segment alone and after a splice and
+asks for the same payloads.
 The sample's first frame is such a run, a leftover of the cut it was taken
 from.
 
