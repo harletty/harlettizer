@@ -142,7 +142,12 @@ data point, smooth.
   than ramped to until both round to the step already held, and stepping on
   that kept a steady mix stepping every frame. A stepped object's gains are
   then fitted by synthesis on the part of the window only the slots after
-  the step make.
+  the step make, and held to the same test the step passed: that part can
+  hold nothing to fit — a transient over before it begins — and the refit
+  come back nought, which erased the transient (a test holds the case). The
+  gains that fail are replaced by the decision's own, fitted in the QMF
+  domain on every slot from the step on; on the 60-second film that also
+  gained 0.15 dB on the slid frames.
 - **The state.** It keeps what the decoder holds: the dequantised gains of the
   last frame an object was present, untouched while it is absent, as the
   decoder leaves them; and the sequence count, which after 1023 restarts at
@@ -179,7 +184,7 @@ from.
 
 | Stream | Fit | Gains on the reference's step | Payload, bytes, mean / max (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
 |---|---|---|---|---|---|
-| film, 60 s | synthesis, steep | 96.9 % | 209 / 327 (207 / 311) | 30.2 / 35.5 dB | 25.6 / 34.5 dB |
+| film, 60 s | synthesis, steep | 96.8 % | 209 / 327 (207 / 311) | 30.3 / 35.5 dB | 25.7 / 34.5 dB |
 | | synthesis | 96.9 % | 209 / 336 | 30.0 / 35.5 dB | 22.5 / 34.5 dB |
 | | centred | 92.3 % | 204 / 303 | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
 | film, 30 s | synthesis, steep | 98.9 % | 170 / 201 (170 / 202) | 37.3 / 41.7 dB | 32.9 / 38.2 dB |
@@ -226,15 +231,17 @@ fit on every stream, slid and stepped.
 
 The steep slope closes part of the stepped frames' gap: 3 to 4 dB on film,
 and the whole stream's objects gain 1.2 dB on the 60-second film, 3.6 on the
-30-second one (28.1 → 29.3 and 32.9 → 36.6 dB). Where it steps, the reference
-mostly does too, at the same slot to within one: on 3.8 of the 6.1 % of
+30-second one (28.1 → 29.4 and 32.9 → 36.6 dB). Where it steps, the reference
+mostly does too, at the same slot to within one: on 3.8 of the 6.0 % of
 objects' frames the 60-second film steps, 1.2 of 1.4 % on the 30-second one;
 on the sample, which never steps, it steps 1.0 % at no cost to the slid
-frames (30.65 against 30.68 dB). It steps less than the reference — 6.1
+frames (30.65 against 30.68 dB). It steps less than the reference — 6.0
 against 9.1 %, 1.4 against 7.8 % — because the reference steps every object
 of a frame together, where the estimator steps an object only when its own
 error says so; stepping more, with a looser margin, gained a little on the
-stepped frames and lost it on the slid ones:
+stepped frames and lost it on the slid ones (measured before the gains sent
+were held to the step's test, which moved the 60-second film by 0.15 dB and
+nothing else):
 
 | Margin | Steps (film 60 s / 30 s) | Objects, whole stream (60 s / 30 s / sample) |
 |---|---|---|

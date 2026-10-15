@@ -134,6 +134,8 @@ pub struct Estimator {
     slot_energy: Vec<f64>,
     steep_gram: Vec<f64>,
     steep_factor: Vec<f64>,
+    /// The gains the steep decision found for the step it chose.
+    step_gains: Matrix,
     sequence: u16,
     pub fit: Fit,
     /// The ridge on the normal equations, relative to their mean diagonal:
@@ -187,6 +189,7 @@ impl Estimator {
             slot_energy: vec![0.0; SPAN * BANDS],
             steep_gram: vec![0.0; (channels * BANDS).pow(2)],
             steep_factor: vec![0.0; (channels * BANDS).pow(2)],
+            step_gains: [[0.0; BANDS]; MAX_CHANNELS],
             sequence: 0,
             fit: Fit::default(),
             ridge: 1e-5,
@@ -324,7 +327,8 @@ impl Estimator {
                 *w = root * f64::from(value);
             }
             self.synthesis_solve(0);
-            let split = if stepping { self.steep_split(o) } else { None };
+            let step = if stepping { self.steep_split(o) } else { None };
+            let split = step.map(|step| step.split);
             if let Some(split) = split {
                 // Stepped at `split`: refitted on the output only the slots
                 // from there on make — a slot's synthesis reaches nine slots
@@ -340,7 +344,21 @@ impl Estimator {
                 }
             }
             let x = &self.solution;
-            let (codes, gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
+            let (mut codes, mut gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
+            if let Some(step) = step {
+                // The gains sent are held to the test the step passed: the
+                // refit on the output after it can find nothing there to fit
+                // — a transient over before its window begins — and come
+                // back nought. Then the decision's own gains are sent, fitted
+                // on every slot from the step on.
+                let error = (0..BANDS)
+                    .map(|band| self.stepped_error(band, step.split, &self.held[o], &gains))
+                    .sum();
+                if !step.passes(error, self.steep_margin) {
+                    let found = self.step_gains;
+                    (codes, gains) = quantise(n, |ch, band| f64::from(found[ch][band]));
+                }
+            }
             self.held[o] = gains;
             out_objects.push(Some(Object {
                 bands_index: BANDS_INDEX,
@@ -432,7 +450,7 @@ impl Estimator {
     /// the next, against the ramp: each the least-squares gains for its
     /// shape, the ramp from the gains held, the step after the held ones.
     #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
-    fn steep_split(&mut self, o: usize) -> Option<usize> {
+    fn steep_split(&mut self, o: usize) -> Option<Step> {
         let n = self.channels;
         for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
             *rhs = [0.0; MAX_CHANNELS];
@@ -534,49 +552,93 @@ impl Estimator {
         // quantiser's steps, as the decoder will have them: a gain between
         // two steps looks better reached at once than ramped to, until both
         // round to the step already held.
-        let best: f64 = (0..BANDS)
-            .map(|band| self.step_error(band, split, &held, ridge))
-            .sum();
+        let mut best = 0.0;
+        for band in 0..BANDS {
+            let (error, gains) = self.step_error(band, split, &held, ridge);
+            best += error;
+            for (ch, gain) in gains.iter().enumerate().take(n) {
+                self.step_gains[ch][band] = *gain as f32;
+            }
+        }
         // And it must buy back a share of the object's own energy: where
         // both errors are down at the quantiser's, their ratio is noise.
-        let signal: f64 = self.slot_energy.iter().sum();
-        (best < f64::from(self.steep_margin) * ramped && ramped - best > STEEP_FLOOR * signal)
-            .then_some(split)
+        let step = Step {
+            split,
+            ramped,
+            signal: self.slot_energy.iter().sum(),
+        };
+        step.passes(best, self.steep_margin).then_some(step)
     }
 
-    /// The error in  of the object [`Self::steep_split`] last weighed,
+    /// The error in `band` of the object [`Self::steep_split`] last weighed,
     /// stepped at `split`: the held gains before it, the least-squares gains
-    /// from it on, rounded to the quantiser's steps.
+    /// from it on, rounded to the quantiser's steps — and those gains.
     #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
-    fn step_error(&self, band: usize, split: usize, held: &Matrix, ridge: f64) -> f64 {
+    fn step_error(
+        &self,
+        band: usize,
+        split: usize,
+        held: &Matrix,
+        ridge: f64,
+    ) -> (f64, [f64; MAX_CHANNELS]) {
         let n = self.channels;
-        let cell = |t: usize| t * BANDS + band;
-        let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
-        let mut before = 0.0;
-        for t in 0..split {
-            before += error(
-                &self.slot_gram[cell(t)],
-                &self.slot_rhs[cell(t)],
-                self.slot_energy[cell(t)],
-                &h,
-                n,
-            );
-        }
         let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
         let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
         for t in split..SPAN {
+            let cell = t * BANDS + band;
             accumulate(
                 &mut system,
                 &mut rhs,
                 &mut energy,
-                &self.slot_gram[cell(t)],
-                &self.slot_rhs[cell(t)],
-                self.slot_energy[cell(t)],
+                &self.slot_gram[cell],
+                &self.slot_rhs[cell],
+                self.slot_energy[cell],
                 n,
             );
         }
         let c = snap(ridged_solve(system, rhs, n, ridge));
-        before + error(&system, &rhs, energy, &c, n)
+        (
+            self.held_error(band, split, held) + error(&system, &rhs, energy, &c, n),
+            c,
+        )
+    }
+
+    /// The error in `band` of the object [`Self::steep_split`] last weighed,
+    /// stepped at `split` to `gains`.
+    fn stepped_error(&self, band: usize, split: usize, held: &Matrix, gains: &Matrix) -> f64 {
+        let n = self.channels;
+        let g: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(gains[ch][band]));
+        let after: f64 = (split..SPAN)
+            .map(|t| {
+                let cell = t * BANDS + band;
+                error(
+                    &self.slot_gram[cell],
+                    &self.slot_rhs[cell],
+                    self.slot_energy[cell],
+                    &g,
+                    n,
+                )
+            })
+            .sum();
+        self.held_error(band, split, held) + after
+    }
+
+    /// The error in `band`, on the slots before `split`, of the held gains.
+    fn held_error(&self, band: usize, split: usize, held: &Matrix) -> f64 {
+        let n = self.channels;
+        let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+        (0..split)
+            .map(|t| {
+                let cell = t * BANDS + band;
+                error(
+                    &self.slot_gram[cell],
+                    &self.slot_rhs[cell],
+                    self.slot_energy[cell],
+                    &h,
+                    n,
+                )
+            })
+            .sum()
     }
 
     /// Keep the solution within what the quantiser holds: the least-squares
@@ -871,6 +933,23 @@ fn cholesky_solve(l: &[f64], m: usize, x: &mut [f64]) {
     for i in (0..m).rev() {
         let s: f64 = (i + 1..m).map(|k| l[k * m + i] * x[k]).sum();
         x[i] = (x[i] - s) / l[i * m + i];
+    }
+}
+
+/// The step [`Estimator::steep_split`] chose for an object, and what any
+/// gains sent for it must beat: the ramp's error, and the object's energy.
+#[derive(Clone, Copy)]
+struct Step {
+    split: usize,
+    ramped: f64,
+    signal: f64,
+}
+
+impl Step {
+    /// Whether a step leaving `error` is worth taking: less than `margin` of
+    /// the ramp's error, and a share of the object's energy bought back.
+    fn passes(&self, error: f64, margin: f32) -> bool {
+        error < f64::from(margin) * self.ramped && self.ramped - error > STEEP_FLOOR * self.signal
     }
 }
 
@@ -1227,6 +1306,58 @@ mod tests {
     /// that one after the first, steps its gains — at the slot the switch reaches the
     /// subbands, the analysis putting a sample's slot four or so after its
     /// own — to the new mix; with the margin at nought it ramps instead.
+    #[test]
+    fn a_short_transient_keeps_nonzero_gains_after_a_step() {
+        // The object switches from L to twice R inside frame 3, and every
+        // downmix channel falls silent two slots later: the step's own
+        // window, the output only the slots after it make, then begins after
+        // the transient has gone, and a refit there alone came back nought.
+        let mut seed = 29u32;
+        let switch = 3 * FRAME + 10 * SUBBANDS;
+        let end = switch + 2 * SUBBANDS;
+        let core: Vec<Vec<f32>> = (0..5)
+            .map(|_| {
+                (0..7 * FRAME)
+                    .map(|t| if t < end { noise(&mut seed) } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+        let object: Vec<f32> = (0..7 * FRAME)
+            .map(|t| {
+                if t < switch {
+                    core[0][t]
+                } else {
+                    2.0 * core[1][t]
+                }
+            })
+            .collect();
+        let input: Vec<Frame> = (0..7)
+            .map(|k| {
+                let frame = |x: &Vec<f32>| x[k * FRAME..(k + 1) * FRAME].to_vec();
+                (core.iter().map(frame).collect(), vec![frame(&object)])
+            })
+            .collect();
+        let payloads = run(&mut Estimator::new(1, 0), &input);
+        let joc = crate::payload::read(&payloads[3].to_bytes()).unwrap();
+        let object = joc.objects[0].as_ref().unwrap();
+        assert!(object.steep);
+        let gains = dequantise(object, 5).unwrap();
+        assert!(
+            gains.iter().flatten().any(|&g| g != 0.0),
+            "the short transient was refitted to an all-zero matrix"
+        );
+        // What the transient needs: R at twice, L near nought — in the wide
+        // bands. A band a subband or two wide has a few slots of transient
+        // after the step to fit five gains on, half of it smeared with the
+        // mix before, and scatters.
+        for (band, (l, r)) in gains[0].iter().zip(&gains[1]).enumerate().skip(5) {
+            assert!(
+                (1.0..=2.5).contains(r) && l.abs() < 0.75,
+                "band {band}: L {l} and R {r} for nought and two"
+            );
+        }
+    }
+
     #[test]
     fn a_mix_that_switches_inside_a_frame_steps_there() {
         const FRAMES: usize = 5;
