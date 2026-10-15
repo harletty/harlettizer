@@ -23,6 +23,7 @@
 use hz_core::{Error, Result};
 use hz_dca::bits::Bits;
 use hz_dca::core::CoreHeader;
+use hz_dca::dtsx;
 use hz_dca::exss::{ChannelMapping, Coding, ExssHeader};
 use hz_dca::navigation::{self, Navigation};
 use hz_dca::split;
@@ -37,6 +38,9 @@ pub struct Options {
     /// The PCM a core-only stream was encoded from: its decode, through the
     /// oracle, is compared with it.
     pub reference: Option<Reference>,
+    /// Where to write the standard DTS:X profile's twelve channels before
+    /// the fold, through the oracle and [`unfold`].
+    pub unfold: Option<PathBuf>,
 }
 
 /// Interleaved 32-bit PCM in WAV order — L, R, C, LFE, Ls, Rs for 5.1 —
@@ -226,6 +230,126 @@ pub fn compare_exact(reference: &Reference, decoded: &[Vec<i32>]) -> Exact {
     exact
 }
 
+/// A 7.1.4 input's channels as 24-bit integers in 32-bit words: the 7.1
+/// with each height folded into its corner as the standard profile folds
+/// it, the heights, and the 7.1 as it was — what a decoder of the bed, of
+/// the extension, and the unfold of both should give.
+pub fn split_7_1_4(reference: &Reference) -> [Reference; 3] {
+    let frames = reference.pcm.chunks_exact(12);
+    let mut composite = Vec::with_capacity(frames.len() * 8);
+    let mut heights = Vec::with_capacity(frames.len() * 4);
+    let mut bed = Vec::with_capacity(frames.len() * 8);
+    for frame in reference.pcm.chunks_exact(12) {
+        for ch in 0..8 {
+            let x = frame[ch] >> 8;
+            // L, R, Lsr and Rsr take TFL, TFR, TBL and TBR.
+            let folded = match [0, 1, 4, 5].iter().position(|&c| c == ch) {
+                Some(h) => unfold::fold(x, frame[8 + h] >> 8, unfold::MINUS_3_DB),
+                None => x,
+            };
+            composite.push(folded << 8);
+            bed.push(frame[ch]);
+        }
+        heights.extend_from_slice(&frame[8..]);
+    }
+    let make = |pcm, channels| Reference { pcm, channels };
+    [make(composite, 8), make(heights, 4), make(bed, 8)]
+}
+
+/// Phase C3's acceptance (a) on a decode through `dca`: the composite bed
+/// and the four heights are what the encoder made of the input, and the
+/// integer unfold of the two is the input's 7.1. The failures.
+#[cfg(feature = "dca-oracle")]
+fn compare_heights(
+    reference: &Reference,
+    decoded: &[Vec<i32>],
+    heights: Option<&[Vec<i32>]>,
+) -> Vec<String> {
+    let [composite, expected_heights, bed] = split_7_1_4(reference);
+    let mut failures = Vec::new();
+    let exact = compare_exact(&composite, decoded);
+    println!("  composite 7.1          {exact}");
+    if !exact.is_exact() {
+        failures.push(format!(
+            "a composite bed through dca that is not the fold: {exact}"
+        ));
+    }
+    let Some(heights) = heights else {
+        failures.push("no heights: dca did not present the standard height profile".into());
+        return failures;
+    };
+    let exact = compare_exact(&expected_heights, heights);
+    println!("  heights                {exact}");
+    if !exact.is_exact() {
+        failures.push(format!(
+            "heights through dca that are not the input's: {exact}"
+        ));
+    }
+    // The bed taken back out: each corner less its height.
+    let unfolded: Vec<Vec<i32>> = decoded
+        .iter()
+        .enumerate()
+        .map(
+            |(ch, plane)| match [0, 1, 4, 5].iter().position(|&c| c == ch) {
+                Some(h) => plane
+                    .iter()
+                    .zip(&heights[h])
+                    .map(|(&c, &y)| unfold::unfold(c, y, unfold::MINUS_3_DB))
+                    .collect(),
+                None => plane.clone(),
+            },
+        )
+        .collect();
+    let exact = compare_exact(&bed, &unfolded);
+    println!("  unfolded 7.1           {exact}");
+    if !exact.is_exact() {
+        failures.push(format!("an unfold that is not the input's 7.1: {exact}"));
+    }
+    failures
+}
+
+/// Write the twelve channels before the fold, from the composite 7.1 the
+/// oracle decoded and its heights, as 32-bit PCM in WAV 7.1.4 order.
+#[cfg(feature = "dca-oracle")]
+fn write_unfolded(
+    path: &std::path::Path,
+    bed: Option<&[Vec<i32>]>,
+    heights: Option<&[Vec<i32>]>,
+) -> Result<()> {
+    let (Some(bed), Some(heights)) = (bed, heights) else {
+        return Err(Error::refused(
+            path,
+            "the stream has no frame dca presents as the standard height profile",
+        ));
+    };
+    let samples = bed[0].len();
+    if bed.len() != 8 || heights.len() != 4 || heights.iter().any(|h| h.len() != samples) {
+        return Err(Error::refused(
+            path,
+            "not every frame of the stream is the standard height profile",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(samples * 12 * 4);
+    for n in 0..samples {
+        for (ch, plane) in bed.iter().enumerate() {
+            let x = match [0, 1, 4, 5].iter().position(|&c| c == ch) {
+                Some(h) => unfold::unfold(plane[n], heights[h][n], unfold::MINUS_3_DB),
+                None => plane[n],
+            };
+            bytes.extend_from_slice(&(x << 8).to_le_bytes());
+        }
+        for plane in heights {
+            bytes.extend_from_slice(&(plane[n] << 8).to_le_bytes());
+        }
+    }
+    std::fs::write(path, bytes).map_err(|e| Error::io(path, e))?;
+    println!(
+        "  unfolded               {samples} samples of 7.1.4 written to {}",
+        path.display()
+    );
+    Ok(())
+}
+
 /// The integer inverse of the height fold.
 ///
 /// The fold puts `(h × q + 2^14) >> 15` of a height into its lower corner,
@@ -298,6 +422,87 @@ struct LosslessTally {
     /// Bytes of the frames read, padding included, and of the largest.
     bytes: u64,
     largest: usize,
+    /// The standard DTS:X profile's extension blocks.
+    extension: ExtensionTally,
+}
+
+/// The extension blocks of the standard DTS:X profile, read and written
+/// back: the fold matrix and the height set's headers.
+#[derive(Default)]
+struct ExtensionTally {
+    blocks: usize,
+    identical: usize,
+    checksums_valid: usize,
+    /// Blocks that are their headers, their data, [`dtsx::TRAILER`] zero
+    /// bytes and zeroes to the word, and end the frame.
+    laid_out: usize,
+    refused: usize,
+    first_refusal: Option<String>,
+    /// Fold matrices by their bytes, the checksum and the byte after it
+    /// included.
+    matrices: BTreeMap<String, usize>,
+    /// Height sets by their PCM and storage resolutions.
+    resolutions: BTreeMap<(u8, u8), usize>,
+    largest: usize,
+    /// Where the last frame's block was, for the navigation word.
+    last: Option<Navigation>,
+    /// Navigation words, and those that point at the block found here.
+    words: usize,
+    words_agree: usize,
+}
+
+impl ExtensionTally {
+    /// Read the block, if `frame` has one, at the word after its bed.
+    fn frame(&mut self, frame: &[u8], headers: &xll::Headers, at: usize) {
+        self.last = None;
+        let start = (headers.len() + headers.band_data_len()).next_multiple_of(4);
+        let Some(block) = frame
+            .get(start..)
+            .filter(|b| b.len() >= 4 && u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == dtsx::SYNC)
+        else {
+            return;
+        };
+        self.blocks += 1;
+        self.last = Some(Navigation {
+            offset: start,
+            size: block.len(),
+        });
+        self.largest = self.largest.max(block.len());
+        let common = &headers.common;
+        match dtsx::Block::read(block, common) {
+            Ok(read) => {
+                if read.checksums(block, common) {
+                    self.checksums_valid += 1;
+                }
+                if matches!(read.write(common), Ok(w) if w[..] == block[..read.len(common)]) {
+                    self.identical += 1;
+                }
+                let data_end = read.len(common) + read.heights.data_len();
+                if read.size(common, read.heights.data_len()) == block.len()
+                    && block
+                        .get(data_end..)
+                        .is_some_and(|t| t.iter().all(|&b| b == 0))
+                {
+                    self.laid_out += 1;
+                }
+                let matrix: String = block[..read.matrix.len()]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                *self.matrices.entry(matrix).or_default() += 1;
+                let set = &read.heights.set;
+                *self
+                    .resolutions
+                    .entry((set.pcm_bit_res, set.storage_bit_res))
+                    .or_default() += 1;
+            }
+            Err(e) => {
+                self.refused += 1;
+                self.first_refusal
+                    .get_or_insert_with(|| format!("frame at byte {at}: {}", e.0));
+            }
+        }
+    }
 }
 
 impl LosslessTally {
@@ -364,6 +569,7 @@ impl LosslessTally {
                         })
                         .collect();
                     *self.shapes.entry(shape.join("+")).or_default() += 1;
+                    self.extension.frame(frame, &headers, at);
                 }
                 Err(e) => {
                     self.refused += 1;
@@ -388,8 +594,15 @@ pub fn run(options: Options) -> Result<()> {
     #[cfg(feature = "dca-oracle")]
     let mut oracle = oracle::Oracle::default();
     #[cfg(feature = "dca-oracle")]
-    if options.reference.is_some() {
+    if options.reference.is_some() || options.unfold.is_some() {
         oracle.keep_pcm();
+    }
+    #[cfg(not(feature = "dca-oracle"))]
+    if options.unfold.is_some() {
+        return Err(Error::refused(
+            &options.input,
+            "--unfold decodes through the oracle: it needs --features dca-oracle",
+        ));
     }
 
     for frame in split::frames(&bytes).take(limit) {
@@ -437,6 +650,11 @@ pub fn run(options: Options) -> Result<()> {
             }
             navigation = navigate(&header, &mut tally);
             lossless_asset(&header, exss, frame.at, &mut tally.lossless);
+            if let Some(word) = navigation {
+                let extension = &mut tally.lossless.extension;
+                extension.words += 1;
+                extension.words_agree += usize::from(extension.last == Some(word));
+            }
             first_exss.get_or_insert(header);
         }
         // Every frame goes through the decoder, a core without an extension
@@ -547,6 +765,7 @@ pub fn run(options: Options) -> Result<()> {
                 lossless.refused
             );
         }
+        report_extension(&lossless.extension);
     }
     let mut failures = Vec::new();
     if tally.cores_identical != tally.cores || tally.substreams_identical != tally.substreams {
@@ -561,17 +780,37 @@ pub fn run(options: Options) -> Result<()> {
     if tally.checksums_valid != tally.substreams {
         failures.push("substream checksums that do not hold".to_string());
     }
+    let extension = &lossless.extension;
+    if extension.identical != extension.blocks
+        || extension.checksums_valid != extension.blocks
+        || extension.laid_out != extension.blocks
+    {
+        failures.push("DTS:X blocks that do not rewrite, check or lay out as written".to_string());
+    }
+    if extension.words_agree != extension.words {
+        failures.push(format!(
+            "{} navigation words that miss the DTS:X block after the bed",
+            extension.words - extension.words_agree
+        ));
+    }
     #[cfg(feature = "dca-oracle")]
     {
         oracle.report();
         failures.extend(oracle.failures());
+        if let Some(path) = &options.unfold {
+            write_unfolded(path, oracle.lossless(), oracle.heights())?;
+        }
         if let (Some(reference), Some(decoded)) = (&options.reference, oracle.lossless()) {
-            let exact = compare_exact(reference, decoded);
-            println!("  lossless round trip    {exact}");
-            if !exact.is_exact() {
-                failures.push(format!(
-                    "a lossless decode through dca that is not its input: {exact}"
-                ));
+            if reference.channels == 12 {
+                failures.extend(compare_heights(reference, decoded, oracle.heights()));
+            } else {
+                let exact = compare_exact(reference, decoded);
+                println!("  lossless round trip    {exact}");
+                if !exact.is_exact() {
+                    failures.push(format!(
+                        "a lossless decode through dca that is not its input: {exact}"
+                    ));
+                }
             }
         } else if let Some(reference) = &options.reference {
             match oracle.pcm() {
@@ -596,6 +835,44 @@ pub fn run(options: Options) -> Result<()> {
         Ok(())
     } else {
         Err(Error::refused(&options.input, failures.join("; ")))
+    }
+}
+
+fn report_extension(extension: &ExtensionTally) {
+    if extension.blocks == 0 {
+        return;
+    }
+    println!(
+        "  DTS:X blocks           {}/{} rewritten byte for byte, {}/{} checksums valid, {}/{} \
+         laid out as written (trailer and padding zero), {} bytes at most",
+        extension.identical,
+        extension.blocks,
+        extension.checksums_valid,
+        extension.blocks,
+        extension.laid_out,
+        extension.blocks,
+        extension.largest
+    );
+    for (matrix, n) in &extension.matrices {
+        println!("                         fold matrix {matrix} × {n}");
+    }
+    let resolutions: Vec<String> = extension
+        .resolutions
+        .iter()
+        .map(|((pcm, storage), n)| format!("{pcm}/{storage} bits × {n}"))
+        .collect();
+    println!(
+        "                         height sets {}; navigation words {}/{} point at the block \
+         after the bed",
+        resolutions.join(", "),
+        extension.words_agree,
+        extension.words
+    );
+    if let Some(why) = &extension.first_refusal {
+        println!(
+            "  DTS:X refused          {} blocks; first, {why}",
+            extension.refused
+        );
     }
 }
 
@@ -772,6 +1049,9 @@ mod oracle {
         /// Decoded lossless frames as the decoder's 24-bit integers, per
         /// channel in WAV order, when asked.
         lossless: Option<Vec<Vec<i32>>>,
+        /// The standard profile's heights, TFL TFR TBL TBR, as 24-bit
+        /// integers, when asked.
+        heights: Option<Vec<Vec<i32>>>,
     }
 
     impl Default for Oracle {
@@ -797,6 +1077,7 @@ mod oracle {
                 metadata_refused: 0,
                 pcm: None,
                 lossless: None,
+                heights: None,
             }
         }
     }
@@ -824,6 +1105,13 @@ mod oracle {
         pub fn keep_pcm(&mut self) {
             self.pcm = Some(Vec::new());
             self.lossless = Some(Vec::new());
+            self.heights = Some(Vec::new());
+        }
+
+        /// The heights of the frames dca presents as the standard height
+        /// profile, when any did.
+        pub fn heights(&self) -> Option<&[Vec<i32>]> {
+            self.heights.as_deref().filter(|h| !h.is_empty())
         }
 
         pub fn pcm(&self) -> Option<&[Vec<f32>]> {
@@ -954,6 +1242,12 @@ mod oracle {
                 .iter()
                 .map(|feed| feed.iter().map(|&s| (s * SCALE) as i32).collect())
                 .collect();
+            if let Some(kept) = &mut self.heights {
+                kept.resize(heights.len().max(kept.len()), Vec::new());
+                for (plane, samples) in kept.iter_mut().zip(&heights) {
+                    plane.extend_from_slice(samples);
+                }
+            }
             let (mut unfolded, mut differs, mut worst) = (0usize, 0usize, 0i32);
             for (speaker, composite) in self.decoder.lossless_samples() {
                 if !plan.touches(speaker) {
@@ -1224,6 +1518,7 @@ mod tests {
             input: path,
             frames: None,
             reference: None,
+            unfold: None,
         });
         std::fs::remove_dir_all(&dir).unwrap();
         result

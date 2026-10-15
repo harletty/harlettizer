@@ -33,13 +33,18 @@
 //! - [`master`]: DTS-HD Master Audio, the core and the lossless layer frame
 //!   by frame, the core a frame ahead.
 //!
-//! The DTS:X extension is phase C3.
+//! Phase C3 is the DTS:X extension's standard profile, a fixed 7.1.4: the
+//! heights folded into the bed's corners and carried beside it.
+//!
+//! - [`dtsx`]: the extension block — the fold matrix, the height set — and
+//!   the fold; [`lossless`] and [`master`] write it.
 
 pub mod adpcm;
 pub mod bits;
 pub mod core;
 pub mod core_decode;
 pub mod crc;
+pub mod dtsx;
 pub mod encoder;
 pub mod exss;
 mod fields;

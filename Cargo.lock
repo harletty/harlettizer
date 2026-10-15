@@ -244,6 +244,7 @@ dependencies = [
  "hz-analysis",
  "hz-cluster",
  "hz-core",
+ "hz-dca",
  "hz-iamf",
  "hz-io",
  "hz-meta",

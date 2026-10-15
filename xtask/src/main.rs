@@ -474,6 +474,13 @@ enum Command {
         /// Channels in `--reference`, the LFE included.
         #[arg(long, value_name = "N")]
         channels: Option<usize>,
+
+        /// Write the standard DTS:X profile's twelve channels before the
+        /// fold here — the 7.1 the oracle decodes with each height taken
+        /// back out of its corner in integers, then the heights — as raw
+        /// interleaved 32-bit PCM in WAV 7.1.4 order. Needs `dca-oracle`.
+        #[arg(long, value_name = "PATH")]
+        unfold: Option<PathBuf>,
     },
 
     /// Encode raw interleaved 32-bit PCM to a DTS core with `hz-dca`, write
@@ -484,13 +491,15 @@ enum Command {
     DtsEncode {
         input: PathBuf,
 
-        /// Channels in the input, the LFE included: 1, 2, 4, 5 or 6, and 8
-        /// with `--lossless`.
+        /// Channels in the input, the LFE included: 1, 2, 4, 5 or 6; with
+        /// `--lossless`, 6 or 8, or 12 — a 7.1.4 in WAV order, written as
+        /// the standard DTS:X profile.
         #[arg(long)]
         channels: usize,
 
         /// Write DTS-HD Master Audio: the core and a lossless layer of this
-        /// many bits a sample, 16 or 24, from 5.1 or 7.1 at 48 kHz.
+        /// many bits a sample, 16 or 24, from 5.1 or 7.1 at 48 kHz; 24 for
+        /// a 7.1.4.
         #[arg(long, value_name = "BITS")]
         lossless: Option<u8>,
 
@@ -910,6 +919,7 @@ fn main() -> ExitCode {
             frames,
             reference,
             channels,
+            unfold,
         } => (|| {
             let reference = match (reference, channels) {
                 (Some(path), Some(channels)) => Some(dts::Reference::read(&path, channels)?),
@@ -919,6 +929,7 @@ fn main() -> ExitCode {
                 input,
                 frames,
                 reference,
+                unfold,
             })
         })(),
         Command::DtsEncode {
