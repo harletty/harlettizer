@@ -7,7 +7,7 @@
 //! per downmix channel to every QMF subband of the band, and slides from the
 //! last frame's gains to this frame's across the frame's 24 slots — at slot
 //! `t` it holds `(1 − w)·p + w·c`, `w = (t + 1)/24`, reaching `c` on the last.
-//! Two ways to choose `c`, by [`Fit`]:
+//! Three ways to choose `c`, by [`Fit`]:
 //!
 //! - [`Fit::Ramp`] — the least-squares fit of the frame's subbands *through the
 //!   ramp*, the previous gains fixed at what the decoder holds:
@@ -25,19 +25,31 @@
 //!   them: the plain least-squares fit over a frame's worth of slots centred
 //!   on the frame's end, half of it from the next frame. No overshoot; a frame
 //!   of latency.
+//! - [`Fit::Synthesis`], the default — the gains that make the *decoder's
+//!   output* closest to the object: each downmix channel's share of each band
+//!   is synthesised through the same bank the decoder runs, and all of an
+//!   object's gains are fitted together, in time, under a frame-long Hann
+//!   window centred on where the decoder's arrival at them is heard. A
+//!   band-by-band fit in the QMF domain cannot see that the decoder's
+//!   synthesis lets each subband leak into its neighbours, which in the narrow
+//!   low bands is a large share of the band; this one fits what the decoder
+//!   plays, leakage and all. A frame of latency, like the centred fit, and
+//!   about three times its work.
 //!
-//! Either way the normal equations' matrices depend on the downmix alone and
-//! are formed once a frame and band; only the right-hand side is the object's.
+//! In the QMF domain the normal equations' matrices depend on the downmix
+//! alone and are formed once a frame and band; only the right-hand side is the
+//! object's. By synthesis it is the same, over all the bands at once.
 //! The least-squares fit is the minimum-mean-square-error reconstruction the
 //! joint object coding literature describes (Purnhagen et al., AES 2016); the
 //! ramp, the held gains and the quantisation are what make it this decoder's.
 //! Which fit to use is measured, not argued: see `docs/joc.md`.
 
 use crate::payload::{Data, Joc, Object};
-use crate::qmf::{Analysis, SUBBANDS, Slot};
+use crate::qmf::{Analysis, DELAY, SUBBANDS, Slot, Synthesis};
 
-/// Slots in a frame of six blocks.
-pub const SLOTS: usize = 1536 / SUBBANDS;
+/// Samples, and slots, in a frame of six blocks.
+const FRAME: usize = 1536;
+pub const SLOTS: usize = FRAME / SUBBANDS;
 /// The parameter bands every reference stream uses: index 5, twelve bands.
 pub const BANDS_INDEX: u8 = 5;
 pub const BANDS: usize = 12;
@@ -65,8 +77,9 @@ pub type Matrix = [[f32; BANDS]; MAX_CHANNELS];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fit {
     Ramp,
-    #[default]
     Centred,
+    #[default]
+    Synthesis,
 }
 
 /// The state an encoder keeps across frames: the analysis banks, two frames
@@ -83,6 +96,24 @@ pub struct Estimator {
     object_slots: Vec<[Slot; 2 * SLOTS]>,
     /// Which objects the earlier of the two frames carries, once there is one.
     pending: Option<Vec<bool>>,
+    /// For [`Fit::Synthesis`]: a synthesis bank per downmix channel and band,
+    /// the last two frames of what each makes of its share of the downmix,
+    /// the objects on the decoder's clock over the same two frames, and the
+    /// last frame of them as they came, to delay the next by.
+    basis: Vec<Synthesis>,
+    basis_out: Vec<Vec<f32>>,
+    target: Vec<Vec<f32>>,
+    raw: Vec<Vec<f32>>,
+    /// The square root of the frame-long Hann window [`Fit::Synthesis`]
+    /// weighs the output by, and the fit's scratch: the basis and the target
+    /// under it, the normal equations, their factor, a right-hand side and its
+    /// solution — kept, so that a frame allocates nothing for them.
+    window_root: Vec<f64>,
+    weighted: Vec<Vec<f64>>,
+    weighted_target: Vec<f64>,
+    gram: Vec<f64>,
+    factor: Vec<f64>,
+    solution: Vec<f64>,
     sequence: u16,
     pub fit: Fit,
     /// The ridge on the normal equations, relative to their mean diagonal:
@@ -110,6 +141,18 @@ impl Estimator {
             core_slots: vec![[Slot::default(); 2 * SLOTS]; channels],
             object_slots: vec![[Slot::default(); 2 * SLOTS]; objects],
             pending: None,
+            basis: vec![Synthesis::new(); channels * BANDS],
+            basis_out: vec![vec![0.0; 2 * FRAME]; channels * BANDS],
+            target: vec![vec![0.0; 2 * FRAME]; objects],
+            raw: vec![vec![0.0; FRAME]; objects],
+            window_root: (0..FRAME)
+                .map(|t| (std::f64::consts::PI * (t as f64 + 0.5) / FRAME as f64).sin())
+                .collect(),
+            weighted: vec![vec![0.0; FRAME]; channels * BANDS],
+            weighted_target: vec![0.0; FRAME],
+            gram: vec![0.0; (channels * BANDS).pow(2)],
+            factor: vec![0.0; (channels * BANDS).pow(2)],
+            solution: vec![0.0; channels * BANDS],
             sequence: 0,
             fit: Fit::default(),
             ridge: 1e-5,
@@ -162,8 +205,131 @@ impl Estimator {
                 );
             }
         }
+        if self.fit == Fit::Synthesis {
+            self.synthesise(objects);
+        }
         let earlier = self.pending.replace(present.to_vec());
         earlier.map(|present| self.estimate(&present))
+    }
+
+    /// Run the new frame through the synthesis basis, and put the objects on
+    /// the decoder's clock beside it.
+    fn synthesise(&mut self, objects: &[&[f32]]) {
+        for out in &mut self.basis_out {
+            out.copy_within(FRAME.., 0);
+        }
+        for ch in 0..self.channels {
+            for t in 0..SLOTS {
+                let slot = self.core_slots[ch][SLOTS + t];
+                for band in 0..BANDS {
+                    let mut share = Slot::default();
+                    for k in band_range(band) {
+                        share.real[k] = slot.real[k];
+                        share.imaginary[k] = slot.imaginary[k];
+                    }
+                    let i = ch * BANDS + band;
+                    let at = FRAME + t * SUBBANDS;
+                    self.basis[i].slot(&share, &mut self.basis_out[i][at..at + SUBBANDS]);
+                }
+            }
+        }
+        for ((target, raw), object) in self.target.iter_mut().zip(&mut self.raw).zip(objects) {
+            target.copy_within(FRAME.., 0);
+            for n in 0..FRAME {
+                target[FRAME + n] = if n >= DELAY {
+                    object[n - DELAY]
+                } else {
+                    raw[FRAME + n - DELAY]
+                };
+            }
+            raw.copy_from_slice(object);
+        }
+    }
+
+    /// The payload of the earlier of the two frames held, by synthesis.
+    fn estimate_by_synthesis(&mut self, present: &[bool]) -> Joc {
+        let n = self.channels;
+        let m = n * BANDS;
+        // The earlier frame ends at FRAME on the core's clock. The decoder
+        // reaches its gains at that slot, and a slot's synthesis is spread
+        // over the prototype's length behind it, so they are heard most
+        // around FRAME + DELAY / 2 — not FRAME + DELAY, where that sample of
+        // the core comes out. Fitted there under a frame-long Hann window:
+        // the decoder ramps towards each frame's gains from the last's, and
+        // the taper weighs the output the way the ramps share it out, where a
+        // flat window of the same length fits each frame's gains to its
+        // neighbours' mixes too, and a short flat one chases transients.
+        let start = FRAME + DELAY / 2 - FRAME / 2;
+        for (weighted, basis) in self.weighted.iter_mut().zip(&self.basis_out) {
+            for ((w, &root), &value) in weighted
+                .iter_mut()
+                .zip(&self.window_root)
+                .zip(&basis[start..start + FRAME])
+            {
+                *w = root * f64::from(value);
+            }
+        }
+        let gram = &mut self.gram;
+        for i in 0..m {
+            for j in i..m {
+                let v = dot(&self.weighted[i], &self.weighted[j]);
+                gram[i * m + j] = v;
+                gram[j * m + i] = v;
+            }
+        }
+        // Each basis is held back against its own energy, not the mean of
+        // all sixty: the bands span tens of decibels, and a ridge shared
+        // across them flattens the quiet ones to nought.
+        for i in 0..m {
+            gram[i * m + i] = gram[i * m + i] * (1.0 + f64::from(self.ridge)) + 1e-12;
+        }
+        cholesky(gram, m, &mut self.factor);
+
+        let mut out_objects = Vec::with_capacity(self.objects.len());
+        for (o, &here) in present.iter().enumerate() {
+            if !here {
+                out_objects.push(None);
+                continue;
+            }
+            for ((w, &root), &value) in self
+                .weighted_target
+                .iter_mut()
+                .zip(&self.window_root)
+                .zip(&self.target[o][start..start + FRAME])
+            {
+                *w = root * f64::from(value);
+            }
+            for (x, weighted) in self.solution.iter_mut().zip(&self.weighted) {
+                *x = dot(weighted, &self.weighted_target);
+            }
+            cholesky_solve(&self.factor, m, &mut self.solution);
+            let x = &self.solution;
+            let (codes, gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
+            self.held[o] = gains;
+            out_objects.push(Some(Object {
+                bands_index: BANDS_INDEX,
+                fine: true,
+                steep: false,
+                offsets: vec![],
+                data: Data::Dense(vec![codes]),
+            }));
+        }
+        self.joc(out_objects)
+    }
+
+    /// The frame's payload around its objects; the sequence count steps on.
+    fn joc(&mut self, objects: Vec<Option<Object>>) -> Joc {
+        let joc = Joc {
+            downmix_config: self.downmix_config,
+            clip_gain: (0, 0),
+            sequence: self.sequence,
+            objects,
+            unflagged_tail: 0,
+            padding: 0,
+            trailing: vec![],
+        };
+        self.sequence = next_sequence(self.sequence);
+        joc
     }
 
     /// The last frame's payload, the frame after it taken as silence.
@@ -180,6 +346,9 @@ impl Estimator {
     /// The payload of the earlier of the two frames held.
     #[allow(clippy::needless_range_loop)] // an object's index reaches four arrays
     fn estimate(&mut self, present: &[bool]) -> Joc {
+        if self.fit == Fit::Synthesis {
+            return self.estimate_by_synthesis(present);
+        }
         // Which slots, and how each weighs on the downmix's two matrices and
         // on the object's side.
         let window: Vec<(usize, f64, f64, f64)> = match self.fit {
@@ -189,7 +358,7 @@ impl Estimator {
                     (t, w * w, w * (1.0 - w), w)
                 })
                 .collect(),
-            Fit::Centred => (SLOTS / 2..SLOTS + SLOTS / 2)
+            Fit::Centred | Fit::Synthesis => (SLOTS / 2..SLOTS + SLOTS / 2)
                 .map(|t| (t, 1.0, 0.0, 1.0))
                 .collect(),
         };
@@ -244,9 +413,7 @@ impl Estimator {
             }
 
             let held = self.held[o];
-            let mut codes = vec![vec![0u16; BANDS]; n];
-            let mut gains = [[0f32; BANDS]; MAX_CHANNELS];
-            let mut previous_level = [0i32; MAX_CHANNELS];
+            let mut solutions = [[0f64; BANDS]; MAX_CHANNELS];
             for band in 0..BANDS {
                 let mut system = a[band];
                 let mut rhs = [0f64; MAX_CHANNELS];
@@ -263,21 +430,10 @@ impl Estimator {
                 }
                 let solution = solve(&mut system, &mut rhs, n);
                 for ch in 0..n {
-                    // Quantise, and carry what the decoder will dequantise.
-                    let q = (solution[ch] / f64::from(STEP)).round().clamp(-96.0, 95.0) as i32;
-                    gains[ch][band] = q as f32 * STEP;
-                    // The dense chain: the first band against the quantiser's
-                    // zero, every other against the band before, modulo 192.
-                    let level = q + 96;
-                    let code = if band == 0 {
-                        q
-                    } else {
-                        level - previous_level[ch]
-                    };
-                    codes[ch][band] = code.rem_euclid(LEVELS) as u16;
-                    previous_level[ch] = level;
+                    solutions[ch][band] = solution[ch];
                 }
             }
+            let (codes, gains) = quantise(n, |ch, band| solutions[ch][band]);
             self.held[o] = gains;
             out_objects.push(Some(Object {
                 bands_index: BANDS_INDEX,
@@ -288,17 +444,70 @@ impl Estimator {
             }));
         }
 
-        let joc = Joc {
-            downmix_config: self.downmix_config,
-            clip_gain: (0, 0),
-            sequence: self.sequence,
-            objects: out_objects,
-            unflagged_tail: 0,
-            padding: 0,
-            trailing: vec![],
-        };
-        self.sequence = next_sequence(self.sequence);
-        joc
+        self.joc(out_objects)
+    }
+}
+
+/// The subbands of a band.
+fn band_range(band: usize) -> std::ops::Range<usize> {
+    BAND_START[band]..BAND_START.get(band + 1).copied().unwrap_or(SUBBANDS)
+}
+
+/// Gains to the decoder's codes: quantise each to the fine step, and chain
+/// each channel's bands — the first against the quantiser's zero, every other
+/// against the band before, modulo 192. Returns the codes and the gains the
+/// decoder will dequantise them to.
+fn quantise(channels: usize, gain: impl Fn(usize, usize) -> f64) -> (Vec<Vec<u16>>, Matrix) {
+    let mut codes = vec![vec![0u16; BANDS]; channels];
+    let mut gains = [[0f32; BANDS]; MAX_CHANNELS];
+    for ch in 0..channels {
+        let mut previous_level = 0i32;
+        for band in 0..BANDS {
+            let q = (gain(ch, band) / f64::from(STEP))
+                .round()
+                .clamp(-96.0, 95.0) as i32;
+            gains[ch][band] = q as f32 * STEP;
+            let level = q + 96;
+            let code = if band == 0 { q } else { level - previous_level };
+            codes[ch][band] = code.rem_euclid(LEVELS) as u16;
+            previous_level = level;
+        }
+    }
+    (codes, gains)
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// The lower-triangular factor of a symmetric positive-definite `m × m`
+/// matrix, row-major, into `l`.
+fn cholesky(a: &[f64], m: usize, l: &mut [f64]) {
+    for i in 0..m {
+        for j in 0..=i {
+            let mut sum = a[i * m + j];
+            for k in 0..j {
+                sum -= l[i * m + k] * l[j * m + k];
+            }
+            l[i * m + j] = if i == j {
+                sum.max(1e-30).sqrt()
+            } else {
+                sum / l[j * m + j]
+            };
+        }
+    }
+}
+
+/// Solve `L Lᵀ x = b` in place, for the factor [`cholesky`] made: `x` holds
+/// `b` on the way in and the solution on the way out.
+fn cholesky_solve(l: &[f64], m: usize, x: &mut [f64]) {
+    for i in 0..m {
+        let s: f64 = (0..i).map(|k| l[i * m + k] * x[k]).sum();
+        x[i] = (x[i] - s) / l[i * m + i];
+    }
+    for i in (0..m).rev() {
+        let s: f64 = (i + 1..m).map(|k| l[k * m + i] * x[k]).sum();
+        x[i] = (x[i] - s) / l[i * m + i];
     }
 }
 
@@ -426,10 +635,35 @@ mod tests {
         let mut seed = 3u32;
         let input = frames(&MIXES, 4, &mut seed);
         let mut estimator = Estimator::new(3, 0);
+        estimator.fit = Fit::Centred;
         let payloads = run(&mut estimator, &input);
         assert_eq!(payloads.len(), 4, "one payload a frame, the last at finish");
         for joc in &payloads[..3] {
             let joc = crate::payload::read(&joc.to_bytes()).unwrap();
+            for (o, mix) in MIXES.iter().enumerate() {
+                let gains = dequantise(joc.objects[o].as_ref().unwrap(), 5).unwrap();
+                for (ch, (row, want)) in gains.iter().zip(mix).enumerate() {
+                    for (band, gain) in row.iter().enumerate() {
+                        assert!(
+                            (gain - want).abs() <= STEP / 2.0 + 2e-3,
+                            "object {o} channel {ch} band {band}: {gain} for {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// So does the fit by synthesis, through the decoder's own bank.
+    #[test]
+    fn the_synthesis_fit_recovers_a_fixed_mix_at_once() {
+        let mut seed = 6u32;
+        let input = frames(&MIXES, 4, &mut seed);
+        let mut estimator = Estimator::new(3, 0);
+        assert_eq!(estimator.fit, Fit::Synthesis, "the default");
+        let payloads = run(&mut estimator, &input);
+        assert_eq!(payloads.len(), 4);
+        for joc in &payloads[..3] {
             for (o, mix) in MIXES.iter().enumerate() {
                 let gains = dequantise(joc.objects[o].as_ref().unwrap(), 5).unwrap();
                 for (ch, (row, want)) in gains.iter().zip(mix).enumerate() {

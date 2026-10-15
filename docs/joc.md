@@ -81,19 +81,34 @@ data point, smooth.
 
 - **The domain.** The decoder analyses the downmix with a 64-band complex QMF
   bank, applies one real gain per downmix channel to every subband of each
-  parameter band, and synthesises the objects. `hz_joc::qmf` is that analysis
-  bank — the prototype transcribed from the workspace decoder, the modulation
-  held to its formula by a test — and the estimator fits in it.
-- **The fit.** Per object and band, least squares of the object's subbands from
-  the downmix's, a small ridge (10⁻⁵ of the mean diagonal) keeping an empty
-  band's gains at nought. The decoder slides from last frame's gains to this
-  frame's across the 24 slots, so there are two ways to choose them:
-  `Fit::Centred`, the default, fits a frame's worth of slots centred on the
-  frame's end, where the decoder arrives at the gains — a frame of latency, no
-  overshoot; `Fit::Ramp` fits through the ramp from the gains the decoder holds
-  — less error inside a frame, but it overshoots a change (×1.47, ×0.78, ×1.10…
-  on a steady mix) and its codes grow with it, past a skip field's 511 bytes on
-  one stream.
+  parameter band, and synthesises the objects. `hz_joc::qmf` is that bank —
+  the prototype transcribed from the workspace decoder, the analysis held to
+  its formula by a test, the synthesis its transpose, the pair handing the
+  input back 577 samples late (`qmf::DELAY`, what the decoder's objects lag
+  the core by) — and the estimator fits through it.
+- **The fit.** Least squares, a small ridge (10⁻⁵) keeping an empty band's
+  gains at nought. The decoder slides from last frame's gains to this frame's
+  across the 24 slots, and there are three ways to choose them:
+  - `Fit::Synthesis`, the default, fits the decoder's *output*. Each downmix
+    channel's share of each band — its subbands in that band, the others
+    silent — is synthesised through the bank, sixty signals for 5.1; an
+    object's sixty gains are the one least-squares mix of them nearest the
+    object, delayed as the decoder delays it. The window is a frame long, Hann
+    tapered, centred on frame end + 288 samples: the decoder arrives at the
+    gains at the frame's last slot, and a slot's synthesis is spread over the
+    prototype behind it, so that is where they are heard — not at frame end +
+    577, where that sample of the core comes out (centred there, every stream
+    lost 1–2 dB). The ridge is against each signal's own energy: one shared
+    across bands tens of decibels apart flattened the quiet ones, and the top
+    band missed the reference's step on 29 % of gains. A frame of latency; about
+    three times the centred fit's work.
+  - `Fit::Centred` fits each band in the QMF domain on a frame's worth of slots
+    centred on the frame's end — a frame of latency, no overshoot, and blind to
+    the leakage below.
+  - `Fit::Ramp` fits through the ramp from the gains the decoder holds — less
+    error inside a frame, but it overshoots a change (×1.47, ×0.78, ×1.10… on a
+    steady mix) and its codes grow with it, past a skip field's 511 bytes on
+    one stream.
 - **The state.** It keeps what the decoder holds: the dequantised gains of the
   last frame an object was present, untouched while it is absent, as the
   decoder leaves them; and the sequence count, which after 1023 restarts at
@@ -104,7 +119,7 @@ data point, smooth.
 ### Against the reference
 
 `cargo run -p xtask --features eac3-oracle -- graft reference.ec3 --out
-refit.ec3 --refit centred` decodes a reference stream's core and the objects it
+refit.ec3 --refit synthesis` (or `centred`, `ramp`) decodes a reference stream's core and the objects it
 rebuilds, estimates the gains from them, carries them in place of the
 reference's on the core `hz-ac3` codes again, and decodes the objects back. It
 reports how close the gains come to the reference's, and the objects rebuilt
@@ -128,40 +143,58 @@ asks for the same payloads.
 The sample's first frame is such a run, a leftover of the cut it was taken
 from.
 
-| Stream | Gains on the reference's step | Payload, bytes (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
-|---|---|---|---|---|
-| film, 60 s | 92.3 % | 204 (207) | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
-| film, 30 s | 96.5 % | 167 (170) | 33.2 / 41.7 dB | 28.4 / 38.2 dB |
-| sample, two runs | 86.3 % | 185 (181) | 27.0 / 34.7 dB | — |
-| channel check | 99.8 % | 134 (134) | 54.3 / 60.7 dB | 56.8 / 58.9 dB |
+| Stream | Fit | Gains on the reference's step | Payload, bytes, mean / max (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
+|---|---|---|---|---|---|
+| film, 60 s | synthesis | 96.9 % | 209 / 336 (207 / 311) | 30.0 / 35.5 dB | 22.6 / 34.4 dB |
+| | centred | 92.3 % | 204 / 303 | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
+| film, 30 s | synthesis | 99.1 % | 169 / 267 (170 / 202) | 36.8 / 41.7 dB | 28.7 / 38.2 dB |
+| | centred | 96.5 % | 167 / 247 | 33.2 / 41.7 dB | 28.4 / 38.2 dB |
+| sample, two runs | synthesis | 93.8 % | 189 / 372 (181 / 218) | 30.7 / 34.6 dB | — |
+| | centred | 86.3 % | 185 / 354 | 27.0 / 34.7 dB | — |
+| channel check | synthesis | 99.9 % | 134 / 154 (134 / 145) | 56.0 / 60.7 dB | 57.2 / 58.9 dB |
+| | centred | 99.8 % | 134 / 157 | 54.3 / 60.7 dB | 56.8 / 58.9 dB |
 
 The comparison favours the reference by construction: its objects *are* what
 its gains rebuild, so its gains reproduce them up to the core's coding, where
 any other quantisation of the same mix pays the full step — a tenth of a gain,
 some −20 dB in that band for a gain near one. What the table measures is how
-nearly an estimate recovers a known mix. On the channel check, whose objects
-sit on speakers, it recovers it almost exactly; on film it misses the
-reference's step on 4 to 14 % of gains, and the misses are not where the
-reference stepped its gains but in the **narrow low bands** — one subband each
-up to band 3 — where they run two to five times the rate of the wide bands:
+nearly an estimate recovers a known mix.
+
+The centred fit, band by band in the QMF domain, missed the reference's step
+on film mostly in the **narrow low bands** — one subband each up to band 3 —
+at two to five times the rate of the wide bands. That is the subbands'
+leakage: the decoder's synthesis lets each subband carry some of its
+neighbours', which in a band one subband wide is a large share of the band,
+and a fit made band by band cannot see it. Fitting the output, all of an
+object's bands together, sees it:
 
 ```
-off the reference's step, by band (film, 60 s):  9.3 16.5 12.5 13.0 8.8 7.8 5.1 4.9 4.4 3.0 2.7 4.8 %
+off the reference's step, by band (film, 60 s)
+  centred:    9.3 16.5 12.5 13.0 8.8 7.8 5.1 4.9 4.4 3.0 2.7 4.8 %
+  synthesis:  3.5  4.7  5.3  6.2 4.2 2.9 2.2 1.8 1.6 1.4 1.2 2.1 %
 ```
 
-That is the subbands' leakage. The decoder's synthesis and the analysis the fit
-runs on its output are not a perfect pair, and with different gains in
-neighbouring bands each subband carries some of its neighbours', which in a
-band one subband wide is a large share of the band; a fit made band by band in
-the QMF domain cannot see it. The next lever is to fit by synthesis — in the
-domain the decoder's output lives in, all of an object's bands together —
-which also gives the steep slope a place to be decided.
+The gain is the synthesis and not the window: the centred fit at its best
+window (six to eight slots either side) reaches 27.7 dB on the sample and 34.4
+on the 30-second film, three to four short. The window's shape was measured
+too: a flat one a frame long fits each frame's gains partly to its neighbours'
+mixes (27.4 dB on the sample); a flat one eight slots long recovers that
+(31.7) but chases transients, one frame of the 60-second film's payload
+reaching 439 bytes and its Evolution frame 537, past the skip field's 511;
+pulling the ridge towards the held gains or smoothing across bands brings it
+under only at a loss of 1 to 3 dB. The Hann window keeps most of the
+short window's gain without the spikes, and is the one that beats the centred
+fit on every stream, slid and stepped.
+
+What is left is mostly the stepped frames, where the reference moves its gains
+within the frame and ours, one set a frame, cannot follow — the steep slope.
 
 ## Not done
 
-- Fitting by synthesis, and the steep slope: the two known gaps above.
-- A budget for the payload's size: ours run near the reference's, but nothing
-  holds them under a skip field's 511 bytes.
+- The steep slope: the stepped frames above.
+- A budget for the payload's size: ours run near the reference's, its largest
+  within a quarter of theirs on film, but nothing holds them under a skip
+  field's 511 bytes.
 - The downmix: these gains are fitted to a reference's core. From a master, the
   core is the objects rendered to 5.1, then coded, and the gains fitted to the
   decoded core — the step that makes `harlettizer` write objects of its own.

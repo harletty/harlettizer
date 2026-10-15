@@ -81,7 +81,8 @@ sequence back to the master's own channels, bit for bit.
   [docs/eac3.md](docs/eac3.md).
 - **Joint object coding** — the payload read and written, every reference
   payload byte for byte ([docs/joc.md](docs/joc.md)); the parameters
-  themselves are not estimated yet.
+  estimated to a reference's own core and objects, through the decoder's
+  synthesis, but not yet to a core of our own.
 - **Not there yet** — joint object coding parameters of our own and AC-4 are in
   [PLAN.md](PLAN.md) and nothing of them is written. For IAMF: no AAC, no
   v1.1 bed beside the v2.0 objects for older decoders, no scalable layers, and

@@ -561,8 +561,9 @@ enum Command {
 
         /// Carry parameters hz-joc estimates — from the reference's core and
         /// the objects the reference rebuilds — in place of the reference's,
-        /// fitted `centred` (on the frame's end, a frame late) or through the
-        /// decoder's `ramp`; and report the reference's own beside them.
+        /// fitted `centred` (on the frame's end, a frame late), through the
+        /// decoder's `ramp`, or by `synthesis` (to the output the decoder's
+        /// bank makes of them); and report the reference's own beside them.
         #[arg(long, value_name = "FIT")]
         refit: Option<String>,
 
@@ -944,9 +945,10 @@ fn main() -> ExitCode {
                 None => Ok(None),
                 Some("centred") => Ok(Some(hz_joc::estimate::Fit::Centred)),
                 Some("ramp") => Ok(Some(hz_joc::estimate::Fit::Ramp)),
+                Some("synthesis") => Ok(Some(hz_joc::estimate::Fit::Synthesis)),
                 Some(other) => Err(hz_core::Error::unsupported(
                     &reference,
-                    format!("`{other}` for the fit; centred or ramp"),
+                    format!("`{other}` for the fit; centred, ramp or synthesis"),
                 )),
             };
             refit.and_then(|refit| {
