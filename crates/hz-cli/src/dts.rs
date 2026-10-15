@@ -157,17 +157,28 @@ impl Sink {
         })
     }
 
-    /// One frame of the stream; `end_trim` is the samples of padding at its
-    /// end, which Matroska states.
-    fn frame(&mut self, frame: &[u8], end_trim: usize) -> std::io::Result<()> {
-        match self {
-            Sink::Raw(out) => out.write_all(frame),
-            Sink::Matroska { out, muxer, frames } => {
-                muxer.block(out, *frames, frame, end_trim)?;
-                *frames += 1;
-                Ok(())
+    /// What one call of the encoder sent — a frame as a rule, none on the
+    /// first call, and as many as a smoothing buffer releases at once — and
+    /// how many frames that was; `end_trim` is the samples of padding at the
+    /// end of the last, which Matroska states.
+    fn frames(&mut self, stream: &[u8], end_trim: usize) -> std::io::Result<u64> {
+        let mut cut = hz_dca::split::frames(stream).peekable();
+        let mut sent = 0;
+        while let Some(frame) = cut.next() {
+            let frame = frame.map_err(|e| std::io::Error::other(e.0))?;
+            let len = frame.core.map_or(0, <[u8]>::len) + frame.exss.map_or(0, <[u8]>::len);
+            let bytes = &stream[frame.at..frame.at + len];
+            match self {
+                Sink::Raw(out) => out.write_all(bytes)?,
+                Sink::Matroska { out, muxer, frames } => {
+                    let trim = if cut.peek().is_none() { end_trim } else { 0 };
+                    muxer.block(out, *frames, bytes, trim)?;
+                    *frames += 1;
+                }
             }
+            sent += 1;
         }
+        Ok(sent)
     }
 
     /// Close the output; `presented` is the samples a channel a decoder
@@ -341,11 +352,9 @@ pub fn run(config: Config) -> Result<()> {
                 break 'blocks;
             }
             // The first call sends nothing: the core runs a frame ahead.
-            if !stream.is_empty() {
-                sink.frame(&stream, 0)
-                    .map_err(|e| Error::io(&config.out, e))?;
-                sent += 1;
-            }
+            sent += sink
+                .frames(&stream, 0)
+                .map_err(|e| Error::io(&config.out, e))?;
         }
         at += got as u64;
         if let Some(progress) = progress.as_mut() {
@@ -363,11 +372,12 @@ pub fn run(config: Config) -> Result<()> {
         stream.clear();
         match encoder.finish(&mut stream) {
             Ok(()) => {
-                // The last frame is the one padded with silence.
-                let padding = (sent + 1) * FRAME_SAMPLES as u64 - at;
-                sink.frame(&stream, padding as usize)
+                // The last frame is the one padded with silence: the stream
+                // has a frame for every frame of input begun.
+                let padding = at.div_ceil(FRAME_SAMPLES as u64) * FRAME_SAMPLES as u64 - at;
+                sent += sink
+                    .frames(&stream, padding as usize)
                     .map_err(|e| Error::io(&config.out, e))?;
-                sent += 1;
             }
             Err(e) => refused = Some(e),
         }
