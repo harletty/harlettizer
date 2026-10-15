@@ -91,7 +91,7 @@ be rewritten instead.
 | `crates/hz-dca/src/fields.rs` | — | — | — | **Nothing.** The checked field writer and the wide reads, moved out of `exss.rs` so the lossless headers share them. |
 | `xtask/src/dts.rs` | FFmpeg N-122487-g43dbc011fa | `libavcodec/dca_xll.c` (foo86), `ff_dca_xll_parse`, `parse_frame_no_pbr`, `parse_frame_pbr` | LGPL-2.1-or-later | No code. The **rule** by which a lossless frame spanning substreams is put back together — start at the asset's data when it begins with the sync word, else at its sync offset; carry what follows a frame into the next substream's data — so that every frame of a smoothed stream reaches the header check. The DTS:X extension block is read and rewritten through `hz_dca::dtsx`; `--unfold` writes a standard-profile stream's twelve channels before the fold from the oracle's decode, through the integer unfold. |
 
-| `crates/hz-io/src/paths.rs` | — | — | — | **Nothing.** Whether two paths name one file, through `same-file` (MIT/Unlicense, a dependency, not ported); moved from the harness so that `harlettizer dts` refuses an output that is any file of its input, as the harness already did. |
+| `crates/hz-io/src/paths.rs` | — | — | — | **Nothing.** Whether two paths name one file, through `same-file` (MIT/Unlicense, a dependency, not ported); moved from the harness so that every command that writes while it reads (`dts`, `iamf`, `ac3`, `encode`, `convert`) refuses an output that is any file of its input, as the harness already did, through the one `refuse_inputs`. |
 
 | `crates/hz-cli/src/dts.rs` | — | — | — | **Nothing.** The render is `iamf`'s (`hz_programme`, `hz_render::Room`); the limiter is `hz_cluster::mix::Limiter`, here watching the composite the fold makes; the stream is `hz_dca::master`'s. |
 

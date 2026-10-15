@@ -69,6 +69,9 @@ const FOLD: f64 = 23170.0 / 32768.0;
 pub fn run(config: Config) -> Result<()> {
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
+    // Creating the output truncates it, and every file of the input is still
+    // to be read: refuse one that is the input, before any work is done.
+    hz_io::paths::refuse_inputs(source.files(), &config.out)?;
     let format = *source.pcm_format();
     if format.sample_format == SampleFormat::Float {
         return Err(Error::unsupported(
@@ -136,8 +139,6 @@ pub fn run(config: Config) -> Result<()> {
     let mut dca = DcaConfig::reference(DcaLayout::SevenPointOneFour, 24);
     dca.core.adpcm = config.adpcm;
     let mut encoder = Encoder::new(dca).map_err(|e| Error::unsupported(&config.out, e.0))?;
-    // Creating the output truncates it, and the input is still to be read.
-    refuse_inputs(source.files(), &config.out)?;
     let out_file = std::fs::File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
     let mut out = std::io::BufWriter::new(out_file);
 
@@ -285,52 +286,4 @@ pub fn run(config: Config) -> Result<()> {
         bytes as f64 * 8.0 / seconds / 1000.0
     );
     Ok(())
-}
-
-/// Refuse `out` when it is one of the `inputs` by any name — the same path,
-/// another spelling, a symbolic or a hard link: creating it would truncate
-/// what the encode is still reading.
-fn refuse_inputs(inputs: &[PathBuf], out: &std::path::Path) -> Result<()> {
-    for input in inputs {
-        if hz_io::paths::aliases(input, out)? {
-            return Err(Error::refused(
-                out,
-                format!(
-                    "is {}, which the encode reads: writing it would destroy the input",
-                    input.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An output that is any of the input's files, under any name, is
-    /// refused before it is created; anything else is not.
-    #[test]
-    fn an_output_that_is_an_input_is_refused() {
-        let dir = std::env::temp_dir().join(format!("hz-cli-dts-alias-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("programme.atmos");
-        let audio = dir.join("programme.atmos.audio");
-        for file in [&config, &audio] {
-            std::fs::write(file, b"master").unwrap();
-        }
-        let inputs = vec![config.clone(), audio.clone()];
-        let link = dir.join("out.dts");
-        std::fs::hard_link(&audio, &link).unwrap();
-        let refused = refuse_inputs(&inputs, &link);
-        let elsewhere = refuse_inputs(&inputs, &dir.join("new.dts"));
-        let itself = refuse_inputs(&inputs, &config);
-        let after = std::fs::read(&audio).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(refused.is_err() && itself.is_err());
-        assert!(elsewhere.is_ok());
-        assert_eq!(after, b"master");
-    }
 }

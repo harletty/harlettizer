@@ -8,7 +8,7 @@
 //! matters most is one only a Windows runner can see.
 
 use hz_core::{Error, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether `out` names the file `input` is, by any path: the same path, one
 /// through `.` and `..` or a symbolic link, or another hard link to it — on
@@ -36,10 +36,30 @@ pub fn aliases(input: &Path, out: &Path) -> Result<bool> {
     })
 }
 
+/// Refuse `out` when it is any of `inputs` by any name ([`aliases`]):
+/// creating it would truncate what the command is still to read.
+///
+/// Called before the output is created, with every file the input is read
+/// from — a master set's config and components, its mono waveforms, a BW64
+/// file — since any of them may be the one a hard link points at.
+pub fn refuse_inputs(inputs: &[PathBuf], out: &Path) -> Result<()> {
+    for input in inputs {
+        if aliases(input, out)? {
+            return Err(Error::refused(
+                out,
+                format!(
+                    "is {}, which this reads: writing it would destroy the input",
+                    input.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// A fresh directory of its own for each test, removed when it ends.
     struct Scratch(PathBuf);
@@ -114,5 +134,48 @@ mod tests {
         let copy = scratch.0.join("copy.ec3");
         std::fs::copy(&input, &copy).unwrap();
         assert!(!aliases(&input, &copy).unwrap());
+    }
+
+    /// A master set's files, the way a command hands them over.
+    fn master(scratch: &Scratch) -> Vec<PathBuf> {
+        [
+            "programme.atmos",
+            "programme.atmos.metadata",
+            "programme.atmos.audio",
+        ]
+        .map(|name| scratch.file(name))
+        .to_vec()
+    }
+
+    #[test]
+    fn an_output_hard_linked_to_any_input_is_refused() {
+        let scratch = Scratch::new("refuse-hard");
+        let inputs = master(&scratch);
+        let link = scratch.0.join("out.ac3");
+        std::fs::hard_link(&inputs[2], &link).unwrap();
+        let refused = refuse_inputs(&inputs, &link).unwrap_err();
+        assert!(matches!(refused, Error::Refused { .. }), "{refused}");
+        // Refused, not opened: the input still holds what it held.
+        assert_eq!(std::fs::read(&inputs[2]).unwrap(), b"reference");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_output_symlinked_to_any_input_is_refused() {
+        let scratch = Scratch::new("refuse-symbolic");
+        let inputs = master(&scratch);
+        let link = scratch.0.join("out.iamf");
+        std::os::unix::fs::symlink(&inputs[0], &link).unwrap();
+        assert!(refuse_inputs(&inputs, &link).is_err());
+        assert!(refuse_inputs(&inputs, &inputs[1]).is_err());
+    }
+
+    #[test]
+    fn an_unrelated_output_is_not_refused() {
+        let scratch = Scratch::new("refuse-other");
+        let inputs = master(&scratch);
+        let other = scratch.file("out.ec3");
+        refuse_inputs(&inputs, &other).unwrap();
+        refuse_inputs(&inputs, &scratch.0.join("new.ec3")).unwrap();
     }
 }
