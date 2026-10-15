@@ -57,7 +57,7 @@ use hz_cluster::scene::Source as SceneSource;
 use hz_core::{Error, Result, speakers};
 use hz_iamf::{Animation, Element, PositionBlock, PositionKind, Subblock};
 use hz_io::container::SampleFormat;
-use hz_programme::fold::Placer;
+use hz_programme::fold::{Folder, Member};
 use hz_programme::follow::Following;
 use hz_programme::mix::{Mixer, Mixing};
 use hz_programme::overlay::{self, Overlaid};
@@ -67,7 +67,6 @@ use hz_programme::quantise::{Levels, Quantiser};
 use hz_programme::source::Source;
 use hz_programme::{Part, parts_of};
 use hz_render::{Keyframe, Layout, Mixdown};
-use std::collections::VecDeque;
 use std::io::Write;
 
 /// Samples between two traced positions.
@@ -702,17 +701,23 @@ fn run_plain(
         ));
     }
     let feed = if folding {
-        let sources: Vec<(usize, Pooled)> = left
+        let sources: Vec<(usize, Member)> = left
             .iter()
             .map(|&index| match parts[index] {
                 Part::Bed {
                     channel, position, ..
-                } => (channel, Pooled::Pinned(position)),
+                } => (
+                    channel,
+                    Member::Bed {
+                        position,
+                        pinned: true,
+                    },
+                ),
                 _ => unreachable!("only bed channels are left over"),
             })
             .chain(carried_objects.iter().map(|&index| match &parts[index] {
                 Part::Object { channel, keyframes } => {
-                    (*channel, Pooled::Moving(Path::new(keyframes), 0))
+                    (*channel, Member::Moving(Path::new(keyframes), 0))
                 }
                 _ => unreachable!("an object"),
             }))
@@ -1219,53 +1224,6 @@ impl BedFill {
     }
 }
 
-/// What a fold takes: a bed channel no layout has, pinned at its speaker, or
-/// an object on its path (and where the walk along it stopped).
-enum Pooled {
-    Pinned([f64; 3]),
-    Moving(Path, usize),
-}
-
-/// One block a fold has read and not yet folded: the master's samples, and
-/// each source's samples with its gain on them and where it is at the
-/// block's end — what the look-ahead weighed it by, kept so that the fold
-/// weighs the same thing.
-#[derive(Default)]
-struct Read {
-    at: u64,
-    frames: usize,
-    raw: Vec<i32>,
-    signals: Vec<Vec<f32>>,
-    /// Where each source is, and where it is pinned when it is a bed channel.
-    places: Vec<([f64; 3], Option<[f64; 3]>)>,
-}
-
-impl Read {
-    /// Source `index` of this block, as a scene takes it.
-    fn source(&self, index: usize) -> SceneSource {
-        let (position, pinned) = self.places[index];
-        SceneSource {
-            position,
-            pinned,
-            mode: if pinned.is_some() {
-                hz_cluster::class::BED
-            } else {
-                hz_render::Mode::default()
-            },
-            ..SceneSource::default()
-        }
-    }
-
-    /// Every source of the block into `scene`, started and finished.
-    fn weigh(&self, scene: &mut hz_cluster::scene::Scene) {
-        scene.start();
-        for (index, signal) in self.signals.iter().enumerate() {
-            scene.push(&self.source(index), signal.iter().map(|&x| f64::from(x)));
-        }
-        scene.finish();
-    }
-}
-
 /// Frames decided a block at a time and handed out a unit at a time.
 struct Pending {
     frames: Vec<i32>,
@@ -1317,23 +1275,17 @@ impl Pending {
 /// carries.
 ///
 /// The same fold the TrueHD encode makes, from the same crates: each block
-/// placed by the energies of the window around it ([`Placer`]), which needs
-/// the blocks ahead read before it is folded — so a fold reads its own
-/// blocks, [`hz_cluster::smooth::SMOOTHING`]'s look-ahead in front of what it
-/// folds, and hands the folded frames out a unit at a time. The mix's
+/// placed by the energies of the window around it, which needs the blocks
+/// ahead read before it is folded — so a fold reads its own blocks,
+/// [`hz_cluster::smooth::SMOOTHING`]'s look-ahead in front of what it folds
+/// ([`Folder`]), and hands the folded frames out a unit at a time. The mix's
 /// options are the command's: the dialnorm's floor, the weighing, the
 /// headroom rule, and the depth the mixed elements are rounded to.
 struct Folding {
     bed: BedFill,
-    sources: Vec<(usize, Pooled)>,
-    placer: Placer,
-    mixer: Mixer,
-    /// What each block read weighs, for the look-ahead: its own scene,
-    /// because a weighted scene's filter has state and this one reads ahead
-    /// of the fold's.
-    ahead: hz_cluster::scene::Scene,
-    read: VecDeque<Read>,
-    spare: Vec<Read>,
+    /// The fold, each block carrying the master's samples it was read from,
+    /// which the bed element is filled from once it is folded.
+    folder: Folder<Vec<i32>>,
     /// Samples a block, and samples read from the master.
     block: usize,
     at: u64,
@@ -1348,7 +1300,7 @@ impl Folding {
     fn new(
         path: &std::path::Path,
         bed: BedFill,
-        sources: Vec<(usize, Pooled)>,
+        sources: Vec<(usize, Member)>,
         count: usize,
         block: usize,
         width: usize,
@@ -1356,32 +1308,11 @@ impl Folding {
         mixing: &Mixing,
         mixed: Quantiser,
     ) -> Result<Self> {
-        use hz_cluster::{Clusterer, Weighting};
-        let fail = |why: hz_core::Error| Error::unsupported(path, why.to_string());
-        let rate = f64::from(sample_rate);
-        let mut mixer = Mixer::new(
-            rate,
-            mixing.weighing,
-            mixing.dialnorm,
-            mixing.headroom.limits(),
-            count,
-        )
-        .map_err(fail)?;
-        mixer.gains = vec![1.0; sources.len()];
+        let folder = Folder::new(sources, count, f64::from(sample_rate), mixing)
+            .map_err(|why| Error::unsupported(path, why.to_string()))?;
         Ok(Self {
             bed,
-            sources,
-            placer: Placer::new(
-                Clusterer::new(count, Weighting::Fitted)
-                    .map_err(fail)?
-                    .flooring(hz_cluster::floor::Floor::for_dialnorm(mixing.dialnorm))
-                    .bounding(mixing.headroom.bounds()),
-                hz_cluster::smooth::SMOOTHING,
-            ),
-            mixer,
-            ahead: hz_cluster::scene::Scene::weighed(rate, mixing.weighing).map_err(fail)?,
-            read: VecDeque::new(),
-            spare: Vec::new(),
+            folder,
             block,
             at: 0,
             exhausted: false,
@@ -1410,11 +1341,10 @@ impl Folding {
             }
             // A block is folded once the blocks its window reaches ahead are
             // in, or there are no more to come.
-            if self.read.len() > self.placer.look_ahead() || self.exhausted {
-                let Some(read) = self.read.pop_front() else {
-                    break;
-                };
-                self.fold(read, stride, scale, carried, account)?;
+            if (self.folder.ready() || self.exhausted)
+                && !self.fold(stride, scale, carried, account)?
+            {
+                break;
             }
         }
         Ok(self.pending.take(want, q))
@@ -1423,83 +1353,59 @@ impl Folding {
     /// Read the next block, whole whatever `--frames` says, and record what
     /// it weighs.
     fn read_block(&mut self, source: &mut Source, stride: usize, scale: &Scale) -> Result<()> {
-        let mut read = self.spare.pop().unwrap_or_default();
-        read.raw.resize(self.block * stride, 0);
-        let frames = source.fill(&mut read.raw, self.block)?;
+        let mut block = self.folder.block();
+        block.carry.resize(self.block * stride, 0);
+        let frames = source.fill(&mut block.carry, self.block)?;
         if frames < self.block {
             self.exhausted = true;
         }
         if frames == 0 {
-            self.spare.push(read);
+            self.folder.recycle(block);
             return Ok(());
         }
-        let t0 = self.at;
-        read.at = t0;
-        read.frames = frames;
-        read.signals.resize_with(self.sources.len(), Vec::new);
-        read.places.clear();
-        for (signal, (channel, pooled)) in read.signals.iter_mut().zip(&mut self.sources) {
-            signal.clear();
-            let raw = &read.raw;
-            read.places.push(match pooled {
-                Pooled::Pinned(position) => {
-                    signal.extend(
-                        (0..frames)
-                            .map(|n| (f64::from(raw[n * stride + *channel]) * scale.input) as f32),
-                    );
-                    (*position, Some(*position))
-                }
-                Pooled::Moving(object_path, hint) => {
-                    signal.extend((0..frames).map(|n| {
-                        let gain = object_path.gain(t0 + n as u64, hint);
-                        (f64::from(raw[n * stride + *channel]) * scale.input * gain) as f32
-                    }));
-                    let end = t0 + frames as u64 - 1;
-                    (object_path.segment(end, hint).at(end).position, None)
-                }
-            });
-        }
-        read.weigh(&mut self.ahead);
-        let energies: Vec<f64> = self.ahead.objects().iter().map(|o| o.energy).collect();
-        self.placer.record(&energies);
+        let input = scale.input;
+        self.folder.read(
+            block,
+            self.at as i64,
+            frames,
+            |raw: &Vec<i32>, n, channel| f64::from(raw[n * stride + channel]) * input,
+        );
         self.at += frames as u64;
-        self.read.push_back(read);
         Ok(())
     }
 
-    /// Fold one block read into the frames waiting to be handed out, and
-    /// append each element's place at its end to its history.
+    /// Fold the oldest block read into the frames waiting to be handed out,
+    /// and append each element's place at its end to its history: whether
+    /// there was one.
     fn fold(
         &mut self,
-        mut read: Read,
         stride: usize,
         scale: &Scale,
         carried: &mut [Carried],
         account: &mut Account,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let Some(read) = self
+            .folder
+            .fold(scale.output.ceiling())
+            .map_err(|why| Error::unsupported(std::path::Path::new("the fold"), why.to_string()))?
+        else {
+            return Ok(false);
+        };
         let frames = read.frames;
-        read.weigh(&mut self.mixer.scene);
-        let clustering = self
-            .placer
-            .place(self.mixer.scene.objects())
-            .map_err(|why| Error::unsupported(std::path::Path::new("the fold"), why.to_string()))?;
-        std::mem::swap(&mut self.mixer.signals, &mut read.signals);
-        self.mixer.fold(
-            &clustering,
-            self.placer.previous(),
-            frames,
-            scale.output.ceiling(),
-        );
-        self.mixer.judge(&clustering);
-        std::mem::swap(&mut self.mixer.signals, &mut read.signals);
-
         let width = self.pending.width;
         let first = self.bed.width;
         let out = self.pending.block(frames);
         self.bed.fill(
-            &read.raw, stride, frames, read.at, scale, out, width, account,
+            &read.carry,
+            stride,
+            frames,
+            read.at as u64,
+            scale,
+            out,
+            width,
+            account,
         );
-        for (element, signal) in self.mixer.mixed.iter().enumerate() {
+        for (element, signal) in self.folder.mixer.mixed.iter().enumerate() {
             for n in 0..frames {
                 out[n * width + first + element] =
                     self.mixed.code(f64::from(signal[n]), &mut account.levels);
@@ -1507,14 +1413,13 @@ impl Folding {
         }
         // Where each element is going, for the blocks and the measurement,
         // which ramp there across the block.
-        for (element, at_end) in clustering.positions.iter().enumerate() {
+        for (element, at_end) in self.folder.positions().iter().enumerate() {
             if let Placement::Folded(folded) = &mut carried[element].placement {
                 folded.history.push(*at_end);
             }
         }
-        self.placer.keep(clustering);
-        self.spare.push(read);
-        Ok(())
+        self.folder.recycle(read);
+        Ok(true)
     }
 }
 
@@ -2242,13 +2147,13 @@ fn drive(job: Drive<'_>) -> Result<()> {
     match &feed {
         Feed::Direct(_) => {}
         Feed::Folded(folding) => {
-            let smoothing = folding.placer.smoothing();
+            let smoothing = folding.folder.placer.smoothing();
             println!(
                 "  fold         {:.4} mean over the presentations, {:.3} at its worst, as a \
                  fraction of the object's own gains; blocks of {}, steadied by a hold over {} \
                  behind and {} ahead",
-                folding.mixer.cost.mean(),
-                folding.mixer.cost.worst,
+                folding.folder.mixer.cost.mean(),
+                folding.folder.mixer.cost.worst,
                 folding.block,
                 smoothing.behind,
                 smoothing.ahead
@@ -2256,15 +2161,16 @@ fn drive(job: Drive<'_>) -> Result<()> {
             println!(
                 "  floor        {:.1} dBFS at the playback level a dialnorm of {:.0} implies, \
                  {:.2} objects a block under it",
-                folding.mixer.floor.threshold_dbfs(),
+                folding.folder.mixer.floor.threshold_dbfs(),
                 config.mixing.dialnorm,
-                folding.mixer.cost.inaudible as f64 / folding.mixer.cost.blocks.max(1) as f64
+                folding.folder.mixer.cost.inaudible as f64
+                    / folding.folder.mixer.cost.blocks.max(1) as f64
             );
             println!(
                 "  headroom     {} blocks where an element's coherent peak was bounded in the \
                  fit, {}; the elements rounded to {} bits",
-                folding.placer.bounded(),
-                match &folding.mixer.limiter {
+                folding.folder.placer.bounded(),
+                match &folding.folder.mixer.limiter {
                     Some(limiter) => format!(
                         "{} where the limiter brought every element down, the mix peaking at \
                          {:.2} of full scale before it",
