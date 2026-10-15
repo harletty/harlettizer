@@ -340,50 +340,103 @@ impl Estimator {
         self.joc(out_objects)
     }
 
-    /// Keep the solution within what the quantiser holds. A gain past its
-    /// bounds would be clamped there by itself, the others left fitted to a
-    /// partner it no longer has; instead it is held at the bound and the
-    /// others are fitted again around it, until none is past.
+    /// Keep the solution within what the quantiser holds: the least-squares
+    /// gains under the bounds, by the primal active-set method for a box. A
+    /// gain clamped by itself would leave the others fitted to a partner it
+    /// no longer has, and one held for good can be wrong once others move —
+    /// so gains are held one at a time, where a step towards the refit
+    /// crosses a bound first, and released when the fit would gain by moving
+    /// one back inside. It ends where no free gain is past a bound and no held
+    /// one wants to leave its own, the optimum over the box. Nothing to do,
+    /// and nothing done, when the unbounded solution is inside.
     fn hold_to_bounds(&mut self, m: usize) {
-        // Past these, a gain would quantise outside the codes −96..=95.
-        let (low, high) = (-96.5 * f64::from(STEP), 95.5 * f64::from(STEP));
-        self.bounded[..m].fill(false);
-        loop {
-            let mut moved = false;
-            for (x, bounded) in self.solution.iter_mut().zip(&mut self.bounded) {
-                if !*bounded && !(low..=high).contains(x) {
-                    *bounded = true;
-                    *x = if *x < low { -96.0 } else { 95.0 } * f64::from(STEP);
-                    moved = true;
-                }
-            }
-            if !moved {
-                return;
-            }
+        // The codes −96..=95; a little past them a gain still rounds inside,
+        // so only a solution past that margin starts the search.
+        let step = f64::from(STEP);
+        let (low, high) = (-96.0 * step, 95.0 * step);
+        if self.solution[..m]
+            .iter()
+            .all(|x| (low - step / 2.0..=high + step / 2.0).contains(x))
+        {
+            return;
+        }
+        // A feasible start: the solution clamped, the clamped ones held.
+        for (x, held) in self.solution.iter_mut().zip(&mut self.bounded).take(m) {
+            *held = !(low..=high).contains(x);
+            *x = x.clamp(low, high);
+        }
+        let mut trial = [0f64; MAX_CHANNELS * BANDS];
+        // Each round holds or releases one gain; the bound keeps a degenerate
+        // case from cycling.
+        for _ in 0..4 * m {
+            // The free gains' fit with the held ones where they are.
             self.free.clear();
             self.free.extend((0..m).filter(|&i| !self.bounded[i]));
             let k = self.free.len();
-            if k == 0 {
-                return;
-            }
             for (a, &i) in self.free.iter().enumerate() {
                 for (b, &j) in self.free.iter().enumerate() {
                     self.reduced[a * k + b] = self.gram[i * m + j];
                 }
-            }
-            cholesky(&self.reduced[..k * k], k, &mut self.reduced_factor[..k * k]);
-            // The right-hand side less what the held gains already give.
-            let mut x = [0f64; MAX_CHANNELS * BANDS];
-            for (a, &i) in self.free.iter().enumerate() {
-                x[a] = self.rhs[i]
+                trial[a] = self.rhs[i]
                     - (0..m)
                         .filter(|&j| self.bounded[j])
                         .map(|j| self.gram[i * m + j] * self.solution[j])
                         .sum::<f64>();
             }
-            cholesky_solve(&self.reduced_factor[..k * k], k, &mut x[..k]);
+            if k > 0 {
+                cholesky(&self.reduced[..k * k], k, &mut self.reduced_factor[..k * k]);
+                cholesky_solve(&self.reduced_factor[..k * k], k, &mut trial[..k]);
+            }
+            // Step towards it as far as the bounds let; the first gain to
+            // reach one is held there.
+            let mut reach = 1.0;
+            let mut blocking = None;
             for (a, &i) in self.free.iter().enumerate() {
-                self.solution[i] = x[a];
+                let (from, to) = (self.solution[i], trial[a]);
+                let bound = if to > high {
+                    high
+                } else if to < low {
+                    low
+                } else {
+                    continue;
+                };
+                let t = ((bound - from) / (to - from)).clamp(0.0, 1.0);
+                if t < reach {
+                    reach = t;
+                    blocking = Some((i, bound));
+                }
+            }
+            for (a, &i) in self.free.iter().enumerate() {
+                self.solution[i] += reach * (trial[a] - self.solution[i]);
+            }
+            if let Some((i, bound)) = blocking {
+                self.solution[i] = bound;
+                self.bounded[i] = true;
+                continue;
+            }
+            // At the free gains' optimum: release the held gain whose bound
+            // costs most, if any — one the error falls by moving inside.
+            let mut release = None;
+            let mut worst = 0.0;
+            for i in (0..m).filter(|&i| self.bounded[i]) {
+                let gradient =
+                    dot(&self.gram[i * m..(i + 1) * m], &self.solution[..m]) - self.rhs[i];
+                // At the upper bound the error falls inward if it rises with
+                // the gain; at the lower, if it falls with it.
+                let pull = if self.solution[i] >= high {
+                    gradient
+                } else {
+                    -gradient
+                };
+                let tolerance = 1e-9 * self.gram[i * m + i] * step;
+                if pull > tolerance && pull > worst {
+                    worst = pull;
+                    release = Some(i);
+                }
+            }
+            match release {
+                Some(i) => self.bounded[i] = false,
+                None => return,
             }
         }
     }
@@ -813,6 +866,51 @@ mod tests {
                 assert!(
                     (level - LEVEL).abs() <= STEP / 2.0 + 2e-3,
                     "frame {frame} band {band}: rebuilt at {level} (gains {held} and {refitted})"
+                );
+            }
+        }
+    }
+
+    /// Two gains past their bounds at once, where holding both is wrong: a
+    /// third channel, C = 0.3·(L − R), lets the object 113.5·L − 118.5·R (in
+    /// steps) be carried by many mixes, and the unbounded fit picks one with
+    /// L at 95.8 and R at −100.8. Holding R at −96 and refitting brings L
+    /// back inside, at 91 with C at 75 — exactly what the quantiser holds.
+    /// Holding both, C cannot make it up: it moves L's and R's shares
+    /// together, and their sum stayed four steps out.
+    #[test]
+    fn a_held_gain_is_released_when_the_refit_brings_it_back_inside() {
+        let mut seed = 23u32;
+        let input: Vec<Frame> = (0..5)
+            .map(|_| {
+                let l: Vec<f32> = (0..1536).map(|_| noise(&mut seed)).collect();
+                let r: Vec<f32> = (0..1536).map(|_| noise(&mut seed)).collect();
+                let c: Vec<f32> = l.iter().zip(&r).map(|(l, r)| 0.3 * (l - r)).collect();
+                let object = (0..1536)
+                    .map(|n| STEP * (85.0 * l[n] - 90.0 * r[n] + 95.0 * c[n]))
+                    .collect();
+                (
+                    vec![l, r, c, vec![0.0; 1536], vec![0.0; 1536]],
+                    vec![object],
+                )
+            })
+            .collect();
+        let mut estimator = Estimator::new(1, 0);
+        let payloads = run(&mut estimator, &input);
+        for (frame, joc) in payloads[..4].iter().enumerate() {
+            let gains = dequantise(joc.objects[0].as_ref().unwrap(), 5).unwrap();
+            let mixes = gains[0].iter().zip(&gains[1]).zip(&gains[2]);
+            for (band, ((&l, &r), &c)) in mixes.enumerate() {
+                // What the mix gives L and R once C is spread back onto them;
+                // three gains each within half a step put these within 0.65.
+                let (on_l, on_r) = ((l + 0.3 * c) / STEP, (r - 0.3 * c) / STEP);
+                assert!(
+                    (on_l - 113.5).abs() <= 0.65 && (on_r + 118.5).abs() <= 0.65,
+                    "frame {frame} band {band}: L {on_l:.2} and R {on_r:.2} steps for 113.5 \
+                     and −118.5 (gains {:.1} {:.1} {:.1} steps)",
+                    l / STEP,
+                    r / STEP,
+                    c / STEP
                 );
             }
         }

@@ -106,10 +106,16 @@ data point, smooth.
     carrying one signal, the second at −40 dB, it asked the quiet one for a
     gain of fifty, which the quantiser clamped, and rebuilt the object 4.5 dB
     low. Shared within a band, the ridge weighs every channel's gain alike and
-    the fit leans on the louder. And a gain the fit still puts past the
-    quantiser's −96..95 steps is held at the bound and the others are fitted
-    again around it, rather than clamped alone. A test holds each case. A
-    frame of latency; about three times the centred fit's work.
+    the fit leans on the louder. And where the fit still puts gains past the
+    quantiser's −96..95 steps, the gains are solved under those bounds — the
+    primal active-set method for a box: a gain is held at a bound where a step
+    towards the refit crosses it first, and released again when the fit
+    would gain by moving it back inside, as one can once another is held.
+    Clamping gains alone, or holding every first offender for good, both
+    leave mixes the quantiser could carry exactly. A test holds each case.
+    On the reference streams the bounds hardly ever bind, and the figures
+    below do not move with them. A frame of latency; about three times the
+    centred fit's work.
   - `Fit::Centred` fits each band in the QMF domain on a frame's worth of slots
     centred on the frame's end — a frame of latency, no overshoot, and blind to
     the leakage below.
