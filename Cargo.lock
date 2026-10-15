@@ -294,6 +294,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hz-joc"
+version = "0.1.0"
+dependencies = [
+ "hz-core",
+]
+
+[[package]]
 name = "hz-meta"
 version = "0.1.0"
 dependencies = [
@@ -722,6 +729,7 @@ dependencies = [
  "hz-core",
  "hz-dca",
  "hz-io",
+ "hz-joc",
  "hz-meta",
  "hz-mlp",
  "hz-render",

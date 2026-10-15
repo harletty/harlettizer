@@ -1,0 +1,12 @@
+[package]
+name = "hz-joc"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Joint object coding (TS 103 420): the payload E-AC-3 carries objects' parameters in"
+
+[dependencies]
+hz-core.workspace = true
