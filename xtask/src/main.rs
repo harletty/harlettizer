@@ -572,6 +572,11 @@ enum Command {
         #[arg(long, value_name = "RIDGE")]
         ridge: Option<f32>,
 
+        /// With `--refit`: step an object's gains at a slot where that leaves
+        /// less than this share of the ramp's error; 0 never steps.
+        #[arg(long, value_name = "SHARE")]
+        steep_margin: Option<f32>,
+
         /// With `--refit`: list the frames where hz-joc's parameters lose
         /// most against the reference's.
         #[arg(long)]
@@ -939,6 +944,7 @@ fn main() -> ExitCode {
             bitrate,
             refit,
             ridge,
+            steep_margin,
             probe,
         } => {
             let refit = match refit.as_deref() {
@@ -958,6 +964,7 @@ fn main() -> ExitCode {
                     bit_rate: bitrate,
                     refit,
                     ridge,
+                    steep_margin,
                     probe,
                 })
             })
