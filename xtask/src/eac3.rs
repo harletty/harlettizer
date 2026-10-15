@@ -282,12 +282,24 @@ fn survey(input: &Path, dump: Option<&Path>, frames: Option<usize>) -> Result<Re
                 if payload.parse_error.is_some() {
                     *report.payload_errors.entry(id).or_default() += 1;
                 }
+                // Every joint object coding payload is checked by its
+                // identifier, not by whether the oracle could read it: one
+                // the oracle rejects is a failure, not something to skip.
+                if id == emdf::JOC {
+                    let oracle = match &payload.parsed {
+                        ParsedEmdfPayloadData::Joc(joc) => Ok(joc),
+                        _ => Err(payload
+                            .parse_error
+                            .as_ref()
+                            .map_or("not a payload it reads".to_string(), ToString::to_string)),
+                    };
+                    check_joc(&mut report, index, &payload.bytes, oracle);
+                }
                 match &payload.parsed {
                     ParsedEmdfPayloadData::Joc(joc) => {
                         *report.joc_downmix.entry(joc.downmix_config).or_default() += 1;
                         *report.joc_objects.entry(joc.object_count).or_default() += 1;
                         *report.joc_channels.entry(joc.channel_count).or_default() += 1;
-                        check_joc(&mut report, index, &payload.bytes, joc);
                     }
                     ParsedEmdfPayloadData::Oamd(oamd) => {
                         *report.oamd_objects.entry(oamd.object_count).or_default() += 1;
@@ -335,8 +347,22 @@ fn next_frame(
 
 /// Read a joint object coding payload with `hz-joc`, write it back, and hold
 /// what it read to what the oracle read.
-fn check_joc(report: &mut Report, index: usize, bytes: &[u8], oracle: &eac3::JocPayload) {
+fn check_joc(
+    report: &mut Report,
+    index: usize,
+    bytes: &[u8],
+    oracle: std::result::Result<&eac3::JocPayload, String>,
+) {
     report.joc_payloads += 1;
+    let oracle = match oracle {
+        Ok(oracle) => Some(oracle),
+        Err(why) => {
+            report.first_joc_failure.get_or_insert(format!(
+                "syncframe {index}: the oracle cannot read it: {why}"
+            ));
+            None
+        }
+    };
     let ours = match hz_joc::read(bytes) {
         Ok(ours) => ours,
         Err(e) => {
@@ -376,6 +402,9 @@ fn check_joc(report: &mut Report, index: usize, bytes: &[u8], oracle: &eac3::Joc
             .first_joc_failure
             .get_or_insert(format!("syncframe {index}: written back, the bytes differ"));
     }
+    let Some(oracle) = oracle else {
+        return;
+    };
     match joc_disagreement(&ours, oracle) {
         None => report.joc_agreed += 1,
         Some(what) => {
@@ -721,4 +750,116 @@ fn histogram<K: std::fmt::Display>(counts: &BTreeMap<K, usize>) -> String {
         .map(|(key, count)| format!("{key} ×{count}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hz_ac3::{ChannelMode, Config, Encoder, FRAME_SAMPLES, Format, Metadata};
+
+    /// A few frames of 5.1 E-AC-3 written here, each carrying one Evolution
+    /// frame with this joint object coding payload in block 2's skip field.
+    fn stream_carrying(joc: &[u8]) -> Vec<u8> {
+        let mut container = BitWriter::new();
+        emdf::write(
+            &mut container,
+            &[emdf::Payload {
+                id: emdf::JOC,
+                bytes: joc,
+                ..emdf::Payload::default()
+            }],
+            emdf::Protection::EAC3,
+        );
+        let container = container.finish();
+        let mut synced = emdf::SYNC_WORD.to_be_bytes().to_vec();
+        synced.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        synced.extend_from_slice(&container);
+
+        let mut encoder = Encoder::new(Config {
+            format: Format::Eac3,
+            sample_rate: 48_000,
+            mode: ChannelMode::ThreeTwo,
+            lfe: true,
+            bit_rate: Some(640),
+            coupling: true,
+            metadata: Metadata::default(),
+        })
+        .unwrap();
+        let planes = vec![vec![0f32; FRAME_SAMPLES]; 6];
+        let refs: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            encoder.carry_skip_field(&synced);
+            encoder.encode(&refs, &mut out).unwrap();
+        }
+        out
+    }
+
+    /// The gate's verdict on a stream, through the command itself.
+    fn verdict(name: &str, stream: &[u8]) -> (Report, Result<()>) {
+        let path =
+            std::env::temp_dir().join(format!("hz-xtask-eac3-{name}-{}.ec3", std::process::id()));
+        std::fs::write(&path, stream).unwrap();
+        let report = survey(&path, None, None).unwrap();
+        let run = run(Options {
+            inputs: vec![path.clone()],
+            dump: None,
+            frames: None,
+        });
+        let _ = std::fs::remove_file(&path);
+        (report, run)
+    }
+
+    /// One object, absent: the smallest payload both readers take.
+    fn valid() -> Vec<u8> {
+        hz_joc::Joc {
+            downmix_config: 0,
+            clip_gain: (0, 0),
+            sequence: 1,
+            objects: vec![None],
+            unflagged_tail: 0,
+            padding: 0,
+            trailing: vec![],
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    fn a_valid_payload_passes() {
+        let (report, run) = verdict("valid", &stream_carrying(&valid()));
+        assert_eq!(report.joc_payloads, 3);
+        assert_eq!((report.joc_rewritten, report.joc_agreed), (3, 3));
+        assert!(run.is_ok(), "{run:?}");
+    }
+
+    /// The case the review found passing: a payload the oracle rejects is
+    /// counted, and fails the command, rather than dropping out of the gate.
+    #[test]
+    fn a_payload_the_oracle_rejects_fails_the_gate() {
+        let truncated = {
+            let mut joc = hz_joc::Joc {
+                objects: vec![None; 40],
+                ..hz_joc::read(&valid()).unwrap()
+            }
+            .to_bytes();
+            joc.truncate(2);
+            joc
+        };
+        let reserved = {
+            // Downmix 0, one object, the extension configuration 1.
+            let mut w = BitWriter::new();
+            w.put(3, 0);
+            w.put(6, 0);
+            w.put(3, 1);
+            w.put(20, 0);
+            w.finish()
+        };
+        for (name, joc) in [("truncated", truncated), ("reserved", reserved)] {
+            let (report, run) = verdict(name, &stream_carrying(&joc));
+            assert_eq!(report.joc_payloads, 3, "{name}: every payload is counted");
+            assert_eq!(report.joc_agreed, 0, "{name}");
+            assert!(report.first_joc_failure.is_some(), "{name}");
+            assert!(run.is_err(), "{name}: the command fails");
+        }
+    }
 }
