@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+hz-ac3.workspace = true
 hz-analysis.workspace = true
 hz-cluster.workspace = true
 hz-core.workspace = true

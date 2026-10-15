@@ -35,6 +35,8 @@ pub struct Config {
     pub bit_rate: Option<u32>,
     pub dialnorm: i8,
     pub coupling: bool,
+    /// Write one independent E-AC-3 substream rather than AC-3.
+    pub eac3: bool,
     pub progress: bool,
 }
 
@@ -118,6 +120,11 @@ pub fn run(config: Config) -> Result<()> {
     }
 
     let mut encoder = Encoder::new(hz_ac3::Config {
+        format: if config.eac3 {
+            hz_ac3::Format::Eac3
+        } else {
+            hz_ac3::Format::Ac3
+        },
         sample_rate,
         mode,
         lfe,
@@ -256,7 +263,8 @@ pub fn run(config: Config) -> Result<()> {
         layout.name
     );
     println!(
-        "  encoded      {syncframes} syncframes, {at} samples, AC-3 at {} kb/s{}",
+        "  encoded      {syncframes} syncframes, {at} samples, {} at {} kb/s{}",
+        if config.eac3 { "E-AC-3" } else { "AC-3" },
         encoder.bit_rate(),
         if encoder.coupled() {
             ", high band coupled"

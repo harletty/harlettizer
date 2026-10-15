@@ -698,6 +698,7 @@ dependencies = [
  "clap",
  "dca",
  "eac3",
+ "hz-ac3",
  "hz-analysis",
  "hz-cluster",
  "hz-core",
