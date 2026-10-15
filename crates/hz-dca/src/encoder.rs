@@ -135,9 +135,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// A disc's core: 5.1 at 48 kHz in 2012-byte frames — 1509 kb/s, under
-    /// the 1536 kb/s its rate code names.
-    pub fn disc_five_one() -> Self {
+    /// The reference streams' core: 5.1 at 48 kHz in 2012-byte frames —
+    /// 1509 kb/s, under the 1536 kb/s its rate code names.
+    pub fn reference_five_one() -> Self {
         Self {
             layout: Layout::FivePointOne,
             sample_rate: 48000,
@@ -1377,7 +1377,7 @@ mod tests {
             let mut encoder = Encoder::new(Config {
                 adpcm,
                 lfe_history_quirk: true,
-                ..Config::disc_five_one()
+                ..Config::reference_five_one()
             })
             .unwrap();
             let mut out = Vec::new();
@@ -1394,7 +1394,7 @@ mod tests {
         let streams = [false, true].map(|lfe_history_quirk| {
             let mut encoder = Encoder::new(Config {
                 lfe_history_quirk,
-                ..Config::disc_five_one()
+                ..Config::reference_five_one()
             })
             .unwrap();
             let mut out = Vec::new();
@@ -1442,8 +1442,8 @@ mod tests {
     }
 
     #[test]
-    fn a_disc_frame_has_the_disc_shape() {
-        let mut encoder = Encoder::new(Config::disc_five_one()).unwrap();
+    fn a_reference_frame_has_the_reference_shape() {
+        let mut encoder = Encoder::new(Config::reference_five_one()).unwrap();
         assert_eq!(encoder.frame_size(), 2012);
         let header = encoder.header();
         assert_eq!(header.bit_rate_code, 24);
@@ -1473,7 +1473,7 @@ mod tests {
                     layout,
                     bit_rate,
                     adpcm,
-                    ..Config::disc_five_one()
+                    ..Config::reference_five_one()
                 })
                 .unwrap();
                 let channels = layout.channels();
@@ -1490,12 +1490,12 @@ mod tests {
     fn a_rate_too_low_for_the_channels_is_refused() {
         let config = Config {
             bit_rate: 192_000,
-            ..Config::disc_five_one()
+            ..Config::reference_five_one()
         };
         assert!(Encoder::new(config).is_err());
         let config = Config {
             sample_rate: 96000,
-            ..Config::disc_five_one()
+            ..Config::reference_five_one()
         };
         assert!(Encoder::new(config).is_err());
     }
@@ -1505,7 +1505,7 @@ mod tests {
         for code in 0..=8u8 {
             let config = Config {
                 pcm_resolution_code: code,
-                ..Config::disc_five_one()
+                ..Config::reference_five_one()
             };
             match Encoder::new(config) {
                 Ok(mut encoder) => {
@@ -1529,7 +1529,7 @@ mod tests {
             sample_rate: 16000,
             bit_rate: 96_000,
             adpcm: true,
-            ..Config::disc_five_one()
+            ..Config::reference_five_one()
         })
         .unwrap();
         assert_eq!(encoder.header().bit_rate_code, 3);

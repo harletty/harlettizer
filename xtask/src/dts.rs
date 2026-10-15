@@ -1078,7 +1078,7 @@ mod tests {
             sample_rate: 16000,
             bit_rate: 96_000,
             adpcm: true,
-            ..Config::disc_five_one()
+            ..Config::reference_five_one()
         })
         .unwrap();
         assert_eq!(encoder.header().bit_rate_code, 3);

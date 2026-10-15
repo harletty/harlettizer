@@ -498,7 +498,8 @@ enum Command {
         #[arg(long, default_value_t = 48000)]
         rate: u32,
 
-        /// Bits a second; the default makes a disc's 2012-byte frame.
+        /// Bits a second; the default makes the reference streams' 2012-byte
+        /// frame.
         #[arg(long, default_value_t = 1_509_000)]
         bit_rate: u32,
 

@@ -286,8 +286,8 @@ impl CoreHeader {
 mod tests {
     use super::*;
 
-    /// A 5.1 core at 48 kHz in 2012-byte frames, the shape of a disc's: 1509
-    /// kb/s actual, under the 1536 kb/s its rate code names.
+    /// A 5.1 core at 48 kHz in 2012-byte frames, the reference streams' shape:
+    /// 1509 kb/s actual, under the 1536 kb/s its rate code names.
     pub(crate) fn five_one() -> CoreHeader {
         CoreHeader {
             normal_frame: true,
