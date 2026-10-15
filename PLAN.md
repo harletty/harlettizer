@@ -714,8 +714,10 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   the reference's step, and its objects come within 4–5 dB of what the
   reference's own gains rebuild on slid frames — 3 to 4 dB better than the
   first, band-by-band fit in the QMF domain, which could not see the
-  subbands' leakage. Next: decide the steep slope (the stepped frames are now
-  the gap), budget the payload, and fit to a core rendered from a master.
+  subbands' leakage. It steps an object's gains at a slot, rather than ramp
+  them, where the frame's error says so (the steep slope): mostly where the
+  reference steps, at the same slot, gaining 3 to 4 dB on the stepped frames
+  of film. Next: budget the payload, and fit to a core rendered from a master.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is

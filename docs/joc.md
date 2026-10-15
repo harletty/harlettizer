@@ -123,6 +123,31 @@ data point, smooth.
     error inside a frame, but it overshoots a change (×1.47, ×0.78, ×1.10… on a
     steady mix) and its codes grow with it, past a skip field's 511 bytes on
     one stream.
+- **The steep slope.** With `Fit::Synthesis` an object's gains may *step*
+  at a slot instead of ramping across the frame: the decoder holds the last
+  frame's gains up to the slot and this frame's from it on (TS 103 420
+  6.6.5). The references step where an object moves inside a frame — every
+  object of the frame at once, at one slot spread over the whole frame, one
+  data point; the gains themselves change little more than on a ramped frame
+  (0.74 against 0.53 in the 60-second film, the same in the 30-second one),
+  so a step says *when* the mix changes, not by how much. The estimator
+  decides per object, in the QMF domain — the decoder's own model before
+  synthesis — over the frame and half the next: the ramp from the held gains
+  to the best gains through it, against, for each of the 24 slots, the held
+  gains before it and the best gains after; all from per-slot sums, 24 small
+  solves a band. The best step is taken when it leaves less than 0.7 of the
+  ramp's error (`steep_margin`, 0 never steps) and buys back at least 10⁻⁴ of
+  the object's energy, both weighed with the gains rounded to the
+  quantiser's steps: a gain between two steps looks better reached at once
+  than ramped to until both round to the step already held, and stepping on
+  that kept a steady mix stepping every frame. A stepped object's gains are
+  then fitted by synthesis on the part of the window only the slots after
+  the step make, and held to the same test the step passed: that part can
+  hold nothing to fit — a transient over before it begins — and the refit
+  come back nought, which erased the transient (a test holds the case). The
+  gains that fail are replaced by the decision's own, fitted in the QMF
+  domain on every slot from the step on; on the 60-second film that also
+  gained 0.15 dB on the slid frames.
 - **The state.** It keeps what the decoder holds: the dequantised gains of the
   last frame an object was present, untouched while it is absent, as the
   decoder leaves them; and the sequence count, which after 1023 restarts at
@@ -159,13 +184,17 @@ from.
 
 | Stream | Fit | Gains on the reference's step | Payload, bytes, mean / max (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
 |---|---|---|---|---|---|
-| film, 60 s | synthesis | 96.9 % | 209 / 336 (207 / 311) | 30.0 / 35.5 dB | 22.5 / 34.5 dB |
+| film, 60 s | synthesis, steep | 96.8 % | 209 / 327 (207 / 311) | 30.3 / 35.5 dB | 25.7 / 34.5 dB |
+| | synthesis | 96.9 % | 209 / 336 | 30.0 / 35.5 dB | 22.5 / 34.5 dB |
 | | centred | 92.3 % | 204 / 303 | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
-| film, 30 s | synthesis | 98.9 % | 170 / 267 (170 / 202) | 36.8 / 41.7 dB | 28.7 / 38.2 dB |
+| film, 30 s | synthesis, steep | 98.9 % | 170 / 201 (170 / 202) | 37.3 / 41.7 dB | 32.9 / 38.2 dB |
+| | synthesis | 98.9 % | 170 / 267 | 36.8 / 41.7 dB | 28.7 / 38.2 dB |
 | | centred | 96.5 % | 167 / 247 | 33.2 / 41.7 dB | 28.4 / 38.2 dB |
-| sample, two runs | synthesis | 93.6 % | 189 / 371 (181 / 218) | 30.7 / 34.6 dB | — |
+| sample, two runs | synthesis, steep | 93.7 % | 189 / 372 (181 / 218) | 30.7 / 34.6 dB | — |
+| | synthesis | 93.6 % | 189 / 371 | 30.7 / 34.6 dB | — |
 | | centred | 86.3 % | 185 / 354 | 27.0 / 34.7 dB | — |
-| channel check | synthesis | 99.9 % | 133 / 153 (134 / 145) | 56.7 / 60.7 dB | 57.2 / 58.9 dB |
+| channel check | synthesis, steep | 99.9 % | 133 / 165 (134 / 145) | 57.1 / 60.7 dB | 58.3 / 58.9 dB |
+| | synthesis | 99.9 % | 133 / 153 | 56.7 / 60.7 dB | 57.2 / 58.9 dB |
 | | centred | 99.8 % | 134 / 157 | 54.3 / 60.7 dB | 56.8 / 58.9 dB |
 
 The comparison favours the reference by construction: its objects *are* what
@@ -200,12 +229,34 @@ under only at a loss of 1 to 3 dB. The Hann window keeps most of the
 short window's gain without the spikes, and is the one that beats the centred
 fit on every stream, slid and stepped.
 
-What is left is mostly the stepped frames, where the reference moves its gains
-within the frame and ours, one set a frame, cannot follow — the steep slope.
+The steep slope closes part of the stepped frames' gap: 3 to 4 dB on film,
+and the whole stream's objects gain 1.2 dB on the 60-second film, 3.6 on the
+30-second one (28.1 → 29.4 and 32.9 → 36.6 dB). Where it steps, the reference
+mostly does too, at the same slot to within one: on 3.8 of the 6.0 % of
+objects' frames the 60-second film steps, 1.2 of 1.4 % on the 30-second one;
+on the sample, which never steps, it steps 1.0 % at no cost to the slid
+frames (30.65 against 30.68 dB). It steps less than the reference — 6.0
+against 9.1 %, 1.4 against 7.8 % — because the reference steps every object
+of a frame together, where the estimator steps an object only when its own
+error says so; stepping more, with a looser margin, gained a little on the
+stepped frames and lost it on the slid ones (measured before the gains sent
+were held to the step's test, which moved the 60-second film by 0.15 dB and
+nothing else):
+
+| Margin | Steps (film 60 s / 30 s) | Objects, whole stream (60 s / 30 s / sample) |
+|---|---|---|
+| 0 (never) | — | 28.1 / 32.9 / 29.3 dB |
+| 0.7 | 6.1 / 1.4 % | 29.3 / 36.6 / 30.4 dB |
+| 0.8 | 7.8 / 1.8 % | 29.3 / 36.7 / 30.4 dB |
+| 0.9 | 10.3 / 2.3 % | 29.2 / 36.8 / 30.3 dB |
+
+The decision makes the fit about 30 % slower; the whole graft still runs
+some eight times faster than real time.
 
 ## Not done
 
-- The steep slope: the stepped frames above.
+- Two data points a frame, which the references never use, and a steep slope
+  decided for the frame's objects together, as they do.
 - A budget for the payload's size: ours run near the reference's, its largest
   within a quarter of theirs on film, but nothing holds them under a skip
   field's 511 bytes.

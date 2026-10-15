@@ -37,6 +37,10 @@ pub struct Options {
     /// With `refit`, the estimator's ridge, relative to the normal
     /// equations' mean diagonal; its own default unless asked.
     pub ridge: Option<f32>,
+    /// With `refit`, the estimator's steep margin — the share of the ramp's
+    /// error a step must leave to be taken, nought for never; its own
+    /// default unless asked.
+    pub steep_margin: Option<f32>,
     /// With `refit`, list the frames where ours lose most against the
     /// reference's parameters.
     pub probe: bool,
@@ -305,6 +309,7 @@ fn refit(
     theirs: &Objects,
     fit: hz_joc::estimate::Fit,
     ridge: Option<f32>,
+    steep_margin: Option<f32>,
 ) -> Result<(Vec<Vec<u8>>, Vec<Vec<bool>>)> {
     use hz_joc::estimate::{Estimator, dequantise};
     use hz_meta::emdf;
@@ -368,6 +373,9 @@ fn refit(
         estimator.fit = fit;
         if let Some(ridge) = ridge {
             estimator.ridge = ridge;
+        }
+        if let Some(margin) = steep_margin {
+            estimator.steep_margin = margin;
         }
         for k in run {
             let joc = &jocs[k];
@@ -463,6 +471,31 @@ fn refit(
             .collect::<Vec<_>>()
             .join(" ")
     );
+    // Where each stepped its gains rather than ramped them, object by frame.
+    let (mut present, mut ours, mut reference_steps, mut both, mut near) = (0, 0, 0, 0, 0);
+    for (estimate, joc) in estimates.iter().zip(&jocs) {
+        for (o, t) in estimate.objects.iter().zip(&joc.objects) {
+            let (Some(o), Some(t)) = (o, t) else {
+                continue;
+            };
+            present += 1;
+            ours += usize::from(o.steep);
+            reference_steps += usize::from(t.steep);
+            if o.steep && t.steep {
+                both += 1;
+                let (a, b) = (o.offsets.first(), t.offsets.first());
+                near += usize::from(a.zip(b).is_some_and(|(a, b)| a.abs_diff(*b) <= 1));
+            }
+        }
+    }
+    let share = |count: usize| 100.0 * count as f64 / present.max(1) as f64;
+    println!(
+        "  steep        ours on {:.1} % of objects' frames, the reference's on {:.1} %; both on {:.1} %, at the same slot (±1) on {:.1} %",
+        share(ours),
+        share(reference_steps),
+        share(both),
+        share(near)
+    );
 
     let protection = |(primary, secondary): (u32, u32)| {
         let length = |bits| match bits {
@@ -554,8 +587,14 @@ pub fn run(options: Options) -> Result<()> {
     let (emdf, baseline, steep) = match options.refit {
         None => (reference.emdf.clone(), None, None),
         Some(fit) => {
-            let (mut emdf, steep) =
-                refit(&options.reference, &reference, &theirs, fit, options.ridge)?;
+            let (mut emdf, steep) = refit(
+                &options.reference,
+                &reference,
+                &theirs,
+                fit,
+                options.ridge,
+                options.steep_margin,
+            )?;
             // The graft of the reference's own parameters, beside ours, on the
             // same core: the skip field's bytes come out of the audio's
             // budget, so both carry each frame's Evolution frame padded to the
@@ -904,7 +943,7 @@ mod splice_tests {
         std::fs::write(&path, stream).unwrap();
         let reference = read_reference(&path).unwrap();
         let theirs = decode_objects(&path).unwrap();
-        let (emdf, _) = refit(&path, &reference, &theirs, Fit::Ramp, None).unwrap();
+        let (emdf, _) = refit(&path, &reference, &theirs, Fit::Ramp, None, None).unwrap();
         let _ = std::fs::remove_file(&path);
         emdf
     }
