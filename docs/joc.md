@@ -98,10 +98,18 @@ data point, smooth.
     gains at the frame's last slot, and a slot's synthesis is spread over the
     prototype behind it, so that is where they are heard — not at frame end +
     577, where that sample of the core comes out (centred there, every stream
-    lost 1–2 dB). The ridge is against each signal's own energy: one shared
-    across bands tens of decibels apart flattened the quiet ones, and the top
-    band missed the reference's step on 29 % of gains. A frame of latency; about
-    three times the centred fit's work.
+    lost 1–2 dB). The ridge is one per band, shared by that band's channels.
+    One across all sixty signals flattened the quiet bands, tens of decibels
+    below the loud ones: the top band missed the reference's step on 29 % of
+    gains. One per signal, against that signal's own energy, did not, but it
+    leaned on every channel equally whatever gain that took: of two channels
+    carrying one signal, the second at −40 dB, it asked the quiet one for a
+    gain of fifty, which the quantiser clamped, and rebuilt the object 4.5 dB
+    low. Shared within a band, the ridge weighs every channel's gain alike and
+    the fit leans on the louder. And a gain the fit still puts past the
+    quantiser's −96..95 steps is held at the bound and the others are fitted
+    again around it, rather than clamped alone. A test holds each case. A
+    frame of latency; about three times the centred fit's work.
   - `Fit::Centred` fits each band in the QMF domain on a frame's worth of slots
     centred on the frame's end — a frame of latency, no overshoot, and blind to
     the leakage below.
@@ -145,13 +153,13 @@ from.
 
 | Stream | Fit | Gains on the reference's step | Payload, bytes, mean / max (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
 |---|---|---|---|---|---|
-| film, 60 s | synthesis | 96.9 % | 209 / 336 (207 / 311) | 30.0 / 35.5 dB | 22.6 / 34.4 dB |
+| film, 60 s | synthesis | 96.9 % | 209 / 336 (207 / 311) | 30.0 / 35.5 dB | 22.5 / 34.5 dB |
 | | centred | 92.3 % | 204 / 303 | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
-| film, 30 s | synthesis | 99.1 % | 169 / 267 (170 / 202) | 36.8 / 41.7 dB | 28.7 / 38.2 dB |
+| film, 30 s | synthesis | 98.9 % | 170 / 267 (170 / 202) | 36.8 / 41.7 dB | 28.7 / 38.2 dB |
 | | centred | 96.5 % | 167 / 247 | 33.2 / 41.7 dB | 28.4 / 38.2 dB |
-| sample, two runs | synthesis | 93.8 % | 189 / 372 (181 / 218) | 30.7 / 34.6 dB | — |
+| sample, two runs | synthesis | 93.6 % | 189 / 371 (181 / 218) | 30.7 / 34.6 dB | — |
 | | centred | 86.3 % | 185 / 354 | 27.0 / 34.7 dB | — |
-| channel check | synthesis | 99.9 % | 134 / 154 (134 / 145) | 56.0 / 60.7 dB | 57.2 / 58.9 dB |
+| channel check | synthesis | 99.9 % | 133 / 153 (134 / 145) | 56.7 / 60.7 dB | 57.2 / 58.9 dB |
 | | centred | 99.8 % | 134 / 157 | 54.3 / 60.7 dB | 56.8 / 58.9 dB |
 
 The comparison favours the reference by construction: its objects *are* what
@@ -171,7 +179,7 @@ object's bands together, sees it:
 ```
 off the reference's step, by band (film, 60 s)
   centred:    9.3 16.5 12.5 13.0 8.8 7.8 5.1 4.9 4.4 3.0 2.7 4.8 %
-  synthesis:  3.5  4.7  5.3  6.2 4.2 2.9 2.2 1.8 1.6 1.4 1.2 2.1 %
+  synthesis:  3.5  4.8  5.3  6.2 4.2 2.9 2.2 1.9 1.6 1.5 1.3 2.3 %
 ```
 
 The gain is the synthesis and not the window: the centred fit at its best

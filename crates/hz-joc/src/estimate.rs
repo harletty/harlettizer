@@ -107,13 +107,19 @@ pub struct Estimator {
     /// The square root of the frame-long Hann window [`Fit::Synthesis`]
     /// weighs the output by, and the fit's scratch: the basis and the target
     /// under it, the normal equations, their factor, a right-hand side and its
-    /// solution — kept, so that a frame allocates nothing for them.
+    /// solution, and the smaller system left when gains are held at the
+    /// quantiser's bounds — kept, so that a frame allocates nothing for them.
     window_root: Vec<f64>,
     weighted: Vec<Vec<f64>>,
     weighted_target: Vec<f64>,
     gram: Vec<f64>,
     factor: Vec<f64>,
     solution: Vec<f64>,
+    rhs: Vec<f64>,
+    bounded: Vec<bool>,
+    free: Vec<usize>,
+    reduced: Vec<f64>,
+    reduced_factor: Vec<f64>,
     sequence: u16,
     pub fit: Fit,
     /// The ridge on the normal equations, relative to their mean diagonal:
@@ -153,6 +159,11 @@ impl Estimator {
             gram: vec![0.0; (channels * BANDS).pow(2)],
             factor: vec![0.0; (channels * BANDS).pow(2)],
             solution: vec![0.0; channels * BANDS],
+            rhs: vec![0.0; channels * BANDS],
+            bounded: vec![false; channels * BANDS],
+            free: Vec::with_capacity(channels * BANDS),
+            reduced: vec![0.0; (channels * BANDS).pow(2)],
+            reduced_factor: vec![0.0; (channels * BANDS).pow(2)],
             sequence: 0,
             fit: Fit::default(),
             ridge: 1e-5,
@@ -277,11 +288,21 @@ impl Estimator {
                 gram[j * m + i] = v;
             }
         }
-        // Each basis is held back against its own energy, not the mean of
-        // all sixty: the bands span tens of decibels, and a ridge shared
-        // across them flattens the quiet ones to nought.
-        for i in 0..m {
-            gram[i * m + i] = gram[i * m + i] * (1.0 + f64::from(self.ridge)) + 1e-12;
+        // The ridge is one per band, shared by its channels: the bands span
+        // tens of decibels, and one ridge across all sixty flattens the
+        // quiet ones to nought; but within a band it must weigh every
+        // channel's gain alike, so that of two channels carrying one signal
+        // the fit leans on the louder — one per signal, against that signal's
+        // own energy, asks a channel at −40 dB for a gain of fifty.
+        for band in 0..BANDS {
+            let mean = (0..n)
+                .map(|ch| gram[(ch * BANDS + band) * (m + 1)])
+                .sum::<f64>()
+                / n as f64;
+            let lambda = f64::from(self.ridge) * mean + 1e-12;
+            for ch in 0..n {
+                gram[(ch * BANDS + band) * (m + 1)] += lambda;
+            }
         }
         cholesky(gram, m, &mut self.factor);
 
@@ -299,10 +320,12 @@ impl Estimator {
             {
                 *w = root * f64::from(value);
             }
-            for (x, weighted) in self.solution.iter_mut().zip(&self.weighted) {
-                *x = dot(weighted, &self.weighted_target);
+            for (b, weighted) in self.rhs.iter_mut().zip(&self.weighted) {
+                *b = dot(weighted, &self.weighted_target);
             }
+            self.solution.copy_from_slice(&self.rhs);
             cholesky_solve(&self.factor, m, &mut self.solution);
+            self.hold_to_bounds(m);
             let x = &self.solution;
             let (codes, gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
             self.held[o] = gains;
@@ -315,6 +338,54 @@ impl Estimator {
             }));
         }
         self.joc(out_objects)
+    }
+
+    /// Keep the solution within what the quantiser holds. A gain past its
+    /// bounds would be clamped there by itself, the others left fitted to a
+    /// partner it no longer has; instead it is held at the bound and the
+    /// others are fitted again around it, until none is past.
+    fn hold_to_bounds(&mut self, m: usize) {
+        // Past these, a gain would quantise outside the codes −96..=95.
+        let (low, high) = (-96.5 * f64::from(STEP), 95.5 * f64::from(STEP));
+        self.bounded[..m].fill(false);
+        loop {
+            let mut moved = false;
+            for (x, bounded) in self.solution.iter_mut().zip(&mut self.bounded) {
+                if !*bounded && !(low..=high).contains(x) {
+                    *bounded = true;
+                    *x = if *x < low { -96.0 } else { 95.0 } * f64::from(STEP);
+                    moved = true;
+                }
+            }
+            if !moved {
+                return;
+            }
+            self.free.clear();
+            self.free.extend((0..m).filter(|&i| !self.bounded[i]));
+            let k = self.free.len();
+            if k == 0 {
+                return;
+            }
+            for (a, &i) in self.free.iter().enumerate() {
+                for (b, &j) in self.free.iter().enumerate() {
+                    self.reduced[a * k + b] = self.gram[i * m + j];
+                }
+            }
+            cholesky(&self.reduced[..k * k], k, &mut self.reduced_factor[..k * k]);
+            // The right-hand side less what the held gains already give.
+            let mut x = [0f64; MAX_CHANNELS * BANDS];
+            for (a, &i) in self.free.iter().enumerate() {
+                x[a] = self.rhs[i]
+                    - (0..m)
+                        .filter(|&j| self.bounded[j])
+                        .map(|j| self.gram[i * m + j] * self.solution[j])
+                        .sum::<f64>();
+            }
+            cholesky_solve(&self.reduced_factor[..k * k], k, &mut x[..k]);
+            for (a, &i) in self.free.iter().enumerate() {
+                self.solution[i] = x[a];
+            }
+        }
     }
 
     /// The frame's payload around its objects; the sequence count steps on.
@@ -674,6 +745,75 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Two downmix channels carrying one signal at very different levels:
+    /// the object is the loud one, and every fit must rebuild it at its level.
+    /// A ridge that weighs each channel's share by its own energy asks the
+    /// quiet one for a gain a hundred times the loud one's, past what the
+    /// quantiser holds; clamped there, it rebuilt the object 4.5 dB low.
+    #[test]
+    fn every_fit_rebuilds_an_object_carried_by_correlated_channels_at_its_level() {
+        const QUIET: f32 = 0.01;
+        for fit in [Fit::Centred, Fit::Synthesis] {
+            let mut seed = 11u32;
+            let input: Vec<Frame> = (0..5)
+                .map(|_| {
+                    let loud: Vec<f32> = (0..1536).map(|_| noise(&mut seed)).collect();
+                    let mut core = vec![loud.clone(), loud.iter().map(|v| QUIET * v).collect()];
+                    core.extend((0..3).map(|_| (0..1536).map(|_| noise(&mut seed)).collect()));
+                    (core, vec![loud])
+                })
+                .collect();
+            let mut estimator = Estimator::new(1, 0);
+            estimator.fit = fit;
+            let payloads = run(&mut estimator, &input);
+            for (frame, joc) in payloads[..4].iter().enumerate() {
+                let joc = crate::payload::read(&joc.to_bytes()).unwrap();
+                let gains = dequantise(joc.objects[0].as_ref().unwrap(), 5).unwrap();
+                for (band, (loud, quiet)) in gains[0].iter().zip(&gains[1]).enumerate() {
+                    let level = loud + QUIET * quiet;
+                    assert!(
+                        (level - 1.0).abs() <= STEP / 2.0 + 2e-3,
+                        "{fit:?} frame {frame} band {band}: rebuilt at {level} \
+                         (gains {loud} and {quiet})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An object louder than the quantiser's largest gain, carried by two
+    /// channels, one at half the other's level. The fit leans on the louder
+    /// past its bound, 10.4 of 13; held there, at 95 steps, the quieter makes
+    /// up the rest and the object is rebuilt at its level. Clamping the one
+    /// gain alone, and leaving the other where the unbounded fit put it,
+    /// rebuilt it at 12.1.
+    #[test]
+    fn a_gain_past_the_quantisers_bounds_is_held_there_and_the_rest_refitted() {
+        const LEVEL: f32 = 13.0;
+        let mut seed = 17u32;
+        let input: Vec<Frame> = (0..5)
+            .map(|_| {
+                let signal: Vec<f32> = (0..1536).map(|_| noise(&mut seed)).collect();
+                let mut core = vec![signal.clone(), signal.iter().map(|v| 0.5 * v).collect()];
+                core.extend((0..3).map(|_| (0..1536).map(|_| noise(&mut seed)).collect()));
+                (core, vec![signal.iter().map(|v| LEVEL * v).collect()])
+            })
+            .collect();
+        let mut estimator = Estimator::new(1, 0);
+        let payloads = run(&mut estimator, &input);
+        for (frame, joc) in payloads[..4].iter().enumerate() {
+            let gains = dequantise(joc.objects[0].as_ref().unwrap(), 5).unwrap();
+            for (band, (held, refitted)) in gains[0].iter().zip(&gains[1]).enumerate() {
+                assert_eq!(*held, 95.0 * STEP, "frame {frame} band {band}");
+                let level = held + 0.5 * refitted;
+                assert!(
+                    (level - LEVEL).abs() <= STEP / 2.0 + 2e-3,
+                    "frame {frame} band {band}: rebuilt at {level} (gains {held} and {refitted})"
+                );
             }
         }
     }
