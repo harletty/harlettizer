@@ -110,14 +110,27 @@ reference's on the core `hz-ac3` codes again, and decodes the objects back. It
 reports how close the gains come to the reference's, and the objects rebuilt
 from them beside the objects the reference's own gains rebuild on the same
 core, split between the frames the reference slid its gains in and those it
-stepped them in, the stream's first two and last two frames left out:
+stepped them in, the stream's first two and last two frames left out.
+
+*The same core* is enforced, not assumed. A skip field's bytes come out of the
+audio's budget, so two encodes carrying payloads of different sizes code the
+audio differently — 204 bytes against 207 left 16 % of a synthetic core's
+samples changed. Both encodes therefore carry each frame's Evolution frame
+padded with zeros to the larger of the two (the container's length may run
+past its last field, TS 102 366 H.2.2.1.2), and the command refuses to report
+unless the two decoded cores are identical. And where the reference's sequence
+count breaks — a splice, after which its decoder starts over — the fit starts
+over too: each unspliced run of frames is fitted by an estimator of its own,
+numbered from the reference's count, its window never reaching across the cut.
+The sample's first frame is such a run, a leftover of the cut it was taken
+from.
 
 | Stream | Gains on the reference's step | Payload, bytes (theirs) | Objects, slid frames: ours / theirs | Stepped frames: ours / theirs |
 |---|---|---|---|---|
 | film, 60 s | 92.3 % | 204 (207) | 26.6 / 35.5 dB | 21.7 / 34.5 dB |
 | film, 30 s | 96.5 % | 167 (170) | 33.2 / 41.7 dB | 28.4 / 38.2 dB |
-| sample | 86.4 % | 184 (181) | 27.0 / 34.7 dB | — |
-| channel check | 99.8 % | 134 (134) | 54.3 / 60.7 dB | 56.9 / 58.9 dB |
+| sample, two runs | 86.3 % | 185 (181) | 27.0 / 34.7 dB | — |
+| channel check | 99.8 % | 134 (134) | 54.3 / 60.7 dB | 56.8 / 58.9 dB |
 
 The comparison favours the reference by construction: its objects *are* what
 its gains rebuild, so its gains reproduce them up to the core's coding, where
@@ -130,7 +143,7 @@ reference stepped its gains but in the **narrow low bands** — one subband each
 up to band 3 — where they run two to five times the rate of the wide bands:
 
 ```
-off the reference's step, by band (sample):  25.1 23.9 31.2 25.2 13.9 10.9 9.7 6.1 6.3 4.3 2.6 4.5 %
+off the reference's step, by band (film, 60 s):  9.3 16.5 12.5 13.0 8.8 7.8 5.1 4.9 4.4 3.0 2.7 4.8 %
 ```
 
 That is the subbands' leakage. The decoder's synthesis and the analysis the fit

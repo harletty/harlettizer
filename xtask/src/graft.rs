@@ -192,6 +192,38 @@ fn decode_objects_of(path: &Path, bytes: &[u8]) -> Result<Objects> {
     Ok(Objects { objects, core })
 }
 
+/// The unspliced runs of frames: a new run wherever the joint object coding
+/// sequence count does not follow the one before — a splice, or a stream cut
+/// and joined.
+fn runs(counts: &[u16]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for k in 1..counts.len() {
+        if counts[k] != hz_joc::estimate::next_sequence(counts[k - 1]) {
+            runs.push(start..k);
+            start = k;
+        }
+    }
+    if !counts.is_empty() {
+        runs.push(start..counts.len());
+    }
+    runs
+}
+
+/// Pad an Evolution frame behind its sync word to `size` bytes, the length
+/// field saying so: TS 102 366 H.2.2.1.2 has the container's tail past its
+/// last field set to nought, and a decoder reads to its length.
+fn pad_synced(frame: &mut Vec<u8>, size: usize) {
+    if frame.is_empty() || frame.len() == size {
+        return;
+    }
+    assert!(frame.len() < size, "padding only grows a frame");
+    assert_eq!(frame[..2], hz_meta::emdf::SYNC_WORD.to_be_bytes());
+    frame.resize(size, 0);
+    let length = (size - 4) as u16;
+    frame[2..4].copy_from_slice(&length.to_be_bytes());
+}
+
 /// The reference's core coded by `hz-ac3`, each frame carrying `emdf[k]`;
 /// with the rate and whether it coupled.
 fn encode(
@@ -284,14 +316,24 @@ fn refit(
         frames.push(frame);
     }
     let count = theirs.objects.len();
-    let first = jocs
-        .first()
-        .ok_or_else(|| Error::malformed(path, "no frames"))?;
-    let mut estimator = Estimator::new(count, first.downmix_config);
-    estimator.set_sequence(first.sequence);
-    estimator.fit = fit;
-    if let Some(ridge) = ridge {
-        estimator.ridge = ridge;
+    if jocs.is_empty() {
+        return Err(Error::malformed(path, "no frames"));
+    }
+    // At a splice the reference's decoder starts over, so the fit does too:
+    // each unspliced run of frames gets an estimator of its own, numbered
+    // from the reference's count, and no window reaches across the cut.
+    let counts: Vec<u16> = jocs.iter().map(|j| j.sequence).collect();
+    let runs = runs(&counts);
+    if runs.len() > 1 {
+        println!(
+            "  splices      the reference starts over at syncframe{} {}; each run fitted on its own",
+            if runs.len() > 2 { "s" } else { "" },
+            runs[1..]
+                .iter()
+                .map(|run| run.start.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // The downmix in the order joint object coding names it: L, R, C, Ls, Rs
@@ -303,28 +345,37 @@ fn refit(
     let silence = vec![0f32; FRAME_SAMPLES];
     let mut ideal = vec![vec![0f32; FRAME_SAMPLES]; count];
     let mut estimates = Vec::with_capacity(jocs.len());
-    for (k, joc) in jocs.iter().enumerate() {
-        let start = k * FRAME_SAMPLES;
-        let core: Vec<&[f32]> = core_order
-            .iter()
-            .map(|ch| {
-                reference.core[*ch]
-                    .get(start..start + FRAME_SAMPLES)
-                    .unwrap_or(&silence)
-            })
-            .collect();
-        for (plane, object) in ideal.iter_mut().zip(&theirs.objects) {
-            for (n, v) in plane.iter_mut().enumerate() {
-                *v = object.get(start + n + latency).copied().unwrap_or(0.0);
-            }
+    for run in runs {
+        let mut estimator = Estimator::new(count, jocs[run.start].downmix_config);
+        estimator.set_sequence(counts[run.start]);
+        estimator.fit = fit;
+        if let Some(ridge) = ridge {
+            estimator.ridge = ridge;
         }
-        let objects: Vec<&[f32]> = ideal.iter().map(Vec::as_slice).collect();
-        let present: Vec<bool> = (0..count)
-            .map(|o| joc.objects.get(o).is_some_and(Option::is_some))
-            .collect();
-        estimates.extend(estimator.push(&core, &objects, &present));
+        for k in run {
+            let joc = &jocs[k];
+            let start = k * FRAME_SAMPLES;
+            let core: Vec<&[f32]> = core_order
+                .iter()
+                .map(|ch| {
+                    reference.core[*ch]
+                        .get(start..start + FRAME_SAMPLES)
+                        .unwrap_or(&silence)
+                })
+                .collect();
+            for (plane, object) in ideal.iter_mut().zip(&theirs.objects) {
+                for (n, v) in plane.iter_mut().enumerate() {
+                    *v = object.get(start + n + latency).copied().unwrap_or(0.0);
+                }
+            }
+            let objects: Vec<&[f32]> = ideal.iter().map(Vec::as_slice).collect();
+            let present: Vec<bool> = (0..count)
+                .map(|o| joc.objects.get(o).is_some_and(Option::is_some))
+                .collect();
+            estimates.extend(estimator.push(&core, &objects, &present));
+        }
+        estimates.extend(estimator.finish());
     }
-    estimates.extend(estimator.finish());
 
     // How close the gains come, where both carry an object.
     // Where the gains part from the reference's, band by band: the narrow
@@ -486,10 +537,19 @@ pub fn run(options: Options) -> Result<()> {
     let (emdf, baseline, steep) = match options.refit {
         None => (reference.emdf.clone(), None, None),
         Some(fit) => {
-            let (emdf, steep) = refit(&options.reference, &reference, &theirs, fit, options.ridge)?;
-            // The graft of the reference's own parameters, beside ours, on
-            // the same core.
-            let stream = encode(&options.out, &reference, &reference.emdf, bit_rate)?.0;
+            let (mut emdf, steep) =
+                refit(&options.reference, &reference, &theirs, fit, options.ridge)?;
+            // The graft of the reference's own parameters, beside ours, on the
+            // same core: the skip field's bytes come out of the audio's
+            // budget, so both carry each frame's Evolution frame padded to the
+            // larger of the two, and the audio is coded alike.
+            let mut theirs_emdf = reference.emdf.clone();
+            for (ours, theirs) in emdf.iter_mut().zip(theirs_emdf.iter_mut()) {
+                let size = ours.len().max(theirs.len());
+                pad_synced(ours, size);
+                pad_synced(theirs, size);
+            }
+            let stream = encode(&options.out, &reference, &theirs_emdf, bit_rate)?.0;
             (
                 emdf,
                 Some(decode_objects_of(&options.out, &stream)?),
@@ -517,6 +577,15 @@ pub fn run(options: Options) -> Result<()> {
         );
     }
     let ours = decode_objects(&options.out)?;
+    if let Some(baseline) = &baseline
+        && baseline.core != ours.core
+    {
+        return Err(Error::refused(
+            &options.out,
+            "the graft and the reference's baseline decode to different cores: the comparison \
+             would measure the audio coding as well as the parameters",
+        ));
+    }
     if ours.objects.len() != theirs.objects.len() {
         return Err(Error::malformed(
             &options.out,
@@ -632,4 +701,108 @@ pub fn run(options: Options) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The review's case — counts 0 to 3 twice — is two runs; the count's
+    /// own wrap, past 1023 to one, is not a splice, and a wrap to nought is.
+    #[test]
+    fn a_splice_starts_a_run_and_a_wrap_does_not() {
+        assert_eq!(runs(&[0, 1, 2, 3, 0, 1, 2, 3]), [0..4, 4..8]);
+        assert_eq!(runs(&[1022, 1023, 1, 2]), [0..4]);
+        assert_eq!(runs(&[1022, 1023, 0, 1]), [0..2, 2..4]);
+        assert_eq!(runs(&[479, 871, 872]), [0..1, 1..3]);
+        assert_eq!(runs(&[5]), [0..1]);
+        assert!(runs(&[]).is_empty());
+    }
+
+    /// An Evolution frame carrying this joint object coding payload, behind
+    /// its sync word.
+    fn synced(joc: &[u8]) -> Vec<u8> {
+        let mut container = hz_core::bits::BitWriter::new();
+        hz_meta::emdf::write(
+            &mut container,
+            &[hz_meta::emdf::Payload {
+                id: hz_meta::emdf::JOC,
+                bytes: joc,
+                ..Default::default()
+            }],
+            hz_meta::emdf::Protection::EAC3,
+        );
+        let container = container.finish();
+        let mut out = hz_meta::emdf::SYNC_WORD.to_be_bytes().to_vec();
+        out.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        out.extend_from_slice(&container);
+        out
+    }
+
+    fn joc(objects: usize) -> Vec<u8> {
+        hz_joc::Joc {
+            downmix_config: 0,
+            clip_gain: (0, 0),
+            sequence: 1,
+            objects: vec![None; objects],
+            unflagged_tail: 0,
+            padding: 0,
+            trailing: vec![],
+        }
+        .to_bytes()
+    }
+
+    /// The review's case: the same audio, carrying Evolution frames of
+    /// different sizes, is coded differently; padded to one size it is coded
+    /// alike, and the padded frame still reads as the one it was.
+    #[test]
+    fn padding_to_one_size_gives_one_core() {
+        let small = synced(&joc(1));
+        let large = synced(&{
+            let mut bytes = joc(64);
+            bytes.resize(200, 0);
+            bytes
+        });
+        assert!(small.len() < large.len());
+
+        let mut seed = 11u32;
+        let core: Vec<Vec<f32>> = (0..6)
+            .map(|_| {
+                (0..8 * FRAME_SAMPLES)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        let path = Path::new("test.ec3");
+        let decoded = |emdf: &Vec<u8>| {
+            let reference = Reference {
+                core: core.clone(),
+                emdf: vec![emdf.clone(); 6],
+                frame_bytes: 3072,
+                sample_rate: 48_000,
+            };
+            let stream = encode(path, &reference, &reference.emdf, 768).unwrap().0;
+            decode_objects_of(path, &stream).unwrap().core
+        };
+        assert_ne!(
+            decoded(&small),
+            decoded(&large),
+            "unpadded, the cores differ"
+        );
+
+        let mut padded = small.clone();
+        pad_synced(&mut padded, large.len());
+        assert_eq!(padded.len(), large.len());
+        assert_eq!(
+            decoded(&padded),
+            decoded(&large),
+            "padded, they are one core"
+        );
+        let (frame, end) = hz_meta::emdf::read_synced(&padded, 0).unwrap();
+        assert_eq!(end, padded.len());
+        assert_eq!(frame.payloads[0].bytes, joc(1));
+    }
 }
