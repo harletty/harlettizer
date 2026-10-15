@@ -22,10 +22,19 @@
 //! coded as itself and the layers are independent, but stay in step.
 //!
 //! The substream header is the reference streams' (one presentation, one
-//! asset, the core backward-compatible in the core substream), with the
-//! smoothing buffer stated as none: every lossless frame sits whole in its
-//! own substream, so the substreams vary in size frame to frame. Smoothing
-//! that peak is phase C4.
+//! asset, the core backward-compatible in the core substream). The stream is
+//! held under a peak bit rate ceiling, the core and every header included
+//! ([`peak::Config`], 24.5 Mb/s by default). A lossless frame goes whole in
+//! its own substream, so the substreams vary in size frame to frame as the
+//! reference streams' do; only a frame too large for its own substream has
+//! part of it sent ahead, in the substreams before it, into the decoder's
+//! smoothing buffer ([`peak::Smoother`]). Where no frame the lossless layer
+//! can write is too large — at the default ceiling, any — the stream states
+//! no smoothing buffer and every frame goes out as soon as it is encoded.
+//! Otherwise the encoder looks [`peak::Config::lookahead`] frames ahead, and
+//! a frame that cannot reach the decoder in time is refused with
+//! [`Refused::PeakRate`], naming it: lossless data is never coded coarser,
+//! and the stream ends before it.
 //!
 //! A 7.1.4 is the DTS:X extension's standard profile ([`crate::dtsx`]): the
 //! stream above, its 7.1 the composite the heights are folded into, and at
@@ -44,6 +53,9 @@ use crate::exss::{
     Xll, XllSync, component,
 };
 use crate::lossless::{self, Layout};
+use crate::navigation::Navigation;
+use crate::peak::{self, Smoother};
+use std::collections::VecDeque;
 
 pub use crate::encoder::Unsupported;
 pub use crate::lossless::Refused;
@@ -54,13 +66,15 @@ pub struct Config {
     pub lossless: lossless::Config,
     /// The core: 5.1 at 48 kHz, whatever else it is.
     pub core: encoder::Config,
+    /// The peak bit rate the stream is held under.
+    pub peak: peak::Config,
 }
 
 impl Config {
     /// The reference streams' shape: the lossless layer as
     /// [`lossless::Config::reference`] lays it out, and a 1509 kb/s core
     /// stating the source's word length as they do — 6 for 24 bits, 0 for
-    /// sixteen.
+    /// sixteen — under the default ceiling.
     pub fn reference(layout: Layout, bits: u8) -> Self {
         Self {
             lossless: lossless::Config::reference(layout, bits),
@@ -68,8 +82,26 @@ impl Config {
                 pcm_resolution_code: if bits > 16 { 6 } else { 0 },
                 ..encoder::Config::reference_five_one()
             },
+            peak: peak::Config::default(),
         }
     }
+}
+
+/// How the stream has used its ceiling so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rate {
+    /// The most bytes a frame may take under the ceiling.
+    pub budget: usize,
+    /// The largest frame sent, core and headers included.
+    pub largest: usize,
+    /// The smoothing buffer the stream states, in bytes: 0 when no frame
+    /// can need it.
+    pub buffer: usize,
+    /// The most bytes the decoder's buffer has held at once.
+    pub held: u64,
+    /// Frames whose substream carried other than exactly their own
+    /// lossless frame.
+    pub ahead: u64,
 }
 
 /// The encoder.
@@ -85,14 +117,53 @@ pub struct Encoder {
     waiting: bool,
     /// The core frame last encoded.
     core_frame: Vec<u8>,
-    /// Frames sent.
+    /// Frames encoded.
     frames: u64,
-    /// Bytes of the lossless frames sent, and how many of their channels
+    /// Bytes of the lossless frames encoded, and how many of their channels
     /// were coded against the core.
     lossless_bytes: u64,
     against_core: u64,
     /// The furthest offset and the largest DTS:X block navigated so far.
     reach: Option<(usize, usize)>,
+    /// The frames encoded and not yet sent: their cores end to end, the
+    /// lossless stream from the first byte not sent, and each frame's
+    /// navigation word when it has one.
+    cores: VecDeque<u8>,
+    lossless_stream: VecDeque<u8>,
+    words: VecDeque<Option<u64>>,
+    smoother: Smoother,
+    /// The buffer code the substreams state.
+    buffer_code: u8,
+    rate: Rate,
+    /// Once a frame cannot be carried, the stream has ended: the refusal.
+    ended: Option<Refused>,
+}
+
+/// Fit `exss` around `size` bytes of data: narrow fields where the whole
+/// substream fits them, wide otherwise, and the header padded to a 32-bit
+/// word as every reference stream's is. Its bytes.
+fn header(exss: &mut ExssHeader, size: u32) -> Vec<u8> {
+    exss.wide = false;
+    loop {
+        exss.reserved = Bits::new();
+        exss.fit()
+            .expect("a lossless frame fits a substream's wide fields");
+        // Every reference stream's header ends on a 32-bit word — 28 to 44
+        // bytes, never between — so that what follows starts on one: zeroes
+        // in the reserved bits to get there.
+        let short = (4 - exss.header_size % 4) % 4;
+        if short > 0 {
+            exss.reserved.pad(8 * short as usize);
+            exss.fit()
+                .expect("a lossless frame fits a substream's wide fields");
+        }
+        exss.size = exss.header_size + size;
+        match exss.write() {
+            Ok(header) => return header,
+            Err(_) if !exss.wide => exss.wide = true,
+            Err(e) => panic!("a fitted substream header does not write: {}", e.0),
+        }
+    }
 }
 
 impl Encoder {
@@ -174,6 +245,56 @@ impl Encoder {
             reserved: Bits::new(),
             crc: 0,
         };
+
+        // The room a substream has for lossless data under the ceiling: the
+        // frame's budget, less the core and the largest header the stream
+        // can need — sync fields at their widest, the navigation word.
+        let peak = config.peak;
+        if peak.buffer_code > 15 {
+            return Err(Unsupported(format!(
+                "a smoothing buffer code of {}: the field holds 0 to 15",
+                peak.buffer_code
+            )));
+        }
+        let budget = peak::frame_budget(peak.ceiling, FRAME_SAMPLES as u32, 48000);
+        let largest = budget.min(1 << 20) as u32;
+        let mut widest = exss.clone();
+        widest.asset_sizes[0] = largest;
+        if let Coding::Components { xll: Some(x), .. } = &mut widest.assets[0].coding {
+            x.size = largest;
+            let delay = peak.lookahead as u32 + 1;
+            x.sync = Some(XllSync {
+                peak_buffer_code: peak.buffer_code,
+                delay_bits: peak::delay_bits(delay),
+                delay_frames: delay,
+                sync_offset: largest - 1,
+            });
+        }
+        if layout == Layout::SevenPointOneFour {
+            widest.assets[0].tail = tail(0);
+        }
+        let overhead = core.frame_size() + header(&mut widest, largest).len();
+        let room = budget.saturating_sub(overhead);
+        if room < 2 {
+            return Err(Unsupported(format!(
+                "a ceiling of {} b/s: {budget} bytes a frame, which the core and the headers \
+                 ({overhead} bytes) leave no room in for the lossless layer",
+                peak.ceiling
+            )));
+        }
+        // Smoothing only where a frame can need it.
+        let smoothing = peak.buffer_code > 0 && lossless.frame_bound() > room;
+        let buffer_code = if smoothing { peak.buffer_code } else { 0 };
+        let smoother = Smoother::new(
+            room,
+            peak::buffer_bytes(buffer_code),
+            if smoothing { peak.lookahead } else { 0 },
+        );
+        let rate = Rate {
+            budget,
+            buffer: peak::buffer_bytes(buffer_code),
+            ..Rate::default()
+        };
         Ok(Self {
             pending: vec![0; FRAME_SAMPLES * layout.channels()],
             waiting: false,
@@ -183,6 +304,13 @@ impl Encoder {
             against_core: 0,
             reach: None,
             decoder: CoreDecoder::new(),
+            cores: VecDeque::new(),
+            lossless_stream: VecDeque::new(),
+            words: VecDeque::new(),
+            smoother,
+            buffer_code,
+            rate,
+            ended: None,
             core,
             lossless,
             exss,
@@ -191,9 +319,14 @@ impl Encoder {
 
     /// Take one frame — [`FRAME_SAMPLES`] samples of every channel,
     /// interleaved in WAV order as 32-bit samples whose bits below the
-    /// configured resolution are zero — and append the stream's frame for
-    /// the frame before it to `out`: nothing on the first call, since the
-    /// core runs a frame ahead. [`Encoder::finish`] sends the last.
+    /// configured resolution are zero — and append to `out` the stream's
+    /// frames that are ready: the frame before this one, since the core runs
+    /// a frame ahead (nothing on the first call), and, where the stream may
+    /// smooth, only once the encoder has looked far enough past it.
+    /// [`Encoder::finish`] sends the rest.
+    ///
+    /// After [`Refused::PeakRate`] the stream has ended: every later call
+    /// returns the same refusal.
     ///
     /// # Panics
     /// If `pcm` is not exactly one frame.
@@ -203,6 +336,9 @@ impl Encoder {
             self.pending.len(),
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
+        if let Some(refused) = &self.ended {
+            return Err(refused.clone());
+        }
         // Refused before anything moves on, naming the input frame: the
         // lossless layer has coded the frames sent, not the one waiting.
         self.lossless
@@ -224,23 +360,26 @@ impl Encoder {
         Ok(())
     }
 
-    /// Send the frame still waiting, with a core made from silence. Nothing
-    /// to send without one.
+    /// Encode the frame still waiting, with a core made from silence, and
+    /// send every frame not yet sent.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
-        if !self.waiting {
-            return Ok(());
+        if let Some(refused) = &self.ended {
+            return Err(refused.clone());
         }
-        let silence = vec![0; self.pending.len()];
-        self.core_frame.clear();
-        self.core
-            .encode(self.lossless.core_input(&silence), &mut self.core_frame);
-        self.send(out)?;
-        self.waiting = false;
-        Ok(())
+        if self.waiting {
+            let silence = vec![0; self.pending.len()];
+            self.core_frame.clear();
+            self.core
+                .encode(self.lossless.core_input(&silence), &mut self.core_frame);
+            self.send(out)?;
+            self.waiting = false;
+        }
+        self.emit(out, true)
     }
 
-    /// The stream's frame for the pending input: the core frame last
-    /// encoded, the substream header, the lossless frame.
+    /// Encode the stream's frame for the pending input — the core frame last
+    /// encoded and the lossless frame — put it in the queue, and send what
+    /// is ready.
     fn send(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
         self.decoder.decode(&self.core);
         // FFmpeg's decoder treats the first frame of a stream that codes
@@ -251,54 +390,80 @@ impl Encoder {
         // first sample.
         let several_sets = self.lossless.config().layout != Layout::FivePointOne;
         let core = (self.frames > 0 || !several_sets).then_some(&self.decoder);
-        let size = self.lossless.encode(&self.pending, core)?.len() as u32;
-        self.exss.asset_sizes[0] = size;
-        if let Coding::Components { xll: Some(x), .. } = &mut self.exss.assets[0].coding {
-            x.size = size;
-        }
-        if let Some(navigation) = self.lossless.extension() {
+        let frame = self.lossless.encode(&self.pending, core)?;
+        let size = frame.len();
+        self.lossless_stream.extend(frame);
+        let word = self.lossless.extension().map(|navigation: Navigation| {
             let (offset, size) = self.reach.unwrap_or_default();
             self.reach = Some((offset.max(navigation.offset), size.max(navigation.size)));
-            self.exss.assets[0].tail = tail(
-                navigation
-                    .word()
-                    .expect("the lossless encoder refuses a block it cannot navigate"),
-            );
-        }
-        // Narrow fields where the whole substream fits them, wide otherwise.
-        self.exss.wide = false;
-        let header = loop {
-            self.exss.reserved = Bits::new();
-            self.exss
-                .fit()
-                .expect("a lossless frame fits a substream's wide fields");
-            // Every reference stream's header ends on a 32-bit word — 28 to
-            // 44 bytes, never between — so that what follows starts on one:
-            // zeroes in the reserved bits to get there.
-            let short = (4 - self.exss.header_size % 4) % 4;
-            if short > 0 {
-                self.exss.reserved.pad(8 * short as usize);
-                self.exss
-                    .fit()
-                    .expect("a lossless frame fits a substream's wide fields");
-            }
-            self.exss.size = self.exss.header_size + size;
-            match self.exss.write() {
-                Ok(header) => break header,
-                Err(_) if !self.exss.wide => self.exss.wide = true,
-                Err(e) => panic!("a fitted substream header does not write: {}", e.0),
-            }
-        };
-        out.extend_from_slice(&self.core_frame);
-        out.extend_from_slice(&header);
-        out.extend_from_slice(self.lossless.frame());
+            navigation
+                .word()
+                .expect("the lossless encoder refuses a block it cannot navigate")
+        });
+        self.words.push_back(word);
+        self.cores.extend(&self.core_frame);
+        self.smoother.push(size);
         self.frames += 1;
-        self.lossless_bytes += u64::from(size);
+        self.lossless_bytes += size as u64;
         self.against_core += u64::from(self.lossless.against_core());
+        self.emit(out, false)
+    }
+
+    /// Send the frames whose substreams can be decided — all of them when
+    /// `flush` — each as its core frame, the substream header and the bytes
+    /// of the lossless stream the smoother gives it.
+    fn emit(&mut self, out: &mut Vec<u8>, flush: bool) -> Result<(), Refused> {
+        while self.smoother.ready() || (flush && self.smoother.waiting() > 0) {
+            let carry = match self.smoother.carry().expect("a frame is waiting") {
+                Ok(carry) => carry,
+                Err((frame, cause)) => {
+                    let refused = Refused::PeakRate { frame, cause };
+                    self.ended = Some(refused.clone());
+                    return Err(refused);
+                }
+            };
+            let bytes = carry.bytes as u32;
+            self.exss.asset_sizes[0] = bytes;
+            if let Coding::Components { xll: Some(x), .. } = &mut self.exss.assets[0].coding {
+                x.size = bytes;
+                x.sync = carry.sync.map(|s| XllSync {
+                    peak_buffer_code: self.buffer_code,
+                    delay_bits: peak::delay_bits(s.delay),
+                    delay_frames: s.delay,
+                    sync_offset: s.offset,
+                });
+            }
+            // The word, when the frame has one, describes the frame the
+            // decoder takes out of its buffer with this substream.
+            self.exss.assets[0].tail = match self.words.pop_front().flatten() {
+                Some(word) => tail(word),
+                None => Bits::new(),
+            };
+            let header = header(&mut self.exss, bytes);
+            let start = out.len();
+            let core = self.core.frame_size();
+            out.extend(self.cores.drain(..core));
+            out.extend_from_slice(&header);
+            out.extend(self.lossless_stream.drain(..carry.bytes));
+            let sent = out.len() - start;
+            debug_assert!(
+                sent <= self.rate.budget,
+                "{sent} bytes over the {}-byte budget",
+                self.rate.budget
+            );
+            self.rate.largest = self.rate.largest.max(sent);
+        }
+        self.rate.held = self.smoother.peak();
+        self.rate.ahead = self.smoother.ahead();
         Ok(())
     }
 
-    /// Bytes of the lossless frames sent so far, headers included.
+    /// How the stream has used its ceiling so far.
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+
+    /// Bytes of the lossless frames encoded so far, headers included.
     pub fn lossless_bytes(&self) -> u64 {
         self.lossless_bytes
     }
@@ -483,6 +648,194 @@ mod tests {
                 assert!(offset <= crate::navigation::MAX_OFFSET && size > 22);
             }
         }
+    }
+
+    /// Tones with a burst of full-scale white noise in every channel from
+    /// frame 10 to 13, all `shift` bits down, 24 bits.
+    fn bursts(channels: usize, frames: usize, shift: u32) -> Vec<i32> {
+        let mut state = 0x2545_f491u32;
+        let tones = tones(channels, frames);
+        tones
+            .iter()
+            .enumerate()
+            .map(|(i, &tone)| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let frame = i / channels / FRAME_SAMPLES;
+                if (10..14).contains(&frame) {
+                    (state as i32) >> shift >> 8 << 8
+                } else {
+                    tone >> shift >> 8 << 8
+                }
+            })
+            .collect()
+    }
+
+    fn encode(config: Config, pcm: &[i32]) -> (Vec<u8>, Result<(), Refused>, Rate) {
+        let channels = config.lossless.layout.channels();
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        for frame in pcm.chunks(FRAME_SAMPLES * channels) {
+            if let Err(e) = encoder.encode(frame, &mut stream) {
+                return (stream, Err(e), encoder.rate());
+            }
+        }
+        let result = encoder.finish(&mut stream);
+        (stream, result, encoder.rate())
+    }
+
+    /// Each frame's bytes, and its substream's lossless data, sync fields
+    /// and descriptor tail.
+    fn substreams(stream: &[u8]) -> Vec<(usize, Vec<u8>, Option<XllSync>, Bits)> {
+        split::frames(stream)
+            .map(|frame| {
+                let frame = frame.unwrap();
+                let exss = frame.exss.unwrap();
+                let header = ExssHeader::read(exss).unwrap();
+                let at = header.header_size as usize;
+                let data = exss[at..at + header.asset_sizes[0] as usize].to_vec();
+                let asset = &header.assets[0];
+                let sync = asset.coding.xll().unwrap().sync.clone();
+                let bytes = frame.core.unwrap().len() + exss.len();
+                (bytes, data, sync, asset.tail.clone())
+            })
+            .collect()
+    }
+
+    /// Under a ceiling the noise does not fit, its frames are sent partly
+    /// ahead, and the decoder's buffer gets back exactly the lossless frames
+    /// a stream that never smooths carries, each with its own substream —
+    /// and, for a 7.1.4, the navigation word of each substream points at
+    /// the block of the frame decoded with it. No frame passes the budget,
+    /// the stream states the buffer it uses and holds no more, and a
+    /// decoder that starts at any substream with a sync takes out the frame
+    /// its delay names.
+    #[test]
+    fn a_lowered_ceiling_sends_frames_ahead_and_every_frame_comes_back_whole() {
+        for (layout, shift, ceiling) in [
+            (Layout::SevenPointOne, 0, 8_500_000),
+            (Layout::SevenPointOneFour, 10, 8_000_000),
+        ] {
+            let pcm = bursts(layout.channels(), 40, shift);
+            let (plain, result, rate) = encode(Config::reference(layout, 24), &pcm);
+            result.unwrap();
+            assert_eq!((rate.buffer, rate.ahead), (0, 0), "{layout:?}");
+            let frames: Vec<Vec<u8>> = substreams(&plain).into_iter().map(|s| s.1).collect();
+            let largest = frames.iter().map(Vec::len).max().unwrap();
+
+            let mut config = Config::reference(layout, 24);
+            config.peak.ceiling = ceiling;
+            config.peak.lookahead = 16;
+            let (smoothed, result, rate) = encode(config, &pcm);
+            result.unwrap_or_else(|e| panic!("{layout:?}: {e}"));
+            let budget = peak::frame_budget(ceiling, 512, 48000);
+            assert!(
+                largest + 2012 > budget,
+                "{layout:?}: the noise has to need it"
+            );
+            assert!(
+                rate.ahead > 0 && rate.largest <= budget,
+                "{layout:?}: {rate:?}"
+            );
+            assert_eq!(rate.buffer, 128 << 10);
+
+            let substreams = substreams(&smoothed);
+            assert_eq!(substreams.len(), frames.len());
+            let mut buffer = peak::DecoderBuffer::new();
+            for (n, (bytes, data, sync, tail)) in substreams.iter().enumerate() {
+                assert!(*bytes <= budget, "{layout:?}: frame {n} is {bytes} bytes");
+                if let Some(s) = sync {
+                    assert_eq!(s.peak_buffer_code, 8);
+                    assert_eq!(s.delay_bits, peak::delay_bits(s.delay_frames));
+                }
+                assert_eq!(
+                    buffer.push(data, sync.as_ref()),
+                    Ok(peak::Taken::Frame(frames[n].len())),
+                    "{layout:?}: substream {n}"
+                );
+                assert_eq!(buffer.frame(), &frames[n][..], "{layout:?}: substream {n}");
+                if layout == Layout::SevenPointOneFour {
+                    let nav = crate::navigation::Navigation::read(tail.word64(2).unwrap()).unwrap();
+                    assert_eq!(nav.offset + nav.size, frames[n].len());
+                    assert_eq!(
+                        &frames[n][nav.offset..nav.offset + 4],
+                        &crate::dtsx::SYNC.to_be_bytes()
+                    );
+                }
+            }
+            assert!(buffer.peak() <= rate.buffer && buffer.peak() as u64 == rate.held);
+            for (n, (_, data, sync, _)) in substreams.iter().enumerate() {
+                let Some(s) = sync else { continue };
+                let due = n + s.delay_frames as usize;
+                let mut joining = peak::DecoderBuffer::new();
+                let mut taken = joining.push(data, Some(s));
+                for (_, data, sync, _) in &substreams[n + 1..=due] {
+                    taken = joining.push(data, sync.as_ref());
+                }
+                assert_eq!(taken, Ok(peak::Taken::Frame(frames[due].len())));
+                assert_eq!(
+                    joining.frame(),
+                    &frames[due][..],
+                    "{layout:?}: joined at {n}"
+                );
+            }
+        }
+    }
+
+    /// A frame that cannot reach the decoder in time is refused, named, and
+    /// the stream ends there: what was sent stays, nothing more is.
+    #[test]
+    fn a_frame_past_the_ceiling_ends_the_stream() {
+        let pcm = bursts(8, 30, 0);
+        let mut config = Config::reference(Layout::SevenPointOne, 24);
+        config.peak.ceiling = 7_000_000;
+        config.peak.buffer_code = 1;
+        config.peak.lookahead = 4;
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let mut refused = None;
+        for (k, frame) in pcm.chunks(FRAME_SAMPLES * 8).enumerate() {
+            if let Err(e) = encoder.encode(frame, &mut stream) {
+                refused = Some((k, e));
+                break;
+            }
+        }
+        let (k, e) = refused.expect("the noise does not fit");
+        let Refused::PeakRate { frame, .. } = e else {
+            panic!("{e}")
+        };
+        assert!(
+            (10..14).contains(&frame) && k as u64 <= frame + 6,
+            "{k}, {e}"
+        );
+        let sent = stream.len();
+        assert!(matches!(
+            encoder.encode(&pcm[..FRAME_SAMPLES * 8], &mut stream),
+            Err(Refused::PeakRate { .. })
+        ));
+        assert!(encoder.finish(&mut stream).is_err());
+        assert_eq!(stream.len(), sent);
+        assert!((substreams(&stream).len() as u64) < frame);
+    }
+
+    /// At the default ceiling no frame the lossless layer can write is too
+    /// large for its substream: the stream states no buffer, and every frame
+    /// goes out as soon as it is encoded, as before.
+    #[test]
+    fn the_default_ceiling_needs_no_buffer() {
+        for layout in [
+            Layout::FivePointOne,
+            Layout::SevenPointOne,
+            Layout::SevenPointOneFour,
+        ] {
+            let encoder = Encoder::new(Config::reference(layout, 24)).unwrap();
+            assert_eq!(encoder.rate().buffer, 0, "{layout:?}");
+            assert!(encoder.lossless.frame_bound() + 2012 + 48 < encoder.rate().budget);
+        }
+        let mut config = Config::reference(Layout::SevenPointOne, 24);
+        config.peak.ceiling = 1_500_000;
+        assert!(Encoder::new(config).is_err(), "no room beside the core");
     }
 
     /// A corner its height takes past 24 bits is refused, naming the input

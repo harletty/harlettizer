@@ -29,6 +29,15 @@
 //! FFmpeg, which decodes the bed, the 7.1 has to be the composite and the
 //! profile DTS-HD MA + DTS:X.
 //!
+//! With `--lossless`, the stream is held under `--ceiling` bits a second,
+//! the core and every header included (24.5 Mb/s by default), frames too
+//! large for their own substream sent partly ahead into a decoder smoothing
+//! buffer of `--buffer` steps of 16 kB (phase C4); `dts` then feeds every
+//! substream to that buffer as both decoders keep it and fails the run on a
+//! frame over the ceiling, a buffer starved or overfull. A frame that cannot
+//! be carried even so is refused, named. `--dialnorm` states a dialogue
+//! normalisation in the core header.
+//!
 //! `--ffmpeg-lfe` reproduces FFmpeg's LFE history defect, which is what makes
 //! a core byte-identical to `ffmpeg -c:a dca -b:a <rate>` on the same samples
 //! (see `hz_dca::encoder::Config::lfe_history_quirk`).
@@ -57,6 +66,12 @@ pub struct Options {
     pub lsb_split: Option<bool>,
     /// Every lossless channel coded as itself, not against the core.
     pub full_coded: bool,
+    /// Bits a second the whole stream is held under, with `--lossless`.
+    pub ceiling: u32,
+    /// The smoothing buffer code, 0 to 15 steps of 16 kB, with `--lossless`.
+    pub buffer: u8,
+    /// The core header's dialogue normalisation, in dB, 0 to 31.
+    pub dialnorm: u8,
     pub out: PathBuf,
 }
 
@@ -92,6 +107,7 @@ pub fn run(options: Options) -> Result<()> {
         adpcm: options.adpcm,
         pcm_resolution_code: 0,
         lfe_history_quirk: options.ffmpeg_lfe,
+        dialnorm: options.dialnorm,
     })
     .map_err(|e| Error::refused(&options.input, e.0))?;
 
@@ -115,6 +131,8 @@ pub fn run(options: Options) -> Result<()> {
         frames: None,
         reference: Some(reference),
         unfold: None,
+        rate_log: None,
+        ceiling: None,
     })
 }
 
@@ -148,6 +166,9 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
         config.lossless.scalable_lsbs = split;
     }
     config.lossless.residual = !options.full_coded;
+    config.core.dialnorm = options.dialnorm;
+    config.peak.ceiling = options.ceiling;
+    config.peak.buffer_code = options.buffer;
     let mut encoder =
         master::Encoder::new(config).map_err(|e| Error::refused(&options.input, e.0))?;
     let per_frame = FRAME_SAMPLES * options.channels;
@@ -186,6 +207,23 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
         encoder.lossless_bytes() as f64 * 8.0 * 48000.0 / (frames as f64 * 512.0) / 1000.0,
         encoder.against_core() as f64 / frames as f64
     );
+    let rate = encoder.rate();
+    let mbps = |bytes: usize| bytes as f64 * 8.0 * 48000.0 / 512.0 / 1e6;
+    println!(
+        "  peak rate              {:.3} Mb/s at the largest frame ({} bytes) under {:.3} ({} \
+         bytes); {} frames sent partly ahead; buffer {}, {} bytes held at most",
+        mbps(rate.largest),
+        rate.largest,
+        mbps(rate.budget),
+        rate.budget,
+        rate.ahead,
+        if rate.buffer == 0 {
+            "none stated".to_string()
+        } else {
+            format!("{} bytes stated", rate.buffer)
+        },
+        rate.held
+    );
     let decoded = dts::run(dts::Options {
         input: options.out.clone(),
         frames: None,
@@ -194,6 +232,8 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
             channels: reference.channels,
         }),
         unfold: None,
+        rate_log: None,
+        ceiling: Some(options.ceiling),
     });
     // FFmpeg decodes the bed, and of a 7.1.4 that is the composite.
     let ffmpeg = if options.channels == 12 {
@@ -378,6 +418,9 @@ mod tests {
                 segments_log2,
                 lsb_split,
                 full_coded,
+                ceiling: hz_dca::peak::CEILING,
+                buffer: 8,
+                dialnorm: 0,
                 out: dir.join("out.dts"),
             });
             std::fs::remove_dir_all(&dir).unwrap();
@@ -387,6 +430,17 @@ mod tests {
 
     /// Encode `pcm` as `run` would from a file, in a directory of its own.
     fn encode_file(name: &str, pcm: &[i32], channels: usize, adpcm: bool) -> Result<()> {
+        encode_under(name, pcm, channels, adpcm, hz_dca::peak::CEILING)
+    }
+
+    /// The same under `ceiling` bits a second.
+    fn encode_under(
+        name: &str,
+        pcm: &[i32],
+        channels: usize,
+        adpcm: bool,
+        ceiling: u32,
+    ) -> Result<()> {
         let dir = std::env::temp_dir().join(format!("hz-dts-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.s32");
@@ -403,6 +457,9 @@ mod tests {
             segments_log2: None,
             lsb_split: None,
             full_coded: false,
+            ceiling,
+            buffer: 8,
+            dialnorm: 0,
             out: dir.join("out.dts"),
         });
         std::fs::remove_dir_all(&dir).unwrap();
@@ -460,6 +517,64 @@ mod tests {
             );
         }
         encode_file("noise-20", &noise(20), 12, false).unwrap();
+    }
+
+    /// Phase C4's worst case: 24-bit white noise at full scale in every
+    /// channel of a 7.1, alone and in a burst a quarter of a second long
+    /// between tones. At the default ceiling both go out whole, every frame
+    /// in its own substream. At 9 Mb/s the burst is smoothed — sent partly
+    /// ahead into the decoder's buffer, under the ceiling — and comes back
+    /// bit for bit through `dca` and FFmpeg, every substream feeding the
+    /// buffer as both keep it; the noise alone is refused at its first
+    /// frame, which no earlier substream can help carry. The same burst in a
+    /// 7.1.4, at 2^-10 of full scale where the navigation word still
+    /// reaches the heights, is smoothed under 8 Mb/s.
+    #[test]
+    fn white_noise_bursts_are_smoothed_under_the_ceiling_or_refused() {
+        let pcm = |channels: usize, shift: u32, burst: std::ops::Range<usize>| {
+            let mut state = 0x2545_f491u32;
+            let tones = signal(channels.min(8), 24);
+            (0..48000)
+                .flat_map(|n| (0..channels).map(move |ch| (n, ch)))
+                .map(|(n, ch)| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let v = if burst.contains(&(n / FRAME_SAMPLES)) {
+                        state as i32
+                    } else {
+                        // The 7.1's channels again for the heights; its
+                        // noise rear and full-scale sides only in a 7.1.
+                        match ch % 8 {
+                            4 | 6 | 7 if channels == 12 => 0,
+                            c => tones[n * 8 + c],
+                        }
+                    };
+                    v >> shift >> 8 << 8
+                })
+                .collect::<Vec<i32>>()
+        };
+        let noise = pcm(8, 0, 0..94);
+        let burst = pcm(8, 0, 40..64);
+        encode_file("worst-noise", &noise, 8, false).unwrap();
+        encode_file("worst-burst", &burst, 8, false).unwrap();
+        encode_under("worst-burst-9", &burst, 8, false, 9_000_000).unwrap();
+        let e = encode_under("worst-noise-9", &noise, 8, false, 9_000_000)
+            .expect_err("white noise over the ceiling from its first frame")
+            .to_string();
+        assert!(
+            e.contains("frame 0 (from sample 0)")
+                && e.contains("more than its substream can carry"),
+            "{e}"
+        );
+        encode_under(
+            "worst-burst-714",
+            &pcm(12, 10, 40..64),
+            12,
+            false,
+            8_000_000,
+        )
+        .unwrap();
     }
 
     #[test]

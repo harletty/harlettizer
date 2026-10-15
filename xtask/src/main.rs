@@ -480,6 +480,12 @@ enum Command {
         /// interleaved 32-bit PCM in WAV 7.1.4 order. Needs `dca-oracle`.
         #[arg(long, value_name = "PATH")]
         unfold: Option<PathBuf>,
+
+        /// Write one CSV line per frame carrying lossless data here: its
+        /// bytes, the lossless data's, the sync fields, the frame the
+        /// decoder takes out of its smoothing buffer, and what it holds.
+        #[arg(long, value_name = "PATH")]
+        rate_log: Option<PathBuf>,
     },
 
     /// Encode raw interleaved 32-bit PCM to a DTS core with `hz-dca`, write
@@ -537,6 +543,22 @@ enum Command {
         /// streams do.
         #[arg(long)]
         full_coded: bool,
+
+        /// With `--lossless`: bits a second the whole stream is held under,
+        /// the core and every header included.
+        #[arg(long, default_value_t = hz_dca::peak::CEILING)]
+        ceiling: u32,
+
+        /// With `--lossless`: the decoder smoothing buffer the stream may
+        /// send frames ahead into, in steps of 16 kB, 0 to 15; 0 sends
+        /// nothing ahead. Stated only where a frame can need it.
+        #[arg(long, default_value_t = 8)]
+        buffer: u8,
+
+        /// The core header's dialogue normalisation, in dB of attenuation,
+        /// 0 to 31.
+        #[arg(long, default_value_t = 0)]
+        dialnorm: u8,
 
         /// Where to write the stream.
         #[arg(long)]
@@ -925,6 +947,7 @@ fn main() -> ExitCode {
             reference,
             channels,
             unfold,
+            rate_log,
         } => (|| {
             let reference = match (reference, channels) {
                 (Some(path), Some(channels)) => Some(dts::Reference::read(&path, channels)?),
@@ -935,6 +958,8 @@ fn main() -> ExitCode {
                 frames,
                 reference,
                 unfold,
+                rate_log,
+                ceiling: None,
             })
         })(),
         Command::DtsEncode {
@@ -948,6 +973,9 @@ fn main() -> ExitCode {
             segments,
             lsb_split,
             full_coded,
+            ceiling,
+            buffer,
+            dialnorm,
             out,
         } => dts_encode::run(dts_encode::Options {
             input,
@@ -960,6 +988,9 @@ fn main() -> ExitCode {
             segments_log2: segments,
             lsb_split,
             full_coded,
+            ceiling,
+            buffer,
+            dialnorm,
             out,
         }),
         #[cfg(feature = "eac3-oracle")]
