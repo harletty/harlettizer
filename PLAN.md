@@ -697,7 +697,16 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   the reference engine at the same settings.
 - **Size**: 3–4 weeks. **Risk**: medium.
 
-#### Phase B3 — Joint object coding
+#### Phase B3 — Joint object coding — **the payload done; the estimation left**
+
+- `hz-joc` reads and writes the payload of TS 103 420 clause 6.2. Every one
+  of the 10 189 payloads of the five local streams writes back byte for byte
+  and reads field for field as the workspace decoder reads it
+  (`cargo xtask eac3`); see [docs/joc.md](docs/joc.md).
+- The reference streams code every object one way: twelve parameter bands,
+  fine quantisation, dense coefficients, one data point a frame, a steep slope
+  for some. That is what the estimator writes first.
+
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is
   parameter estimation: given N objects, produce the 5.1 core downmix plus

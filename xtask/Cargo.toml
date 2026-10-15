@@ -16,6 +16,7 @@ hz-cluster.workspace = true
 hz-core.workspace = true
 hz-dca.workspace = true
 hz-io.workspace = true
+hz-joc.workspace = true
 hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
 hz-render.workspace = true

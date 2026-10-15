@@ -79,7 +79,10 @@ sequence back to the master's own channels, bit for bit.
   stream's objects ride on a core coded here and come back as close as the
   core does. No dependent substream and no objects of our own yet. See
   [docs/eac3.md](docs/eac3.md).
-- **Not there yet** — joint object coding of our own and AC-4 are in
+- **Joint object coding** — the payload read and written, every reference
+  payload byte for byte ([docs/joc.md](docs/joc.md)); the parameters
+  themselves are not estimated yet.
+- **Not there yet** — joint object coding parameters of our own and AC-4 are in
   [PLAN.md](PLAN.md) and nothing of them is written. For IAMF: no AAC, no
   v1.1 bed beside the v2.0 objects for older decoders, no scalable layers, and
   no browser has been tried; [docs/iamf.md](docs/iamf.md#not-done) has the
@@ -334,6 +337,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | | |
 |---|---|
 | [docs/encode.md](docs/encode.md) | The `encode` command: what a real programme did, the progress protocol, what `--fast` costs |
+| [docs/joc.md](docs/joc.md) | Joint object coding: the payload layer, how it is held to the reference streams, and the one shape every reference stream codes its objects in |
 | [docs/eac3.md](docs/eac3.md) | `ac3 --eac3`: the independent substream, where the objects go, how it compares with FFmpeg, and the graft of a reference stream's objects onto our core |
 | [docs/ac3.md](docs/ac3.md) | The `ac3` command: the render and fold, the encoder ported from FFmpeg, how it compares, and what is not done |
 | [docs/iamf.md](docs/iamf.md) | The `iamf` command: the bed and the v2.0 objects, the render, the loudness, the FLAC encoder, Opus, Matroska and MP4, the options, what checked each, and what is not done |

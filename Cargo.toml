@@ -16,6 +16,7 @@ members = [
     "crates/hz-core",
     "crates/hz-dca",
     "crates/hz-iamf",
+    "crates/hz-joc",
     "crates/hz-io",
     "crates/hz-meta",
     "crates/hz-mlp",
@@ -38,6 +39,7 @@ hz-cluster = { path = "crates/hz-cluster" }
 hz-core = { path = "crates/hz-core" }
 hz-dca = { path = "crates/hz-dca" }
 hz-iamf = { path = "crates/hz-iamf" }
+hz-joc = { path = "crates/hz-joc" }
 hz-analysis = { path = "crates/hz-analysis" }
 hz-io = { path = "crates/hz-io" }
 hz-meta = { path = "crates/hz-meta" }
