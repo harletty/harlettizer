@@ -538,6 +538,23 @@ enum Command {
         /// Kilobits a second; the reference's own unless asked.
         #[arg(long, value_name = "KBPS")]
         bitrate: Option<u32>,
+
+        /// Carry parameters hz-joc estimates — from the reference's core and
+        /// the objects the reference rebuilds — in place of the reference's,
+        /// fitted `centred` (on the frame's end, a frame late) or through the
+        /// decoder's `ramp`; and report the reference's own beside them.
+        #[arg(long, value_name = "FIT")]
+        refit: Option<String>,
+
+        /// With `--refit`: the estimator's ridge, relative to the normal
+        /// equations' mean diagonal.
+        #[arg(long, value_name = "RIDGE")]
+        ridge: Option<f32>,
+
+        /// With `--refit`: list the frames where hz-joc's parameters lose
+        /// most against the reference's.
+        #[arg(long)]
+        probe: bool,
     },
 
     /// Read E-AC-3 streams through the `eac3` oracle: their substreams, the
@@ -893,11 +910,30 @@ fn main() -> ExitCode {
             reference,
             out,
             bitrate,
-        } => graft::run(graft::Options {
-            reference,
-            out,
-            bit_rate: bitrate,
-        }),
+            refit,
+            ridge,
+            probe,
+        } => {
+            let refit = match refit.as_deref() {
+                None => Ok(None),
+                Some("centred") => Ok(Some(hz_joc::estimate::Fit::Centred)),
+                Some("ramp") => Ok(Some(hz_joc::estimate::Fit::Ramp)),
+                Some(other) => Err(hz_core::Error::unsupported(
+                    &reference,
+                    format!("`{other}` for the fit; centred or ramp"),
+                )),
+            };
+            refit.and_then(|refit| {
+                graft::run(graft::Options {
+                    reference,
+                    out,
+                    bit_rate: bitrate,
+                    refit,
+                    ridge,
+                    probe,
+                })
+            })
+        }
         #[cfg(not(feature = "eac3-oracle"))]
         Command::Graft { .. } => Err(hz_core::Error::Unsupported {
             path: PathBuf::new(),

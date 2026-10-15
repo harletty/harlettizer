@@ -5,8 +5,11 @@
 //! byte to the reference streams. Estimating the parameters, the part that is
 //! research, comes on top of it.
 
+pub mod estimate;
 pub mod huffman;
 pub mod payload;
+mod prototype;
+pub mod qmf;
 mod trees;
 
 pub use payload::{Data, Joc, Object, SparsePoint, Unreadable, read};
