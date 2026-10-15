@@ -45,7 +45,7 @@ specifications.
 
 | Source | License | Use |
 |---|---|---|
-| FFmpeg `libavcodec` (`mlpenc.c`, `ac3enc*.c`, `eac3enc.c`, `dca.c`, `dca_exss.c`, `dcaenc.c`) | LGPL-2.1-or-later | Port to Rust; keep per-file attribution |
+| FFmpeg `libavcodec` (`mlpenc.c`, `ac3enc*.c`, `eac3enc.c`, `dca.c`, `dca_exss.c`, `dcaenc.c`, `dcaadpcm.c`, `dcadata.c`, `dcahuff.c`) and `libavutil` (`tx_template.c`, the fixed-point MDCT `dcaenc.c` calls) | LGPL-2.1-or-later | Port to Rust; keep per-file attribution |
 | `truehd` crate (Rainbaby / truehdd) | Apache-2.0 | Bitstream structures, bit IO, CRC — and the decoder used as the test oracle |
 | `oxideav-ac4` | MIT | AC-4 framing and channel-based encoding |
 | `damf` crate (harletty-bridge) | Apache-2.0 | Master-file metadata model and writers |

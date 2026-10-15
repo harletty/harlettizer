@@ -774,18 +774,77 @@ played on hardware.**
   whether DTS wants more than that is still the maintainer's to decide.
 - Fixtures synthetic, as everywhere else.
 
-#### Phase C1 — Core encoder (5.1, lossy)
+#### Phase C1 — Core encoder (5.1, lossy) — **done**
 
-- Port `dcaenc.c`: 48 kHz, 512-sample frames, 1509 kb/s, 5.1. This is the
-  backward-compatible layer every legacy decoder and receiver plays.
-- The core carries the 5.1 fold of the 7.1 bed — the rears folded into the
-  side surrounds at the coefficient the XLL layer declares — which is what
-  the reference streams carry.
-- **Accept when**: it decodes cleanly in FFmpeg and in `dca`, and matches
-  `ffmpeg -c:a dca` at the same bitrate (the same encoder, so this checks
-  the port). `dcaenc`'s quality is modest; a better core is a separate job,
-  after C3.
-- **Size**: 1–2 weeks. **Risk**: low.
+- ✅ **`hz_dca::encoder`**: `dcaenc.c` ported stage for stage — the 32-band
+  polyphase analysis, the 64× LFE decimation, the masking model, the SNR-offset
+  search, Huffman, block or plain codes per allocation, optional subband ADPCM
+  (`dcaadpcm.c`) — with the fixed-point MDCT `av_tx` gives it
+  (`hz_dca::mdct`, from `libavutil/tx_template.c`). Everything FFmpeg's encoder
+  takes: mono, stereo, 2.2, 5.0 and 5.1, 8 to 48 kHz, 32 to 3840 kb/s.
+  `Config::disc_five_one()` is the disc's frame: 5.1 at 48 kHz, 1509 kb/s,
+  2012-byte frames, rate code 24 (1536 kb/s). The header is written through
+  `CoreHeader`. No allocation per frame; ten seconds of 5.1 encode in 0.25 s,
+  2.0 s with ADPCM — FFmpeg's own times are 0.23 s and 2.2 s.
+- ✅ **It is FFmpeg's stream, byte for byte.** Against `ffmpeg -c:a dca`
+  (n9.0.2) on the same samples, with FFmpeg's LFE history reproduced: 16 of 17
+  synthetic configurations identical — 5.1, 5.0, 2.2, stereo and mono; 8, 16,
+  22.05, 32, 44.1 and 48 kHz; 128 kb/s to 3840 kb/s, and 5.1 down to 700
+  kb/s, near the 670 kb/s it accepts at all; ADPCM on and off; silence,
+  full-scale squares, full-scale noise. The
+  seventeenth, full-scale white noise in all six channels, differs by 2 bytes in
+  2 of 563 frames, inside the LFE block: FFmpeg reads one sample *before* its
+  input buffer there (below), so its output depends on memory it does not own.
+  The MDCT is libavutil's to the last bit on all 1024 outputs checked. Two
+  hashes of FFmpeg's streams, from an integer-synthesised fixture, are a test.
+- ✅ **One defect of FFmpeg's is fixed, and optional.** Its LFE history is
+  filled from a channel-order entry of −1: the previous sample's last input
+  channel, the right surround. So half of each LFE output's window sees the
+  right surround of the previous frame. Fixed by default; the LFE, a 60 Hz tone
+  beside a chirp in the right surround, comes back at **11.2 dB SNR instead of
+  2.6**, and the streams differ in nothing but the 72-bit LFE block.
+  `Config::lfe_history_quirk` puts the defect back, for the comparison.
+- ✅ **A second defect, found in review, is fixed outright.** FFmpeg's
+  encoder takes the lossless step sizes when the rate *code* is 3; code 3 is
+  96 kb/s, and FFmpeg's decoder compares the rate the code names (lossless is
+  code 31). With ADPCM the encoder's predictor history then follows steps no
+  decoder uses: a 440 Hz tone, mono at 16 kHz and 96 kb/s, comes back from
+  FFmpeg's own stream at −3.0 dB SNR and from this one at 80.1 dB. Without
+  ADPCM the step size is never used and the streams stay identical. A test
+  decodes that case through FFmpeg where it is installed.
+- 🔴 **`dca` has the same confusion, in its decoder.** It reads rate code 3 as
+  lossless and dequantises every subband with the wrong steps, so any 96 kb/s
+  core decodes wrong through the oracle — 0.4 dB SNR on a stream FFmpeg's
+  decoder takes at 80.2 dB, ADPCM or not. At that rate the oracle is not one;
+  the fix belongs in harletty-bridge.
+- ✅ **It decodes cleanly in both decoders.** `dca` (the oracle) decodes every
+  frame of all 17 streams, and FFmpeg reports no error on any.
+  `cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 6
+  --out out.dts` encodes, rewrites every header and decodes through `dca`; `dts
+  --reference` does the same for any core stream. Both decoders put the output
+  512 samples behind the input and agree on every channel's SNR to 0.01 dB. On
+  ten seconds of 5.1 at 1509 kb/s: L (pink noise) 23.5 dB, R (440 Hz) 66.0,
+  C (beeps) 76.2, Ls (white noise above 3 kHz) 14.0, Rs (gated chirp)
+  69.1.
+- **What the port measured about `dcaenc`, for the better core after C3:**
+  the LFE is decimated through the decoder's own interpolator, so its band
+  limit applies twice — −0.3 dB at 20 Hz, −2.8 dB at 60, −11.5 dB at 120 —
+  which is what limits the LFE above (54 dB once that response is taken out);
+  noise-like material sits at 14–24 dB; one subframe of two subsubframes,
+  every subband active, no joint intensity, no VQ, no transient modes.
+- **Header fields discs set differently**, measured on the 32 local streams
+  with a 2012-byte core: they carry `aspf` 1 (FFmpeg: 0) and, from a 24-bit
+  source, `pcmr` 6 (FFmpeg: 0; two discs carry 0). The word length is
+  `Config::pcm_resolution_code`; `aspf` 1 means a DSYNC after each
+  subsubframe, sixteen bits FFmpeg's layout does not spend, and is left as
+  FFmpeg has it.
+- 🔴 **Not in this phase: the 5.1 fold of the 7.1 bed.** The core carries the
+  rears folded into the side surrounds at the coefficient the XLL layer
+  declares; `hz-dca` reads no XLL channel set yet, and the `dca` crate does not
+  expose the coefficients it parses. The fold lands with C2, which writes them;
+  the encoder takes 5.1 meanwhile. Nor is there a `harlettizer` command: one
+  would be `hz-cli`'s `ac3` path with this encoder behind it, and it is worth
+  more once C2 can put the lossless layer beside the core.
 
 #### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1
 

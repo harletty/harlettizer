@@ -14,6 +14,7 @@ mod coords;
 mod corpus;
 mod drc;
 mod dts;
+mod dts_encode;
 #[cfg(feature = "eac3-oracle")]
 mod eac3;
 mod ffmpeg_check;
@@ -463,6 +464,47 @@ enum Command {
         /// Stop after this many frames.
         #[arg(long, value_name = "N")]
         frames: Option<usize>,
+
+        /// Raw interleaved 32-bit PCM in WAV order that a core-only stream
+        /// was encoded from: with the oracle, its decode is compared with it.
+        #[arg(long, value_name = "PATH", requires = "channels")]
+        reference: Option<PathBuf>,
+
+        /// Channels in `--reference`, the LFE included.
+        #[arg(long, value_name = "N")]
+        channels: Option<usize>,
+    },
+
+    /// Encode raw interleaved 32-bit PCM to a DTS core with `hz-dca`, write
+    /// it, and read it back as `dts --reference` does: phase C1's round
+    /// trip. Decoding needs `--features dca-oracle`.
+    DtsEncode {
+        input: PathBuf,
+
+        /// Channels in the input, the LFE included: 1, 2, 4, 5 or 6.
+        #[arg(long)]
+        channels: usize,
+
+        /// Hertz.
+        #[arg(long, default_value_t = 48000)]
+        rate: u32,
+
+        /// Bits a second; the default makes a disc's 2012-byte frame.
+        #[arg(long, default_value_t = 1_509_000)]
+        bit_rate: u32,
+
+        /// Code subbands as ADPCM where prediction pays.
+        #[arg(long)]
+        adpcm: bool,
+
+        /// Reproduce FFmpeg's LFE history, for a byte comparison with
+        /// `ffmpeg -c:a dca`.
+        #[arg(long)]
+        ffmpeg_lfe: bool,
+
+        /// Where to write the stream.
+        #[arg(long)]
+        out: PathBuf,
     },
 
     /// Decode an AC-3 or E-AC-3 stream through the `eac3` crate, and with
@@ -812,7 +854,39 @@ fn main() -> ExitCode {
             tau,
             against,
         }),
-        Command::Dts { input, frames } => dts::run(dts::Options { input, frames }),
+        Command::Dts {
+            input,
+            frames,
+            reference,
+            channels,
+        } => (|| {
+            let reference = match (reference, channels) {
+                (Some(path), Some(channels)) => Some(dts::Reference::read(&path, channels)?),
+                _ => None,
+            };
+            dts::run(dts::Options {
+                input,
+                frames,
+                reference,
+            })
+        })(),
+        Command::DtsEncode {
+            input,
+            channels,
+            rate,
+            bit_rate,
+            adpcm,
+            ffmpeg_lfe,
+            out,
+        } => dts_encode::run(dts_encode::Options {
+            input,
+            channels,
+            sample_rate: rate,
+            bit_rate,
+            adpcm,
+            ffmpeg_lfe,
+            out,
+        }),
         #[cfg(feature = "eac3-oracle")]
         Command::Graft {
             reference,

@@ -33,6 +33,121 @@ pub struct Options {
     pub input: PathBuf,
     /// Stop after this many frames.
     pub frames: Option<usize>,
+    /// The PCM a core-only stream was encoded from: its decode, through the
+    /// oracle, is compared with it.
+    pub reference: Option<Reference>,
+}
+
+/// Interleaved 32-bit PCM in WAV order — L, R, C, LFE, Ls, Rs for 5.1 —
+/// what `ffmpeg -f s32le` writes and `hz-dca`'s encoder reads.
+pub struct Reference {
+    pub pcm: Vec<i32>,
+    pub channels: usize,
+}
+
+impl Reference {
+    pub fn read(path: &std::path::Path, channels: usize) -> Result<Self> {
+        let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        if channels == 0 || bytes.len() % (4 * channels) != 0 {
+            return Err(Error::malformed(
+                path,
+                format!("not whole frames of {channels} 32-bit samples"),
+            ));
+        }
+        let pcm = bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Ok(Self { pcm, channels })
+    }
+
+    fn channel(&self, ch: usize) -> impl Iterator<Item = f64> + '_ {
+        self.pcm
+            .iter()
+            .skip(ch)
+            .step_by(self.channels)
+            .map(|&s| f64::from(s) / 2_147_483_648.0)
+    }
+}
+
+/// How a decode compares with the PCM it was made from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    /// Samples the decode lags the input by.
+    pub lag: usize,
+    /// Signal to error in decibels, per channel in WAV order; infinite for
+    /// a channel decoded exactly, `None` for a silent one.
+    pub snr_db: Vec<Option<f64>>,
+}
+
+/// Compare a decode, channel by channel in WAV order, with its reference.
+///
+/// The lag is the one, up to 2048 samples, at which the two correlate best
+/// over all channels; the first and last frame are left out of the figures,
+/// since the encoder starts from silence and pads the end. `None` when there
+/// is too little of either to say: under three frames.
+///
+/// # Panics
+/// If the decode does not have the reference's channels.
+#[cfg_attr(not(feature = "dca-oracle"), allow(dead_code))]
+pub fn compare(reference: &Reference, decoded: &[Vec<f32>]) -> Option<Comparison> {
+    const MAX_LAG: usize = 2048;
+    const WINDOW: usize = 8192;
+    const EDGE: usize = 512;
+    assert_eq!(decoded.len(), reference.channels);
+    let reference: Vec<Vec<f64>> = (0..reference.channels)
+        .map(|ch| reference.channel(ch).collect())
+        .collect();
+    let len = reference[0].len();
+    let decoded_len = decoded.iter().map(Vec::len).min()?;
+    // Every candidate lag has to leave the whole window inside the decode.
+    let max_lag = MAX_LAG.min(decoded_len / 2);
+    let window = WINDOW.min(len).min(decoded_len - max_lag);
+    if len < 3 * EDGE || window < EDGE {
+        return None;
+    }
+    let correlation = |lag: usize| -> f64 {
+        reference
+            .iter()
+            .zip(decoded)
+            .map(|(r, d)| {
+                r[..window]
+                    .iter()
+                    .zip(&d[lag..lag + window])
+                    .map(|(&a, &b)| a * f64::from(b))
+                    .sum::<f64>()
+            })
+            .sum()
+    };
+    // The first best, so that a periodic signal is not placed a period late.
+    let mut lag = 0;
+    let mut best = f64::NEG_INFINITY;
+    for candidate in 0..max_lag {
+        let c = correlation(candidate);
+        if c > best {
+            best = c;
+            lag = candidate;
+        }
+    }
+    let end = len
+        .min(decoded_len.saturating_sub(lag))
+        .saturating_sub(2 * EDGE);
+    if end <= EDGE {
+        return None;
+    }
+    let snr_db = reference
+        .iter()
+        .zip(decoded)
+        .map(|(r, d)| {
+            let (mut signal, mut error) = (0.0f64, 0.0f64);
+            for (&a, &b) in r[EDGE..end].iter().zip(&d[lag + EDGE..lag + end]) {
+                signal += a * a;
+                error += (a - f64::from(b)).powi(2);
+            }
+            (signal > 0.0).then(|| 10.0 * (signal / error).log10())
+        })
+        .collect();
+    Some(Comparison { lag, snr_db })
 }
 
 /// The integer inverse of the height fold.
@@ -88,6 +203,10 @@ pub fn run(options: Options) -> Result<()> {
     let mut first_exss = None;
     #[cfg(feature = "dca-oracle")]
     let mut oracle = oracle::Oracle::default();
+    #[cfg(feature = "dca-oracle")]
+    if options.reference.is_some() {
+        oracle.keep_pcm();
+    }
 
     for frame in split::frames(&bytes).take(limit) {
         let frame = frame.map_err(|e| Error::malformed(&options.input, e.0))?;
@@ -213,12 +332,56 @@ pub fn run(options: Options) -> Result<()> {
     {
         oracle.report();
         failures.extend(oracle.failures());
+        if let Some(reference) = &options.reference {
+            match oracle.pcm() {
+                Some(pcm) if pcm.len() != reference.channels => failures.push(format!(
+                    "a decode of {} channels against a reference of {}",
+                    pcm.len(),
+                    reference.channels
+                )),
+                Some(pcm) => match compare(reference, pcm) {
+                    Some(comparison) => report_comparison(&comparison),
+                    None => println!("  round trip             too short to compare"),
+                },
+                None => {}
+            }
+        }
+    }
+    #[cfg(not(feature = "dca-oracle"))]
+    if options.reference.is_some() {
+        println!("  round trip             needs --features dca-oracle to decode");
     }
     if failures.is_empty() {
         Ok(())
     } else {
         Err(Error::refused(&options.input, failures.join("; ")))
     }
+}
+
+#[cfg_attr(not(feature = "dca-oracle"), allow(dead_code))]
+fn report_comparison(comparison: &Comparison) {
+    const NAMES: [&str; 6] = ["L", "R", "C", "LFE", "Ls", "Rs"];
+    let names: &[&str] = match comparison.snr_db.len() {
+        1 => &["C"],
+        2 => &["L", "R"],
+        4 => &["L", "R", "Ls", "Rs"],
+        5 => &["L", "R", "C", "Ls", "Rs"],
+        _ => &NAMES,
+    };
+    let snr: Vec<String> = comparison
+        .snr_db
+        .iter()
+        .zip(names)
+        .map(|(snr, name)| match snr {
+            Some(db) => format!("{name} {db:.2}"),
+            None => format!("{name} silent"),
+        })
+        .collect();
+    println!(
+        "  round trip             lag {} samples; SNR dB {}",
+        comparison.lag,
+        snr.join(", ")
+    );
 }
 
 /// The navigation word in the lossless asset's descriptor tail, if there is
@@ -315,6 +478,8 @@ mod oracle {
         /// Frames by the presentation `dca` detects.
         presentations: std::collections::BTreeMap<String, usize>,
         metadata_refused: usize,
+        /// Decoded core-only frames, per channel in WAV order, when asked.
+        pcm: Option<Vec<Vec<f32>>>,
     }
 
     impl Default for Oracle {
@@ -338,11 +503,39 @@ mod oracle {
                 not_q15: 0,
                 presentations: Default::default(),
                 metadata_refused: 0,
+                pcm: None,
             }
         }
     }
 
+    /// A channel's place in WAV order among those a core can carry.
+    fn wav_rank(channel: dca::BedChannel) -> usize {
+        use dca::BedChannel::*;
+        match channel {
+            FrontLeft => 0,
+            FrontRight => 1,
+            Center => 2,
+            LowFrequencyEffects => 3,
+            SurroundLeft => 4,
+            SurroundRight => 5,
+            RearCenter => 6,
+            RearLeft => 7,
+            RearRight => 8,
+            WideLeft => 9,
+            WideRight => 10,
+        }
+    }
+
     impl Oracle {
+        /// Keep the PCM of core-only frames, for [`super::compare`].
+        pub fn keep_pcm(&mut self) {
+            self.pcm = Some(Vec::new());
+        }
+
+        pub fn pcm(&self) -> Option<&[Vec<f32>]> {
+            self.pcm.as_deref()
+        }
+
         pub fn core(&mut self, ours: &CoreHeader, core: &[u8]) {
             self.cores += 1;
             // A header dca refuses is a disagreement too.
@@ -367,7 +560,26 @@ mod oracle {
                 // A core alone. The split only yields frames with at least
                 // one half.
                 match self.core_decoder.push_access_unit(core.unwrap_or(&[])) {
-                    Ok(_) => self.decoded += 1,
+                    Ok(pushed) => {
+                        self.decoded += 1;
+                        if let Some(pcm) = &mut self.pcm {
+                            let frame = pushed.pcm;
+                            let mut planes: Vec<(usize, Vec<f32>)> = frame
+                                .fullband_channel_order
+                                .iter()
+                                .map(|&c| wav_rank(c))
+                                .zip(frame.fullband_channels)
+                                .collect();
+                            if let Some(lfe) = frame.lfe_channel {
+                                planes.push((3, lfe));
+                            }
+                            planes.sort_by_key(|(rank, _)| *rank);
+                            pcm.resize(planes.len(), Vec::new());
+                            for (plane, (_, samples)) in pcm.iter_mut().zip(planes) {
+                                plane.extend(samples);
+                            }
+                        }
+                    }
                     Err(_) => self.decode_errors += 1,
                 }
                 return;
@@ -553,6 +765,108 @@ mod oracle {
 #[cfg(test)]
 mod tests {
     use super::unfold::*;
+    use super::{Reference, compare};
+
+    /// At 96 kb/s — rate code 3 — FFmpeg's encoder takes the lossless step
+    /// sizes and its ADPCM stream decodes to noise; the port's has to decode
+    /// to the tone it was made from. Through FFmpeg's decoder, which reads
+    /// rate code 3 as 96 kb/s: the `dca` oracle reads it as lossless and
+    /// decodes every core at that rate wrong (PLAN.md, phase C1). Skipped
+    /// where there is no `ffmpeg`.
+    #[test]
+    fn adpcm_at_rate_code_3_decodes_to_its_input() {
+        use hz_dca::encoder::{Config, Encoder, FRAME_SAMPLES, Layout};
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("no ffmpeg: rate code 3 not decoded");
+            return;
+        }
+        let pcm: Vec<i32> = (0..16000)
+            .map(|n| {
+                let phase = std::f64::consts::TAU * 440.0 * f64::from(n) / 16000.0;
+                (phase.sin() * f64::from(1 << 30)) as i32
+            })
+            .collect();
+        let mut encoder = Encoder::new(Config {
+            layout: Layout::Mono,
+            sample_rate: 16000,
+            bit_rate: 96_000,
+            adpcm: true,
+            ..Config::disc_five_one()
+        })
+        .unwrap();
+        assert_eq!(encoder.header().bit_rate_code, 3);
+        let mut stream = Vec::new();
+        let mut frame = [0i32; FRAME_SAMPLES];
+        for chunk in pcm.chunks(FRAME_SAMPLES) {
+            frame[..chunk.len()].copy_from_slice(chunk);
+            frame[chunk.len()..].fill(0);
+            encoder.encode(&frame, &mut stream);
+        }
+        let path = std::env::temp_dir().join(format!("hz-dts-rate3-{}.dts", std::process::id()));
+        std::fs::write(&path, &stream).unwrap();
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "dts", "-i"])
+            .arg(&path)
+            .args(["-f", "f32le", "-"])
+            .output()
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(output.status.success());
+        let decoded: Vec<f32> = output
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        // Scored at the core's delay, 512 samples: a lone tone correlates
+        // almost as well a sample either side.
+        let (mut signal, mut error) = (0.0f64, 0.0f64);
+        for (n, &s) in pcm.iter().enumerate().skip(512).take(16000 - 1024) {
+            let s = f64::from(s) / 2_147_483_648.0;
+            signal += s * s;
+            error += (s - f64::from(decoded[n + 512])).powi(2);
+        }
+        let snr = 10.0 * (signal / error).log10();
+        assert!(snr > 60.0, "{snr} dB");
+    }
+
+    #[test]
+    fn a_decode_too_short_to_compare_is_not_compared() {
+        for len in [0, 1, 512, 1535] {
+            let reference = Reference {
+                pcm: vec![0; len],
+                channels: 1,
+            };
+            for decoded_len in [0, len, len + 512] {
+                assert_eq!(compare(&reference, &[vec![0.0; decoded_len]]), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_delayed_decode_is_found_and_scored() {
+        let channels = 2;
+        let len = 48000;
+        let mut pcm = Vec::with_capacity(len * channels);
+        let mut seed = 0x9e37_79b9u32;
+        for _ in 0..len {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pcm.push((seed as i32) >> 2);
+            pcm.push(0);
+        }
+        let reference = Reference { pcm, channels };
+        let lag = 512;
+        let mut decoded = vec![vec![0f32; len + lag]; channels];
+        for n in 0..len {
+            let s = reference.pcm[n * channels] as f64 / 2_147_483_648.0;
+            // An error forty decibels down.
+            decoded[0][n + lag] = (s * 1.01) as f32;
+        }
+        let comparison = compare(&reference, &decoded).unwrap();
+        assert_eq!(comparison.lag, lag);
+        assert!((comparison.snr_db[0].unwrap() - 40.0).abs() < 0.1);
+        assert_eq!(comparison.snr_db[1], None);
+    }
 
     #[test]
     fn the_unfold_undoes_the_fold_exactly() {
@@ -590,6 +904,7 @@ mod tests {
         let result = super::run(super::Options {
             input: path,
             frames: None,
+            reference: None,
         });
         std::fs::remove_dir_all(&dir).unwrap();
         result
