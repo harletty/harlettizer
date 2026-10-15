@@ -697,7 +697,7 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   the reference engine at the same settings.
 - **Size**: 3–4 weeks. **Risk**: medium.
 
-#### Phase B3 — Joint object coding — **the payload done; the estimation left**
+#### Phase B3 — Joint object coding — **the payload done; a first estimator**
 
 - `hz-joc` reads and writes the payload of TS 103 420 clause 6.2. Every one
   of the 10 189 payloads of the five local streams writes back byte for byte
@@ -706,6 +706,12 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
 - The reference streams code every object one way: twelve parameter bands,
   fine quantisation, dense coefficients, one data point a frame, a steep slope
   for some. That is what the estimator writes first.
+- `hz_joc::estimate` fits the gains in the decoder's QMF domain (`hz_joc::qmf`,
+  its analysis bank). Refitted to a reference's own core and objects
+  (`cargo xtask graft --refit centred`), 86 to 99.8 % of its gains land on the
+  reference's step; the misses gather in the narrow low bands, the subbands'
+  leakage a band-by-band fit cannot see. Next: fit by synthesis, decide the
+  steep slope, budget the payload, and fit to a core rendered from a master.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is
