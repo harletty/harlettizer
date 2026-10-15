@@ -511,6 +511,17 @@ enum Command {
         #[arg(long)]
         ffmpeg_lfe: bool,
 
+        /// With `--lossless`: `log2` of the segments in a lossless frame,
+        /// 1 (two of 256 samples, the reference streams') to 8.
+        #[arg(long, value_name = "LOG2")]
+        segments: Option<u8>,
+
+        /// With `--lossless`: code the MSB/LSB split flag (splitting
+        /// nothing) or not. The reference streams code it at 24 bits and not
+        /// at 16, which is the default.
+        #[arg(long, value_name = "BOOL")]
+        lsb_split: Option<bool>,
+
         /// Where to write the stream.
         #[arg(long)]
         out: PathBuf,
@@ -887,6 +898,8 @@ fn main() -> ExitCode {
             bit_rate,
             adpcm,
             ffmpeg_lfe,
+            segments,
+            lsb_split,
             out,
         } => dts_encode::run(dts_encode::Options {
             input,
@@ -896,6 +909,8 @@ fn main() -> ExitCode {
             bit_rate,
             adpcm,
             ffmpeg_lfe,
+            segments_log2: segments,
+            lsb_split,
             out,
         }),
         #[cfg(feature = "eac3-oracle")]

@@ -885,7 +885,7 @@ What C2a did:
   local streams, **all 409,072 lossless frame headers** of the 39 that carry
   them come back byte for byte, every checksum valid — channel sets of 6+2 on
   the 7.1 streams, 6 on the 5.1 ones, 2 on a 96 kHz stereo one; 49 frames of
-  the 16-bit 5.1 disc span two substreams. The core and substream headers of
+  the 16-bit 5.1 reference stream span two substreams. The core and substream headers of
   all 43 still rewrite byte for byte (422,168 and 421,417), and the oracle
   decodes every frame.
 - ✅ **The reference streams' shape**, measured with that reader and copied.
@@ -895,7 +895,7 @@ What C2a did:
   by −3 dB and each rear folds into its side at −3 dB, so a decoder of both
   sets subtracts `(rear · 32767 + 2^14) >> 15` from the side. Two segments of
   256 samples, the MSB/LSB split flag on with nothing split (the 16-bit 5.1
-  disc leaves it off and uses eight segments of 64), no band checksums,
+  reference stream leaves it off and uses eight segments of 64), no band checksums,
   frames padded to a 32-bit word. A 5.1 is one set, C L R Ls Rs LFE (`0x3f`).
 - ✅ **`hz_dca::lossless`**: PCM to lossless frames, every channel coded as
   itself. No encoder exists to port, so it is the decoder run backwards —
@@ -917,7 +917,7 @@ What C2a did:
   inside the first set, which the format allows (the decoders' arithmetic
   wraps there and undoes it exactly); the core's copy is clipped.
 - ✅ **`hz_dca::master`**: DTS-HD Master Audio frame by frame — the C1 core
-  (5.1 at 1509 kb/s, the word-length code the discs use) and an extension
+  (5.1 at 1509 kb/s, the word-length code the reference streams carry) and an extension
   substream whose one asset is the lossless layer, with the reference
   streams' substream header (one presentation, the core backward-compatible,
   component mask `0x201`, speaker activity `0x84b` or `0x00f`, the embedded
@@ -934,9 +934,12 @@ What C2a did:
   each. Synthetic full-scale white noise, full-scale squares that overflow
   the fold, alternating extremes, silence and a mix, 5.1 and 7.1 at 16 and
   24 bits: identical. `master_audio_comes_back_bit_for_bit` holds the four
-  configurations, through `dca` with the feature and FFmpeg where installed;
-  the crate's own tests decode with a mirror of FFmpeg's reader, so CI checks
-  the round trip without either. One LSB added in the fold fails both.
+  configurations, and two shapes off the reference streams' (`--segments`,
+  `--lsb-split`: eight segments without the split flag at 24 bits, 256 of two
+  samples with it at 16), through `dca` with the feature and FFmpeg where
+  installed; the crate's own tests decode with a mirror of FFmpeg's reader,
+  so CI checks the round trip without either. One LSB added in the fold fails
+  both.
 - **What it costs.** On that material the lossless layer alone is 49.5 % of
   the 24-bit 7.1 PCM, against 46.7 % for `flac -8` on the same samples;
   5.1/24 47.4 % (FLAC 45.4), 7.1/16 28.8 % (26.2), 5.1/16 27.1 % (26.0). The
@@ -953,7 +956,7 @@ What C2a did:
   Neither `dca` nor FFmpeg checks the lossless headers' checksums by default
   (FFmpeg does with `-err_detect crccheck`), so this crate's reader does and
   the test asks FFmpeg to. `dca` ends a Rice code's unary part at 2^20; the
-  encoder keeps every quotient under 2^16.
+  encoder keeps every quotient at most 2^16.
 - 🔴 **Not written in C2a**, none of it needed for lossless: hybrid Rice codes
   (isolated outliers in binary), the MSB/LSB split, the stereo downmix a
   primary set can carry (the reference streams carry none), and peak-rate

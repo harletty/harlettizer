@@ -297,7 +297,7 @@ fn round_trip(config: Config, pcm: &[i32]) -> usize {
 fn seven_one_comes_back_bit_for_bit() {
     for bits in [16, 24] {
         let pcm = signal(Layout::SevenPointOne, bits, 4);
-        round_trip(Config::disc(Layout::SevenPointOne, bits), &pcm);
+        round_trip(Config::reference(Layout::SevenPointOne, bits), &pcm);
     }
 }
 
@@ -305,7 +305,7 @@ fn seven_one_comes_back_bit_for_bit() {
 fn five_one_comes_back_bit_for_bit() {
     for bits in [16, 24] {
         let pcm = signal(Layout::FivePointOne, bits, 4);
-        round_trip(Config::disc(Layout::FivePointOne, bits), &pcm);
+        round_trip(Config::reference(Layout::FivePointOne, bits), &pcm);
     }
 }
 
@@ -316,7 +316,7 @@ fn every_segmentation_and_split_flag_comes_back() {
             let config = Config {
                 segments_log2,
                 scalable_lsbs,
-                ..Config::disc(Layout::SevenPointOne, 24)
+                ..Config::reference(Layout::SevenPointOne, 24)
             };
             let pcm = signal(Layout::SevenPointOne, 24, 2);
             round_trip(config, &pcm);
@@ -329,7 +329,7 @@ fn silence_and_full_scale_noise_come_back() {
     for bits in [16u8, 24] {
         let channels = 8;
         let silent = vec![0i32; FRAME_SAMPLES * channels * 2];
-        round_trip(Config::disc(Layout::SevenPointOne, bits), &silent);
+        round_trip(Config::reference(Layout::SevenPointOne, bits), &silent);
         let mut state = 0x1234_5678u32;
         let noise: Vec<i32> = (0..FRAME_SAMPLES * channels * 2)
             .map(|_| {
@@ -339,7 +339,7 @@ fn silence_and_full_scale_noise_come_back() {
                 (state as i32) >> (32 - bits) << (32 - bits)
             })
             .collect();
-        let bytes = round_trip(Config::disc(Layout::SevenPointOne, bits), &noise);
+        let bytes = round_trip(Config::reference(Layout::SevenPointOne, bits), &noise);
         // Noise does not compress: about the PCM itself, and no worse than a
         // few percent over it.
         let pcm = FRAME_SAMPLES * channels * 2 * usize::from(bits) / 8;
@@ -350,7 +350,7 @@ fn silence_and_full_scale_noise_come_back() {
 #[test]
 fn the_core_gets_the_fold_a_first_set_decoder_presents() {
     let pcm = signal(Layout::SevenPointOne, 24, 1);
-    let mut encoder = Encoder::new(Config::disc(Layout::SevenPointOne, 24)).unwrap();
+    let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOne, 24)).unwrap();
     encoder.encode(&pcm).unwrap();
     let core = encoder.core_pcm();
     // −3 dB of every channel, and of each side plus its rear.
@@ -379,7 +379,7 @@ fn the_core_gets_the_fold_a_first_set_decoder_presents() {
 fn bits_below_the_resolution_are_refused() {
     let mut pcm = vec![0i32; FRAME_SAMPLES * 6];
     pcm[6 * 10 + 4] = 0x100 | 0x80;
-    let mut encoder = Encoder::new(Config::disc(Layout::FivePointOne, 24)).unwrap();
+    let mut encoder = Encoder::new(Config::reference(Layout::FivePointOne, 24)).unwrap();
     assert_eq!(
         encoder.encode(&pcm).unwrap_err(),
         Refused::Resolution {
@@ -390,7 +390,7 @@ fn bits_below_the_resolution_are_refused() {
         }
     );
     pcm[6 * 10 + 4] = 0x1_0000;
-    let mut encoder = Encoder::new(Config::disc(Layout::FivePointOne, 16)).unwrap();
+    let mut encoder = Encoder::new(Config::reference(Layout::FivePointOne, 16)).unwrap();
     assert!(encoder.encode(&pcm).is_ok());
     pcm[6 * 10 + 4] = 0x8000;
     assert!(encoder.encode(&pcm).is_err());

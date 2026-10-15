@@ -31,18 +31,22 @@ pub use crate::lossless::Refused;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub lossless: lossless::Config,
-    /// The core's rate in bits a second; [`encoder::Config::disc_five_one`]'s
-    /// by default.
-    pub core_bit_rate: u32,
+    /// The core: 5.1 at 48 kHz, whatever else it is.
+    pub core: encoder::Config,
 }
 
 impl Config {
-    /// The reference streams' shape: a 1509 kb/s core and the lossless
-    /// layer as [`lossless::Config::disc`] lays it out.
-    pub fn disc(layout: Layout, bits: u8) -> Self {
+    /// The reference streams' shape: the lossless layer as
+    /// [`lossless::Config::reference`] lays it out, and a 1509 kb/s core
+    /// stating the source's word length as they do — 6 for 24 bits, 0 for
+    /// sixteen.
+    pub fn reference(layout: Layout, bits: u8) -> Self {
         Self {
-            lossless: lossless::Config::disc(layout, bits),
-            core_bit_rate: encoder::Config::disc_five_one().bit_rate,
+            lossless: lossless::Config::reference(layout, bits),
+            core: encoder::Config {
+                pcm_resolution_code: if bits > 16 { 6 } else { 0 },
+                ..encoder::Config::disc_five_one()
+            },
         }
     }
 }
@@ -57,14 +61,14 @@ pub struct Encoder {
 impl Encoder {
     pub fn new(config: Config) -> Result<Self, Unsupported> {
         let bits = config.lossless.bits;
+        if config.core.layout != encoder::Layout::FivePointOne || config.core.sample_rate != 48000 {
+            return Err(Unsupported(format!(
+                "a {:?} core at {} Hz: the lossless layer sits beside a 5.1 core at 48 kHz",
+                config.core.layout, config.core.sample_rate
+            )));
+        }
         let lossless = lossless::Encoder::new(config.lossless).map_err(|e| Unsupported(e.0))?;
-        let core = encoder::Encoder::new(encoder::Config {
-            bit_rate: config.core_bit_rate,
-            // The source's word length, as the discs state it: 6 is 24 bits,
-            // 0 sixteen.
-            pcm_resolution_code: if bits > 16 { 6 } else { 0 },
-            ..encoder::Config::disc_five_one()
-        })?;
+        let core = encoder::Encoder::new(config.core)?;
         let layout = lossless.config().layout;
         let exss = ExssHeader {
             user_defined: 0,

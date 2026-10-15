@@ -40,12 +40,24 @@ pub struct Options {
     pub bit_rate: u32,
     pub adpcm: bool,
     pub ffmpeg_lfe: bool,
+    /// `log2` of the lossless frame's segments, when not the reference
+    /// streams' 1.
+    pub segments_log2: Option<u8>,
+    /// The MSB/LSB split flag, when not the reference streams' (on at 24
+    /// bits, off at 16).
+    pub lsb_split: Option<bool>,
     pub out: PathBuf,
 }
 
 pub fn run(options: Options) -> Result<()> {
     if let Some(bits) = options.lossless {
         return run_lossless(&options, bits);
+    }
+    if options.segments_log2.is_some() || options.lsb_split.is_some() {
+        return Err(Error::refused(
+            &options.input,
+            "segments and the LSB split are the lossless layer's: they need --lossless",
+        ));
     }
     let layout = match options.channels {
         1 => Layout::Mono,
@@ -111,11 +123,18 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
         ));
     }
     let reference = Reference::read(&options.input, options.channels)?;
-    let mut encoder = master::Encoder::new(master::Config {
-        core_bit_rate: options.bit_rate,
-        ..master::Config::disc(layout, bits)
-    })
-    .map_err(|e| Error::refused(&options.input, e.0))?;
+    let mut config = master::Config::reference(layout, bits);
+    config.core.bit_rate = options.bit_rate;
+    config.core.adpcm = options.adpcm;
+    config.core.lfe_history_quirk = options.ffmpeg_lfe;
+    if let Some(segments_log2) = options.segments_log2 {
+        config.lossless.segments_log2 = segments_log2;
+    }
+    if let Some(split) = options.lsb_split {
+        config.lossless.scalable_lsbs = split;
+    }
+    let mut encoder =
+        master::Encoder::new(config).map_err(|e| Error::refused(&options.input, e.0))?;
     let per_frame = FRAME_SAMPLES * options.channels;
     let mut frame = vec![0i32; per_frame];
     let mut stream = Vec::new();
@@ -266,12 +285,23 @@ mod tests {
     /// for bit, every frame and every channel, through `dca` (with the
     /// `dca-oracle` feature) and through FFmpeg (where it is installed);
     /// every header of the stream, the lossless frames' included, reads and
-    /// writes back byte for byte with its checksum valid.
+    /// writes back byte for byte with its checksum valid. The reference
+    /// streams' shape for each, and two others: eight segments without the
+    /// split flag at 24 bits, and 256 segments of two samples with it at 16,
+    /// the core with ADPCM.
     #[test]
     fn master_audio_comes_back_bit_for_bit() {
-        for (channels, bits) in [(6, 16), (6, 24), (8, 16), (8, 24)] {
+        let shapes = [
+            (6, 16, None, None, false),
+            (6, 24, None, None, false),
+            (8, 16, None, None, false),
+            (8, 24, None, None, false),
+            (8, 24, Some(3), Some(false), false),
+            (6, 16, Some(8), Some(true), true),
+        ];
+        for (channels, bits, segments_log2, lsb_split, adpcm) in shapes {
             let dir = std::env::temp_dir().join(format!(
-                "hz-dts-ma-{}-{channels}-{bits}",
+                "hz-dts-ma-{}-{channels}-{bits}-{segments_log2:?}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
@@ -287,12 +317,16 @@ mod tests {
                 lossless: Some(bits),
                 sample_rate: 48000,
                 bit_rate: 1_509_000,
-                adpcm: false,
+                adpcm,
                 ffmpeg_lfe: false,
+                segments_log2,
+                lsb_split,
                 out: dir.join("out.dts"),
             });
             std::fs::remove_dir_all(&dir).unwrap();
-            result.unwrap_or_else(|e| panic!("{channels} channels at {bits} bits: {e}"));
+            result.unwrap_or_else(|e| {
+                panic!("{channels} channels at {bits} bits, segments {segments_log2:?}: {e}")
+            });
         }
     }
 

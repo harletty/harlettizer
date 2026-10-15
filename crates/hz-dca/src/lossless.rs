@@ -109,7 +109,7 @@ impl Fold {
     /// The reference streams' fold: every channel of the 5.1 at −3 dB, each
     /// rear into its side at −3 dB, so that a side and its rear at full scale
     /// together reach full scale and no further.
-    pub const DISC: Fold = Fold {
+    pub const REFERENCE: Fold = Fold {
         scale: 0x100 | 217,
         rear: 0x100 | 217,
     };
@@ -134,13 +134,13 @@ pub struct Config {
 
 impl Config {
     /// The reference streams' shape for `layout` at `bits`.
-    pub fn disc(layout: Layout, bits: u8) -> Self {
+    pub fn reference(layout: Layout, bits: u8) -> Self {
         Self {
             layout,
             bits,
             segments_log2: 1,
             scalable_lsbs: bits > 16,
-            fold: Fold::DISC,
+            fold: Fold::REFERENCE,
         }
     }
 }
