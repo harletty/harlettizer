@@ -44,6 +44,7 @@
 //! ramp, the held gains and the quantisation are what make it this decoder's.
 //! Which fit to use is measured, not argued: see `docs/joc.md`.
 
+use crate::huffman::{Codebook, Kind};
 use crate::payload::{Data, Joc, Object};
 use crate::qmf::{Analysis, DELAY, SUBBANDS, Slot, Synthesis};
 
@@ -78,6 +79,8 @@ fn band_of(subband: usize) -> usize {
 
 /// Per downmix channel and band, a gain: one object's matrix.
 pub type Matrix = [[f32; BANDS]; MAX_CHANNELS];
+/// Per channel and band, unquantised.
+type Gains = [[f64; BANDS]; MAX_CHANNELS];
 
 /// How a frame's gains are chosen; see the module notes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +139,11 @@ pub struct Estimator {
     steep_factor: Vec<f64>,
     /// The gains the steep decision found for the step it chose.
     step_gains: Matrix,
+    /// For the budget: the gains each object's codes were quantised from,
+    /// and how much an error in each weighs — the fit's own normal
+    /// equations' diagonal.
+    wanted: Vec<Gains>,
+    weights: Vec<Gains>,
     sequence: u16,
     pub fit: Fit,
     /// The ridge on the normal equations, relative to their mean diagonal:
@@ -148,6 +156,15 @@ pub struct Estimator {
     /// than ramp them across the frame, where that leaves less than this
     /// share of the ramp's error in the frame. Nought never steps.
     pub steep_margin: f32,
+    /// The most bytes the payload the next [`Self::push`] or
+    /// [`Self::finish`] returns may take — what a skip field leaves it beside
+    /// the frame's other payloads. A payload over it has its gains quantised
+    /// again, trading error for bits, until it fits: or, if even gains all
+    /// nought do not, as small as a payload of its objects can be. Unlimited
+    /// unless set.
+    pub budget: usize,
+    /// Payloads [`Self::budget`] has made smaller so far.
+    squeezed: usize,
 }
 
 impl Estimator {
@@ -190,10 +207,14 @@ impl Estimator {
             steep_gram: vec![0.0; (channels * BANDS).pow(2)],
             steep_factor: vec![0.0; (channels * BANDS).pow(2)],
             step_gains: [[0.0; BANDS]; MAX_CHANNELS],
+            wanted: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
+            weights: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             sequence: 0,
             fit: Fit::default(),
             ridge: 1e-5,
             steep_margin: STEEP_MARGIN,
+            budget: usize::MAX,
+            squeezed: 0,
         }
     }
 
@@ -345,6 +366,9 @@ impl Estimator {
             }
             let x = &self.solution;
             let (mut codes, mut gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
+            for (ch, wanted) in self.wanted[o].iter_mut().enumerate().take(n) {
+                *wanted = std::array::from_fn(|band| x[ch * BANDS + band]);
+            }
             if let Some(step) = step {
                 // The gains sent are held to the test the step passed: the
                 // refit on the output after it can find nothing there to fit
@@ -357,6 +381,15 @@ impl Estimator {
                 if !step.passes(error, self.steep_margin) {
                     let found = self.step_gains;
                     (codes, gains) = quantise(n, |ch, band| f64::from(found[ch][band]));
+                    for (wanted, found) in self.wanted[o].iter_mut().zip(&found) {
+                        *wanted = found.map(f64::from);
+                    }
+                }
+            }
+            let m = n * BANDS;
+            for ch in 0..n {
+                for band in 0..BANDS {
+                    self.weights[o][ch][band] = self.gram[(ch * BANDS + band) * (m + 1)];
                 }
             }
             self.held[o] = gains;
@@ -744,7 +777,7 @@ impl Estimator {
 
     /// The frame's payload around its objects; the sequence count steps on.
     fn joc(&mut self, objects: Vec<Option<Object>>) -> Joc {
-        let joc = Joc {
+        let mut joc = Joc {
             downmix_config: self.downmix_config,
             clip_gain: (0, 0),
             sequence: self.sequence,
@@ -753,8 +786,90 @@ impl Estimator {
             padding: 0,
             trailing: vec![],
         };
+        if self.budget < usize::MAX && joc.to_bytes().len() > self.budget {
+            self.fit_budget(&mut joc);
+        }
         self.sequence = next_sequence(self.sequence);
         joc
+    }
+
+    /// Bring a payload over the budget under it: every present object's
+    /// codes chosen again, channel by channel, for the least error plus λ
+    /// times their bits, one λ for the frame — the least that fits, found by
+    /// bisection. Codes are differences between neighbouring bands and a
+    /// difference of nought costs one bit, so a larger λ flattens the gains
+    /// across bands where that costs least; in the limit every code is
+    /// nought, the smallest a payload of these objects can be. Only a frame
+    /// over its budget pays for this.
+    fn fit_budget(&mut self, joc: &mut Joc) {
+        let step = f64::from(STEP);
+        // Scaled by the objects quantised again: an absent one's weights are
+        // whatever its last frame left, and a loud object gone from a quiet
+        // frame put every λ the search tried past the useful ones.
+        let scale = self
+            .weights
+            .iter()
+            .zip(&joc.objects)
+            .filter(|(_, object)| object.is_some())
+            .flat_map(|(weights, _)| weights.iter().flatten())
+            .fold(0f64, |m, &w| m.max(w))
+            .max(1e-30)
+            * step
+            * step;
+        let fits = |estimator: &Self, joc: &mut Joc, lambda: f64| {
+            estimator.requantise(joc, lambda);
+            joc.to_bytes().len() <= estimator.budget
+        };
+        // A λ that fits and a quarter of it that does not, each way from the
+        // scale — at most to where every code is nought, beyond which nothing
+        // gets smaller, or to where the least λ tried still fits — then the
+        // least that fits between them, halving the ratio.
+        let (mut low, mut high) = (scale / 4.0, scale);
+        for _ in 0..40 {
+            if !fits(self, joc, high) {
+                (low, high) = (high, high * 4.0);
+            } else if fits(self, joc, low) {
+                (low, high) = (low / 4.0, low);
+            } else {
+                break;
+            }
+        }
+        for _ in 0..24 {
+            let middle = (low * high).sqrt();
+            if fits(self, joc, middle) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        self.requantise(joc, high);
+        self.squeezed += 1;
+        let n = self.channels;
+        for (held, object) in self.held.iter_mut().zip(&joc.objects) {
+            if let Some(gains) = object.as_ref().and_then(|o| dequantise(o, n)) {
+                *held = gains;
+            }
+        }
+    }
+
+    /// Every present object's codes for the trade of error against bits at
+    /// `lambda`.
+    fn requantise(&self, joc: &mut Joc, lambda: f64) {
+        let book = Codebook::get(Kind::Matrix { fine: true });
+        for (o, object) in joc.objects.iter_mut().enumerate() {
+            let Some(object) = object else {
+                continue;
+            };
+            let codes = (0..self.channels)
+                .map(|ch| trade(&self.wanted[o][ch], &self.weights[o][ch], lambda, book))
+                .collect();
+            object.data = Data::Dense(vec![codes]);
+        }
+    }
+
+    /// How many payloads [`Self::budget`] has made smaller so far.
+    pub fn squeezed(&self) -> usize {
+        self.squeezed
     }
 
     /// The last frame's payload, the frame after it taken as silence.
@@ -859,6 +974,10 @@ impl Estimator {
                 }
             }
             let (codes, gains) = quantise(n, |ch, band| solutions[ch][band]);
+            for ch in 0..n {
+                self.wanted[o][ch] = solutions[ch];
+                self.weights[o][ch] = std::array::from_fn(|band| a[band][ch][ch]);
+            }
             self.held[o] = gains;
             out_objects.push(Some(Object {
                 bands_index: BANDS_INDEX,
@@ -876,6 +995,81 @@ impl Estimator {
 /// The subbands of a band.
 fn band_range(band: usize) -> std::ops::Range<usize> {
     BAND_START[band]..BAND_START.get(band + 1).copied().unwrap_or(SUBBANDS)
+}
+
+/// A channel's fine codes for the least `Σ w·(gain − wanted)² + λ·bits`
+/// over its bands: a Viterbi search over each band's candidate levels — a
+/// few either side of its own, the channel's weighted mean and nought, the
+/// last two so that a flat run, or all nought, is always there to take.
+fn trade(wanted: &[f64; BANDS], weight: &[f64; BANDS], lambda: f64, book: &Codebook) -> Vec<u16> {
+    const NEAR: i32 = 6;
+    const MOST: usize = 2 * NEAR as usize + 1 + 5 + 1;
+    let step = f64::from(STEP);
+    let level = |gain: f64| (gain / step).round().clamp(-96.0, 95.0) as i32;
+    let total: f64 = weight.iter().sum();
+    let mean = if total > 0.0 {
+        level(wanted.iter().zip(weight).map(|(g, w)| g * w).sum::<f64>() / total)
+    } else {
+        0
+    };
+    let mut candidates = [[0i32; MOST]; BANDS];
+    let mut counts = [0usize; BANDS];
+    for band in 0..BANDS {
+        let own = level(wanted[band]);
+        let near = (own - NEAR..=own + NEAR)
+            .chain(mean - 2..=mean + 2)
+            .chain(0..=0);
+        for q in near.filter(|q| (-96..=95).contains(q)) {
+            let list = &mut candidates[band][..counts[band]];
+            if !list.contains(&q) {
+                candidates[band][counts[band]] = q;
+                counts[band] += 1;
+            }
+        }
+    }
+    let bits = |code: i32| book.length(code.rem_euclid(LEVELS) as u16) as f64;
+    let error = |band: usize, q: i32| weight[band] * (f64::from(q) * step - wanted[band]).powi(2);
+    let mut cost = [[0f64; MOST]; BANDS];
+    let mut from = [[0usize; MOST]; BANDS];
+    for s in 0..counts[0] {
+        let q = candidates[0][s];
+        cost[0][s] = error(0, q) + lambda * bits(q);
+    }
+    for band in 1..BANDS {
+        for s in 0..counts[band] {
+            let q = candidates[band][s];
+            let (best, at) = (0..counts[band - 1])
+                .map(|p| {
+                    (
+                        cost[band - 1][p] + lambda * bits(q - candidates[band - 1][p]),
+                        p,
+                    )
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .expect("candidates");
+            cost[band][s] = best + error(band, q);
+            from[band][s] = at;
+        }
+    }
+    let last = BANDS - 1;
+    let mut s = (0..counts[last])
+        .min_by(|a, b| cost[last][*a].total_cmp(&cost[last][*b]))
+        .expect("candidates");
+    let mut levels = [0i32; BANDS];
+    for band in (0..BANDS).rev() {
+        levels[band] = candidates[band][s];
+        s = from[band][s];
+    }
+    (0..BANDS)
+        .map(|band| {
+            let code = if band == 0 {
+                levels[0]
+            } else {
+                levels[band] - levels[band - 1]
+            };
+            code.rem_euclid(LEVELS) as u16
+        })
+        .collect()
 }
 
 /// Gains to the decoder's codes: quantise each to the fine step, and chain
@@ -1408,6 +1602,145 @@ mod tests {
                 .all(|joc| joc.objects[0].as_ref().is_some_and(|o| !o.steep)),
             "a margin of nought never steps"
         );
+    }
+
+    /// Objects of their own noise, which no mix of the downmix carries: their
+    /// gains scatter across bands, and their payloads run large.
+    fn unruly(objects: usize, frames: usize, seed: &mut u32) -> Vec<Frame> {
+        (0..frames)
+            .map(|_| {
+                let core: Vec<Vec<f32>> = (0..5)
+                    .map(|_| (0..1536).map(|_| noise(seed)).collect())
+                    .collect();
+                let objects = (0..objects)
+                    .map(|o| {
+                        (0..1536)
+                            .map(|n| core[o % 5][n] + 2.0 * noise(seed))
+                            .collect()
+                    })
+                    .collect();
+                (core, objects)
+            })
+            .collect()
+    }
+
+    /// A payload over its budget comes back under it, still a payload the
+    /// decoder reads, its gains the nearest the budget allows; a payload
+    /// under it is untouched, byte for byte.
+    #[test]
+    fn a_payload_over_its_budget_is_brought_under_it() {
+        let mut seed = 31u32;
+        let input = unruly(8, 5, &mut seed);
+        let free = run(&mut Estimator::new(8, 0), &input);
+        let sizes: Vec<usize> = free.iter().map(|j| j.to_bytes().len()).collect();
+        let largest = *sizes.iter().max().unwrap();
+        let budget = largest * 3 / 4;
+        assert!(
+            sizes.iter().any(|&s| s > budget),
+            "something to bring under"
+        );
+        let mut estimator = Estimator::new(8, 0);
+        estimator.budget = budget;
+        let held = run(&mut estimator, &input);
+        for (k, held) in held.iter().enumerate() {
+            let bytes = held.to_bytes();
+            assert!(
+                bytes.len() <= budget,
+                "frame {k}: {} bytes for {budget}",
+                bytes.len()
+            );
+            let read = crate::payload::read(&bytes).unwrap();
+            for object in read.objects.iter().flatten() {
+                assert!(dequantise(object, 5).is_some());
+            }
+        }
+        // A budget every payload is under leaves every one as it was.
+        let mut roomy = Estimator::new(8, 0);
+        roomy.budget = largest;
+        for (k, (free, roomy)) in free.iter().zip(run(&mut roomy, &input)).enumerate() {
+            assert_eq!(free.to_bytes(), roomy.to_bytes(), "frame {k}");
+        }
+    }
+
+    /// The budget's search is scaled by the objects it quantises again, not
+    /// by weights an absent object left behind.
+    #[test]
+    fn an_absent_objects_old_weights_do_not_set_the_budgets_scale() {
+        // Two objects, loud for two frames, then the downmix 100 dB quieter
+        // and the second object gone. Its weights from the loud frames stayed
+        // behind; taken into the search's scale they put every λ it tried
+        // far past the useful ones, and the present object was sent with
+        // gains all nought, in a payload half its budget.
+        const BUDGET: usize = 30;
+        for fit in [Fit::Centred, Fit::Synthesis] {
+            let mut seed = 43u32;
+            let mut estimator = Estimator::new(2, 0);
+            estimator.fit = fit;
+            let mut payloads = Vec::new();
+            for k in 0..8 {
+                let level = if k < 2 { 1.0 } else { 1e-5 };
+                let core: Vec<Vec<f32>> = (0..5)
+                    .map(|_| (0..1536).map(|_| level * noise(&mut seed)).collect())
+                    .collect();
+                let objects: Vec<Vec<f32>> = (0..2)
+                    .map(|o| {
+                        (0..1536)
+                            .map(|n| core[o][n] + 2.0 * level * noise(&mut seed))
+                            .collect()
+                    })
+                    .collect();
+                if k == 5 {
+                    estimator.budget = BUDGET;
+                }
+                let core: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                let objects: Vec<&[f32]> = objects.iter().map(Vec::as_slice).collect();
+                payloads.extend(estimator.push(&core, &objects, &[true, k < 2]));
+            }
+            assert!(estimator.squeezed() > 0, "{fit:?}: the budget was needed");
+            for (frame, joc) in payloads.iter().enumerate().skip(4) {
+                let bytes = joc.to_bytes();
+                assert!(bytes.len() <= BUDGET, "{fit:?} frame {frame}");
+                let object = joc.objects[0].as_ref().unwrap();
+                let gains = dequantise(object, 5).unwrap();
+                let mean = gains[0].iter().sum::<f32>() / BANDS as f32;
+                assert!(
+                    mean > 0.5,
+                    "{fit:?} frame {frame}: L's gains average {mean} for one, in {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
+    /// With a budget not even gains all nought fit, the payload is the
+    /// smallest these objects can make — every code nought — and no panic.
+    #[test]
+    fn a_budget_below_the_smallest_payload_gives_the_smallest() {
+        let mut seed = 37u32;
+        let input = unruly(4, 3, &mut seed);
+        let mut estimator = Estimator::new(4, 0);
+        estimator.budget = 1;
+        for joc in run(&mut estimator, &input) {
+            for object in joc.objects.iter().flatten() {
+                let Data::Dense(points) = &object.data else {
+                    panic!("dense");
+                };
+                assert!(points[0].iter().flatten().all(|&c| c == 0));
+            }
+        }
+    }
+
+    /// With nothing asked for bits, the trade is the plain quantisation.
+    #[test]
+    fn a_trade_at_nought_is_the_plain_quantisation() {
+        let mut seed = 41u32;
+        let book = Codebook::get(Kind::Matrix { fine: true });
+        for _ in 0..20 {
+            let wanted: [f64; BANDS] = std::array::from_fn(|_| f64::from(noise(&mut seed)) * 12.0);
+            let weight: [f64; BANDS] = std::array::from_fn(|_| f64::from(noise(&mut seed)) + 0.6);
+            let (codes, _) = quantise(1, |_, band| wanted[band]);
+            assert_eq!(trade(&wanted, &weight, 0.0, book), codes[0]);
+        }
     }
 
     /// The ramp fit overshoots a step in the mix and settles over a few

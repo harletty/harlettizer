@@ -717,7 +717,10 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   subbands' leakage. It steps an object's gains at a slot, rather than ramp
   them, where the frame's error says so (the steep slope): mostly where the
   reference steps, at the same slot, gaining 3 to 4 dB on the stepped frames
-  of film. Next: budget the payload, and fit to a core rendered from a master.
+  of film. A budget keeps each payload within what the skip field leaves it,
+  quantising gains for bits only where a frame is over (`--skip-limit`
+  exercises it: the 60-second film loses 0.02 dB at 330 bytes). Next: fit
+  to a core rendered from a master.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is
