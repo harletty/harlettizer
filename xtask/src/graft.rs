@@ -186,41 +186,11 @@ fn snr(reference: &[f32], test: &[f32]) -> f64 {
     10.0 * (signal / noise.max(1e-30)).log10()
 }
 
-/// Whether `out` names the file `reference` is, by any path: written first,
-/// it would replace the reference before the reference is decoded for the
-/// comparison, which would then compare the graft with itself.
-fn aliases(reference: &Path, out: &Path) -> Result<bool> {
-    let reference_at = std::fs::canonicalize(reference).map_err(|e| Error::io(reference, e))?;
-    let out_at = match std::fs::canonicalize(out) {
-        Ok(path) => path,
-        // Not there yet: where it would be, through its directory's links.
-        Err(_) => {
-            let parent = match out.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent,
-                _ => Path::new("."),
-            };
-            match (std::fs::canonicalize(parent), out.file_name()) {
-                (Ok(dir), Some(name)) => dir.join(name),
-                _ => return Ok(false),
-            }
-        }
-    };
-    if reference_at == out_at {
-        return Ok(true);
-    }
-    // Another name for the same file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(a), Ok(b)) = (std::fs::metadata(reference), std::fs::metadata(out)) {
-            return Ok(a.dev() == b.dev() && a.ino() == b.ino());
-        }
-    }
-    Ok(false)
-}
-
 pub fn run(options: Options) -> Result<()> {
-    if aliases(&options.reference, &options.out)? {
+    // Written before the reference is decoded a second time for the
+    // comparison, an output that is the reference would replace it and the
+    // graft would be compared with itself.
+    if crate::paths::aliases(&options.reference, &options.out)? {
         return Err(Error::refused(
             &options.out,
             "the output is the reference: writing it would replace what the graft is compared with",

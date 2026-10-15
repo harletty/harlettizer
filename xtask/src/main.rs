@@ -24,6 +24,7 @@ mod make_master;
 mod mlp;
 mod mounts;
 mod overlay_check;
+mod paths;
 mod roundtrip;
 mod speech;
 mod thd;
