@@ -148,6 +148,20 @@ data point, smooth.
   gains that fail are replaced by the decision's own, fitted in the QMF
   domain on every slot from the step on; on the 60-second film that also
   gained 0.15 dB on the slid frames.
+- **The budget.** A skip field holds 511 bytes, and the payload shares them
+  with the frame's object metadata and the rest; the caller sets
+  `Estimator::budget` to what is left. A payload over it has every present
+  object's codes chosen again, channel by channel, for the least error plus
+  λ times their bits — a Viterbi search over each band's candidate levels, a
+  few either side of its own, the channel's weighted mean and nought — one λ
+  for the frame, the least that fits, found by bisection. The error is
+  weighed by the fit's own normal equations: the synthesis fit's diagonal,
+  the centred fit's per band. Codes are differences between neighbouring
+  bands and a difference of nought costs one bit, so a larger λ flattens the
+  gains across bands where that costs least; in the limit every code is
+  nought, the smallest a payload of the frame's objects can be, which is sent
+  if even it does not fit. A payload under its budget is untouched, byte for
+  byte, and only a frame over it pays for the search.
 - **The state.** It keeps what the decoder holds: the dequantised gains of the
   last frame an object was present, untouched while it is absent, as the
   decoder leaves them; and the sequence count, which after 1023 restarts at
@@ -253,13 +267,31 @@ nothing else):
 The decision makes the fit about 30 % slower; the whole graft still runs
 some eight times faster than real time.
 
+`graft` gives the estimator each frame's room — the skip field's 511 bytes
+less the frame's other payloads and the container, the payload's size field
+at its longest — and `--skip-limit` lowers the 511 to exercise the budget.
+At 511 no payload of the four streams needed it, and every figure above
+stands. Lower, the 60-second film, whose payloads run largest:
+
+| Skip limit | Payloads made smaller | Payload, mean / max | Objects, whole stream |
+|---|---|---|---|
+| 511 | 0 | 209 / 327 bytes | 29.40 dB |
+| 400 | 1 | 209 / 302 bytes | 29.40 dB |
+| 330 | 387 of 1875 | 206 / 232 bytes | 29.38 dB |
+| 280 | 1635 of 1875 | 180 / 182 bytes | 28.05 dB |
+
+At 280 the room falls below the payloads' mean, and most frames give up a
+seventh of their bits for 1.35 dB; the sample and the 30-second film, at the
+same limit, make 4 and 17 payloads smaller and lose nothing measurable. A
+frame made smaller takes some 8 ms more, a quarter of its own duration.
+
 ## Not done
 
 - Two data points a frame, which the references never use, and a steep slope
   decided for the frame's objects together, as they do.
-- A budget for the payload's size: ours run near the reference's, its largest
-  within a quarter of theirs on film, but nothing holds them under a skip
-  field's 511 bytes.
+- Coarse quantisation and fewer parameter bands, which the budget could also
+  trade for bits; the references use neither, and at a skip field's 511
+  bytes nothing yet needs them.
 - The downmix: these gains are fitted to a reference's core. From a master, the
   core is the objects rendered to 5.1, then coded, and the gains fitted to the
   decoded core — the step that makes `harlettizer` write objects of its own.

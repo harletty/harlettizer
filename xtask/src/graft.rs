@@ -41,6 +41,9 @@ pub struct Options {
     /// error a step must leave to be taken, nought for never; its own
     /// default unless asked.
     pub steep_margin: Option<f32>,
+    /// The most bytes an Evolution frame may take: a skip field's 511
+    /// unless asked, ours fitted under it. Lower, it exercises the budget.
+    pub skip_limit: usize,
     /// With `refit`, list the frames where ours lose most against the
     /// reference's parameters.
     pub probe: bool,
@@ -231,6 +234,61 @@ fn runs(counts: &[u16]) -> Vec<std::ops::Range<usize>> {
     runs
 }
 
+/// What the refit is tuned by.
+#[derive(Clone, Copy)]
+struct Tuning {
+    ridge: Option<f32>,
+    steep_margin: Option<f32>,
+    skip_limit: usize,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            ridge: None,
+            steep_margin: None,
+            skip_limit: SKIP_LIMIT,
+        }
+    }
+}
+
+/// The most bytes a skip field holds.
+pub const SKIP_LIMIT: usize = 511;
+
+/// `frame` written again behind its sync word, `joc` as its joint object
+/// coding payload.
+fn evolution_frame(frame: &hz_meta::emdf::Frame, joc: &[u8]) -> Vec<u8> {
+    use hz_meta::emdf;
+    let protection = |(primary, secondary): (u32, u32)| {
+        let length = |bits| match bits {
+            8 => emdf::ProtectionLength::Bits8,
+            32 => emdf::ProtectionLength::Bits32,
+            _ => emdf::ProtectionLength::Bits128,
+        };
+        emdf::Protection {
+            primary: length(primary),
+            secondary: (secondary != 0).then(|| length(secondary)),
+        }
+    };
+    let payloads: Vec<emdf::Payload<'_>> = frame
+        .payloads
+        .iter()
+        .map(|p| emdf::Payload {
+            id: p.id,
+            bytes: if p.id == emdf::JOC { joc } else { &p.bytes },
+            sample_offset: p.sample_offset.unwrap_or(0),
+            config: p.config,
+        })
+        .collect();
+    let mut container = hz_core::bits::BitWriter::new();
+    emdf::write(&mut container, &payloads, protection(frame.protection));
+    let container = container.finish();
+    let mut synced = emdf::SYNC_WORD.to_be_bytes().to_vec();
+    synced.extend_from_slice(&(container.len() as u16).to_be_bytes());
+    synced.extend_from_slice(&container);
+    synced
+}
+
 /// Pad an Evolution frame behind its sync word to `size` bytes, the length
 /// field saying so: TS 102 366 H.2.2.1.2 has the container's tail past its
 /// last field set to nought, and a decoder reads to its length.
@@ -277,7 +335,7 @@ fn encode(
                     .unwrap_or(0.0);
             }
         }
-        if frame_emdf.len() > 511 {
+        if frame_emdf.len() > SKIP_LIMIT {
             return Err(Error::refused(
                 out,
                 format!(
@@ -308,8 +366,7 @@ fn refit(
     reference: &Reference,
     theirs: &Objects,
     fit: hz_joc::estimate::Fit,
-    ridge: Option<f32>,
-    steep_margin: Option<f32>,
+    tuning: Tuning,
 ) -> Result<(Vec<Vec<u8>>, Vec<Vec<bool>>)> {
     use hz_joc::estimate::{Estimator, dequantise};
     use hz_meta::emdf;
@@ -358,6 +415,19 @@ fn refit(
         );
     }
 
+    // Each frame's room for our payload: the skip limit less what its other
+    // payloads and the container take, the payload's size field at its
+    // longest.
+    let placeholder = [0u8; 256];
+    let room: Vec<usize> = frames
+        .iter()
+        .map(|frame| {
+            let overhead = evolution_frame(frame, &placeholder).len() - placeholder.len();
+            tuning.skip_limit.saturating_sub(overhead)
+        })
+        .collect();
+    let mut squeezed = 0;
+
     // The downmix in the order joint object coding names it: L, R, C, Ls, Rs
     // — WAV planes 0, 1, 2, 4, 5.
     let core_order = [0usize, 1, 2, 4, 5];
@@ -371,13 +441,19 @@ fn refit(
         let mut estimator = Estimator::new(count, jocs[run.start].downmix_config);
         estimator.set_sequence(counts[run.start]);
         estimator.fit = fit;
-        if let Some(ridge) = ridge {
+        if let Some(ridge) = tuning.ridge {
             estimator.ridge = ridge;
         }
-        if let Some(margin) = steep_margin {
+        if let Some(margin) = tuning.steep_margin {
             estimator.steep_margin = margin;
         }
+        let last = run.end - 1;
+        let first = run.start;
         for k in run {
+            // The push hands back the frame before, so that frame's room.
+            if k > first {
+                estimator.budget = room[k - 1];
+            }
             let joc = &jocs[k];
             let start = k * FRAME_SAMPLES;
             let core: Vec<&[f32]> = core_order
@@ -399,7 +475,9 @@ fn refit(
                 .collect();
             estimates.extend(estimator.push(&core, &objects, &present));
         }
+        estimator.budget = room[last];
         estimates.extend(estimator.finish());
+        squeezed += estimator.squeezed();
     }
 
     // How close the gains come, where both carry an object.
@@ -496,39 +574,18 @@ fn refit(
         share(both),
         share(near)
     );
-
-    let protection = |(primary, secondary): (u32, u32)| {
-        let length = |bits| match bits {
-            8 => emdf::ProtectionLength::Bits8,
-            32 => emdf::ProtectionLength::Bits32,
-            _ => emdf::ProtectionLength::Bits128,
-        };
-        emdf::Protection {
-            primary: length(primary),
-            secondary: (secondary != 0).then(|| length(secondary)),
-        }
-    };
-    let mut out = Vec::with_capacity(frames.len());
-    for (frame, estimate) in frames.iter().zip(&estimates) {
-        let joc = estimate.to_bytes();
-        let payloads: Vec<emdf::Payload<'_>> = frame
-            .payloads
-            .iter()
-            .map(|p| emdf::Payload {
-                id: p.id,
-                bytes: if p.id == emdf::JOC { &joc } else { &p.bytes },
-                sample_offset: p.sample_offset.unwrap_or(0),
-                config: p.config,
-            })
-            .collect();
-        let mut container = hz_core::bits::BitWriter::new();
-        emdf::write(&mut container, &payloads, protection(frame.protection));
-        let container = container.finish();
-        let mut synced = emdf::SYNC_WORD.to_be_bytes().to_vec();
-        synced.extend_from_slice(&(container.len() as u16).to_be_bytes());
-        synced.extend_from_slice(&container);
-        out.push(synced);
+    if squeezed > 0 {
+        println!(
+            "  budget       {squeezed} payloads quantised coarser to fit their Evolution frame under {} bytes",
+            tuning.skip_limit
+        );
     }
+
+    let out: Vec<Vec<u8>> = frames
+        .iter()
+        .zip(&estimates)
+        .map(|(frame, estimate)| evolution_frame(frame, &estimate.to_bytes()))
+        .collect();
     // Where the reference stepped its parameters at a slot rather than
     // sliding them: the frames a smooth fit cannot follow.
     let steep = jocs
@@ -592,8 +649,11 @@ pub fn run(options: Options) -> Result<()> {
                 &reference,
                 &theirs,
                 fit,
-                options.ridge,
-                options.steep_margin,
+                Tuning {
+                    ridge: options.ridge,
+                    steep_margin: options.steep_margin,
+                    skip_limit: options.skip_limit,
+                },
             )?;
             // The graft of the reference's own parameters, beside ours, on the
             // same core: the skip field's bytes come out of the audio's
@@ -943,7 +1003,7 @@ mod splice_tests {
         std::fs::write(&path, stream).unwrap();
         let reference = read_reference(&path).unwrap();
         let theirs = decode_objects(&path).unwrap();
-        let (emdf, _) = refit(&path, &reference, &theirs, Fit::Ramp, None, None).unwrap();
+        let (emdf, _) = refit(&path, &reference, &theirs, Fit::Ramp, Tuning::default()).unwrap();
         let _ = std::fs::remove_file(&path);
         emdf
     }

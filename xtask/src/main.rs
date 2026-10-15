@@ -584,6 +584,12 @@ enum Command {
         #[arg(long, value_name = "SHARE")]
         steep_margin: Option<f32>,
 
+        /// With `--refit`: the most bytes an Evolution frame may take, ours
+        /// fitted under it — a skip field's 511 unless lowered to exercise
+        /// the budget.
+        #[arg(long, value_name = "BYTES", default_value_t = 511)]
+        skip_limit: usize,
+
         /// With `--refit`: list the frames where hz-joc's parameters lose
         /// most against the reference's.
         #[arg(long)]
@@ -954,6 +960,7 @@ fn main() -> ExitCode {
             refit,
             ridge,
             steep_margin,
+            skip_limit,
             probe,
         } => {
             let refit = match refit.as_deref() {
@@ -974,6 +981,7 @@ fn main() -> ExitCode {
                     refit,
                     ridge,
                     steep_margin,
+                    skip_limit,
                     probe,
                 })
             })
