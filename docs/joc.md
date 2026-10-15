@@ -288,6 +288,60 @@ seventh of their bits for 1.35 dB; the sample and the 30-second film, at the
 same limit, make 4 and 17 payloads smaller and lose nothing measurable. A
 frame made smaller takes some 8 ms more, a quarter of its own duration.
 
+## Objects of our own: `harlettizer ac3 --eac3 --joc`
+
+From a master, the 5.1 core is the programme rendered and folded as
+`harlettizer ac3` renders it, and every object and bed channel but the LFE is
+an element of its own — fifteen at most, what the reference streams carry; a
+master with more is refused until its objects can be clustered. Each syncframe
+carries an Evolution frame in block 2's skip field, as the references do: the
+object metadata (payload 11, one block, every element moving across the frame
+to where it is at the frame's end — the references' `Long` ramp), then the
+joint object coding payload (14), group nought, kept, the second
+frame-aligned.
+
+The gains are fitted to the core a decoder plays, which `hz-ac3` reconstructs
+(docs/ac3.md). Two things are in the way of fitting it and carrying the result
+in the same frame: a frame's fit looks half a frame ahead, into a core not yet
+coded, and the Evolution frame's bytes come out of the audio's, so what it
+carries changes the core it was fitted to. So every Evolution frame is padded
+to one size — enough for the references' payloads, sixteen bytes an element,
+and never less than the smallest payload the elements can make — which makes
+the core's bits independent of what it carries; and two encoders run, a probe a
+frame ahead carrying a placeholder of that size, whose reconstruction the gains
+are fitted to, and the stream's encoder a frame behind carrying the real
+thing. The two code the same audio into the same bits, and every frame checks
+that they did: the stream's core is the core the gains were fitted to, or
+nothing is written. (A test gives the probe a placeholder forty bytes short,
+and the writer refuses its first frame.)
+
+`hz-meta`'s object metadata writer reads and writes back every payload of the
+30-second film byte for byte (`cargo xtask eac3` now reports it), whose
+programme is the same shape as ours: the LFE, then dynamic objects, no sample
+offset. The other references use what it does not model — a sample offset
+inside the payload, speaker-anchored beds — which nothing here writes.
+
+`cargo xtask joc-check stream.ec3 --master in.atmos` decodes a stream's
+objects through the workspace decoder and holds each to its element of the
+master, the decoder's lag — the encoder's delay and joint object coding's 577
+samples — taken out:
+
+| Master | Elements | Evolution frame | Objects against the master's elements |
+|---|---|---|---|
+| synthetic, 4 objects and a bed channel | 5 | 133 bytes | 26.3 dB (47.7, 30.8, 24.1, 22.5, 28.4) |
+| synthetic, 10 broadband objects | 10 | 233 bytes | 7.1 dB |
+| synthetic, 10 objects switching on and off | 10 | 233 bytes | 9.9 dB |
+| synthetic, a 7.1.2 bed and 6 broadband objects | 15 | 332 bytes | 7.2 dB |
+
+The workspace decoder reads every frame's object metadata with the elements
+the master has, and the LFE. These are not the reference comparisons above:
+those hold the gains to what a reference's own gains rebuild, which is itself
+a joint object coding reconstruction; these hold the objects to the master's,
+which no five-channel downmix can give back where ten or fifteen independent
+broadband sources overlap in the same speakers. Room is not what limits them:
+an allowance of 16, 24, 32 or 64 bytes an element moves the result by less
+than half a decibel, the larger frames taking their bytes from the core.
+
 ## Not done
 
 - Two data points a frame, which the references never use, and a steep slope
@@ -295,7 +349,9 @@ frame made smaller takes some 8 ms more, a quarter of its own duration.
 - Coarse quantisation and fewer parameter bands, which the budget could also
   trade for bits; the references use neither, and at a skip field's 511
   bytes nothing yet needs them.
-- The downmix: these gains are fitted to a reference's core. From a master, the
-  core is the objects rendered to 5.1, then coded, and the gains fitted to the
-  decoded core — the step that makes `harlettizer` write objects of its own.
+- Masters of more than fifteen elements: their objects clustered into
+  fifteen, as the TrueHD and IAMF writers cluster theirs, on frames of 1536
+  samples.
+- The programme's loudness and information payloads (1 and 2), which the
+  references carry and these streams do not; and listening, on a receiver.
 - The extension configuration's data.

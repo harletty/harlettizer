@@ -151,6 +151,11 @@ struct Report {
     joc_objects: BTreeMap<usize, usize>,
     joc_channels: BTreeMap<usize, usize>,
     oamd_objects: BTreeMap<usize, usize>,
+    /// Object metadata payloads, and those `hz-meta` reads and writes back
+    /// byte for byte.
+    oamd_payloads: usize,
+    oamd_rewritten: usize,
+    first_oamd_failure: Option<String>,
 }
 
 /// Bytes read from a stream at a time.
@@ -295,6 +300,9 @@ fn survey(input: &Path, dump: Option<&Path>, frames: Option<usize>) -> Result<Re
                     };
                     check_joc(&mut report, index, &payload.bytes, oracle);
                 }
+                if id == emdf::OAMD {
+                    check_oamd(&mut report, index, &payload.bytes);
+                }
                 match &payload.parsed {
                     ParsedEmdfPayloadData::Joc(joc) => {
                         *report.joc_downmix.entry(joc.downmix_config).or_default() += 1;
@@ -347,6 +355,43 @@ fn next_frame(
 
 /// Read a joint object coding payload with `hz-joc`, write it back, and hold
 /// what it read to what the oracle read.
+/// Whether `hz-meta` reads an object metadata payload and writes it back
+/// byte for byte — what an encoder carrying its own needs to trust.
+fn check_oamd(report: &mut Report, index: usize, bytes: &[u8]) {
+    report.oamd_payloads += 1;
+    let failure = match hz_meta::oamd::ObjectAudioMetadata::read(bytes) {
+        Err(e) => format!("unread: {e}"),
+        Ok(metadata) => {
+            let written = match metadata.write() {
+                Ok(written) => written,
+                Err(e) => {
+                    report
+                        .first_oamd_failure
+                        .get_or_insert_with(|| format!("syncframe {index}: unwritten: {e}"));
+                    return;
+                }
+            };
+            if written == bytes {
+                report.oamd_rewritten += 1;
+                return;
+            }
+            let at = written
+                .iter()
+                .zip(bytes)
+                .position(|(a, b)| a != b)
+                .unwrap_or(written.len().min(bytes.len()));
+            format!(
+                "written back as {} bytes for {}, first differing at byte {at}",
+                written.len(),
+                bytes.len()
+            )
+        }
+    };
+    report
+        .first_oamd_failure
+        .get_or_insert_with(|| format!("syncframe {index}: {failure}"));
+}
+
 fn check_joc(
     report: &mut Report,
     index: usize,
@@ -685,6 +730,15 @@ impl Report {
         }
         if !self.oamd_objects.is_empty() {
             println!("  oamd         {} objects", histogram(&self.oamd_objects));
+        }
+        if self.oamd_payloads > 0 {
+            println!(
+                "  oamd payload {}/{} rewritten byte for byte by hz-meta",
+                self.oamd_rewritten, self.oamd_payloads
+            );
+            if let Some(first) = &self.first_oamd_failure {
+                println!("               first failure: {first}");
+            }
         }
         println!(
             "  read         {}/{} frames as the oracle does",

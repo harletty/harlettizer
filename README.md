@@ -82,14 +82,17 @@ sequence back to the master's own channels, bit for bit.
 - **E-AC-3** — one independent substream at any rate up to 1024 kb/s, with an
   Evolution frame carried where reference streams carry theirs: a reference
   stream's objects ride on a core coded here and come back as close as the
-  core does. No dependent substream and no objects of our own yet. See
+  core does; and objects of our own, from a master of up to fifteen
+  elements (`--joc`). No dependent substream yet. See
   [docs/eac3.md](docs/eac3.md).
 - **Joint object coding** — the payload read and written, every reference
   payload byte for byte ([docs/joc.md](docs/joc.md)); the parameters
-  estimated to a reference's own core and objects, through the decoder's
-  synthesis, but not yet to a core of our own.
-- **Not there yet** — joint object coding parameters of our own and AC-4 are in
-  [PLAN.md](PLAN.md) and nothing of them is written. For IAMF: no AAC, no
+  estimated through the decoder's synthesis — to a reference's own core and
+  objects, or, from a master, to the 5.1 core a decoder plays of ours. A
+  master with more than fifteen elements is refused until its objects can be
+  clustered.
+- **Not there yet** — AC-4 is in [PLAN.md](PLAN.md) and nothing of it is
+  written. For IAMF: no AAC, no
   v1.1 bed beside the v2.0 objects for older decoders, no scalable layers, and
   no browser has been tried; [docs/iamf.md](docs/iamf.md#not-done) has the
   list.
@@ -289,6 +292,7 @@ mkvinfo programme.mka                                             # the Matroska
 harlettizer ac3 programme.atmos --out programme.ac3                    # 5.1 at 448 kb/s
 harlettizer ac3 programme.atmos --out programme.ac3 --layout 2.0       # stereo at 192 kb/s
 harlettizer ac3 programme.atmos --out programme.ec3 --eac3 --bitrate 768   # E-AC-3, 5.1
+harlettizer ac3 programme.atmos --out programme.ec3 --eac3 --joc       # E-AC-3, 5.1 and its objects
 ```
 
 Renders the programme to 7.1 on the room's cube, folds it to 5.1 or stereo

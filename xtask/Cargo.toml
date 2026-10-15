@@ -18,6 +18,7 @@ hz-dca.workspace = true
 hz-io.workspace = true
 hz-joc.workspace = true
 hz-meta.workspace = true
+hz-programme.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
 hz-render.workspace = true
 # An independent reader for the object metadata payload, used as an oracle and
