@@ -50,6 +50,15 @@ fn master_to_adm(config_path: &Path, output: &Path, presentation: usize) -> Resu
         );
     }
 
+    // The audio is streamed into the output, so creating an output that is
+    // any file of the set would truncate it before it is read.
+    let inputs: Vec<PathBuf> = std::iter::once(config_path)
+        .chain(components.metadata.path())
+        .chain(Some(audio))
+        .map(Path::to_path_buf)
+        .collect();
+    hz_io::paths::refuse_inputs(&inputs, output)?;
+
     let events = set.read_events(presentation)?;
     let mut reader = CafReader::open(audio)?;
     let source = *reader.format();
@@ -142,6 +151,14 @@ fn adm_to_master(input: &Path, config_path: &Path) -> Result<()> {
     let metadata_name = format!("{stem}.atmos.metadata");
     let audio_name = format!("{stem}.atmos.audio");
     let directory = config_path.parent().unwrap_or(Path::new("."));
+    let audio_path: PathBuf = directory.join(&audio_name);
+
+    // The config is written first and the audio streamed from the input
+    // after it: none of the three may be the input under any name.
+    let inputs = [input.to_path_buf()];
+    for out in [config_path, &directory.join(&metadata_name), &audio_path] {
+        hz_io::paths::refuse_inputs(&inputs, out)?;
+    }
 
     let mut config = recovered.config;
     config.presentations[0].metadata = metadata_name.clone();
@@ -149,7 +166,6 @@ fn adm_to_master(input: &Path, config_path: &Path) -> Result<()> {
     config.write(config_path)?;
     recovered.events.write(&directory.join(&metadata_name))?;
 
-    let audio_path: PathBuf = directory.join(&audio_name);
     let mut writer = CafWriter::create(
         &audio_path,
         PcmFormat::master(source.pcm.sample_rate, source.pcm.channels),

@@ -488,6 +488,9 @@ struct Live {
 
 pub fn run(config: Config) -> Result<()> {
     let mut source = Source::open(&config.input, config.mono_prefix.as_deref())?;
+    // Creating the output truncates it, and every file of the input is still
+    // to be read: refuse one that is the input, before any work is done.
+    hz_io::paths::refuse_inputs(source.files(), &config.out)?;
     if config.cluster.is_some() && config.overlay.is_some() {
         return Err(Error::unsupported(
             &config.input,

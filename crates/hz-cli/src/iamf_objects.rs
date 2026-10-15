@@ -541,6 +541,9 @@ pub fn run(config: Config) -> Result<()> {
     let kind = config.objects.expect("the objects mode");
     let path = config.input.as_path();
     let source = Source::open(path, config.mono_prefix.as_deref())?;
+    // Creating the output truncates it, and every file of the input is still
+    // to be read: refuse one that is the input, before any work is done.
+    hz_io::paths::refuse_inputs(source.files(), &config.out)?;
     let format = *source.pcm_format();
     if format.sample_format == SampleFormat::Float {
         return Err(Error::unsupported(

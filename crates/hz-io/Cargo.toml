@@ -13,7 +13,9 @@ hz-core.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
 quick-xml.workspace = true
-# Whether two paths are one file, hard links included: device and inode on
-# Unix, volume and file index on Windows, which the standard library only
-# offers on Unix.
+
+# Whether two paths are one file, hard links included: the volume and file
+# index on Windows, which the standard library does not offer there. Unix
+# compares device and inode through the standard library, without opening.
+[target.'cfg(not(unix))'.dependencies]
 same-file.workspace = true
