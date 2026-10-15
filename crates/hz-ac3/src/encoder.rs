@@ -21,6 +21,15 @@
 //! Channels are indexed as FFmpeg indexes them, because the port is easier to
 //! hold against its source that way: nought is the coupling channel, then the
 //! coded channels in their coded order, the LFE last.
+//!
+//! Asked to ([`Encoder::reconstruct`]), the encoder also keeps what a
+//! decoder will make of each frame — the mantissas dequantised as A/52 §7.3
+//! has them, the coupling undone by the coordinates the stream carries, the
+//! stereo pair's rematrixing undone, the inverse transform windowed and
+//! overlapped — so that what is fitted to the core, as joint object coding's
+//! gains are, can be fitted to the core a decoder plays. It is the decoder's
+//! output less the dither a decoder may add where a bin has no bits: the
+//! noise is a receiver's own and fits nothing.
 
 use crate::bitalloc::{self, BANDS, COEFS, Codes, Parameters};
 use crate::mdct::{BLOCK, Mdct, WINDOW, kbd_window};
@@ -340,6 +349,22 @@ pub struct Encoder {
     /// whether it carries any.
     skip_field: Vec<u8>,
     skip_pending: bool,
+    /// What a decoder makes of each frame, when asked for.
+    reconstruction: Option<Box<Reconstruction>>,
+}
+
+/// A decoder's side of the stream, kept as the encoder writes it.
+struct Reconstruction {
+    /// Per channel and block, the coefficients the stream carries,
+    /// dequantised; the coupled channels' high band filled in from the
+    /// coupling channel.
+    coef: Planes<f32, COEFS>,
+    /// Per coded channel, the second half of the last block's inverse
+    /// transform, windowed: the next block's first half overlaps it.
+    overlap: Vec<[f32; BLOCK]>,
+    /// Per input channel, in WAV order, the last frame decoded.
+    output: Vec<Vec<f32>>,
+    inverse: [f32; WINDOW],
 }
 
 impl Encoder {
@@ -529,6 +554,7 @@ impl Encoder {
             frame_exp: None,
             skip_field: Vec::with_capacity(512),
             skip_pending: false,
+            reconstruction: None,
         };
         encoder.frame_bits_fixed = encoder.count_frame_bits_fixed();
         if encoder.coupling.is_some() {
@@ -544,6 +570,28 @@ impl Encoder {
             }
         }
         Ok(encoder)
+    }
+
+    /// From the next frame on, keep what a decoder will make of each one:
+    /// [`Self::decoded`]. The stream is the same either way.
+    pub fn reconstruct(&mut self) {
+        let planes = self.coef.data.len() / BLOCKS;
+        self.reconstruction = Some(Box::new(Reconstruction {
+            coef: Planes::new(planes),
+            overlap: vec![[0.0; BLOCK]; self.channels],
+            output: vec![vec![0.0; FRAME_SAMPLES]; self.channels],
+            inverse: [0.0; WINDOW],
+        }));
+    }
+
+    /// The last frame [`Self::encode`] wrote, as a decoder plays it: input
+    /// channel `ch` in WAV order, [`FRAME_SAMPLES`] samples, [`DELAY`] behind
+    /// the input that went in — less the dither a decoder may add where a bin
+    /// has no bits. `None` unless [`Self::reconstruct`] was asked.
+    pub fn decoded(&self, ch: usize) -> Option<&[f32]> {
+        self.reconstruction
+            .as_ref()
+            .map(|r| r.output[ch].as_slice())
     }
 
     /// Input channels, in WAV order.
@@ -617,6 +665,7 @@ impl Encoder {
         self.allocate()?;
         self.group_exponents();
         self.quantize();
+        self.rebuild();
         self.write(out);
         self.skip_pending = false;
         Ok(())
@@ -1105,6 +1154,11 @@ impl Encoder {
     }
 
     fn quantize(&mut self) {
+        if let Some(r) = self.reconstruction.as_mut() {
+            for plane in &mut r.coef.data {
+                plane.fill(0.0);
+            }
+        }
         for blk in 0..BLOCKS {
             let mut groups = Groups::default();
             for &ch in &self.order[..self.order_len] {
@@ -1115,27 +1169,96 @@ impl Encoder {
                 let i = Planes::<u8, COEFS>::index(ch, blk);
                 for bin in self.start_freq[ch]..self.end_freq[ch] {
                     let (c, e) = (fixed[bin], i32::from(exp[bin]));
-                    let v = match bap[bin] {
+                    let level = match bap[bin] {
                         0 => 0,
-                        1 => groups
-                            .one
-                            .add(&mut self.qmant, i, bin, sym_quant(c, e, 3), 3),
-                        2 => groups
-                            .two
-                            .add(&mut self.qmant, i, bin, sym_quant(c, e, 5), 5),
+                        1 => sym_quant(c, e, 3),
+                        2 => sym_quant(c, e, 5),
                         3 => sym_quant(c, e, 7),
-                        4 => groups
-                            .four
-                            .add(&mut self.qmant, i, bin, sym_quant(c, e, 11), 11),
+                        4 => sym_quant(c, e, 11),
                         5 => sym_quant(c, e, 15),
                         14 => asym_quant(c, e, 14),
                         15 => asym_quant(c, e, 16),
                         b => asym_quant(c, e, i32::from(b) - 1),
                     };
+                    let v = match bap[bin] {
+                        1 => groups.one.add(&mut self.qmant, i, bin, level, 3),
+                        2 => groups.two.add(&mut self.qmant, i, bin, level, 5),
+                        4 => groups.four.add(&mut self.qmant, i, bin, level, 11),
+                        _ => level,
+                    };
                     self.qmant.data[i][bin] = v as i16;
+                    if let Some(r) = self.reconstruction.as_mut() {
+                        r.coef.data[i][bin] = dequantise(bap[bin], level) * (-e as f32).exp2();
+                    }
                 }
             }
         }
+    }
+
+    /// The frame as a decoder rebuilds it, into the reconstruction: coupling
+    /// undone, rematrixing undone, each block's inverse transform windowed
+    /// and overlapped with the last one's.
+    fn rebuild(&mut self) {
+        let Some(mut r) = self.reconstruction.take() else {
+            return;
+        };
+        let mut coordinates = [[0f32; MAX_CPL_BANDS]; MAX_CHANNELS];
+        for blk in 0..BLOCKS {
+            if let Some(c) = self.coupling {
+                let cpl = *r.coef.at(CPL, blk);
+                for (ch, coordinates) in coordinates
+                    .iter_mut()
+                    .enumerate()
+                    .take(self.fbw + 1)
+                    .skip(1)
+                {
+                    // A block without new coordinates keeps the last ones;
+                    // the first block always has new ones.
+                    if self.new_coordinates[blk][ch] != 0 {
+                        let coded = &self.coordinates[blk][ch];
+                        for (band, value) in coordinates.iter_mut().enumerate().take(c.bands) {
+                            *value = coupling_coordinate(
+                                coded.master,
+                                coded.exp[band],
+                                coded.mant[band],
+                            );
+                        }
+                    }
+                    let out = r.coef.at_mut(ch, blk);
+                    let mut bin = c.start;
+                    for (band, &size) in c.band_sizes[..c.bands].iter().enumerate() {
+                        for _ in 0..size {
+                            out[bin] = cpl[bin] * coordinates[band];
+                            bin += 1;
+                        }
+                    }
+                }
+            }
+            if self.mode == ChannelMode::Stereo {
+                let coefs = self.end_freq[1].min(self.end_freq[2]);
+                for band in 0..self.rematrix_bands {
+                    if !self.rematrix[blk][band] {
+                        continue;
+                    }
+                    for i in REMATRIX_BANDS[band]..coefs.min(REMATRIX_BANDS[band + 1]) {
+                        let (sum, difference) = (r.coef.at(1, blk)[i], r.coef.at(2, blk)[i]);
+                        r.coef.at_mut(1, blk)[i] = sum + difference;
+                        r.coef.at_mut(2, blk)[i] = sum - difference;
+                    }
+                }
+            }
+            for ch in 1..=self.channels {
+                let mut inverse = r.inverse;
+                self.mdct.inverse(r.coef.at(ch, blk), &mut inverse);
+                let overlap = &mut r.overlap[ch - 1];
+                let out = &mut r.output[self.map[ch - 1]][blk * BLOCK..(blk + 1) * BLOCK];
+                for i in 0..BLOCK {
+                    out[i] = overlap[i] + inverse[i] * self.window[i];
+                    overlap[i] = inverse[BLOCK + i] * self.window[BLOCK - 1 - i];
+                }
+            }
+        }
+        self.reconstruction = Some(r);
     }
 
     fn count_frame_bits_fixed(&self) -> usize {
@@ -1668,6 +1791,37 @@ struct Groups {
     four: Group,
 }
 
+/// A mantissa as a decoder reads it back, before its exponent: a symmetric
+/// quantiser's level to the middle of its step, an asymmetric one's two's
+/// complement to a fraction (A/52 §7.3.3).
+fn dequantise(bap: u8, level: i32) -> f32 {
+    let symmetric = |levels: i32| (2 * level - (levels - 1)) as f32 / levels as f32;
+    match bap {
+        0 => 0.0,
+        1 => symmetric(3),
+        2 => symmetric(5),
+        3 => symmetric(7),
+        4 => symmetric(11),
+        5 => symmetric(15),
+        14 => level as f32 / (1 << 13) as f32,
+        15 => level as f32 / (1 << 15) as f32,
+        b => level as f32 / (1 << (b - 2)) as f32,
+    }
+}
+
+/// A coupling coordinate as a decoder reads it back (A/52 §7.4.3): its
+/// mantissa a fraction, with an implied leading bit unless its exponent is
+/// the largest, scaled down by the exponent and three steps of the master's
+/// — and up by eight, the factor the encoder took out to keep it in range.
+fn coupling_coordinate(master: u8, exp: u8, mant: u8) -> f32 {
+    let mantissa = if exp == 15 {
+        f32::from(mant) / 16.0
+    } else {
+        (f32::from(mant) + 16.0) / 32.0
+    };
+    8.0 * mantissa * (-(f32::from(exp) + 3.0 * f32::from(master))).exp2()
+}
+
 fn sym_quant(c: i32, e: i32, levels: i32) -> i32 {
     let v = (((levels * c) >> (24 - e)) + levels) >> 1;
     debug_assert!((0..levels).contains(&v));
@@ -1878,6 +2032,56 @@ mod tests {
             bit_rate: Some(kbps),
             coupling,
             metadata: Metadata::default(),
+        }
+    }
+
+    /// Asking for the reconstruction leaves the stream as it was, byte for
+    /// byte, and what it reconstructs follows the input, [`DELAY`] late. That
+    /// it is what a decoder plays is held to the workspace's decoder in
+    /// `xtask` (`ac3::tests`).
+    #[test]
+    fn the_reconstruction_follows_the_input_and_leaves_the_stream_alone() {
+        for format in [Format::Ac3, Format::Eac3] {
+            let config = Config {
+                format,
+                ..config(48_000, ChannelMode::ThreeTwo, true, 640, false)
+            };
+            let mut encoder = Encoder::new(config).unwrap();
+            encoder.reconstruct();
+            let (mut stream, mut input, mut output) = (Vec::new(), Vec::new(), Vec::new());
+            for f in 0..8 {
+                let channels: Vec<Vec<f32>> = (0..encoder.channels())
+                    .map(|ch| sine(220.0 * (ch + 1) as f32, 0.3, f * FRAME_SAMPLES, 48_000.0))
+                    .collect();
+                let refs: Vec<&[f32]> = channels.iter().map(Vec::as_slice).collect();
+                encoder.encode(&refs, &mut stream).unwrap();
+                input.extend_from_slice(&channels[0]);
+                output.extend_from_slice(encoder.decoded(0).unwrap());
+            }
+            let mut again = Encoder::new(config).unwrap();
+            let mut same = Vec::new();
+            for f in 0..8 {
+                let channels: Vec<Vec<f32>> = (0..again.channels())
+                    .map(|ch| sine(220.0 * (ch + 1) as f32, 0.3, f * FRAME_SAMPLES, 48_000.0))
+                    .collect();
+                let refs: Vec<&[f32]> = channels.iter().map(Vec::as_slice).collect();
+                again.encode(&refs, &mut same).unwrap();
+            }
+            assert_eq!(
+                stream, same,
+                "{format:?}: reconstructing changed the stream"
+            );
+            let (mut signal, mut error) = (0f64, 0f64);
+            for n in FRAME_SAMPLES..input.len() - DELAY {
+                let (x, y) = (f64::from(input[n]), f64::from(output[n + DELAY]));
+                signal += x * x;
+                error += (y - x) * (y - x);
+            }
+            let snr = 10.0 * (signal / error).log10();
+            assert!(
+                snr > 40.0,
+                "{format:?}: the reconstruction follows at {snr:.1} dB"
+            );
         }
     }
 

@@ -61,6 +61,31 @@ runs, the exponent steps that reach one bin past the coupling channel — so
 that the first comparison is of a port, and so that each departure later is a
 measured one.
 
+## What a decoder plays
+
+Asked to (`Encoder::reconstruct`), the encoder keeps what a decoder makes of
+each frame, and hands it back after `encode` (`Encoder::decoded`), a frame per
+channel in WAV order, `DELAY` behind the input: the mantissas dequantised as
+A/52 §7.3.3 has them, each times two to the minus its exponent; the coupled
+channels' high band rebuilt from the coupling channel by the coordinates the
+stream carries (§7.4.3, the decoder's factor of eight included); the stereo
+pair's rematrixing undone; and the inverse transform of §7.9.4 — the same
+DCT-IV and FFT as the forward one, unfolded, windowed and overlapped. The
+stream is the same byte for byte whether it is asked for or not, and an
+encode that does not ask pays nothing.
+
+It is what a decoder plays less one thing: where a bin has no bits, a decoder
+may add dither noise, a receiver's own and correlated with nothing, which the
+workspace's decoder does not add either. Held to that decoder, frame by frame
+and channel by channel — E-AC-3 5.1 and AC-3 5.1 coupled, AC-3 stereo coupled
+and rematrixed — the two agree to 104–106 dB, the largest difference
+1.5·10⁻⁵ of full scale: float rounding against a decoder in fixed point. With
+the coordinates or the rematrixing left out, the agreement falls to 15 and 22
+dB, so the test reaches both.
+
+It is there for what has to be fitted to the core a decoder plays: joint
+object coding's gains, fitted to the 5.1 core the objects are carried on.
+
 ## Against FFmpeg
 
 A 30-second 5.1 film excerpt (the core of an E-AC-3 stream, decoded), and a
