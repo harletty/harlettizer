@@ -293,14 +293,16 @@ impl Encoder {
                 config.bits
             )));
         }
-        let segment_samples = FRAME_SAMPLES >> config.segments_log2;
-        // 256 is the longest segment 48 kHz allows; one sample is no segment.
-        if !(2..=256).contains(&segment_samples) {
+        // 256 samples is the longest segment 48 kHz allows, two the shortest
+        // that is one: from two segments of a frame to 256. Checked before
+        // any shift by the count.
+        if !(1..=8).contains(&config.segments_log2) {
             return Err(Unsupported(format!(
-                "{} segments of {segment_samples} samples: a 48 kHz segment is 2 to 256",
-                1 << config.segments_log2
+                "2^{} segments: a 48 kHz frame has 2 to 256, segments of 256 to 2 samples",
+                config.segments_log2
             )));
         }
+        let segment_samples = FRAME_SAMPLES >> config.segments_log2;
         use speaker::*;
         let (sets, mask_bits) = match config.layout {
             // WAV: L R C LFE Ls Rs.

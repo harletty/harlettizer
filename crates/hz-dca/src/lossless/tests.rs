@@ -376,6 +376,24 @@ fn the_core_gets_the_fold_a_first_set_decoder_presents() {
 }
 
 #[test]
+fn a_segment_count_outside_the_format_is_refused_not_shifted() {
+    for segments_log2 in [0, 9, 62, 63, 64, 255] {
+        let config = Config {
+            segments_log2,
+            ..Config::reference(Layout::FivePointOne, 16)
+        };
+        assert!(Encoder::new(config).is_err(), "{segments_log2}");
+    }
+    for segments_log2 in 1..=8 {
+        let config = Config {
+            segments_log2,
+            ..Config::reference(Layout::FivePointOne, 16)
+        };
+        assert!(Encoder::new(config).is_ok(), "{segments_log2}");
+    }
+}
+
+#[test]
 fn bits_below_the_resolution_are_refused() {
     let mut pcm = vec![0i32; FRAME_SAMPLES * 6];
     pcm[6 * 10 + 4] = 0x100 | 0x80;
