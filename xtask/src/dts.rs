@@ -23,9 +23,10 @@
 use hz_core::{Error, Result};
 use hz_dca::bits::Bits;
 use hz_dca::core::CoreHeader;
-use hz_dca::exss::{Coding, ExssHeader};
+use hz_dca::exss::{ChannelMapping, Coding, ExssHeader};
 use hz_dca::navigation::{self, Navigation};
 use hz_dca::split;
+use hz_dca::xll;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -150,6 +151,81 @@ pub fn compare(reference: &Reference, decoded: &[Vec<f32>]) -> Option<Comparison
     Some(Comparison { lag, snr_db })
 }
 
+/// How a lossless decode compares with its input, sample for sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exact {
+    pub channels: usize,
+    /// Samples compared per channel: the input's.
+    pub samples: usize,
+    /// Channels the decode does not have, or has too few samples of.
+    pub short: Vec<usize>,
+    /// Per channel, samples that differ, and the first.
+    pub differing: Vec<(usize, usize, usize)>,
+}
+
+impl Exact {
+    pub fn is_exact(&self) -> bool {
+        self.short.is_empty() && self.differing.is_empty()
+    }
+}
+
+impl std::fmt::Display for Exact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_exact() {
+            return write!(
+                f,
+                "{} channels × {} samples bit-exact",
+                self.channels, self.samples
+            );
+        }
+        if !self.short.is_empty() {
+            write!(f, "channels {:?} missing or short; ", self.short)?;
+        }
+        for (ch, count, first) in &self.differing {
+            write!(
+                f,
+                "channel {ch}: {count} samples differ, first at {first}; "
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Compare a decode as 24-bit integers, per channel in WAV order, with the
+/// 32-bit input it was made from: every input sample, at no lag.
+pub fn compare_exact(reference: &Reference, decoded: &[Vec<i32>]) -> Exact {
+    let channels = reference.channels;
+    let samples = reference.pcm.len() / channels;
+    let mut exact = Exact {
+        channels,
+        samples,
+        short: Vec::new(),
+        differing: Vec::new(),
+    };
+    for ch in 0..channels {
+        let Some(plane) = decoded.get(ch).filter(|p| p.len() >= samples) else {
+            exact.short.push(ch);
+            continue;
+        };
+        let mut count = 0;
+        let mut first = None;
+        for (n, (&d, r)) in plane
+            .iter()
+            .zip(reference.pcm.iter().skip(ch).step_by(channels))
+            .enumerate()
+        {
+            if d != r >> 8 {
+                count += 1;
+                first.get_or_insert(n);
+            }
+        }
+        if let Some(first) = first {
+            exact.differing.push((ch, count, first));
+        }
+    }
+    exact
+}
+
 /// The integer inverse of the height fold.
 ///
 /// The fold puts `(h × q + 2^14) >> 15` of a height into its lower corner,
@@ -193,6 +269,96 @@ struct Tally {
     navigation_max_size: usize,
     tail_bits: BTreeMap<usize, usize>,
     first_difference: Option<String>,
+    lossless: LosslessTally,
+}
+
+/// The lossless frames' headers, read and written back.
+#[derive(Default)]
+struct LosslessTally {
+    /// The lossless frame being reassembled from the substreams that carry
+    /// it, when it spans them (peak bit rate smoothing).
+    pending: Vec<u8>,
+    frames: usize,
+    identical: usize,
+    checksums_valid: usize,
+    /// Assets whose data neither starts a frame nor says where one starts,
+    /// while no frame is pending.
+    unsynchronised: usize,
+    /// Frames whose headers this reader refuses, and why the first was.
+    refused: usize,
+    first_refusal: Option<String>,
+    /// Frames that span substreams.
+    spanning: usize,
+    /// Channel sets per frame → frames.
+    shapes: BTreeMap<String, usize>,
+}
+
+impl LosslessTally {
+    /// Take one asset's lossless data and check every frame it completes.
+    fn asset(&mut self, data: &[u8], sync_offset: Option<u32>, one_to_one: bool, at: usize) {
+        let starts =
+            |d: &[u8]| d.len() >= 4 && u32::from_be_bytes([d[0], d[1], d[2], d[3]]) == xll::SYNC;
+        if self.pending.is_empty() {
+            let start = if starts(data) {
+                0
+            } else {
+                match sync_offset.map(|o| o as usize) {
+                    Some(o) if o < data.len() && starts(&data[o..]) => o,
+                    _ => {
+                        self.unsynchronised += 1;
+                        return;
+                    }
+                }
+            };
+            self.pending.extend_from_slice(&data[start..]);
+        } else {
+            self.pending.extend_from_slice(data);
+            self.spanning += 1;
+        }
+        while !self.pending.is_empty() {
+            if !starts(&self.pending) {
+                break;
+            }
+            let size = match xll::CommonHeader::read(&self.pending) {
+                Ok(common) => common.frame_size as usize,
+                // A header cut short by the substream's end: wait for the
+                // rest. Common headers are at most 256 bytes.
+                Err(_) if self.pending.len() < 256 => return,
+                Err(_) => break,
+            };
+            if size > self.pending.len() {
+                return;
+            }
+            let frame = &self.pending[..size];
+            self.frames += 1;
+            match xll::Headers::read(frame, one_to_one) {
+                Ok(headers) => {
+                    if headers.checksums(frame).all() {
+                        self.checksums_valid += 1;
+                    }
+                    if matches!(headers.write(one_to_one), Ok(w) if w[..] == frame[..headers.len()])
+                    {
+                        self.identical += 1;
+                    }
+                    let shape: Vec<String> = headers
+                        .channel_sets
+                        .iter()
+                        .map(|c| format!("{}", c.channels))
+                        .collect();
+                    *self.shapes.entry(shape.join("+")).or_default() += 1;
+                }
+                Err(e) => {
+                    self.refused += 1;
+                    self.first_refusal
+                        .get_or_insert_with(|| format!("frame at byte {at}: {}", e.0));
+                }
+            }
+            self.pending.drain(..size);
+        }
+        // What is left does not start a frame: drop it, and resynchronise on
+        // the next asset.
+        self.pending.clear();
+    }
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -252,6 +418,7 @@ pub fn run(options: Options) -> Result<()> {
                 _ => {}
             }
             navigation = navigate(&header, &mut tally);
+            lossless_asset(&header, exss, frame.at, &mut tally.lossless);
             first_exss.get_or_insert(header);
         }
         // Every frame goes through the decoder, a core without an extension
@@ -321,9 +488,44 @@ pub fn run(options: Options) -> Result<()> {
             );
         }
     }
+    let lossless = &tally.lossless;
+    if lossless.frames > 0 || lossless.unsynchronised > 0 {
+        let shapes: Vec<String> = lossless
+            .shapes
+            .iter()
+            .map(|(shape, n)| format!("{shape} × {n}"))
+            .collect();
+        println!(
+            "  lossless headers       {}/{} rewritten byte for byte, {}/{} checksums valid; \
+             channel sets {}",
+            lossless.identical,
+            lossless.frames,
+            lossless.checksums_valid,
+            lossless.frames,
+            shapes.join(", ")
+        );
+        if lossless.spanning > 0 || lossless.unsynchronised > 0 {
+            println!(
+                "                         {} substreams continue a frame, {} start without one",
+                lossless.spanning, lossless.unsynchronised
+            );
+        }
+        if let Some(why) = &lossless.first_refusal {
+            println!(
+                "  lossless refused       {} frames; first, {why}",
+                lossless.refused
+            );
+        }
+    }
     let mut failures = Vec::new();
     if tally.cores_identical != tally.cores || tally.substreams_identical != tally.substreams {
         failures.push("headers that do not rewrite byte for byte".to_string());
+    }
+    if lossless.identical != lossless.frames || lossless.refused > 0 {
+        failures.push("lossless headers that do not rewrite byte for byte".to_string());
+    }
+    if lossless.checksums_valid != lossless.frames {
+        failures.push("lossless header checksums that do not hold".to_string());
     }
     if tally.checksums_valid != tally.substreams {
         failures.push("substream checksums that do not hold".to_string());
@@ -332,7 +534,15 @@ pub fn run(options: Options) -> Result<()> {
     {
         oracle.report();
         failures.extend(oracle.failures());
-        if let Some(reference) = &options.reference {
+        if let (Some(reference), Some(decoded)) = (&options.reference, oracle.lossless()) {
+            let exact = compare_exact(reference, decoded);
+            println!("  lossless round trip    {exact}");
+            if !exact.is_exact() {
+                failures.push(format!(
+                    "a lossless decode through dca that is not its input: {exact}"
+                ));
+            }
+        } else if let Some(reference) = &options.reference {
             match oracle.pcm() {
                 Some(pcm) if pcm.len() != reference.channels => failures.push(format!(
                     "a decode of {} channels against a reference of {}",
@@ -382,6 +592,52 @@ fn report_comparison(comparison: &Comparison) {
         comparison.lag,
         snr.join(", ")
     );
+}
+
+/// Hand the first lossless asset's data to the lossless tally.
+fn lossless_asset(header: &ExssHeader, exss: &[u8], at: usize, tally: &mut LosslessTally) {
+    let mut offset = header.header_size as usize;
+    for (asset, &size) in header.assets.iter().zip(&header.asset_sizes) {
+        if let Coding::Components {
+            core,
+            xbr,
+            xxch,
+            x96,
+            lbr,
+            xll: Some(x),
+            ..
+        } = &asset.coding
+        {
+            // The components before it in the asset, in their order.
+            let before = core.map_or(0, |(s, _)| s)
+                + xbr.unwrap_or(0)
+                + xxch.unwrap_or(0)
+                + x96.unwrap_or(0)
+                + lbr.as_ref().map_or(0, |l| l.size);
+            offset += before as usize;
+            let Some(data) = exss.get(offset..offset + x.size as usize) else {
+                return;
+            };
+            let one_to_one = !matches!(
+                asset.statics.as_ref().map(|s| &s.mapping),
+                Some(ChannelMapping::Representation(_))
+            );
+            tally.asset(data, x.sync.as_ref().map(|s| s.sync_offset), one_to_one, at);
+            return;
+        }
+        if let Coding::Lossless(x) = &asset.coding {
+            let Some(data) = exss.get(offset..offset + x.size as usize) else {
+                return;
+            };
+            let one_to_one = !matches!(
+                asset.statics.as_ref().map(|s| &s.mapping),
+                Some(ChannelMapping::Representation(_))
+            );
+            tally.asset(data, x.sync.as_ref().map(|s| s.sync_offset), one_to_one, at);
+            return;
+        }
+        offset += size as usize;
+    }
 }
 
 /// The navigation word in the lossless asset's descriptor tail, if there is
@@ -480,6 +736,9 @@ mod oracle {
         metadata_refused: usize,
         /// Decoded core-only frames, per channel in WAV order, when asked.
         pcm: Option<Vec<Vec<f32>>>,
+        /// Decoded lossless frames as the decoder's 24-bit integers, per
+        /// channel in WAV order, when asked.
+        lossless: Option<Vec<Vec<i32>>>,
     }
 
     impl Default for Oracle {
@@ -504,6 +763,7 @@ mod oracle {
                 presentations: Default::default(),
                 metadata_refused: 0,
                 pcm: None,
+                lossless: None,
             }
         }
     }
@@ -530,10 +790,16 @@ mod oracle {
         /// Keep the PCM of core-only frames, for [`super::compare`].
         pub fn keep_pcm(&mut self) {
             self.pcm = Some(Vec::new());
+            self.lossless = Some(Vec::new());
         }
 
         pub fn pcm(&self) -> Option<&[Vec<f32>]> {
             self.pcm.as_deref()
+        }
+
+        /// The lossless frames' samples, when any decoded.
+        pub fn lossless(&self) -> Option<&[Vec<i32>]> {
+            self.lossless.as_deref().filter(|l| !l.is_empty())
         }
 
         pub fn core(&mut self, ours: &CoreHeader, core: &[u8]) {
@@ -596,6 +862,26 @@ mod oracle {
                 }
             };
             self.decoded += 1;
+            if let Some(lossless) = &mut self.lossless {
+                // dca's speaker slots, the side surrounds moved into Ls/Rs:
+                // WAV's 7.1 is L R C LFE, the rears, the sides; its 5.1
+                // L R C LFE Ls Rs.
+                let speakers: Vec<(usize, &[i32])> = self.decoder.lossless_samples().collect();
+                let rears = speakers.iter().any(|&(s, _)| s == 7 || s == 8);
+                let order: &[usize] = if rears {
+                    &[1, 2, 0, 5, 7, 8, 3, 4]
+                } else {
+                    &[1, 2, 0, 5, 3, 4]
+                };
+                let planes: Vec<&[i32]> = order
+                    .iter()
+                    .filter_map(|&want| speakers.iter().find(|&&(s, _)| s == want).map(|&(_, v)| v))
+                    .collect();
+                lossless.resize(planes.len().max(lossless.len()), Vec::new());
+                for (plane, samples) in lossless.iter_mut().zip(planes) {
+                    plane.extend_from_slice(samples);
+                }
+            }
             // The block the decoder located — by the word where its reader
             // takes it, by the end of the lossless band data where not. The
             // alternate profiles carry no word at all.

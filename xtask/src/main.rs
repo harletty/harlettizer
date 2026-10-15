@@ -478,13 +478,21 @@ enum Command {
 
     /// Encode raw interleaved 32-bit PCM to a DTS core with `hz-dca`, write
     /// it, and read it back as `dts --reference` does: phase C1's round
-    /// trip. Decoding needs `--features dca-oracle`.
+    /// trip. With `--lossless`, DTS-HD Master Audio, compared bit for bit
+    /// through the oracle and through FFmpeg: phase C2's. Decoding through
+    /// the oracle needs `--features dca-oracle`.
     DtsEncode {
         input: PathBuf,
 
-        /// Channels in the input, the LFE included: 1, 2, 4, 5 or 6.
+        /// Channels in the input, the LFE included: 1, 2, 4, 5 or 6, and 8
+        /// with `--lossless`.
         #[arg(long)]
         channels: usize,
+
+        /// Write DTS-HD Master Audio: the core and a lossless layer of this
+        /// many bits a sample, 16 or 24, from 5.1 or 7.1 at 48 kHz.
+        #[arg(long, value_name = "BITS")]
+        lossless: Option<u8>,
 
         /// Hertz.
         #[arg(long, default_value_t = 48000)]
@@ -874,6 +882,7 @@ fn main() -> ExitCode {
         Command::DtsEncode {
             input,
             channels,
+            lossless,
             rate,
             bit_rate,
             adpcm,
@@ -882,6 +891,7 @@ fn main() -> ExitCode {
         } => dts_encode::run(dts_encode::Options {
             input,
             channels,
+            lossless,
             sample_rate: rate,
             bit_rate,
             adpcm,

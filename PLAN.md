@@ -847,15 +847,15 @@ played on hardware.**
   `Config::pcm_resolution_code`; `aspf` 1 means a DSYNC after each
   subsubframe, sixteen bits FFmpeg's layout does not spend, and is left as
   FFmpeg has it.
-- 🔴 **Not in this phase: the 5.1 fold of the 7.1 bed.** The core carries the
-  rears folded into the side surrounds at the coefficient the XLL layer
-  declares; `hz-dca` reads no XLL channel set yet, and the `dca` crate does not
-  expose the coefficients it parses. The fold lands with C2, which writes them;
-  the encoder takes 5.1 meanwhile. Nor is there a `harlettizer` command: one
-  would be `hz-cli`'s `ac3` path with this encoder behind it, and it is worth
-  more once C2 can put the lossless layer beside the core.
+- ✅ **Not in this phase, done in C2a: the 5.1 fold of the 7.1 bed.** The
+  core carries the rears folded into the side surrounds at the coefficient the
+  XLL layer declares; `hz-dca` read no XLL channel set then, and the `dca`
+  crate does not expose the coefficients it parses. The fold landed with C2a,
+  which writes them (below). Nor is there a `harlettizer` command: one would
+  be `hz-cli`'s `ac3` path with this encoder behind it, and it is worth more
+  now that C2 puts the lossless layer beside the core (C5).
 
-#### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1
+#### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1 — **C2a done; C2b left**
 
 - The channel-set hierarchy the reference streams use: a six-channel set and
   a two-channel set whose downmix is embedded in the first (7.1 → 5.1);
@@ -871,6 +871,94 @@ played on hardware.**
   master is useful on its own.
 - **Size**: 3–5 weeks. **Risk**: medium — no encoder to read from, only the
   specification and the decoder.
+
+What C2a did:
+
+- ✅ **`hz_dca::xll`**: the lossless frame's headers — the common header, the
+  channel set sub-headers with their downmix matrices and per-band predictor
+  fields, the navigation table — as a model that keeps every field, with a
+  reader and a writer; checksums computed, the reserved bits before each kept
+  as raw bits, the fields FFmpeg refuses (replacement sets, speaker
+  positions, extension bands) read as Table 8-4 lays them out. `cargo xtask
+  dts` now reads and rewrites every lossless frame too, putting back together
+  the frames peak-rate smoothing spreads over two substreams. On the 43
+  local streams, **all 409,072 lossless frame headers** of the 39 that carry
+  them come back byte for byte, every checksum valid — channel sets of 6+2 on
+  the 7.1 streams, 6 on the 5.1 ones, 2 on a 96 kHz stereo one; 49 frames of
+  the 16-bit 5.1 disc span two substreams. The core and substream headers of
+  all 43 still rewrite byte for byte (422,168 and 421,417), and the oracle
+  decodes every frame.
+- ✅ **The reference streams' shape**, measured with that reader and copied.
+  A 7.1 is a six-channel set — C, L, R, LFE and the side surrounds Lss/Rss,
+  mask `0x627` — and a two-channel set of the rears Lsr/Rsr (`0x180`) whose
+  downmix is embedded in the first. Every row of its matrix scales the 5.1
+  by −3 dB and each rear folds into its side at −3 dB, so a decoder of both
+  sets subtracts `(rear · 32767 + 2^14) >> 15` from the side. Two segments of
+  256 samples, the MSB/LSB split flag on with nothing split (the 16-bit 5.1
+  disc leaves it off and uses eight segments of 64), no band checksums,
+  frames padded to a 32-bit word. A 5.1 is one set, C L R Ls Rs LFE (`0x3f`).
+- ✅ **`hz_dca::lossless`**: PCM to lossless frames, every channel coded as
+  itself. No encoder exists to port, so it is the decoder run backwards —
+  §8.5, and FFmpeg's `dca_xll.c` rounding for rounding: the embedded
+  downmix; pairwise decorrelation, the pairing and coefficients that save
+  most under each channel's cheapest fixed predictor; prediction per channel,
+  fixed of order 0 to 3 or adaptive of order 1 to 15 from a windowed
+  Levinson–Durbin fit, its reflection coefficients quantised to the format's
+  table and turned into the direct form exactly as the decoder turns them
+  (an order whose arithmetic would leave 32 bits is refused, since C and
+  Rust decoders would wrap it differently); and per segment Rice or binary
+  codes, per channel or shared, or the previous segment's again. Every choice
+  is priced exactly and the cheapest taken. Input with bits below the stated
+  resolution is refused, naming the sample.
+- ✅ **The fold**: the core is made from the 5.1 a decoder of the first set
+  alone presents — every channel at −3 dB, each side with its rear — so a 7.1
+  input now has a 5.1 core and a core-only player hears the same mix as a
+  5.1 lossless one. A side and its rear both at full scale pass 24 bits
+  inside the first set, which the format allows (the decoders' arithmetic
+  wraps there and undoes it exactly); the core's copy is clipped.
+- ✅ **`hz_dca::master`**: DTS-HD Master Audio frame by frame — the C1 core
+  (5.1 at 1509 kb/s, the word-length code the discs use) and an extension
+  substream whose one asset is the lossless layer, with the reference
+  streams' substream header (one presentation, the core backward-compatible,
+  component mask `0x201`, speaker activity `0x84b` or `0x00f`, the embedded
+  six-channel flag on a 7.1) and no smoothing buffer stated: every lossless
+  frame sits whole in its own substream.
+- ✅ **Bit-exact through both decoders, every frame and every channel.**
+  `cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 8
+  --lossless 24 --out out.dts` encodes, rewrites every header, decodes
+  through `dca` and compares its integers with the input, then decodes
+  through FFmpeg (n9.0.2, `-err_detect crccheck`) and compares again; FFmpeg
+  has to report DTS-HD MA and print nothing. Ten seconds of real 7.1 decoded
+  from a reference stream, at 24 bits and requantised to 16, and its 5.1:
+  all 480,000 samples of every channel identical through both, 938 frames
+  each. Synthetic full-scale white noise, full-scale squares that overflow
+  the fold, alternating extremes, silence and a mix, 5.1 and 7.1 at 16 and
+  24 bits: identical. `master_audio_comes_back_bit_for_bit` holds the four
+  configurations, through `dca` with the feature and FFmpeg where installed;
+  the crate's own tests decode with a mirror of FFmpeg's reader, so CI checks
+  the round trip without either. One LSB added in the fold fails both.
+- **What it costs.** On that material the lossless layer alone is 49.5 % of
+  the 24-bit 7.1 PCM, against 46.7 % for `flac -8` on the same samples;
+  5.1/24 47.4 % (FLAC 45.4), 7.1/16 28.8 % (26.2), 5.1/16 27.1 % (26.0). The
+  gap is mostly the format's: frames of 512 samples whose predictors restart
+  every frame, the first samples of each coded raw. Full-scale noise costs
+  102–103 % of its PCM, 10.9 Mb/s for 7.1/24 with the core — under the 24.5 Mb/s
+  ceiling at 48 kHz whatever the material; what C4 has to manage is the
+  buffer, not the peak frame. The lossless layer encodes at 18× real time for
+  7.1/24 (0.54 s for ten seconds), 12× with the core; the sample paths do not
+  allocate per frame (the small header model is rebuilt each frame).
+- **What the streams and FFmpeg say that the specification does not.** The
+  navigation table's pseudo-code (§8.4.2) reads a segment size before each
+  segment's channel set sizes; neither FFmpeg nor any stream has one.
+  Neither `dca` nor FFmpeg checks the lossless headers' checksums by default
+  (FFmpeg does with `-err_detect crccheck`), so this crate's reader does and
+  the test asks FFmpeg to. `dca` ends a Rice code's unary part at 2^20; the
+  encoder keeps every quotient under 2^16.
+- 🔴 **Not written in C2a**, none of it needed for lossless: hybrid Rice codes
+  (isolated outliers in binary), the MSB/LSB split, the stereo downmix a
+  primary set can carry (the reference streams carry none), and peak-rate
+  smoothing (C4). The first two would save bits on some material; C2b, the
+  residual against the core, is where the bitrate is.
 
 #### Phase C3 — The DTS:X extension, fixed 7.1.4
 
