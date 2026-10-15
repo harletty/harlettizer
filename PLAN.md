@@ -804,6 +804,19 @@ played on hardware.**
   beside a chirp in the right surround, comes back at **11.2 dB SNR instead of
   2.6**, and the streams differ in nothing but the 72-bit LFE block.
   `Config::lfe_history_quirk` puts the defect back, for the comparison.
+- ✅ **A second defect, found in review, is fixed outright.** FFmpeg's
+  encoder takes the lossless step sizes when the rate *code* is 3; code 3 is
+  96 kb/s, and FFmpeg's decoder compares the rate the code names (lossless is
+  code 31). With ADPCM the encoder's predictor history then follows steps no
+  decoder uses: a 440 Hz tone, mono at 16 kHz and 96 kb/s, comes back from
+  FFmpeg's own stream at −3.0 dB SNR and from this one at 80.1 dB. Without
+  ADPCM the step size is never used and the streams stay identical. A test
+  decodes that case through FFmpeg where it is installed.
+- 🔴 **`dca` has the same confusion, in its decoder.** It reads rate code 3 as
+  lossless and dequantises every subband with the wrong steps, so any 96 kb/s
+  core decodes wrong through the oracle — 0.4 dB SNR on a stream FFmpeg's
+  decoder takes at 80.2 dB, ADPCM or not. At that rate the oracle is not one;
+  the fix belongs in harletty-bridge.
 - ✅ **It decodes cleanly in both decoders.** `dca` (the oracle) decodes every
   frame of all 17 streams, and FFmpeg reports no error on any.
   `cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 6

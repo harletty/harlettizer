@@ -16,8 +16,10 @@
 //! frame's bits fit, and a bitstream of one subframe of two subsubframes.
 //! What it can do is what that encoder can — up to 5.1, the sample rates from
 //! 8 to 48 kHz, every transmission rate, ADPCM by choice — and the stream is
-//! that encoder's, byte for byte, with one exception that is a defect of the
-//! original and is optional here ([`Config::lfe_history_quirk`]).
+//! that encoder's, byte for byte, except where the original has a defect: the
+//! LFE history, which is optional here ([`Config::lfe_history_quirk`]), and
+//! the step sizes at 96 kb/s with ADPCM, which are the decoders' here and
+//! not FFmpeg's (see `State::step_size`).
 //!
 //! The arithmetic is FFmpeg's throughout, rounding for rounding, including the
 //! fixed-point MDCT the masking model sees the signal through ([`crate::mdct`]):
@@ -36,7 +38,7 @@
 //! 160 kB more for the ADPCM predictor search when it is on.
 
 use crate::adpcm::{self, Adpcm, mul32, norm, quantize_value};
-use crate::core::{BIT_RATES, CoreHeader};
+use crate::core::{BIT_RATES, BITS_PER_SAMPLE, CoreHeader};
 use crate::mdct::{self, Mdct};
 use crate::tables::{
     ADPCM_COEFFS, BIT_CONSUMPTION, BITALLOC_12_COUNT, BITALLOC_OFFSETS, BITALLOC_SIZES,
@@ -337,9 +339,12 @@ impl Encoder {
                 config.bit_rate
             )));
         }
-        if config.pcm_resolution_code > 7 {
+        if BITS_PER_SAMPLE
+            .get(usize::from(config.pcm_resolution_code))
+            .is_none_or(|&bits| bits == 0)
+        {
             return Err(Unsupported(format!(
-                "word-length code {}",
+                "word-length code {} is not a defined one",
                 config.pcm_resolution_code
             )));
         }
@@ -792,9 +797,16 @@ impl State {
         }
     }
 
+    /// The quantiser step a decoder dequantises with: the lossless table
+    /// only when the rate *named by the code* is the lossless sentinel.
+    /// FFmpeg's encoder compares the code itself with 3 — which is 96 kb/s —
+    /// while its decoder, and every other, compares the rate; at 96 kb/s with
+    /// ADPCM its predictor history then follows the wrong steps and the
+    /// stream decodes to noise. Here the encoder agrees with the decoders,
+    /// which leaves it on the lossy table at every rate it can write.
     fn step_size(&self, ch: usize, band: usize) -> i32 {
         let abits = self.abits[ch][band] as usize;
-        if self.bit_rate_code == 3 {
+        if BIT_RATES[usize::from(self.bit_rate_code)] == 3 {
             LOSSLESS_QUANT[abits] as i32
         } else {
             LOSSY_QUANT[abits] as i32
@@ -1486,5 +1498,45 @@ mod tests {
             ..Config::disc_five_one()
         };
         assert!(Encoder::new(config).is_err());
+    }
+
+    #[test]
+    fn only_a_defined_word_length_is_written() {
+        for code in 0..=8u8 {
+            let config = Config {
+                pcm_resolution_code: code,
+                ..Config::disc_five_one()
+            };
+            match Encoder::new(config) {
+                Ok(mut encoder) => {
+                    assert!(matches!(code, 0..=3 | 5 | 6), "code {code} accepted");
+                    let mut out = Vec::new();
+                    encoder.encode(&[0; FRAME_SAMPLES * 6], &mut out);
+                    let header = CoreHeader::read(&out).unwrap();
+                    assert_eq!(header.pcm_resolution_code, code);
+                }
+                Err(_) => assert!(matches!(code, 4 | 7 | 8), "code {code} refused"),
+            }
+        }
+    }
+
+    /// Rate code 3 is 96 kb/s, not lossless: the steps are the lossy ones,
+    /// which is what a decoder uses there.
+    #[test]
+    fn rate_code_3_dequantises_with_the_lossy_steps() {
+        let encoder = Encoder::new(Config {
+            layout: Layout::Mono,
+            sample_rate: 16000,
+            bit_rate: 96_000,
+            adpcm: true,
+            ..Config::disc_five_one()
+        })
+        .unwrap();
+        assert_eq!(encoder.header().bit_rate_code, 3);
+        let mut state = encoder.state;
+        for abits in 1..27 {
+            state.abits[0][0] = abits;
+            assert_eq!(state.step_size(0, 0), LOSSY_QUANT[abits as usize] as i32);
+        }
     }
 }
