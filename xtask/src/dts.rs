@@ -309,12 +309,16 @@ fn compare_heights(
 }
 
 /// Write the twelve channels before the fold, from the composite 7.1 the
-/// oracle decoded and its heights, as 32-bit PCM in WAV 7.1.4 order.
+/// oracle decoded and its heights, as 32-bit PCM in WAV 7.1.4 order. Each
+/// frame is unfolded with the gains its own matrix states, whatever they
+/// are; a frame whose matrix `hz_dca::dtsx` does not read is refused, named,
+/// rather than unfolded with gains it may not have used.
 #[cfg(feature = "dca-oracle")]
 fn write_unfolded(
     path: &std::path::Path,
     bed: Option<&[Vec<i32>]>,
     heights: Option<&[Vec<i32>]>,
+    folds: &[(usize, Option<Vec<[i32; 8]>>)],
 ) -> Result<()> {
     let (Some(bed), Some(heights)) = (bed, heights) else {
         return Err(Error::refused(
@@ -323,29 +327,56 @@ fn write_unfolded(
         ));
     };
     let samples = bed[0].len();
-    if bed.len() != 8 || heights.len() != 4 || heights.iter().any(|h| h.len() != samples) {
+    if bed.len() != 8
+        || heights.len() != 4
+        || heights.iter().any(|h| h.len() != samples)
+        || folds.iter().map(|(n, _)| n).sum::<usize>() != samples
+    {
         return Err(Error::refused(
             path,
             "not every frame of the stream is the standard height profile",
         ));
     }
+    // The bed's column of each WAV channel: L R C LFE Lsr Rsr Lss Rss in
+    // C L R LFE Lsr Rsr Lss Rss.
+    const COLUMN: [usize; 8] = [1, 2, 0, 3, 4, 5, 6, 7];
     let mut bytes = Vec::with_capacity(samples * 12 * 4);
-    for n in 0..samples {
-        for (ch, plane) in bed.iter().enumerate() {
-            let x = match [0, 1, 4, 5].iter().position(|&c| c == ch) {
-                Some(h) => unfold::unfold(plane[n], heights[h][n], unfold::MINUS_3_DB),
-                None => plane[n],
-            };
-            bytes.extend_from_slice(&(x << 8).to_le_bytes());
+    let (mut at, mut other) = (0usize, 0usize);
+    for (frame, (length, gains)) in folds.iter().enumerate() {
+        let Some(gains) = gains else {
+            return Err(Error::refused(
+                path,
+                format!(
+                    "frame {frame}: a fold matrix this reader does not take, so its unfold is \
+                     not known"
+                ),
+            ));
+        };
+        other += usize::from(*gains != hz_dca::dtsx::FoldMatrix::standard().gains().unwrap());
+        for n in at..at + length {
+            for (ch, plane) in bed.iter().enumerate() {
+                let mut x = plane[n];
+                for (height, row) in heights.iter().zip(gains) {
+                    let q = row[COLUMN[ch]];
+                    if q != 0 {
+                        x -= hz_dca::dtsx::fold(height[n], q);
+                    }
+                }
+                bytes.extend_from_slice(&(x << 8).to_le_bytes());
+            }
+            for plane in heights {
+                bytes.extend_from_slice(&(plane[n] << 8).to_le_bytes());
+            }
         }
-        for plane in heights {
-            bytes.extend_from_slice(&(plane[n] << 8).to_le_bytes());
-        }
+        at += length;
     }
     std::fs::write(path, bytes).map_err(|e| Error::io(path, e))?;
     println!(
-        "  unfolded               {samples} samples of 7.1.4 written to {}",
-        path.display()
+        "  unfolded               {samples} samples of 7.1.4 written to {}, {} of {} frames \
+         with a fold other than the standard one",
+        path.display(),
+        other,
+        folds.len()
     );
     Ok(())
 }
@@ -597,6 +628,17 @@ pub fn run(options: Options) -> Result<()> {
     if options.reference.is_some() || options.unfold.is_some() {
         oracle.keep_pcm();
     }
+    if let Some(unfold) = &options.unfold
+        && hz_io::paths::aliases(&options.input, unfold)?
+    {
+        return Err(Error::refused(
+            unfold,
+            format!(
+                "is {}, the stream it is unfolded from: writing it would destroy the stream",
+                options.input.display()
+            ),
+        ));
+    }
     #[cfg(not(feature = "dca-oracle"))]
     if options.unfold.is_some() {
         return Err(Error::refused(
@@ -798,7 +840,7 @@ pub fn run(options: Options) -> Result<()> {
         oracle.report();
         failures.extend(oracle.failures());
         if let Some(path) = &options.unfold {
-            write_unfolded(path, oracle.lossless(), oracle.heights())?;
+            write_unfolded(path, oracle.lossless(), oracle.heights(), oracle.folds())?;
         }
         if let (Some(reference), Some(decoded)) = (&options.reference, oracle.lossless()) {
             if reference.channels == 12 {
@@ -1052,6 +1094,11 @@ mod oracle {
         /// The standard profile's heights, TFL TFR TBL TBR, as 24-bit
         /// integers, when asked.
         heights: Option<Vec<Vec<i32>>>,
+        /// For each frame whose heights are kept, its samples and the Q15
+        /// gain each height was folded into each bed column at
+        /// (`[height][column]`), as its own matrix states it — `None` for
+        /// a matrix `hz_dca::dtsx` does not read.
+        folds: Vec<(usize, Option<Vec<[i32; 8]>>)>,
     }
 
     impl Default for Oracle {
@@ -1078,6 +1125,7 @@ mod oracle {
                 pcm: None,
                 lossless: None,
                 heights: None,
+                folds: Vec::new(),
             }
         }
     }
@@ -1112,6 +1160,12 @@ mod oracle {
         /// profile, when any did.
         pub fn heights(&self) -> Option<&[Vec<i32>]> {
             self.heights.as_deref().filter(|h| !h.is_empty())
+        }
+
+        /// The fold of each frame whose heights are kept: its samples, and
+        /// its matrix's gains when `hz_dca::dtsx` reads it.
+        pub fn folds(&self) -> &[(usize, Option<Vec<[i32; 8]>>)] {
+            &self.folds
         }
 
         pub fn pcm(&self) -> Option<&[Vec<f32>]> {
@@ -1247,6 +1301,15 @@ mod oracle {
                 for (plane, samples) in kept.iter_mut().zip(&heights) {
                     plane.extend_from_slice(samples);
                 }
+                // The fold this frame states, read by our own reader from
+                // the block dca located: what an unfold of it has to undo.
+                let gains = hz_dca::dtsx::FoldMatrix::read(&frame.x_payload)
+                    .ok()
+                    .filter(|m| m.crc_is_valid(&frame.x_payload))
+                    .and_then(|m| m.gains().ok())
+                    .filter(|g| g.len() == heights.len());
+                self.folds
+                    .push((heights.first().map_or(0, Vec::len), gains));
             }
             let (mut unfolded, mut differs, mut worst) = (0usize, 0usize, 0i32);
             for (speaker, composite) in self.decoder.lossless_samples() {
@@ -1604,5 +1667,117 @@ mod tests {
             .expect_err("a refused frame must fail the command")
             .to_string();
         assert!(message.contains("dca refuses 1 frames"), "{message}");
+    }
+
+    /// A synthetic 7.1.4 stream, four frames, and its input: tones in the
+    /// corners and the heights, at half scale.
+    fn height_stream() -> (Vec<u8>, Vec<i32>) {
+        use hz_dca::encoder::FRAME_SAMPLES;
+        use hz_dca::lossless::Layout;
+        use hz_dca::master::{Config, Encoder};
+        let frames = 4;
+        let pcm: Vec<i32> = (0..frames * FRAME_SAMPLES * 12)
+            .map(|i| {
+                let (n, ch) = (i / 12, i % 12);
+                let f = 110.0 * (ch + 1) as f64;
+                let x = (std::f64::consts::TAU * f * n as f64 / 48000.0).sin();
+                ((x * 0.45 * f64::from(1 << 23)) as i32) << 8
+            })
+            .collect();
+        let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOneFour, 24)).unwrap();
+        let mut stream = Vec::new();
+        for frame in pcm.chunks(FRAME_SAMPLES * 12) {
+            encoder.encode(frame, &mut stream).unwrap();
+        }
+        encoder.finish(&mut stream).unwrap();
+        (stream, pcm)
+    }
+
+    /// `--unfold` never writes over the stream it reads, under any name.
+    #[test]
+    fn an_unfold_onto_its_own_stream_is_refused() {
+        let dir = std::env::temp_dir().join(format!("hz-dts-unfold-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("stream.dts");
+        let (stream, _) = height_stream();
+        std::fs::write(&input, &stream).unwrap();
+        let link = dir.join("unfolded.s32");
+        std::fs::hard_link(&input, &link).unwrap();
+        let result = super::run(super::Options {
+            input: input.clone(),
+            frames: None,
+            reference: None,
+            unfold: Some(link),
+        });
+        let after = std::fs::read(&input).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let message = result
+            .expect_err("an unfold onto its own stream")
+            .to_string();
+        assert!(message.contains("destroy"), "{message}");
+        assert_eq!(after, stream);
+    }
+
+    /// Each frame is unfolded with the fold its own matrix states: a stream
+    /// whose TFL row is rewritten to unity in two frames, the checksum
+    /// recomputed, unfolds those two at unity and the others at −3 dB.
+    #[cfg(feature = "dca-oracle")]
+    #[test]
+    fn an_unfold_takes_each_frames_own_matrix() {
+        use hz_dca::dtsx::{FoldMatrix, UNITY, fold};
+        use hz_dca::encoder::FRAME_SAMPLES;
+        let (mut stream, pcm) = height_stream();
+        let mut standard = FoldMatrix::standard();
+        standard.fit();
+        let standard = standard.write().unwrap();
+        let mut unity = FoldMatrix::standard();
+        unity.rows[0].codes = vec![UNITY];
+        unity.fit();
+        let unity = unity.write().unwrap();
+        assert_eq!(unity.len(), standard.len());
+        let at: Vec<usize> = (0..stream.len() - standard.len())
+            .filter(|&i| stream[i..i + standard.len()] == standard[..])
+            .collect();
+        assert_eq!(at.len(), 4);
+        for &i in &at[1..3] {
+            stream[i..i + unity.len()].copy_from_slice(&unity);
+        }
+        let dir = std::env::temp_dir().join(format!("hz-dts-unfold-gains-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (input, out) = (dir.join("stream.dts"), dir.join("unfolded.s32"));
+        std::fs::write(&input, &stream).unwrap();
+        let result = super::run(super::Options {
+            input,
+            frames: None,
+            reference: None,
+            unfold: Some(out.clone()),
+        });
+        let unfolded = std::fs::read(&out);
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
+        let unfolded: Vec<i32> = unfolded
+            .unwrap()
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 8)
+            .collect();
+        assert_eq!(unfolded.len(), pcm.len());
+        for (n, (got, input)) in unfolded.chunks(12).zip(pcm.chunks(12)).enumerate() {
+            let (l, tfl) = (input[0] >> 8, input[8] >> 8);
+            // The stream carries L with TFL folded in at −3 dB; frames 1 and
+            // 2 now say unity, and are taken back out at unity.
+            let composite = l + fold(tfl, 23170);
+            let q = if (1..3).contains(&(n / FRAME_SAMPLES)) {
+                32768
+            } else {
+                23170
+            };
+            assert_eq!(got[0], composite - fold(tfl, q), "sample {n}");
+            assert_eq!(
+                &got[1..],
+                &input[1..].iter().map(|s| s >> 8).collect::<Vec<_>>()[..]
+            );
+        }
     }
 }

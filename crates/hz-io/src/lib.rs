@@ -30,6 +30,7 @@
 pub mod adm;
 pub mod container;
 pub mod master;
+pub mod paths;
 pub mod project;
 pub mod settings;
 mod yaml;

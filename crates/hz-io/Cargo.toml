@@ -13,3 +13,7 @@ hz-core.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
 quick-xml.workspace = true
+# Whether two paths are one file, hard links included: device and inode on
+# Unix, volume and file index on Windows, which the standard library only
+# offers on Unix.
+same-file.workspace = true
