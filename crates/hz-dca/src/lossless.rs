@@ -7,7 +7,8 @@
 // What was taken and what was changed is recorded in docs/provenance.md.
 
 //! The lossless encoder: PCM in, one lossless (XLL) frame per 512 samples
-//! out, every channel coded as itself.
+//! out, each channel the core carries coded as its difference from the
+//! core's reconstruction where that is cheaper, every other as itself.
 //!
 //! No open encoder of this layer exists to port, so this is the decoder run
 //! backwards: every step a decoder takes (ETSI TS 102 114 §8.5, and FFmpeg's
@@ -24,26 +25,34 @@
 //! its own channels with the rears already mixed in, at the coefficients the
 //! second set's header states ([`Fold`]), and a decoder of both sets takes
 //! them out again. A decoder of the first set alone gets the 5.1 that fold
-//! makes, and so does the core ([`Encoder::core_pcm`]).
+//! makes, and so does the core ([`Encoder::core_input`]).
 //!
 //! Each set, each frame:
 //!
 //! 1. **The embedded downmix** (7.1, first set): each channel plus its share
 //!    of the rears, `x + (y · c' + 2^14) >> 15`, `c'` the coefficient over
 //!    the scale as the decoder computes it.
-//! 2. **Pairwise decorrelation**: the channels paired, and in a pair the
+//! 2. **The core** (first set, [`Config::residual`]): each channel less the
+//!    core's reconstruction of it ([`CoreDecoder`]) brought to the set's
+//!    resolution — and, for a 7.1, back up from the fold's scale — exactly as
+//!    the decoder adds it back (`combine_residual_frame`), wherever coding
+//!    that difference costs fewer bits than coding the channel. The decoder
+//!    adds the core before it undoes the downmix, so what the difference is
+//!    taken from is the channel with its rears in it.
+//! 3. **Pairwise decorrelation**: the channels paired, and in a pair the
 //!    second less `(first · a + 4) >> 3` for the `a` that saves the most.
-//! 3. **Prediction**, per channel: a fixed predictor of order 0 to 3, or an
+//! 4. **Prediction**, per channel: a fixed predictor of order 0 to 3, or an
 //!    adaptive one of order 1 to 15 whose reflection coefficients are fitted
 //!    (Levinson–Durbin), quantised to the format's table and turned into the
 //!    direct form exactly as the decoder turns them.
-//! 4. **Entropy coding**, per segment: Rice or binary codes, per channel or
+//! 5. **Entropy coding**, per segment: Rice or binary codes, per channel or
 //!    shared, or the previous segment's parameters again.
 //!
-//! Steps 1 to 4 work in buffers made when the encoder is built; what is
+//! Steps 1 to 5 work in buffers made when the encoder is built; what is
 //! rebuilt each frame is the header model, a few hundred bytes.
 
 use crate::bits::Bits;
+use crate::core_decode::CoreDecoder;
 use crate::encoder::FRAME_SAMPLES;
 use crate::xll::{
     self, Band, ChannelSet, CommonHeader, Decorrelation, Downmix, Headers, Lsb, Mapping,
@@ -130,6 +139,11 @@ pub struct Config {
     pub scalable_lsbs: bool,
     /// The fold of a 7.1; unused for 5.1.
     pub fold: Fold,
+    /// Code a channel the core carries as its difference from the core's
+    /// reconstruction, where that costs less — as the reference streams do —
+    /// when [`Encoder::encode`] is given that reconstruction. Off, every
+    /// channel is coded as itself, independent of the core.
+    pub residual: bool,
 }
 
 impl Config {
@@ -141,6 +155,7 @@ impl Config {
             segments_log2: 1,
             scalable_lsbs: bits > 16,
             fold: Fold::REFERENCE,
+            residual: true,
         }
     }
 }
@@ -205,10 +220,17 @@ struct Set {
     /// in the order of the mask's bits.
     inputs: Vec<usize>,
     mask: u32,
+    /// The core's channel (WAV 5.1 order) each of the set's channels is
+    /// coded against, where the core carries it.
+    core: Vec<Option<usize>>,
+    /// Which channels the frame codes as themselves rather than against the
+    /// core: the header's residual mask, a bit per channel.
+    full: u32,
     /// The non-primary set's downmix codes, scale first in each row.
     downmix: Option<Vec<u16>>,
     /// The samples, per channel in the set's order: the input, then (first
-    /// set of a 7.1) with the rears mixed in.
+    /// set of a 7.1) with the rears mixed in, then less the core where it is
+    /// coded against it.
     samples: Vec<Vec<i32>>,
     /// The decorrelated channels, in coded order.
     coded: Vec<Vec<i32>>,
@@ -219,12 +241,20 @@ struct Set {
 }
 
 impl Set {
-    fn new(inputs: Vec<usize>, mask: u32, downmix: Option<Vec<u16>>, scalable: bool) -> Self {
+    fn new(
+        inputs: Vec<usize>,
+        mask: u32,
+        core: Vec<Option<usize>>,
+        downmix: Option<Vec<u16>>,
+        scalable: bool,
+    ) -> Self {
         let n = inputs.len();
         let buffers = || vec![vec![0i32; FRAME_SAMPLES]; n];
         Self {
             inputs,
             mask,
+            core,
+            full: (1 << n) - 1,
             downmix,
             samples: buffers(),
             coded: buffers(),
@@ -256,10 +286,9 @@ impl Set {
 pub struct Encoder {
     config: Config,
     sets: Vec<Set>,
-    /// Per row of the first set's downmix matrix (one per channel of the
-    /// first set), the scale in Q15 and, per rear, the coefficient the
-    /// decoder subtracts with, in Q15.
-    fold: Vec<(i32, Vec<i32>)>,
+    /// One row of the first set's downmix matrix per channel of the first
+    /// set; none for a 5.1.
+    fold: Vec<Row>,
     /// Bits of a coding parameter (`nabits`).
     parameter_bits: u32,
     /// The 5.1 the core is to be made from, interleaved in WAV order, 32-bit.
@@ -273,6 +302,17 @@ pub struct Encoder {
     search: Search,
 }
 
+/// One row of the fold as the decoder holds it.
+struct Row {
+    /// The scale, in Q15.
+    scale: i32,
+    /// Its inverse, in Q16: what brings the core back up from the scale
+    /// before a residual is added to it.
+    inverse: i32,
+    /// Per rear, the coefficient the decoder subtracts with, in Q15.
+    undo: Vec<i32>,
+}
+
 /// Scratch for the predictor and pairing searches.
 struct Search {
     /// Every channel's part A and part B, priced as one run.
@@ -283,6 +323,8 @@ struct Search {
     best: Vec<i32>,
     codes: Vec<u32>,
     windowed: Vec<f64>,
+    /// A channel less the core, being priced against the channel.
+    difference: Vec<i32>,
 }
 
 impl Encoder {
@@ -305,11 +347,12 @@ impl Encoder {
         let segment_samples = FRAME_SAMPLES >> config.segments_log2;
         use speaker::*;
         let (sets, mask_bits) = match config.layout {
-            // WAV: L R C LFE Ls Rs.
+            // WAV: L R C LFE Ls Rs, the core's own order.
             Layout::FivePointOne => (
                 vec![Set::new(
                     vec![2, 0, 1, 4, 5, 3],
                     C | L | R | LS | RS | LFE,
+                    [2, 0, 1, 4, 5, 3].map(Some).to_vec(),
                     None,
                     config.scalable_lsbs,
                 )],
@@ -333,13 +376,23 @@ impl Encoder {
                 }
                 (
                     vec![
+                        // The side surrounds against the core's surrounds,
+                        // which carry them (`ff_dca_core_map_spkr`).
                         Set::new(
                             vec![2, 0, 1, 3, 6, 7],
                             C | L | R | LFE | LSS | RSS,
+                            [2, 0, 1, 3, 4, 5].map(Some).to_vec(),
                             None,
                             config.scalable_lsbs,
                         ),
-                        Set::new(vec![4, 5], LSR | RSR, Some(codes), config.scalable_lsbs),
+                        // The core has no rears.
+                        Set::new(
+                            vec![4, 5],
+                            LSR | RSR,
+                            vec![None, None],
+                            Some(codes),
+                            config.scalable_lsbs,
+                        ),
                     ],
                     11,
                 )
@@ -363,7 +416,11 @@ impl Encoder {
                                 if c < 0 { -magnitude } else { magnitude }
                             })
                             .collect();
-                        (scale, undo)
+                        Row {
+                            scale,
+                            inverse,
+                            undo,
+                        }
                     })
                     .collect()
             }
@@ -443,6 +500,7 @@ impl Encoder {
                 best: vec![0; FRAME_SAMPLES],
                 codes: vec![0; FRAME_SAMPLES],
                 windowed: vec![0.0; FRAME_SAMPLES],
+                difference: vec![0; FRAME_SAMPLES],
             },
             config,
         })
@@ -463,11 +521,40 @@ impl Encoder {
         }
     }
 
-    /// The 5.1 a decoder of the first channel set alone presents, for the
-    /// frame last encoded: interleaved in WAV order — L, R, C, LFE, Ls, Rs —
-    /// as 32-bit samples. What the core is to be encoded from. For a 5.1 it
-    /// is the input itself.
-    pub fn core_pcm(&self) -> &[i32] {
+    /// The 5.1 a decoder of the first channel set alone presents for `pcm`,
+    /// interleaved in WAV order — L, R, C, LFE, Ls, Rs — as 32-bit samples:
+    /// what the core is to be encoded from. For a 5.1 it is the input itself;
+    /// for a 7.1, the first set as [`Encoder::encode`] folds it, scaled as a
+    /// decoder of that set alone scales it.
+    ///
+    /// # Panics
+    /// If `pcm` is not exactly one frame.
+    pub fn core_input(&mut self, pcm: &[i32]) -> &[i32] {
+        let channels = self.config.layout.channels();
+        assert_eq!(
+            pcm.len(),
+            FRAME_SAMPLES * channels,
+            "a frame is {FRAME_SAMPLES} samples of each channel"
+        );
+        let [front, rears] = &self.sets[..] else {
+            self.core.copy_from_slice(pcm);
+            return &self.core;
+        };
+        let shift = 32 - u32::from(self.config.bits);
+        let (low, high) = (-(1i32 << (31 - shift)), (1i32 << (31 - shift)) - 1);
+        for (row, (&input, slot)) in self.fold.iter().zip(front.inputs.iter().zip(&front.core)) {
+            let slot = slot.expect("the core carries every channel of the first set");
+            for n in 0..FRAME_SAMPLES {
+                // As `fold_rears` folds, rear by rear.
+                let mut x = pcm[n * channels + input] >> shift;
+                for (&rear, &c) in rears.inputs.iter().zip(&row.undo) {
+                    if c != 0 {
+                        x = x.wrapping_add(mul(pcm[n * channels + rear] >> shift, c, 15));
+                    }
+                }
+                self.core[n * 6 + slot] = mul(x, row.scale, 15).clamp(low, high) << shift;
+            }
+        }
         &self.core
     }
 
@@ -476,37 +563,64 @@ impl Encoder {
         &self.frame
     }
 
+    /// How many channels the frame last encoded codes against the core.
+    pub fn against_core(&self) -> u32 {
+        self.sets
+            .iter()
+            .map(|set| (((1 << set.channels()) - 1) & !set.full).count_ones())
+            .sum()
+    }
+
+    /// Refuse a frame the configured resolution cannot carry.
+    pub fn check(&self, pcm: &[i32]) -> Result<(), Refused> {
+        let channels = self.config.layout.channels();
+        let shift = 32 - u32::from(self.config.bits);
+        match pcm.iter().position(|&s| s & ((1 << shift) - 1) != 0) {
+            Some(at) => Err(Refused::Resolution {
+                channel: at % channels,
+                sample: at / channels,
+                value: pcm[at],
+                bits: self.config.bits,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Encode one frame — [`FRAME_SAMPLES`] samples of every channel,
     /// interleaved in WAV order as 32-bit samples whose bits below the
     /// configured resolution are zero — and return the lossless frame.
     ///
+    /// `core` is the core's reconstruction of the same samples — a decoder's
+    /// output for the core frame that travels with this one, which is the
+    /// core encoded from the *next* frame's [`Encoder::core_input`], since a
+    /// decoder's output is a frame behind its input. With it, and
+    /// [`Config::residual`] on, each channel the core carries is coded
+    /// against it where that is cheaper; without it, every channel is coded
+    /// as itself.
+    ///
     /// # Panics
     /// If `pcm` is not exactly one frame.
-    pub fn encode(&mut self, pcm: &[i32]) -> Result<&[u8], Refused> {
+    pub fn encode(&mut self, pcm: &[i32], core: Option<&CoreDecoder>) -> Result<&[u8], Refused> {
         let channels = self.config.layout.channels();
         assert_eq!(
             pcm.len(),
             FRAME_SAMPLES * channels,
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
+        self.check(pcm)?;
         let shift = 32 - u32::from(self.config.bits);
-        if let Some(at) = pcm.iter().position(|&s| s & ((1 << shift) - 1) != 0) {
-            return Err(Refused::Resolution {
-                channel: at % channels,
-                sample: at / channels,
-                value: pcm[at],
-                bits: self.config.bits,
-            });
-        }
         for set in &mut self.sets {
             for (plane, &input) in set.samples.iter_mut().zip(&set.inputs) {
                 for (n, sample) in plane.iter_mut().enumerate() {
                     *sample = pcm[n * channels + input] >> shift;
                 }
             }
+            set.full = (1 << set.channels()) - 1;
         }
         self.fold_rears();
-        self.fill_core(pcm);
+        if let Some(core) = core.filter(|_| self.config.residual) {
+            self.subtract_core(core);
+        }
         let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
         let parameter_bits = self.parameter_bits;
         for set in &mut self.sets {
@@ -524,8 +638,8 @@ impl Encoder {
         let [front, rears] = &mut self.sets[..] else {
             return;
         };
-        for (plane, (_, undo)) in front.samples.iter_mut().zip(&self.fold) {
-            for (rear, &c) in rears.samples.iter().zip(undo) {
+        for (plane, row) in front.samples.iter_mut().zip(&self.fold) {
+            for (rear, &c) in rears.samples.iter().zip(&row.undo) {
                 if c == 0 {
                     continue;
                 }
@@ -536,23 +650,50 @@ impl Encoder {
         }
     }
 
-    /// The core's 5.1: the first set as a decoder of it alone scales it.
-    fn fill_core(&mut self, pcm: &[i32]) {
-        if self.fold.is_empty() {
-            self.core.copy_from_slice(pcm);
-            return;
-        }
-        let bits = u32::from(self.config.bits);
-        let (low, high) = (-(1i32 << (bits - 1)), (1i32 << (bits - 1)) - 1);
-        let front = &self.sets[0];
-        // The first set's channels are C L R LFE Lss Rss; WAV 5.1 is
-        // L R C LFE Ls Rs.
-        const WAV: [usize; 6] = [2, 0, 1, 3, 4, 5];
-        for ((plane, (scale, _)), &slot) in front.samples.iter().zip(&self.fold).zip(&WAV) {
-            for (n, &x) in plane.iter().enumerate() {
-                self.core[n * 6 + slot] = mul(x, *scale, 15).clamp(low, high) << (32 - bits);
+    /// Take the core out of each channel of the first set it carries, where
+    /// coding what is left costs less than coding the channel: the inverse
+    /// of the decoder's `combine_residual_frame`. The core is brought to the
+    /// set's resolution with rounding and, below a downmix, back up from its
+    /// scale first and clipped to 24 bits; the decoder adds it to the
+    /// channel before it undoes that downmix, so the channel here has its
+    /// rears in it.
+    fn subtract_core(&mut self, core: &CoreDecoder) {
+        // No LSBs are split off, so the core comes down by what the
+        // resolution lacks of 24 bits.
+        let shift = 24 - u32::from(self.config.bits);
+        let round = if shift > 0 { 1 << (shift - 1) } else { 0 };
+        let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
+        let parameter_bits = self.parameter_bits;
+        let search = &mut self.search;
+        let mut difference = std::mem::take(&mut search.difference);
+        let set = &mut self.sets[0];
+        for ch in 0..set.channels() {
+            let Some(slot) = set.core[ch] else {
+                continue;
+            };
+            let src = core.channel(slot);
+            let x = &mut set.samples[ch];
+            match self.fold.get(ch) {
+                Some(row) => {
+                    for ((d, &x), &s) in difference.iter_mut().zip(x.iter()).zip(src) {
+                        let core = clip23(mul(s, row.inverse, 16).wrapping_add(round) >> shift);
+                        *d = x.wrapping_sub(core);
+                    }
+                }
+                None => {
+                    for ((d, &x), &s) in difference.iter_mut().zip(x.iter()).zip(src) {
+                        *d = x.wrapping_sub(s.wrapping_add(round) >> shift);
+                    }
+                }
+            }
+            let itself = search_prediction(x, parameter_bits, segment_samples, search).0;
+            let against = search_prediction(&difference, parameter_bits, segment_samples, search).0;
+            if against < itself {
+                x.copy_from_slice(&difference);
+                set.full &= !(1 << ch);
             }
         }
+        search.difference = difference;
     }
 
     /// Lay the frame out: headers sized to the band data, the data, and
@@ -583,6 +724,7 @@ impl Encoder {
             }
         }
         for (header, set) in self.headers.channel_sets.iter_mut().zip(&self.sets) {
+            header.residual_encode = set.full as u16;
             header.bands[0].clone_from(&set.band);
             header.reserved = Bits::new();
         }
@@ -1251,16 +1393,16 @@ fn adaptive_residual(x: &[i32], coeff: &[i32], out: &mut [i32]) -> Option<()> {
     Some(())
 }
 
-/// Choose coded channel `ch`'s predictor and leave its residual, zigzagged,
-/// in the set.
-fn predict(
-    set: &mut Set,
-    ch: usize,
+/// The cheapest predictor for `x`, fixed or adaptive: its bits — the
+/// samples' codes and the predictor's own fields — its adaptive and fixed
+/// orders, and its reflection coefficient indices. Its residual is left in
+/// `search.best`.
+fn search_prediction(
+    x: &[i32],
     parameter_bits: u32,
     segment_samples: usize,
     search: &mut Search,
-) {
-    let x = &set.coded[ch];
+) -> (u64, (u8, u8), [i8; MAX_ORDER]) {
     let mut best_bits = u64::MAX;
     let mut best = (0u8, 0u8);
     for order in 0..=3u8 {
@@ -1297,7 +1439,20 @@ fn predict(
             search.best.copy_from_slice(&search.work);
         }
     }
-    let (adaptive, fixed) = best;
+    (best_bits, best, indices)
+}
+
+/// Choose coded channel `ch`'s predictor and leave its residual, zigzagged,
+/// in the set.
+fn predict(
+    set: &mut Set,
+    ch: usize,
+    parameter_bits: u32,
+    segment_samples: usize,
+    search: &mut Search,
+) {
+    let (_, (adaptive, fixed), indices) =
+        search_prediction(&set.coded[ch], parameter_bits, segment_samples, search);
     set.band.adaptive_orders[ch] = adaptive;
     set.band.fixed_orders[ch] = fixed;
     set.band.reflection[ch].clear();

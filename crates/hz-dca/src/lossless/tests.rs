@@ -6,10 +6,10 @@ use hz_core::bits_read::BitReader;
 type Decoded = Vec<(u32, Vec<i32>)>;
 
 /// The frame decoded as FFmpeg's `dca_xll.c` decodes it, every channel set
-/// active: the test's own reader, so that a round trip is checked where the
-/// oracles are not installed. Band 0 only, no LSB section; anything else
-/// panics.
-fn decode(frame: &[u8]) -> Decoded {
+/// active, residual channels added to `core`: the test's own reader, so that
+/// a round trip is checked where the oracles are not installed. Band 0 only,
+/// no LSB section; anything else panics.
+fn decode(frame: &[u8], core: Option<&CoreDecoder>) -> Decoded {
     let headers = Headers::read(frame, true).unwrap();
     assert!(headers.checksums(frame).all(), "a checksum fails");
     let common = &headers.common;
@@ -101,6 +101,50 @@ fn decode(frame: &[u8]) -> Decoded {
             }
         }
     }
+    // Add the core to the residual channels (`combine_residual_frame`), the
+    // core brought back up from the scale of the next downmix below it.
+    for (index, (set, channels)) in sets.iter().zip(&mut buffers).enumerate() {
+        let full = (1u32 << set.channels) - 1;
+        if u32::from(set.residual_encode) == full {
+            continue;
+        }
+        let core = core.expect("residual channels need the core");
+        let below = sets[index + 1..].iter().find_map(|o| match &o.mapping {
+            Mapping::Speakers(Speakers {
+                primary: false,
+                downmix:
+                    Some(Downmix {
+                        embedded: true,
+                        codes,
+                        ..
+                    }),
+                hierarchical: true,
+                ..
+            }) => Some((usize::from(o.channels), codes)),
+            _ => None,
+        });
+        let shift = 24 - u32::from(set.pcm_bit_res);
+        let round = if shift > 0 { 1 << (shift - 1) } else { 0 };
+        let mut mask = set.mask().unwrap();
+        for (ch, samples) in channels.iter_mut().enumerate() {
+            let bit = mask.trailing_zeros();
+            mask &= mask - 1;
+            if u32::from(set.residual_encode) & (1 << ch) != 0 {
+                continue;
+            }
+            let src = core.channel(core_slot(bit));
+            for (x, &s) in samples.iter_mut().zip(src) {
+                let add = match below {
+                    Some((n, codes)) => {
+                        let (_, inverse) = xll::scale(codes[ch * (n + 1)]).unwrap();
+                        clip23((mul(s, inverse, 16) + round) >> shift)
+                    }
+                    None => (s + round) >> shift,
+                };
+                *x = x.wrapping_add(add);
+            }
+        }
+    }
     // Undo the embedded downmixes.
     for o in 1..sets.len() {
         let Mapping::Speakers(Speakers {
@@ -148,6 +192,21 @@ fn decode(frame: &[u8]) -> Decoded {
     }
     out.sort_by_key(|(bit, _)| *bit);
     out
+}
+
+/// The core channel, in WAV 5.1 order, a speaker bit is coded against
+/// (`ff_dca_core_map_spkr`): itself, or for a side surround the core's
+/// surround.
+fn core_slot(bit: u32) -> usize {
+    match bit {
+        0 => 2,
+        1 => 0,
+        2 => 1,
+        3 | 9 => 4,
+        4 | 10 => 5,
+        5 => 3,
+        _ => panic!("speaker {bit} is not in the core"),
+    }
 }
 
 fn read_segment(
@@ -268,29 +327,92 @@ fn speakers(layout: Layout) -> Vec<u32> {
 }
 
 fn round_trip(config: Config, pcm: &[i32]) -> usize {
+    round_trip_with(config, pcm, false).0
+}
+
+/// Encode `pcm` and decode every frame with the test's reader, checking it
+/// against the input: with `against_core`, as `master` pairs the layers, the
+/// core a frame ahead and its reconstruction given to the lossless layer —
+/// but not for the first frame of a 7.1, as there. The bytes of the
+/// lossless frames, and the channels coded against the core.
+fn round_trip_with(config: Config, pcm: &[i32], against_core: bool) -> (usize, u32) {
     let layout = config.layout;
     let bits = config.bits;
     let channels = layout.channels();
     let mut encoder = Encoder::new(config).unwrap();
-    let mut bytes = 0;
-    for frame in pcm.chunks(FRAME_SAMPLES * channels) {
-        let coded = encoder.encode(frame).unwrap().to_vec();
+    let mut core =
+        crate::encoder::Encoder::new(crate::encoder::Config::reference_five_one()).unwrap();
+    let mut reconstruction = CoreDecoder::new();
+    let frames: Vec<&[i32]> = pcm.chunks(FRAME_SAMPLES * channels).collect();
+    let silence = vec![0i32; FRAME_SAMPLES * channels];
+    let mut core_frame = Vec::new();
+    if against_core {
+        core.encode(encoder.core_input(frames[0]), &mut core_frame);
+        core.restart_prediction();
+    }
+    let (mut bytes, mut residual) = (0, 0);
+    for (k, frame) in frames.iter().enumerate() {
+        let mut given = None;
+        if against_core {
+            let next = frames.get(k + 1).copied().unwrap_or(&silence);
+            core_frame.clear();
+            core.encode(encoder.core_input(next), &mut core_frame);
+            reconstruction.decode(&core);
+            if k > 0 || layout == Layout::FivePointOne {
+                given = Some(&reconstruction);
+            }
+        }
+        let coded = encoder.encode(frame, given).unwrap().to_vec();
+        residual += encoder.against_core();
         bytes += coded.len();
         let headers = Headers::read(&coded, true).unwrap();
         assert_eq!(headers.write(true).unwrap(), coded[..headers.len()]);
-        let decoded = decode(&coded);
+        let decoded = decode(&coded, given);
         for (input, &bit) in speakers(layout).iter().enumerate() {
             let (_, samples) = decoded.iter().find(|(b, _)| *b == bit).unwrap();
             for (n, &s) in samples.iter().enumerate() {
                 assert_eq!(
                     s,
                     frame[n * channels + input] >> (32 - bits),
-                    "speaker {bit}, sample {n}"
+                    "frame {k}, speaker {bit}, sample {n}"
                 );
             }
         }
     }
-    bytes
+    (bytes, residual)
+}
+
+/// Coded against the core, both layouts at both resolutions come back bit
+/// for bit, most channels are coded against it, and the layer is smaller
+/// than coded alone.
+#[test]
+fn coded_against_the_core_it_comes_back_bit_for_bit() {
+    for layout in [Layout::FivePointOne, Layout::SevenPointOne] {
+        for bits in [16, 24] {
+            let pcm = signal(layout, bits, 6);
+            let (alone, _) = round_trip_with(Config::reference(layout, bits), &pcm, false);
+            let (against, residual) = round_trip_with(Config::reference(layout, bits), &pcm, true);
+            assert!(
+                residual > 0,
+                "{layout:?} at {bits} bits: nothing against the core"
+            );
+            assert!(
+                against < alone,
+                "{layout:?} at {bits} bits: {against} bytes against the core, {alone} alone"
+            );
+        }
+    }
+}
+
+/// With the residual off, the core's reconstruction is not used.
+#[test]
+fn the_residual_off_codes_every_channel_as_itself() {
+    let pcm = signal(Layout::SevenPointOne, 24, 3);
+    let config = Config {
+        residual: false,
+        ..Config::reference(Layout::SevenPointOne, 24)
+    };
+    assert_eq!(round_trip_with(config, &pcm, true).1, 0);
 }
 
 #[test]
@@ -351,8 +473,7 @@ fn silence_and_full_scale_noise_come_back() {
 fn the_core_gets_the_fold_a_first_set_decoder_presents() {
     let pcm = signal(Layout::SevenPointOne, 24, 1);
     let mut encoder = Encoder::new(Config::reference(Layout::SevenPointOne, 24)).unwrap();
-    encoder.encode(&pcm).unwrap();
-    let core = encoder.core_pcm();
+    let core = encoder.core_input(&pcm).to_vec();
     // −3 dB of every channel, and of each side plus its rear.
     let q = 23170;
     for n in 0..FRAME_SAMPLES {
@@ -399,7 +520,7 @@ fn bits_below_the_resolution_are_refused() {
     pcm[6 * 10 + 4] = 0x100 | 0x80;
     let mut encoder = Encoder::new(Config::reference(Layout::FivePointOne, 24)).unwrap();
     assert_eq!(
-        encoder.encode(&pcm).unwrap_err(),
+        encoder.encode(&pcm, None).unwrap_err(),
         Refused::Resolution {
             channel: 4,
             sample: 10,
@@ -409,9 +530,9 @@ fn bits_below_the_resolution_are_refused() {
     );
     pcm[6 * 10 + 4] = 0x1_0000;
     let mut encoder = Encoder::new(Config::reference(Layout::FivePointOne, 16)).unwrap();
-    assert!(encoder.encode(&pcm).is_ok());
+    assert!(encoder.encode(&pcm, None).is_ok());
     pcm[6 * 10 + 4] = 0x8000;
-    assert!(encoder.encode(&pcm).is_err());
+    assert!(encoder.encode(&pcm, None).is_err());
 }
 
 #[test]

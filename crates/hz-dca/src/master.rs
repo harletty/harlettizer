@@ -5,8 +5,21 @@
 //! is the lossless layer ([`crate::lossless`]). The core is the 5.1 a
 //! decoder of the lossless layer's first channel set alone presents — the
 //! input itself for a 5.1, the fold for a 7.1 — so a core-only decoder and a
-//! 5.1 lossless decoder play the same mix, and every lossless channel is
-//! coded as itself, independent of the core.
+//! 5.1 lossless decoder play the same mix.
+//!
+//! The lossless layer codes each channel the core carries as its difference
+//! from the core's reconstruction where that is cheaper
+//! ([`lossless::Config::residual`]), so the encoder decodes every core frame
+//! it sends as a decoder will ([`CoreDecoder`]). A decoder's core output is
+//! a frame behind its input, so the core runs a frame ahead of the lossless
+//! layer: the stream's frame *n* carries the core encoded from input frame
+//! *n* + 1, which decodes to input frame *n*, beside the lossless frame of
+//! input frame *n*. The core frame made from the first input frame decodes to
+//! the silence before it and is not sent, and [`Encoder::finish`] sends the
+//! last input frame with a core made from silence. So the stream has a frame
+//! per input frame, and both layers decode in step with the input — the
+//! lossless layer to the sample. With the residual off, every channel is
+//! coded as itself and the layers are independent, but stay in step.
 //!
 //! The substream header is the reference streams' (one presentation, one
 //! asset, the core backward-compatible in the core substream), with the
@@ -15,8 +28,8 @@
 //! that peak is phase C4.
 
 use crate::bits::Bits;
+use crate::core_decode::CoreDecoder;
 use crate::encoder;
-#[cfg(doc)]
 use crate::encoder::FRAME_SAMPLES;
 use crate::exss::{
     AssetDescriptor, AssetStatics, ChannelMapping, Coding, ExssHeader, Presentation, StaticFields,
@@ -56,6 +69,20 @@ pub struct Encoder {
     core: encoder::Encoder,
     lossless: lossless::Encoder,
     exss: ExssHeader,
+    /// The core as a decoder of the stream reconstructs it.
+    decoder: CoreDecoder,
+    /// The input frame waiting for the core frame that decodes to it, and
+    /// whether there is one.
+    pending: Vec<i32>,
+    waiting: bool,
+    /// The core frame last encoded.
+    core_frame: Vec<u8>,
+    /// Frames sent.
+    frames: u64,
+    /// Bytes of the lossless frames sent, and how many of their channels
+    /// were coded against the core.
+    lossless_bytes: u64,
+    against_core: u64,
 }
 
 impl Encoder {
@@ -138,20 +165,79 @@ impl Encoder {
             crc: 0,
         };
         Ok(Self {
+            pending: vec![0; FRAME_SAMPLES * layout.channels()],
+            waiting: false,
+            core_frame: Vec::with_capacity(core.frame_size()),
+            frames: 0,
+            lossless_bytes: 0,
+            against_core: 0,
+            decoder: CoreDecoder::new(),
             core,
             lossless,
             exss,
         })
     }
 
-    /// Encode one frame — [`FRAME_SAMPLES`] samples of every channel,
+    /// Take one frame — [`FRAME_SAMPLES`] samples of every channel,
     /// interleaved in WAV order as 32-bit samples whose bits below the
-    /// configured resolution are zero — and append it to `out`.
+    /// configured resolution are zero — and append the stream's frame for
+    /// the frame before it to `out`: nothing on the first call, since the
+    /// core runs a frame ahead. [`Encoder::finish`] sends the last.
     ///
     /// # Panics
     /// If `pcm` is not exactly one frame.
     pub fn encode(&mut self, pcm: &[i32], out: &mut Vec<u8>) -> Result<(), Refused> {
-        let size = self.lossless.encode(pcm)?.len() as u32;
+        assert_eq!(
+            pcm.len(),
+            self.pending.len(),
+            "a frame is {FRAME_SAMPLES} samples of each channel"
+        );
+        // Refused before anything moves on.
+        self.lossless.check(pcm)?;
+        self.core_frame.clear();
+        self.core
+            .encode(self.lossless.core_input(pcm), &mut self.core_frame);
+        if !self.waiting {
+            // What this core frame decodes to is the silence before the
+            // input: it is not sent, and the stream's decoder starts its
+            // subband prediction on the next from silence.
+            self.core.restart_prediction();
+        } else {
+            self.send(out)?;
+        }
+        self.pending.copy_from_slice(pcm);
+        self.waiting = true;
+        Ok(())
+    }
+
+    /// Send the frame still waiting, with a core made from silence. Nothing
+    /// to send without one.
+    pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
+        if !self.waiting {
+            return Ok(());
+        }
+        let silence = vec![0; self.pending.len()];
+        self.core_frame.clear();
+        self.core
+            .encode(self.lossless.core_input(&silence), &mut self.core_frame);
+        self.send(out)?;
+        self.waiting = false;
+        Ok(())
+    }
+
+    /// The stream's frame for the pending input: the core frame last
+    /// encoded, the substream header, the lossless frame.
+    fn send(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
+        self.decoder.decode(&self.core);
+        // FFmpeg's decoder treats the first frame of a stream that codes
+        // channels against the core in more than one channel set as one to
+        // recover from, and presents it from the core alone (as it does
+        // after a seek). A first frame that codes every channel as itself
+        // has nothing to recover, so the stream decodes losslessly from its
+        // first sample.
+        let several_sets = self.lossless.config().layout == Layout::SevenPointOne;
+        let core = (self.frames > 0 || !several_sets).then_some(&self.decoder);
+        let size = self.lossless.encode(&self.pending, core)?.len() as u32;
         self.exss.asset_sizes[0] = size;
         if let Coding::Components { xll: Some(x), .. } = &mut self.exss.assets[0].coding {
             x.size = size;
@@ -169,14 +255,125 @@ impl Encoder {
                 Err(e) => panic!("a fitted substream header does not write: {}", e.0),
             }
         };
-        self.core.encode(self.lossless.core_pcm(), out);
+        out.extend_from_slice(&self.core_frame);
         out.extend_from_slice(&header);
         out.extend_from_slice(self.lossless.frame());
+        self.frames += 1;
+        self.lossless_bytes += u64::from(size);
+        self.against_core += u64::from(self.lossless.against_core());
         Ok(())
+    }
+
+    /// Bytes of the lossless frames sent so far, headers included.
+    pub fn lossless_bytes(&self) -> u64 {
+        self.lossless_bytes
+    }
+
+    /// Channels of the frames sent so far that were coded against the core,
+    /// summed over the frames.
+    pub fn against_core(&self) -> u64 {
+        self.against_core
     }
 
     /// Bytes of the core in every frame.
     pub fn core_frame_size(&self) -> usize {
         self.core.frame_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{split, xll};
+
+    /// Tones, so that the core is close and the difference from it cheap.
+    fn tones(channels: usize, frames: usize) -> Vec<i32> {
+        (0..frames * FRAME_SAMPLES * channels)
+            .map(|i| {
+                let (n, ch) = (i / channels, i % channels);
+                let phase = std::f64::consts::TAU * 110.0 * (ch + 1) as f64 * n as f64 / 48000.0;
+                ((phase.sin() * 0.4 * f64::from(1 << 23)) as i32) << 8
+            })
+            .collect()
+    }
+
+    /// The residual masks of every lossless frame's first channel set.
+    fn residual_masks(stream: &[u8]) -> Vec<u16> {
+        split::frames(stream)
+            .map(|frame| {
+                let exss = frame.unwrap().exss.unwrap();
+                let header = ExssHeader::read(exss).unwrap();
+                let at = header.header_size as usize;
+                let xll = &exss[at..at + header.asset_sizes[0] as usize];
+                xll::Headers::read(xll, true).unwrap().channel_sets[0].residual_encode
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_frame_goes_out_per_frame_in_the_first_coded_alone_in_a_7_1() {
+        for layout in [Layout::FivePointOne, Layout::SevenPointOne] {
+            let channels = layout.channels();
+            let mut encoder = Encoder::new(Config::reference(layout, 24)).unwrap();
+            let mut stream = Vec::new();
+            for (k, frame) in tones(channels, 5)
+                .chunks(FRAME_SAMPLES * channels)
+                .enumerate()
+            {
+                encoder.encode(frame, &mut stream).unwrap();
+                assert_eq!(
+                    stream.is_empty(),
+                    k == 0,
+                    "{layout:?}: the core runs a frame ahead"
+                );
+            }
+            encoder.finish(&mut stream).unwrap();
+            let masks = residual_masks(&stream);
+            assert_eq!(masks.len(), 5, "{layout:?}");
+            // FFmpeg would recover from a 7.1's first frame coded against the
+            // core; a 5.1's it decodes as it is.
+            assert_eq!(
+                masks[0] == 0x3f,
+                layout == Layout::SevenPointOne,
+                "{layout:?}"
+            );
+            assert!(
+                masks[1..].iter().all(|&m| m != 0x3f),
+                "{layout:?}: {masks:x?}"
+            );
+            // Nothing is left to send.
+            let sent = stream.len();
+            encoder.finish(&mut stream).unwrap();
+            assert_eq!(stream.len(), sent);
+        }
+    }
+
+    #[test]
+    fn full_coding_codes_no_channel_against_the_core() {
+        let mut config = Config::reference(Layout::SevenPointOne, 24);
+        config.lossless.residual = false;
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        for frame in tones(8, 3).chunks(FRAME_SAMPLES * 8) {
+            encoder.encode(frame, &mut stream).unwrap();
+        }
+        encoder.finish(&mut stream).unwrap();
+        assert_eq!(residual_masks(&stream), [0x3f; 3]);
+        assert_eq!(encoder.against_core(), 0);
+    }
+
+    #[test]
+    fn a_refused_frame_moves_nothing_on() {
+        let mut encoder = Encoder::new(Config::reference(Layout::FivePointOne, 16)).unwrap();
+        let mut stream = Vec::new();
+        let mut pcm: Vec<i32> = tones(6, 1).iter().map(|s| s & !0xffff).collect();
+        encoder.encode(&pcm, &mut stream).unwrap();
+        pcm[7] |= 0x100;
+        assert!(encoder.encode(&pcm, &mut stream).is_err());
+        assert!(stream.is_empty());
+        pcm[7] &= !0xffff;
+        encoder.encode(&pcm, &mut stream).unwrap();
+        encoder.finish(&mut stream).unwrap();
+        assert_eq!(residual_masks(&stream).len(), 2);
     }
 }

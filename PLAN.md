@@ -865,7 +865,7 @@ played on hardware.**
   be `hz-cli`'s `ac3` path with this encoder behind it, and it is worth more
   now that C2 puts the lossless layer beside the core (C5).
 
-#### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1 — **C2a done; C2b left**
+#### Phase C2 — EXSS and XLL, lossless 7.1 / 5.1 — **done**
 
 - The channel-set hierarchy the reference streams use: a six-channel set and
   a two-channel set whose downmix is embedded in the first (7.1 → 5.1);
@@ -875,7 +875,7 @@ played on hardware.**
   whatever the core does, so C1 and C2 do not wait on each other.
 - **C2b**: residual against the core, for bitrate. The encoder then has to
   reconstruct the core exactly as the decoder does — its fixed-point path —
-  so a core decode runs inside the encoder loop.
+  so a core decode runs inside the encoder loop. ✅ Done, below.
 - **Accept when**: bit-exact through `dca` and FFmpeg on every frame and
   every channel, at 16 and 24 bits. A 7.1 DTS-HD Master Audio stream from a
   master is useful on its own.
@@ -973,6 +973,104 @@ What C2a did:
   smoothing (C4). The first two would save bits on some material; C2b, the
   residual against the core, is where the bitrate is.
 
+What C2b did:
+
+- ✅ **`hz_dca::core_decode`**: the core as a decoder reconstructs it, on the
+  fixed-point path a lossless decoder adds its residuals to
+  (`ff_dca_core_filter_fixed`) — each subband dequantised, with the scale
+  factor adjustment of Huffman-coded ones and plain words read back signed;
+  ADPCM undone from the decoder's own history, clipped to 24 bits; the
+  32-band synthesis through `dcadct.c`'s fixed-point cosine modulation and
+  `synth_filter.c`'s 512-tap window; the LFE scaled at its 0.035 step and
+  interpolated 64 times. It reads the frame from the encoder that wrote it —
+  allocations, scale factor indices, predictors, quantised values — rather
+  than parsing the bytes, and handles what that encoder writes. **It is
+  FFmpeg's decode to the last bit**: against `ffmpeg -flags +bitexact`, which
+  takes the same path, every sample of every channel, LFE included, with
+  ADPCM and without, and on full-scale noise and squares where the clips and
+  the cosine modulation's input scaling engage; hashes of FFmpeg's output
+  stand in for it where it is not installed. About 36 kB of state, nothing
+  allocated per frame.
+- ✅ **Residual coding** (`lossless::Config::residual`, on by default;
+  `dts-encode --full-coded` keeps C2a's mode). Per frame and per channel of
+  the first set, the channel is coded as its difference from the core's
+  reconstruction where that is cheaper — both priced with the full predictor
+  search — exactly inverting `combine_residual_frame`: the core brought to
+  the set's resolution by `24 − bits` with rounding, for a 7.1 first raised
+  by the fold scale's Q16 inverse and clipped to 24 bits, and added *before*
+  the embedded downmix is undone, so the difference is taken from the channel
+  with its rears in it. The side surrounds of a 7.1 are coded against the
+  core's surrounds (`ff_dca_core_map_spkr`); the rears never are. The
+  header's residual mask says which channels are.
+- ✅ **The core runs a frame ahead of the lossless layer.** A decoder's core
+  output is 512 samples behind its input, so the stream's frame *n* carries
+  the core encoded from input frame *n* + 1 — which decodes to input frame
+  *n* — beside the lossless frame of input frame *n*. The core frame made
+  from the first input frame decodes to the silence before it and is not
+  sent; the core encoder's subband prediction restarts from silence, as the
+  decoder's does; `master::Encoder::finish` sends the last input frame with a
+  core made from silence. The stream keeps one frame per input frame, and
+  both layers now decode in step with the input. In C2a a core-only decode
+  was a frame late; that is fixed for full coding too.
+- ✅ **FFmpeg's recovery frame.** FFmpeg decodes the first frame of a stream
+  that has residual channels and more than one channel set from the core
+  alone (`Forcing XLL recovery mode`, as after a seek) — and so it does on
+  the reference streams, whose first frame codes the LFE against the core. A
+  7.1's first frame is therefore coded without the core, and the stream is
+  bit-exact through FFmpeg from its first sample. `dca` has no such mode.
+- ✅ **Bit-exact through both decoders, every frame and every channel.** The
+  four standard-profile reference streams' beds, decoded whole by FFmpeg
+  (34,311 frames, 6 min 6 s) — the 7.1 bed at 24 bits, the 5.1 its first set
+  presents, both requantised to 16 — encoded with a plain and an ADPCM core,
+  residual and full-coded: 64 streams. Ten seconds each of tones, pink noise,
+  full-scale white noise and a mix of them with silence and a chirp, the same
+  16 configurations: 64 more. Cores at 768 and 3840 kb/s instead of 1509: 12
+  more. Every one identical to its input through `dca` and through FFmpeg
+  (`-err_detect crccheck`), every header rewriting byte for byte with its
+  checksum valid. `master_audio_comes_back_bit_for_bit` now holds 14
+  configurations: 5.1 and 7.1 at 16 and 24 bits against a plain and an ADPCM
+  core and coded alone, and the two off-reference shapes. The crate's own
+  tests decode the residual with the FFmpeg-mirror reader as well.
+- **What it saves.** The lossless layer alone, full-coded (C2a) against
+  residual (C2b), plain core at 1509 kb/s; the last column is the reference
+  encoder's own bed on the same streams (its lossless frames up to the
+  DTS:X block the navigation word points at, which is the same 7.1 our input
+  is decoded from):
+
+  | 7.1, 24 bits, standard-profile reference stream | C2a | C2b | saved | reference bed |
+  |---|---|---|---|---|
+  | stream 1 | 4403 kb/s | 3447 kb/s | 21.7 % | 3618 kb/s |
+  | stream 2 | 4268 kb/s | 3113 kb/s | 27.1 % | 3282 kb/s |
+  | stream 3 | 3538 kb/s | 2660 kb/s | 24.8 % | 2815 kb/s |
+  | stream 4 | 4675 kb/s | 3622 kb/s | 22.5 % | 3800 kb/s |
+
+  So the residual takes a fifth to a quarter off a 24-bit 7.1, and the
+  layer comes out 4.7–5.5 % smaller than the reference encoder's on its own
+  material. The lower the resolution the larger the share the core already
+  carries: 7.1/16 40–45 % smaller, 5.1/24 31–38 %, 5.1/16 61–75 % (252 kb/s
+  for stream 2's). Synthetic: tones 30–70 %, pink noise 16–38 %, the mix
+  28–70 %, and even full-scale white noise 7–18 % (101.7 % of its PCM → 94.4
+  % for 7.1/24), the core's 14 dB on noise still being worth something. An
+  ADPCM core changes the layer by under 2 %. The LFE is the channel least
+  often coded against the core — the C1 core limits its band twice — where
+  the four standard-profile streams code all six against it in every frame
+  but at most one. Across the 39 lossless streams of the local corpus, every
+  one codes its first set against the core: 18 all six channels in every
+  frame, the other 21 choosing per frame and channel, as this encoder does.
+- ✅ **`cargo xtask dts` on the 43 local streams**, again: every core,
+  substream and lossless header rewrites byte for byte (422,168, 421,417 and
+  409,072), every checksum valid, the oracle decodes every frame. It now also
+  reports each channel set's residual mask, the lossless frames' sizes, and
+  the average navigated offset — the bed's share of a DTS:X frame, which is
+  where the reference encoder's bed rate above comes from.
+- **What it costs.** The encoder prices each first-set channel twice, as
+  itself and against the core, with the full predictor search, and decodes
+  the core it sends: with the core, 7.1/24 encodes at 8× real time (28 s for
+  stream 4's 3 min 35 s) against 12× full-coded. Nothing more is allocated per
+  frame. And the frames are smaller at their largest too: 7572 bytes at most
+  over the four beds, against 9108 full-coded — which matters to C3, whose
+  navigation word cannot point past 8188 bytes.
+
 #### Phase C3 — The DTS:X extension, fixed 7.1.4
 
 - Render the master to 7.1.4 (`hz-programme`, `hz-render::Room`, as the IAMF
@@ -990,7 +1088,8 @@ What C2a did:
   domain: a frame that cannot be navigated is rejected with an error naming
   it, never truncated or re-quantised (`Navigation::word` already refuses
   it). The bed uses the C2b residual coding here, not C2a's full-coded
-  form.
+  form: on the four standard-profile streams' beds its largest frame is
+  7,572 bytes, under the bound, where full coding reaches 9,108.
 - 🔴 **Headroom.** Bed plus 0.707 × height can pass 24-bit full scale. The
   fold needs the limiter (`Headroom::Limit`) or a margin before it, or the
   lossless bed clips.

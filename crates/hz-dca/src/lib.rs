@@ -20,21 +20,25 @@
 //! - [`adpcm`]: subband prediction, by choice;
 //! - [`tables`]: the format's tables and the encoder's own.
 //!
-//! Phase C2 is the lossless layer, every channel coded as itself (C2a), and
-//! the stream that carries it beside the core:
+//! Phase C2 is the lossless layer — every channel coded as itself (C2a), or
+//! the channels the core carries as their difference from it (C2b) — and the
+//! stream that carries it beside the core:
 //!
 //! - [`xll`]: the lossless frame's headers — common header, channel set
 //!   sub-headers, navigation table — read and written;
+//! - [`core_decode`]: the core as a decoder reconstructs it, which the
+//!   lossless layer's residuals are taken against;
 //! - [`lossless`]: PCM to lossless frames, 5.1 or 7.1 at 16 or 24 bits, the
 //!   7.1's rears folded into the 5.1 below them;
 //! - [`master`]: DTS-HD Master Audio, the core and the lossless layer frame
-//!   by frame.
+//!   by frame, the core a frame ahead.
 //!
 //! The DTS:X extension is phase C3.
 
 pub mod adpcm;
 pub mod bits;
 pub mod core;
+pub mod core_decode;
 pub mod crc;
 pub mod encoder;
 pub mod exss;

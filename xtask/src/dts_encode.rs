@@ -46,6 +46,8 @@ pub struct Options {
     /// The MSB/LSB split flag, when not the reference streams' (on at 24
     /// bits, off at 16).
     pub lsb_split: Option<bool>,
+    /// Every lossless channel coded as itself, not against the core.
+    pub full_coded: bool,
     pub out: PathBuf,
 }
 
@@ -53,10 +55,11 @@ pub fn run(options: Options) -> Result<()> {
     if let Some(bits) = options.lossless {
         return run_lossless(&options, bits);
     }
-    if options.segments_log2.is_some() || options.lsb_split.is_some() {
+    if options.segments_log2.is_some() || options.lsb_split.is_some() || options.full_coded {
         return Err(Error::refused(
             &options.input,
-            "segments and the LSB split are the lossless layer's: they need --lossless",
+            "segments, the LSB split and full coding are the lossless layer's: they need \
+             --lossless",
         ));
     }
     let layout = match options.channels {
@@ -133,12 +136,14 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
     if let Some(split) = options.lsb_split {
         config.lossless.scalable_lsbs = split;
     }
+    config.lossless.residual = !options.full_coded;
     let mut encoder =
         master::Encoder::new(config).map_err(|e| Error::refused(&options.input, e.0))?;
     let per_frame = FRAME_SAMPLES * options.channels;
     let mut frame = vec![0i32; per_frame];
     let mut stream = Vec::new();
     let mut frames = 0;
+    let started = std::time::Instant::now();
     for chunk in reference.pcm.chunks(per_frame) {
         frame[..chunk.len()].copy_from_slice(chunk);
         frame[chunk.len()..].fill(0);
@@ -147,14 +152,32 @@ fn run_lossless(options: &Options, bits: u8) -> Result<()> {
             .map_err(|e| Error::refused(&options.input, format!("frame {frames}: {e}")))?;
         frames += 1;
     }
+    encoder
+        .finish(&mut stream)
+        .map_err(|e| Error::refused(&options.input, format!("frame {frames}: {e}")))?;
+    let took = started.elapsed().as_secs_f64();
     std::fs::write(&options.out, &stream).map_err(|e| Error::io(&options.out, e))?;
     let pcm_bytes = reference.pcm.len() * usize::from(bits) / 8;
     println!(
         "encoded {frames} frames, {} bytes: {:.1} % of the {bits}-bit PCM, the {}-byte cores \
-         included",
+         included; in {took:.2} s, {:.0}× real time",
         stream.len(),
         100.0 * stream.len() as f64 / pcm_bytes as f64,
-        encoder.core_frame_size()
+        encoder.core_frame_size(),
+        frames as f64 * FRAME_SAMPLES as f64 / 48000.0 / took
+    );
+    let core_channels = if options.channels == 8 {
+        6
+    } else {
+        options.channels
+    };
+    println!(
+        "  lossless layer         {} bytes, {:.1} % of the PCM, {:.0} kb/s; {:.2} of {core_channels} \
+         channels a frame coded against the core",
+        encoder.lossless_bytes(),
+        100.0 * encoder.lossless_bytes() as f64 / pcm_bytes as f64,
+        encoder.lossless_bytes() as f64 * 8.0 * 48000.0 / (frames as f64 * 512.0) / 1000.0,
+        encoder.against_core() as f64 / frames as f64
     );
     let decoded = dts::run(dts::Options {
         input: options.out.clone(),
@@ -281,27 +304,32 @@ mod tests {
         pcm
     }
 
-    /// Phase C2a's acceptance: 5.1 and 7.1 at 16 and 24 bits come back bit
+    /// Phase C2's acceptance: 5.1 and 7.1 at 16 and 24 bits come back bit
     /// for bit, every frame and every channel, through `dca` (with the
     /// `dca-oracle` feature) and through FFmpeg (where it is installed);
     /// every header of the stream, the lossless frames' included, reads and
-    /// writes back byte for byte with its checksum valid. The reference
-    /// streams' shape for each, and two others: eight segments without the
-    /// split flag at 24 bits, and 256 segments of two samples with it at 16,
-    /// the core with ADPCM.
+    /// writes back byte for byte with its checksum valid. Each with the
+    /// channels the core carries coded against it (C2b), the core with ADPCM
+    /// and without, and each coded alone (C2a); and two shapes off the
+    /// reference streams': eight segments without the split flag at 24 bits,
+    /// and 256 segments of two samples with it at 16, the core with ADPCM.
     #[test]
     fn master_audio_comes_back_bit_for_bit() {
-        let shapes = [
-            (6, 16, None, None, false),
-            (6, 24, None, None, false),
-            (8, 16, None, None, false),
-            (8, 24, None, None, false),
-            (8, 24, Some(3), Some(false), false),
-            (6, 16, Some(8), Some(true), true),
-        ];
-        for (channels, bits, segments_log2, lsb_split, adpcm) in shapes {
+        let mut shapes = Vec::new();
+        for (channels, bits) in [(6, 16), (6, 24), (8, 16), (8, 24)] {
+            for (adpcm, full_coded) in [(false, false), (true, false), (false, true)] {
+                shapes.push((channels, bits, None, None, adpcm, full_coded));
+            }
+        }
+        shapes.push((8, 24, Some(3), Some(false), false, false));
+        shapes.push((6, 16, Some(8), Some(true), true, false));
+        for (channels, bits, segments_log2, lsb_split, adpcm, full_coded) in shapes {
+            let what = format!(
+                "{channels} channels at {bits} bits, segments {segments_log2:?}, adpcm {adpcm}, \
+                 full-coded {full_coded}"
+            );
             let dir = std::env::temp_dir().join(format!(
-                "hz-dts-ma-{}-{channels}-{bits}-{segments_log2:?}",
+                "hz-dts-ma-{}-{channels}-{bits}-{segments_log2:?}-{adpcm}-{full_coded}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
@@ -321,12 +349,11 @@ mod tests {
                 ffmpeg_lfe: false,
                 segments_log2,
                 lsb_split,
+                full_coded,
                 out: dir.join("out.dts"),
             });
             std::fs::remove_dir_all(&dir).unwrap();
-            result.unwrap_or_else(|e| {
-                panic!("{channels} channels at {bits} bits, segments {segments_log2:?}: {e}")
-            });
+            result.unwrap_or_else(|e| panic!("{what}: {e}"));
         }
     }
 
