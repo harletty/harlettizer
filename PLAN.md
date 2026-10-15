@@ -724,7 +724,16 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   up to fifteen elements, the gains fitted to the 5.1 core a decoder plays —
   `hz-ac3` reconstructs it — and carried with the object metadata in each
   syncframe's skip field; `cargo xtask joc-check` holds the decoded objects
-  to the master's. Next: cluster larger masters into fifteen elements.
+  to the master's.
+- **Larger masters folded into fifteen**: the objects and bed channels of a
+  master with more, folded by `hz_programme::fold::Folder` (the IAMF writer's
+  fold, moved there) a syncframe at a time, on the decoded core's clock, two
+  frames ahead. A 40-object master decodes with fifteen objects;
+  `joc-check --elements` holds them to the elements carried (3–7 dB on
+  dense synthetic scenes, as a 15-element master carried as it is) and
+  renders the scene on 7.1.4 against the master's (16–22 dB for the fold,
+  6–11 dB decoded); see [docs/joc.md](docs/joc.md). Next: the loudness and
+  programme payloads, and a receiver.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is

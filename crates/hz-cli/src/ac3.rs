@@ -328,15 +328,41 @@ pub fn run(config: Config) -> Result<()> {
         }
     );
     if let Sink::Joc(writer) = &sink {
+        let carried = writer.elements();
         println!(
-            "  objects      {element_count} carried by joint object coding, fitted to the core \
-             a decoder plays; every Evolution frame {} bytes{}",
+            "  objects      {carried} carried by joint object coding{}, fitted to the core a \
+             decoder plays; every Evolution frame {} bytes{}",
+            if carried < element_count {
+                format!(", the master's {element_count} elements folded into them")
+            } else {
+                String::new()
+            },
             writer.evolution_bytes(),
             match writer.squeezed() {
                 0 => String::new(),
                 n => format!(", {n} payloads quantised coarser to fit"),
             }
         );
+        if let Some(folder) = writer.folder() {
+            let cost = &folder.mixer.cost;
+            let smoothing = folder.placer.smoothing();
+            println!(
+                "  fold         {:.4} mean over the presentations, {:.3} at its worst, as a \
+                 fraction of the object's own gains; a block a syncframe, steadied by a hold \
+                 over {} behind and {} ahead",
+                cost.mean(),
+                cost.worst,
+                smoothing.behind,
+                smoothing.ahead
+            );
+            println!(
+                "  floor        {:.1} dBFS at the playback level a dialnorm of {} implies, \
+                 {:.2} objects a block under it",
+                folder.mixer.floor.threshold_dbfs(),
+                config.dialnorm,
+                cost.inaudible as f64 / cost.blocks.max(1) as f64
+            );
+        }
     }
     println!(
         "  loudness     {} on {}, the stream stating a dialnorm of {}",

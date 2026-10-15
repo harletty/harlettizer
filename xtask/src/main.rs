@@ -574,6 +574,14 @@ enum Command {
         /// Where a master's mono WAVs sit, when not beside it.
         #[arg(long, value_name = "PATH")]
         mono_prefix: Option<PathBuf>,
+
+        /// The encoder's trace of the elements it carried
+        /// (`HZ_JOC_TRACE=<dir> harlettizer ac3 --eac3 --joc …`): compare
+        /// the objects with them rather than with the master's, which a
+        /// master folded into fifteen elements needs, and render the scene
+        /// against the master's.
+        #[arg(long, value_name = "DIR")]
+        elements: Option<PathBuf>,
     },
 
     /// Re-encode a reference E-AC-3 stream's 5.1 core with `hz-ac3`, carry
@@ -1024,10 +1032,12 @@ fn main() -> ExitCode {
             stream,
             master,
             mono_prefix,
+            elements,
         } => joc_check::run(joc_check::Options {
             stream,
             master,
             mono_prefix,
+            elements,
         }),
         #[cfg(not(feature = "eac3-oracle"))]
         Command::JocCheck { .. } => Err(hz_core::Error::Unsupported {
