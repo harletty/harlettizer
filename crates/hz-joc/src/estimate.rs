@@ -803,31 +803,40 @@ impl Estimator {
     /// over its budget pays for this.
     fn fit_budget(&mut self, joc: &mut Joc) {
         let step = f64::from(STEP);
+        // Scaled by the objects quantised again: an absent one's weights are
+        // whatever its last frame left, and a loud object gone from a quiet
+        // frame put every λ the search tried past the useful ones.
         let scale = self
             .weights
             .iter()
-            .flatten()
-            .flatten()
+            .zip(&joc.objects)
+            .filter(|(_, object)| object.is_some())
+            .flat_map(|(weights, _)| weights.iter().flatten())
             .fold(0f64, |m, &w| m.max(w))
             .max(1e-30)
             * step
             * step;
-        let size = |estimator: &Self, joc: &mut Joc, lambda: f64| {
+        let fits = |estimator: &Self, joc: &mut Joc, lambda: f64| {
             estimator.requantise(joc, lambda);
-            joc.to_bytes().len()
+            joc.to_bytes().len() <= estimator.budget
         };
-        // A λ that fits — at most where every code is nought, beyond which
-        // nothing gets smaller — then the least that does.
-        let mut high = scale;
-        let mut tries = 0;
-        while size(self, joc, high) > self.budget && tries < 40 {
-            high *= 4.0;
-            tries += 1;
+        // A λ that fits and a quarter of it that does not, each way from the
+        // scale — at most to where every code is nought, beyond which nothing
+        // gets smaller, or to where the least λ tried still fits — then the
+        // least that fits between them, halving the ratio.
+        let (mut low, mut high) = (scale / 4.0, scale);
+        for _ in 0..40 {
+            if !fits(self, joc, high) {
+                (low, high) = (high, high * 4.0);
+            } else if fits(self, joc, low) {
+                (low, high) = (low / 4.0, low);
+            } else {
+                break;
+            }
         }
-        let mut low = 0.0;
         for _ in 0..24 {
-            let middle = 0.5 * (low + high);
-            if size(self, joc, middle) <= self.budget {
+            let middle = (low * high).sqrt();
+            if fits(self, joc, middle) {
                 high = middle;
             } else {
                 low = middle;
@@ -1650,6 +1659,56 @@ mod tests {
         roomy.budget = largest;
         for (k, (free, roomy)) in free.iter().zip(run(&mut roomy, &input)).enumerate() {
             assert_eq!(free.to_bytes(), roomy.to_bytes(), "frame {k}");
+        }
+    }
+
+    /// The budget's search is scaled by the objects it quantises again, not
+    /// by weights an absent object left behind.
+    #[test]
+    fn an_absent_objects_old_weights_do_not_set_the_budgets_scale() {
+        // Two objects, loud for two frames, then the downmix 100 dB quieter
+        // and the second object gone. Its weights from the loud frames stayed
+        // behind; taken into the search's scale they put every λ it tried
+        // far past the useful ones, and the present object was sent with
+        // gains all nought, in a payload half its budget.
+        const BUDGET: usize = 30;
+        for fit in [Fit::Centred, Fit::Synthesis] {
+            let mut seed = 43u32;
+            let mut estimator = Estimator::new(2, 0);
+            estimator.fit = fit;
+            let mut payloads = Vec::new();
+            for k in 0..8 {
+                let level = if k < 2 { 1.0 } else { 1e-5 };
+                let core: Vec<Vec<f32>> = (0..5)
+                    .map(|_| (0..1536).map(|_| level * noise(&mut seed)).collect())
+                    .collect();
+                let objects: Vec<Vec<f32>> = (0..2)
+                    .map(|o| {
+                        (0..1536)
+                            .map(|n| core[o][n] + 2.0 * level * noise(&mut seed))
+                            .collect()
+                    })
+                    .collect();
+                if k == 5 {
+                    estimator.budget = BUDGET;
+                }
+                let core: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                let objects: Vec<&[f32]> = objects.iter().map(Vec::as_slice).collect();
+                payloads.extend(estimator.push(&core, &objects, &[true, k < 2]));
+            }
+            assert!(estimator.squeezed() > 0, "{fit:?}: the budget was needed");
+            for (frame, joc) in payloads.iter().enumerate().skip(4) {
+                let bytes = joc.to_bytes();
+                assert!(bytes.len() <= BUDGET, "{fit:?} frame {frame}");
+                let object = joc.objects[0].as_ref().unwrap();
+                let gains = dequantise(object, 5).unwrap();
+                let mean = gains[0].iter().sum::<f32>() / BANDS as f32;
+                assert!(
+                    mean > 0.5,
+                    "{fit:?} frame {frame}: L's gains average {mean} for one, in {} bytes",
+                    bytes.len()
+                );
+            }
         }
     }
 

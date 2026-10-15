@@ -154,7 +154,10 @@ data point, smooth.
   object's codes chosen again, channel by channel, for the least error plus
   λ times their bits — a Viterbi search over each band's candidate levels, a
   few either side of its own, the channel's weighted mean and nought — one λ
-  for the frame, the least that fits, found by bisection. The error is
+  for the frame, the least that fits: bracketed up or down from a scale set
+  by the objects being quantised — an absent object's last weights once
+  set it, and a quiet frame's present object was sent at nought — then
+  found by bisection of the ratio. The error is
   weighed by the fit's own normal equations: the synthesis fit's diagonal,
   the centred fit's per band. Codes are differences between neighbouring
   bands and a difference of nought costs one bit, so a larger λ flattens the
