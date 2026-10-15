@@ -706,12 +706,16 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
 - The reference streams code every object one way: twelve parameter bands,
   fine quantisation, dense coefficients, one data point a frame, a steep slope
   for some. That is what the estimator writes first.
-- `hz_joc::estimate` fits the gains in the decoder's QMF domain (`hz_joc::qmf`,
-  its analysis bank). Refitted to a reference's own core and objects
-  (`cargo xtask graft --refit centred`), 86 to 99.8 % of its gains land on the
-  reference's step; the misses gather in the narrow low bands, the subbands'
-  leakage a band-by-band fit cannot see. Next: fit by synthesis, decide the
-  steep slope, budget the payload, and fit to a core rendered from a master.
+- `hz_joc::estimate` fits the gains to the decoder's output: each downmix
+  channel's share of each band synthesised through the decoder's QMF bank
+  (`hz_joc::qmf`), an object's sixty gains fitted together under a frame-long
+  Hann window. Refitted to a reference's own core and objects
+  (`cargo xtask graft --refit synthesis`), 93.6 to 99.9 % of its gains land on
+  the reference's step, and its objects come within 4–5 dB of what the
+  reference's own gains rebuild on slid frames — 3 to 4 dB better than the
+  first, band-by-band fit in the QMF domain, which could not see the
+  subbands' leakage. Next: decide the steep slope (the stepped frames are now
+  the gap), budget the payload, and fit to a core rendered from a master.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is
