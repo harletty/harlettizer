@@ -523,6 +523,13 @@ enum Command {
         #[arg(long, value_name = "BOOL")]
         lsb_split: Option<bool>,
 
+        /// With `--lossless`: code every channel as itself, independent of
+        /// the core (phase C2a), rather than the channels the core carries as
+        /// their difference from it where that is cheaper, as the reference
+        /// streams do.
+        #[arg(long)]
+        full_coded: bool,
+
         /// Where to write the stream.
         #[arg(long)]
         out: PathBuf,
@@ -919,6 +926,7 @@ fn main() -> ExitCode {
             ffmpeg_lfe,
             segments,
             lsb_split,
+            full_coded,
             out,
         } => dts_encode::run(dts_encode::Options {
             input,
@@ -930,6 +938,7 @@ fn main() -> ExitCode {
             ffmpeg_lfe,
             segments_log2: segments,
             lsb_split,
+            full_coded,
             out,
         }),
         #[cfg(feature = "eac3-oracle")]

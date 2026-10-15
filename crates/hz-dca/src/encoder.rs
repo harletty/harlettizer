@@ -267,6 +267,9 @@ struct State {
     /// The expected peak of the prediction residual.
     diff_peak_cb: [[i32; SUBBANDS]; MAX_CHANNELS],
     downsampled_lfe: [i32; LFE_SAMPLES],
+    /// The LFE samples quantised, of which the stream carries the low eight
+    /// bits.
+    lfe_codes: [i32; LFE_SAMPLES],
     masking_curve_cb: [[i32; 256]; SUBSUBFRAMES],
     bit_allocation_sel: [i32; MAX_CHANNELS],
     abits: [[i32; SUBBANDS]; MAX_CHANNELS],
@@ -388,6 +391,7 @@ impl Encoder {
             peak_cb: [[0; SUBBANDS]; MAX_CHANNELS],
             diff_peak_cb: [[0; SUBBANDS]; MAX_CHANNELS],
             downsampled_lfe: [0; LFE_SAMPLES],
+            lfe_codes: [0; LFE_SAMPLES],
             masking_curve_cb: [[0; 256]; SUBSUBFRAMES],
             // Six: no Huffman code for the allocation.
             bit_allocation_sel: [6; MAX_CHANNELS],
@@ -491,6 +495,9 @@ impl Encoder {
             let (scale, quant) = s.calc_one_scale(s.lfe_peak_cb, 11);
             s.lfe_scale_factor = scale;
             s.lfe_quant = quant;
+            for (code, &sample) in s.lfe_codes.iter_mut().zip(&s.downsampled_lfe) {
+                *code = quantize_value(sample, quant);
+            }
         }
         s.shift_history(pcm, self.config.lfe_history_quirk);
         s.fill_in_adpcm_buffer();
@@ -515,6 +522,83 @@ impl Encoder {
         out.extend_from_slice(w.bytes());
         out.resize(start + s.frame_size, 0);
     }
+
+    /// Forget the subband prediction history, as though the frame just
+    /// written had not been: what a stream that leaves it out needs, since
+    /// its decoder starts the next frame's ADPCM from silence.
+    pub(crate) fn restart_prediction(&mut self) {
+        let s = &mut *self.state;
+        for ch in 0..s.fullband_channels {
+            for band in 0..SUBBANDS {
+                s.adpcm_history[ch][band] = [0; 2 * ADPCM_COEFFS];
+                s.subband[ch][band][..ADPCM_COEFFS].fill(0);
+            }
+        }
+    }
+
+    /// Coded channels, the LFE apart.
+    pub(crate) fn coded_channels(&self) -> usize {
+        self.state.fullband_channels
+    }
+
+    /// The input channel coded channel `ch` is made from.
+    pub(crate) fn input_channel(&self, ch: usize) -> usize {
+        self.state.channel_order[ch] as usize
+    }
+
+    /// Whether the steps are the lossless table's: never at a rate this
+    /// encoder writes (see `State::step_size`).
+    pub(crate) fn lossless_steps(&self) -> bool {
+        BIT_RATES[usize::from(self.state.bit_rate_code)] == 3
+    }
+
+    /// Subband `band` of coded channel `ch` as the frame last written sends
+    /// it.
+    pub(crate) fn subband(&self, ch: usize, band: usize) -> Coded<'_> {
+        let s = &self.state;
+        let abits = s.abits[ch][band];
+        let huffman = (1..=CODE_BOOKS as i32).contains(&abits)
+            && s.quant_index_sel[ch][abits as usize - 1]
+                < i32::from(QUANT_INDEX_GROUP_SIZE[abits as usize - 1]);
+        let mode = s.prediction_mode[ch][band];
+        Coded {
+            abits,
+            scale_index: s.scale_factor[ch][band] as usize,
+            predictor: (mode >= 0).then_some(mode as usize),
+            huffman,
+            // Neither Huffman nor block codes: plain words.
+            linear: !huffman && abits > 7,
+            samples: &s.quantized[ch][band],
+        }
+    }
+
+    /// The input channel of the LFE.
+    pub(crate) fn lfe_channel(&self) -> usize {
+        self.state.lfe_index
+    }
+
+    /// The LFE of the frame last written — its quantised samples, of which
+    /// the stream carries the low eight bits, and its scale factor index —
+    /// when there is one.
+    pub(crate) fn lfe(&self) -> Option<(&[i32; LFE_SAMPLES], usize)> {
+        let s = &self.state;
+        s.lfe_channel
+            .then_some((&s.lfe_codes, s.lfe_scale_factor as usize))
+    }
+}
+
+/// One subband of a frame, as the stream carries it.
+pub(crate) struct Coded<'a> {
+    /// The allocation code; nought for a subband without samples.
+    pub abits: i32,
+    pub scale_index: usize,
+    /// The ADPCM predictor's index, when the subband is predicted.
+    pub predictor: Option<usize>,
+    /// Huffman codes, for which the decoder adjusts the scale factor.
+    pub huffman: bool,
+    /// Plain words of `abits − 3` bits, which a decoder reads as signed.
+    pub linear: bool,
+    pub samples: &'a [i32; SUBBAND_SAMPLES],
 }
 
 impl State {
@@ -1280,8 +1364,8 @@ impl State {
 
         // LFE: eight samples and a scale factor.
         if self.lfe_channel {
-            for &s in &self.downsampled_lfe {
-                w.put(8, (quantize_value(s, self.lfe_quant) & 0xff) as u32);
+            for &code in &self.lfe_codes {
+                w.put(8, (code & 0xff) as u32);
             }
             w.put(8, self.lfe_scale_factor as u32);
         }
@@ -1303,7 +1387,7 @@ impl State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn tone(frames: usize, channels: usize) -> Vec<i32> {
@@ -1322,7 +1406,7 @@ mod tests {
     /// same on every platform: two tones from an integer resonator — which
     /// subband prediction pays on — noise through one-pole low-passes of
     /// different corners, and a square wave in the LFE.
-    fn fixture(frames: usize) -> Vec<i32> {
+    pub(crate) fn fixture(frames: usize) -> Vec<i32> {
         let mut seed = 0x2545_f491u32;
         let mut state = [0i32; 6];
         // y[n] = 2cos(w)·y[n−1] − y[n−2], at 440 Hz and 1250 Hz, started at

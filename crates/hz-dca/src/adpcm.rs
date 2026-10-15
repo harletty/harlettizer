@@ -41,7 +41,7 @@ pub(crate) fn mul32(a: i32, b: i32) -> i32 {
 
 /// `clip23`: saturate to 24 bits signed.
 #[inline(always)]
-fn clip23(a: i32) -> i32 {
+pub(crate) fn clip23(a: i32) -> i32 {
     a.clamp(-(1 << 23), (1 << 23) - 1)
 }
 

@@ -266,6 +266,10 @@ struct Tally {
     navigation_at: BTreeMap<usize, usize>,
     navigation_max: Option<Navigation>,
     navigation_max_offset: usize,
+    /// Every navigated block's offset and size, summed: what of the lossless
+    /// frames is the bed before the extension, and what the extension.
+    navigation_offsets: u64,
+    navigation_sizes: u64,
     navigation_max_size: usize,
     tail_bits: BTreeMap<usize, usize>,
     first_difference: Option<String>,
@@ -291,6 +295,9 @@ struct LosslessTally {
     spanning: usize,
     /// Channel sets per frame → frames.
     shapes: BTreeMap<String, usize>,
+    /// Bytes of the frames read, padding included, and of the largest.
+    bytes: u64,
+    largest: usize,
 }
 
 impl LosslessTally {
@@ -331,6 +338,8 @@ impl LosslessTally {
             }
             let frame = &self.pending[..size];
             self.frames += 1;
+            self.bytes += size as u64;
+            self.largest = self.largest.max(size);
             match xll::Headers::read(frame, one_to_one) {
                 Ok(headers) => {
                     if headers.checksums(frame).all() {
@@ -343,7 +352,16 @@ impl LosslessTally {
                     let shape: Vec<String> = headers
                         .channel_sets
                         .iter()
-                        .map(|c| format!("{}", c.channels))
+                        .map(|c| {
+                            // The channels coded against the core, when any.
+                            let full = (1u32 << c.channels) - 1;
+                            let residual = full & !u32::from(c.residual_encode);
+                            if residual == 0 {
+                                format!("{}", c.channels)
+                            } else {
+                                format!("{} (residual {residual:#x})", c.channels)
+                            }
+                        })
                         .collect();
                     *self.shapes.entry(shape.join("+")).or_default() += 1;
                 }
@@ -486,6 +504,11 @@ pub fn run(options: Options) -> Result<()> {
                 tally.navigation_max_size,
                 navigation::MAX_SIZE
             );
+            println!(
+                "  navigated on average   offset {:.1} bytes, block {:.1} bytes",
+                tally.navigation_offsets as f64 / found as f64,
+                tally.navigation_sizes as f64 / found as f64
+            );
         }
     }
     let lossless = &tally.lossless;
@@ -504,6 +527,14 @@ pub fn run(options: Options) -> Result<()> {
             lossless.frames,
             shapes.join(", ")
         );
+        if lossless.frames > 0 {
+            println!(
+                "  lossless frames        {} bytes, {:.1} a frame, {} at most",
+                lossless.bytes,
+                lossless.bytes as f64 / lossless.frames as f64,
+                lossless.largest
+            );
+        }
         if lossless.spanning > 0 || lossless.unsynchronised > 0 {
             println!(
                 "                         {} substreams continue a frame, {} start without one",
@@ -650,6 +681,8 @@ fn navigate(header: &ExssHeader, tally: &mut Tally) -> Option<Navigation> {
     let (bit, navigation) = find_word(&asset.tail)?;
     *tally.navigation_at.entry(bit).or_default() += 1;
     tally.navigation_max_offset = tally.navigation_max_offset.max(navigation.offset);
+    tally.navigation_offsets += navigation.offset as u64;
+    tally.navigation_sizes += navigation.size as u64;
     tally.navigation_max_size = tally.navigation_max_size.max(navigation.size);
     tally.navigation_max = Some(navigation);
     Some(navigation)
