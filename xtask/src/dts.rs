@@ -3,7 +3,11 @@
 //! ```text
 //! cargo xtask dts stream.dts [--frames N]
 //! cargo run -p xtask --features dca-oracle -- dts stream.dts
+//! cargo run -p xtask --features dca-oracle -- dts programme.mka
 //! ```
+//!
+//! A Matroska file (`.mka`, `.mkv`) is read through its `A_DTS` track: its
+//! blocks, one frame each, are the stream.
 //!
 //! Phase C0's acceptance: every core frame header and every extension
 //! substream header of a reference stream read by `hz-dca` and written again,
@@ -616,8 +620,51 @@ impl LosslessTally {
     }
 }
 
+/// The stream an `A_DTS` track carries: its blocks one after the other,
+/// each of which has to be whole frames.
+fn demux(path: &std::path::Path, file: &[u8]) -> Result<Vec<u8>> {
+    use hz_matroska::{id, read};
+    let malformed = |e: read::Malformed| Error::malformed(path, e.0);
+    let (_, parts) = read::segment(file).map_err(malformed)?;
+    let tracks = read::only(&parts, id::TRACKS).map_err(malformed)?;
+    let mut number = None;
+    for entry in read::children(file, tracks.at, tracks.end).map_err(malformed)? {
+        let fields = read::children(file, entry.at, entry.end).map_err(malformed)?;
+        let codec = read::only(&fields, id::CODEC_ID).map_err(malformed)?;
+        if &file[codec.at..codec.end] == b"A_DTS" {
+            number = Some(read::uint(
+                file,
+                read::only(&fields, id::TRACK_NUMBER).map_err(malformed)?,
+            ));
+            break;
+        }
+    }
+    let number = number.ok_or_else(|| Error::malformed(path, "no A_DTS track"))?;
+    let blocks = read::blocks(file, number).map_err(malformed)?;
+    let padded = blocks
+        .iter()
+        .filter(|b| b.discard_padding.is_some())
+        .count();
+    println!(
+        "matroska: track {number}, A_DTS, {} blocks, {} of them stating padding",
+        blocks.len(),
+        padded
+    );
+    Ok(blocks.iter().flat_map(|b| b.frame).copied().collect())
+}
+
 pub fn run(options: Options) -> Result<()> {
-    let bytes = std::fs::read(&options.input).map_err(|e| Error::io(&options.input, e))?;
+    let file = std::fs::read(&options.input).map_err(|e| Error::io(&options.input, e))?;
+    let matroska = options
+        .input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mka") || e.eq_ignore_ascii_case("mkv"));
+    let bytes = if matroska {
+        demux(&options.input, &file)?
+    } else {
+        file
+    };
     let limit = options.frames.unwrap_or(usize::MAX);
     let mut tally = Tally::default();
     let mut first_core = None;
@@ -1717,6 +1764,56 @@ mod tests {
             .to_string();
         assert!(message.contains("destroy"), "{message}");
         assert_eq!(after, stream);
+    }
+
+    /// A Matroska file's `A_DTS` track is read as the stream its blocks
+    /// carry: a frame a block, as `harlettizer dts` writes it, gives back
+    /// the raw stream byte for byte, and the command reads it.
+    #[test]
+    fn a_matroska_track_is_read_as_the_stream_it_carries() {
+        use hz_matroska::{Muxer, Track};
+        let (stream, _) = height_stream();
+        let mut file = std::io::Cursor::new(Vec::new());
+        let track = Track {
+            codec_id: "A_DTS",
+            codec_private: None,
+            sample_rate: 48_000,
+            frame: 512,
+            channels: 8,
+            bits: Some(24),
+            codec_delay: None,
+            seek_pre_roll: None,
+            uid: 1,
+            writing_app: "test",
+        };
+        let (mut muxer, _) = Muxer::start(&mut file, &track).unwrap();
+        let mut frames = 0;
+        for (n, frame) in hz_dca::split::frames(&stream).enumerate() {
+            let frame = frame.unwrap();
+            let len = frame.core.map_or(0, <[u8]>::len) + frame.exss.map_or(0, <[u8]>::len);
+            muxer
+                .block(&mut file, n as u64, &stream[frame.at..frame.at + len], 0)
+                .unwrap();
+            frames += 1;
+        }
+        muxer.finish(&mut file, frames * 512).unwrap();
+        let file = file.into_inner();
+        let path = std::path::Path::new("stream.mka");
+        assert_eq!(super::demux(path, &file).unwrap(), stream);
+
+        let dir = std::env::temp_dir().join(format!("hz-dts-matroska-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("stream.mka");
+        std::fs::write(&input, &file).unwrap();
+        let result = super::run(super::Options {
+            input,
+            frames: None,
+            reference: None,
+            unfold: None,
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
     }
 
     /// Each frame is unfolded with the fold its own matrix states: a stream

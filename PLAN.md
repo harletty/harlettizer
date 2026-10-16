@@ -1219,7 +1219,7 @@ What C3 did:
   7.1.4, limited as above, and written as a raw `.dts`, with `--adpcm` for the
   core. On an 11-object master (6,643 frames) and a 40-object scene, `dca`
   presents the height profile on every frame, every block rewrites, and
-  FFmpeg reports DTS:X. Matroska and progress lines are C5. `docs/dts.md`
+  FFmpeg reports DTS:X. Matroska is C5's. `docs/dts.md`
   has the command, the checks, the domain and the receiver recipe.
 - 🔴 **(c) and (d)** need a receiver and a listener. `docs/dts.md` has the
   recipe: re-encode a reference stream's own 7.1.4 and play the two side by
@@ -1235,12 +1235,63 @@ What C3 did:
   buffer model and stays bit-exact.
 - **Size**: about a week. **Risk**: low to medium.
 
-#### Phase C5 — Command line and containers
+#### Phase C5 — Command line and containers — **done; the receiver check is C3's (c)**
 
 - `harlettizer dts` (or `encode --codec dts`) with the usual progress lines;
   raw `.dts` (core + EXSS) and Matroska (`A_DTS`), by generalising the IAMF
   Matroska writer.
 - **Size**: about a week. **Risk**: low.
+
+What C5 did:
+
+- ✅ **`harlettizer dts --layout 7.1.4 | 7.1 | 5.1 --bits 24 | 16`**, its own
+  command beside `ac3` and `iamf`, as they are built. 7.1.4 is C3's standard
+  DTS:X profile and stays 24-bit, refused at 16 before anything is read. 7.1
+  and 5.1 are C2's DTS-HD Master Audio beds: the 7.1 render routed as `iamf`
+  routes it; the 5.1 rendered on 7.1 and folded as `ac3` folds it
+  (`presentation_matrix`), since the room's cube has no place for a ±110°
+  surround. The limiter watches the channels, and for 7.1.4 the composite too.
+  `--progress` is the shared reporter. The input/output guard of #47 holds,
+  and a frame the navigation word cannot reach still ends the encode with
+  `Refused::Navigation` naming it — `frame 0 (from sample 0): …`; what was
+  sent before is left, and a Matroska file is closed around it.
+- ✅ **`hz-matroska`**: IAMF's muxer, moved out of `hz-iamf` into a crate of
+  its own with no dependency, so that `A_IAMF` and `A_DTS` share one muxer
+  rather than two copies of it. A mapping now states its codec id, private
+  data, `Channels`, `CodecDelay` and `SeekPreRoll`; the clusters, cues, seek
+  head, the `DiscardPadding` group and the patching at the end are written
+  once. IAMF's `.mka` files are byte for byte what they were before the move
+  (FLAC and LPCM, a 15-object master). A reader comes with it, for the
+  checks.
+- ✅ **`A_DTS`**: no private data, a frame (core + substream) a block, every
+  block a key frame. `Channels` and `BitDepth` as `mkvmerge` v102 states them
+  for the same stream — the bed's channels, eight for a 7.1.4, and the
+  lossless layer's depth. The last block states the padding of the last frame
+  as `DiscardPadding`, so FFmpeg decodes the `.mka` to exactly the master's
+  length (100,000 samples where the `.dts` gives 196 whole frames).
+- ✅ **Checked**, on a 20-second synthetic master (eleven objects over a 7.1.2
+  bed), each layout in both containers. The `.mka`'s blocks are the `.dts`
+  byte for byte, `mkvextract` agreeing. `cargo xtask dts --features
+  dca-oracle`, which now reads an `.mka` through its `A_DTS` track, rewrites
+  every core, substream, lossless and extension header byte for byte, finds
+  the navigation word on all 1,875 frames of the 7.1.4, and `dca` decodes
+  every frame, presenting the height profile on each 7.1.4 one. The decode —
+  `--unfold` for the 7.1.4, FFmpeg's for the beds — re-encoded by
+  `dts-encode`, which holds `dca` and FFmpeg to its input bit for bit, gives
+  the command's stream back byte for byte. `ffprobe` reports `DTS-HD MA +
+  DTS:X` (7.1) and `DTS-HD MA` (7.1, 5.1(side)), `mkvmerge --identify` a
+  DTS-HD Master Audio track. mpv (0.41) demuxes the `.mka` and, with
+  `--audio-spdif=dts-hd --audio-channels=7.1`, makes one IEC 61937 DTS-HD
+  burst per frame at 192 kHz on eight channels — what the receiver will be
+  sent.
+- ✅ **Tests**: `crates/hz-cli/tests/dts.rs` runs the command on masters it
+  writes: every layout and depth to both containers, frames and headers
+  checked as above, the track's fields and its padding; FFmpeg's decode of
+  the `.mka` held to the master bit for bit — the 7.1, and the 7.1.4's
+  composite — where FFmpeg is installed; the navigation refusal by name; the
+  alias guard; the options refused; the progress lines.
+- 🔴 **C3's (c)**, playing as DTS:X on a licensed receiver, is still open:
+  `docs/dts.md` has the recipe, now with the `.mka` and mpv.
 
 #### Phase C6 — Objects (research)
 

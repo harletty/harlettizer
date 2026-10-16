@@ -248,6 +248,7 @@ dependencies = [
  "hz-iamf",
  "hz-io",
  "hz-joc",
+ "hz-matroska",
  "hz-meta",
  "hz-mlp",
  "hz-programme",
@@ -280,6 +281,7 @@ name = "hz-iamf"
 version = "0.1.0"
 dependencies = [
  "hz-core",
+ "hz-matroska",
  "pkg-config",
  "symphonia-bundle-flac",
  "symphonia-core",
@@ -302,6 +304,10 @@ version = "0.1.0"
 dependencies = [
  "hz-core",
 ]
+
+[[package]]
+name = "hz-matroska"
+version = "0.1.0"
 
 [[package]]
 name = "hz-meta"
@@ -733,6 +739,7 @@ dependencies = [
  "hz-dca",
  "hz-io",
  "hz-joc",
+ "hz-matroska",
  "hz-meta",
  "hz-mlp",
  "hz-programme",

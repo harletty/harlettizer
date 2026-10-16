@@ -461,6 +461,8 @@ enum Command {
     /// for the DTS:X navigation word. With `--features dca-oracle`, also
     /// compare against the workspace decoder and measure the height unfold.
     Dts {
+        /// A raw stream, or a Matroska file (`.mka`, `.mkv`) whose `A_DTS`
+        /// track is read.
         input: PathBuf,
 
         /// Stop after this many frames.
