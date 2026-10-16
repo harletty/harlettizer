@@ -82,14 +82,6 @@ pub const OPUS_BITRATE: u32 = 96;
 /// The output, open, with its descriptors written.
 pub(crate) type Output = Writer<BufWriter<File>>;
 
-/// Whether `out` names a Matroska file, which the sequence is then the one
-/// track of.
-fn is_matroska(out: &std::path::Path) -> bool {
-    out.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("mka") || e.eq_ignore_ascii_case("mkv"))
-}
-
 /// Open `config.out` and start a sequence of these elements there.
 pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
     open_presenting(
@@ -118,7 +110,7 @@ pub(crate) fn open_presenting(
         presentation,
     };
     let out = BufWriter::new(out_file);
-    let writer = if is_matroska(&config.out) {
+    let writer = if crate::is_matroska(&config.out) {
         Writer::matroska(out, iamf_config, "harlettizer")
     } else {
         Writer::new(out, iamf_config)

@@ -48,11 +48,12 @@
 
 use crate::flac;
 use crate::layout::{Layout, STEREO_SOUND_SYSTEM};
-use crate::matroska::{self, Muxer};
+use crate::matroska;
 use crate::obu::{ObuType, put_leb128, put_obu, q7_8};
 #[cfg(feature = "opus")]
 use crate::opus;
 use crate::position::{self, Animation, PositionKind, Subblock};
+use hz_matroska::Muxer;
 use std::fmt;
 use std::io::{self, Seek, SeekFrom, Write};
 
@@ -428,7 +429,7 @@ impl<W: Write + Seek> Writer<W> {
                     bits: (!matches!(config.codec, Codec::Opus { .. })).then_some(config.bits),
                     writing_app,
                 };
-                let (muxer, start) = Muxer::start(&mut out, &track)?;
+                let (muxer, start) = matroska::start(&mut out, &track)?;
                 (Framing::Matroska(muxer), start)
             }
         };

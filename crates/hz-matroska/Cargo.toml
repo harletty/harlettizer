@@ -1,0 +1,13 @@
+[package]
+name = "hz-matroska"
+description = "Matroska audio track writing for harlettizer: one track, one frame a block"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Dependency-free, like the codec crates that sit on it: it is the container
+# around their frames, and knows none of them.
+[dependencies]

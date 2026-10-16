@@ -10,8 +10,16 @@ mod iamf_objects;
 use clap::{Parser, Subcommand};
 use hz_programme::mix::{self, Headroom, Mixing};
 use hz_programme::overlay;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// Whether `out` names a Matroska file, which a command then writes its
+/// stream into as the one track.
+pub(crate) fn is_matroska(out: &Path) -> bool {
+    out.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mka") || e.eq_ignore_ascii_case("mkv"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -304,21 +312,24 @@ enum Command {
         progress: bool,
     },
 
-    /// Render a programme to 7.1.4 and write it as DTS-HD Master Audio with
-    /// the DTS:X extension's standard profile.
+    /// Render a programme to 5.1, 7.1 or 7.1.4 and write it as DTS-HD Master
+    /// Audio — for 7.1.4, with the DTS:X extension's standard profile.
     ///
     /// Takes a master set or an ADM BW64 file at 48 kHz. Its bed channels are
     /// routed to their speakers and its objects panned on the room's cube, as
-    /// `iamf` renders them; each height is folded into the corner below it
-    /// at −3 dB, the 7.1 that makes coded losslessly at 24 bits beside a 5.1
-    /// core, and the heights carried losslessly in the extension. A limiter
-    /// keeps every corner with its height in it under full scale. Writes a
-    /// raw elementary stream. See `docs/dts.md`.
+    /// `iamf` renders them. The render is coded losslessly beside a 5.1 core;
+    /// for 7.1.4 each height is folded into the corner below it at −3 dB, the
+    /// 7.1 that makes coded losslessly at 24 bits, and the heights carried
+    /// losslessly in the extension, and a limiter keeps every corner with its
+    /// height in it under full scale. Writes a raw elementary stream, or a
+    /// Matroska file whose one track is the stream (`A_DTS`) when `--out`
+    /// ends in `.mka` or `.mkv`. See `docs/dts.md`.
     Dts {
         /// A master set's `.atmos` config, or an ADM BW64 file.
         input: PathBuf,
 
-        /// Write the elementary stream here.
+        /// Write the stream here: into Matroska if it ends in `.mka` or
+        /// `.mkv`, as a raw elementary stream otherwise.
         #[arg(long)]
         out: PathBuf,
 
@@ -330,6 +341,15 @@ enum Command {
         /// `encode --mono-prefix`.
         #[arg(long, value_name = "PREFIX")]
         mono_prefix: Option<PathBuf>,
+
+        /// `7.1.4`, the DTS:X standard profile; `7.1`; or `5.1`.
+        #[arg(long, default_value = "7.1.4")]
+        layout: String,
+
+        /// Bits of the lossless layer: 24, or 16 for 5.1 and 7.1. A 7.1.4
+        /// is 24 bits: a height's share of a corner is a 24-bit quantity.
+        #[arg(long, default_value_t = 24)]
+        bits: u8,
 
         /// Code the core's subbands with prediction (ADPCM). The lossless
         /// layers are the same either way.
@@ -841,16 +861,47 @@ fn main() -> ExitCode {
             out,
             frames,
             mono_prefix,
+            layout,
+            bits,
             adpcm,
             progress,
-        } => dts::run(dts::Config {
-            input,
-            out,
-            frames,
-            mono_prefix,
-            adpcm,
-            progress,
-        }),
+        } => {
+            let layout = match layout.as_str() {
+                "7.1.4" => Ok(hz_dca::lossless::Layout::SevenPointOneFour),
+                "7.1" => Ok(hz_dca::lossless::Layout::SevenPointOne),
+                "5.1" => Ok(hz_dca::lossless::Layout::FivePointOne),
+                other => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("`{other}` for the layout; 7.1.4, 7.1 or 5.1"),
+                )),
+            };
+            let bits = match (&layout, bits) {
+                (Ok(hz_dca::lossless::Layout::SevenPointOneFour), 16) => {
+                    Err(hz_core::Error::unsupported(
+                        &input,
+                        "16 bits for 7.1.4; the DTS:X profile is 24-bit, since a height's share \
+                         of a corner is a 24-bit quantity",
+                    ))
+                }
+                (_, 16 | 24) => Ok(bits),
+                (_, other) => Err(hz_core::Error::unsupported(
+                    &input,
+                    format!("{other} bits; 16 or 24"),
+                )),
+            };
+            layout.and_then(|layout| {
+                dts::run(dts::Config {
+                    input,
+                    out,
+                    frames,
+                    mono_prefix,
+                    layout,
+                    bits: bits?,
+                    adpcm,
+                    progress,
+                })
+            })
+        }
         Command::Iamf {
             input,
             out,
