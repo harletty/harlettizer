@@ -129,11 +129,7 @@ pub fn run(config: Config) -> Result<()> {
             }
             Part::Object { channel, keyframes } => {
                 following.object(channel, &keyframes);
-                elements.push(crate::joc::Element::Object {
-                    channel,
-                    path: hz_programme::path::Path::new(&keyframes),
-                    hint: 0,
-                });
+                elements.push(crate::joc::Element::object(channel, keyframes));
                 objects += 1;
             }
         }
@@ -194,6 +190,11 @@ pub fn run(config: Config) -> Result<()> {
     let mut frame = Vec::new();
     let (mut clipped, mut peak) = (0u64, 0f64);
 
+    let lag = if config.joc {
+        crate::joc::LATENCY
+    } else {
+        DELAY
+    };
     let mut at = 0u64;
     let mut syncframes = 0u64;
     loop {
@@ -267,9 +268,12 @@ pub fn run(config: Config) -> Result<()> {
             progress.at(at);
         }
         // Past the input's end, the frames keep coming until the decoder's
-        // output has caught up with it — see [`lag`].
+        // output has caught up with it: its last samples are DELAY behind —
+        // and with objects, joint object coding's latency further — and a
+        // final frame that is nearly full has not that much silence in it to
+        // carry them out.
         let ended = got < FRAME_SAMPLES;
-        if ended && caught_up(syncframes, at, lag(config.joc)) {
+        if ended && syncframes >= syncframes_to_cover(at, lag) {
             break;
         }
     }
@@ -385,18 +389,10 @@ pub fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Samples a decoder's last output is behind the input that went in: the
-/// core's [`DELAY`], and with joint object coding the objects' own on top,
-/// the QMF banks a decoder rebuilds them through. A final frame that is
-/// nearly full has not that much silence in it to carry them out.
-fn lag(joc: bool) -> u64 {
-    (DELAY + if joc { hz_joc::qmf::DELAY } else { 0 }) as u64
-}
-
-/// Whether `syncframes` frames carry a decoder's output past the last of
-/// `at` samples of input, `lag` behind.
-fn caught_up(syncframes: u64, at: u64, lag: u64) -> bool {
-    syncframes * FRAME_SAMPLES as u64 >= at + lag
+/// Syncframes that carry `samples` of input all the way out of a decoder
+/// whose output lags its input by `lag`.
+fn syncframes_to_cover(samples: u64, lag: usize) -> u64 {
+    (samples + lag as u64).div_ceil(FRAME_SAMPLES as u64)
 }
 
 /// Where each frame of core goes: an encoder, or the joint object coding
@@ -410,21 +406,17 @@ enum Sink {
 mod tests {
     use super::*;
 
-    /// A stream runs on until a decoder has played the input's last
-    /// sample: a core's, the encoder's delay behind; an object's, the joint
-    /// object coding latency behind that — 1000 samples take one syncframe
-    /// for the core, and two once objects have to come out of it as well.
+    /// A frame's padding that carries the core's delay out need not carry the
+    /// objects' too: 1280 samples fit one syncframe with the core's 256
+    /// behind, but the objects' 833 need a second, or the last 577 samples
+    /// of the programme are lost to them.
     #[test]
-    fn a_stream_runs_on_until_the_objects_have_caught_up() {
-        assert!(caught_up(1, 1000, lag(false)));
-        assert!(!caught_up(1, 1000, lag(true)));
-        assert!(caught_up(2, 1000, lag(true)));
-        for at in [1u64, 1000, 1536, 1537, 3000, 48_000] {
-            let mut syncframes = at.div_ceil(FRAME_SAMPLES as u64);
-            while !caught_up(syncframes, at, lag(true)) {
-                syncframes += 1;
-            }
-            assert!(syncframes * FRAME_SAMPLES as u64 >= at + 256 + 577, "{at}");
-        }
+    fn the_stream_runs_until_the_objects_are_out() {
+        assert_eq!(syncframes_to_cover(1280, DELAY), 1);
+        assert_eq!(syncframes_to_cover(1280, crate::joc::LATENCY), 2);
+        assert_eq!(crate::joc::LATENCY, DELAY + 577);
+        assert_eq!(syncframes_to_cover(1536 - 833, crate::joc::LATENCY), 1);
+        assert_eq!(syncframes_to_cover(1536 - 832, crate::joc::LATENCY), 2);
+        assert_eq!(syncframes_to_cover(0, DELAY), 1);
     }
 }

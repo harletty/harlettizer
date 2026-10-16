@@ -30,7 +30,8 @@ use hz_meta::emdf;
 use hz_meta::oamd::{Block, Gain, Object, ObjectAudioMetadata, Position, Ramp, Render};
 use hz_programme::fold::{self, Folder, Member};
 use hz_programme::mix::{Headroom, Mixing};
-use hz_programme::path::Path as Trajectory;
+use hz_programme::path::{self, Path as Trajectory};
+use hz_render::{Keyframe, Mode};
 use std::path::{Path, PathBuf};
 
 /// Elements a payload carries at most, as the reference streams do.
@@ -41,6 +42,10 @@ const SKIP_LIMIT: usize = 511;
 /// reference streams' run about eleven on average and twenty at most; past
 /// this, the payload's budget quantises gains coarser.
 const ROOM_PER_ELEMENT: usize = 16;
+/// Samples a decoder's objects lag the master by: the core's delay, then
+/// joint object coding's own (its QMF banks'). The stream has to run this far
+/// past the master's end, and the object metadata is timed on this clock.
+pub const LATENCY: usize = DELAY + hz_joc::qmf::DELAY;
 /// The core's channels joint object coding reconstructs from, in WAV order:
 /// L, R, C, Ls, Rs.
 const CORE: [usize; 5] = [0, 1, 2, 4, 5];
@@ -51,6 +56,11 @@ pub enum Element {
         channel: usize,
         path: Trajectory,
         hint: usize,
+        /// Its updates, the next one due and the last one in force: what
+        /// its size and rendering are, which do not ramp.
+        keyframes: Vec<Keyframe>,
+        next: usize,
+        current: Keyframe,
     },
     Bed {
         channel: usize,
@@ -59,6 +69,18 @@ pub enum Element {
 }
 
 impl Element {
+    /// An object, from its updates.
+    pub fn object(channel: usize, keyframes: Vec<Keyframe>) -> Self {
+        Self::Object {
+            channel,
+            path: Trajectory::new(&keyframes),
+            hint: 0,
+            current: keyframes.first().copied().unwrap_or_default(),
+            keyframes,
+            next: 0,
+        }
+    }
+
     fn channel(&self) -> usize {
         match self {
             Self::Object { channel, .. } | Self::Bed { channel, .. } => *channel,
@@ -74,6 +96,41 @@ impl Element {
             }
             Self::Bed { position, .. } => (*position, 1.0),
         }
+    }
+
+    /// Where it is at sample `t`, rendered as the master says: an object's
+    /// size, and whether it snaps, which zones confine it, how it follows
+    /// the screen and whether its height counts.
+    fn render(&mut self, t: u64) -> Render {
+        let (position, _) = self.state(t);
+        match self {
+            Self::Object {
+                keyframes,
+                next,
+                current,
+                ..
+            } => {
+                path::advance(keyframes, next, current, t);
+                Render {
+                    size: crate::encode::size_of(current.spread),
+                    ..rendered(position, current.mode)
+                }
+            }
+            Self::Bed { .. } => rendered(position, Mode::default()),
+        }
+    }
+}
+
+/// An element at `position` rendering by `mode`: its height counted where
+/// the mode counts it and it has any.
+fn rendered(position: [f64; 3], mode: Mode) -> Render {
+    Render {
+        position: Position::from_master(position),
+        elevation: mode.elevation && position[2].abs() > f64::EPSILON,
+        zones: mode.zones,
+        screen: mode.screen,
+        snap: mode.snap,
+        ..Render::default()
     }
 }
 
@@ -97,24 +154,32 @@ struct Direct {
     /// Per element, the last [`DELAY`] samples of the frame before and this
     /// frame's: the first [`FRAME_SAMPLES`] are on the decoded core's clock.
     signals: Vec<Vec<f32>>,
-    positions: Vec<[f64; 3]>,
+    renders: Vec<Render>,
 }
 
 /// The master's elements folded into [`MAX_ELEMENTS`] by `hz-cluster`, a
-/// syncframe a block, the blocks on the decoded core's clock: each block is
-/// the span of the master a frame of objects carries and the span a frame's
-/// object metadata ramps its positions across, so the weights ramp across
-/// the same span to the same positions. The fold places a block once it has
-/// read the blocks its window reaches ahead, so the core is held back with
-/// the block it was rendered beside.
+/// syncframe a block, the blocks on the clock of the objects a decoder
+/// plays, [`LATENCY`] behind the master: each block is the span of the
+/// master a frame's objects come out as, the span its object metadata ramps
+/// their positions across, so the weights ramp across the same span to the
+/// same positions. The estimator takes the elements on the core's clock,
+/// [`hz_joc::qmf::DELAY`] into a block and on into the next, so a frame is
+/// coded once the block after its own is folded; and the fold places a
+/// block once it has read the blocks its window reaches ahead. So the core
+/// is held back with the block it was rendered beside.
 struct Folded {
     /// Each block carrying the core rendered beside it, planar.
     folder: Folder<Vec<Vec<f32>>>,
-    /// The master's last [`DELAY`] samples of the frame before and this
+    /// The master's last [`LATENCY`] samples of the frame before and this
     /// frame's, interleaved: its first [`FRAME_SAMPLES`] are the block.
     master: Vec<f32>,
     /// Frames read.
     frames: u64,
+    /// The block folded last, held until the one after it is, and its
+    /// elements: per element, its samples and then the next block's.
+    held: Option<fold::Block<Vec<Vec<f32>>>>,
+    elements: Vec<Vec<f32>>,
+    renders: Vec<Render>,
 }
 
 /// The two encoders and the estimator, and what passes between them.
@@ -128,9 +193,9 @@ struct Coder {
     size: usize,
     placeholder: Vec<u8>,
     /// Where each element is at the end of the last two frames that went
-    /// in, frame `k` at `k % 2`: the object metadata is written a frame
-    /// behind.
-    positions: [Vec<[f64; 3]>; 2],
+    /// in, and how it renders, frame `k` at `k % 2`: the object metadata is
+    /// written a frame behind.
+    renders: [Vec<Render>; 2],
     /// The last frame of core that went in, for the stream's encoder a frame
     /// behind, and what the probe decoded of it.
     core: Vec<Vec<f32>>,
@@ -181,12 +246,12 @@ impl Trace {
         }))
     }
 
-    fn frame(&mut self, signals: &[&[f32]], positions: &[[f64; 3]]) -> Result<()> {
+    fn frame(&mut self, signals: &[&[f32]], renders: &[Render]) -> Result<()> {
         use std::io::Write;
         let fail = |e| Error::io(Path::new("HZ_JOC_TRACE"), e);
-        let line: Vec<String> = positions
+        let line: Vec<String> = renders
             .iter()
-            .flat_map(|&p| Position::from_master(p).to_master())
+            .flat_map(|render| render.position.to_master())
             .map(|x| format!("{x}"))
             .collect();
         writeln!(self.positions, "{}", line.join(",")).map_err(fail)?;
@@ -236,7 +301,7 @@ impl Writer {
             let feed = Feed::Direct(Box::new(Direct {
                 elements,
                 signals: vec![vec![0.0; DELAY + FRAME_SAMPLES]; count],
-                positions: vec![[0.0; 3]; count],
+                renders: vec![Render::default(); count],
             }));
             (feed, count)
         } else {
@@ -299,7 +364,7 @@ impl Writer {
                 direct.read(input, stride, got, at);
                 let signals: Vec<&[f32]> =
                     direct.signals.iter().map(|s| &s[..FRAME_SAMPLES]).collect();
-                self.coder.step(core, &signals, &direct.positions, out)
+                self.coder.step(core, &signals, &direct.renders, out)
             }
             Feed::Folded(folded) => {
                 folded.read(core, input, stride, got);
@@ -318,6 +383,7 @@ impl Writer {
             while folded.folder.waiting() > 0 {
                 folded.code(&mut self.coder, out)?;
             }
+            folded.last(&mut self.coder, out)?;
         }
         self.coder.finish(out)
     }
@@ -325,16 +391,16 @@ impl Writer {
 
 impl Direct {
     /// This frame's samples of each element, on the decoded core's clock,
-    /// and where each is at its end.
+    /// and where each is at the end of the frame of objects a decoder plays.
     fn read(&mut self, input: &[f32], stride: usize, got: usize, at: u64) {
-        // The frame's end on the decoded core's clock, [`DELAY`] behind the
-        // master's.
-        let end = (at + FRAME_SAMPLES as u64).saturating_sub(DELAY as u64);
-        for ((element, signal), position) in self
+        // The metadata comes with its access unit, and so does the audio it
+        // places: the objects', [`LATENCY`] behind the master.
+        let end = (at + FRAME_SAMPLES as u64).saturating_sub(LATENCY as u64);
+        for ((element, signal), render) in self
             .elements
             .iter_mut()
             .zip(&mut self.signals)
-            .zip(&mut self.positions)
+            .zip(&mut self.renders)
         {
             signal.copy_within(FRAME_SAMPLES.., 0);
             let channel = element.channel();
@@ -346,7 +412,7 @@ impl Direct {
                     0.0
                 };
             }
-            *position = element.state(end).0;
+            *render = element.render(end);
         }
     }
 }
@@ -359,7 +425,9 @@ impl Folded {
         let members = elements
             .into_iter()
             .map(|element| match element {
-                Element::Object { channel, path, .. } => (channel, Member::Moving(path, 0)),
+                Element::Object {
+                    channel, keyframes, ..
+                } => (channel, Member::classed(keyframes)),
                 Element::Bed { channel, position } => (
                     channel,
                     Member::Bed {
@@ -389,18 +457,22 @@ impl Folded {
             folder,
             master: Vec::new(),
             frames: 0,
+            held: None,
+            elements: vec![vec![0.0; 2 * FRAME_SAMPLES]; MAX_ELEMENTS],
+            renders: vec![Render::default(); MAX_ELEMENTS],
         })
     }
 
     /// Read one frame: its core into the block's carry, and the master's
-    /// samples into the block on the decoded core's clock — the last
-    /// [`DELAY`] of the frame before and all but the last [`DELAY`] of this.
+    /// samples into the block on the decoded objects' clock — the last
+    /// [`LATENCY`] of the frame before and all but the last [`LATENCY`] of
+    /// this.
     fn read(&mut self, core: &[&[f32]], input: &[f32], stride: usize, got: usize) {
         if self.master.is_empty() {
-            self.master = vec![0.0; (DELAY + FRAME_SAMPLES) * stride];
+            self.master = vec![0.0; (LATENCY + FRAME_SAMPLES) * stride];
         }
         self.master.copy_within(FRAME_SAMPLES * stride.., 0);
-        let fresh = &mut self.master[DELAY * stride..];
+        let fresh = &mut self.master[LATENCY * stride..];
         fresh[..got * stride].copy_from_slice(&input[..got * stride]);
         fresh[got * stride..].fill(0.0);
 
@@ -410,7 +482,7 @@ impl Folded {
             kept.clear();
             kept.extend_from_slice(plane);
         }
-        let at = (self.frames * FRAME_SAMPLES as u64) as i64 - DELAY as i64;
+        let at = (self.frames * FRAME_SAMPLES as u64) as i64 - LATENCY as i64;
         let master = &self.master;
         self.folder.read(block, at, FRAME_SAMPLES, |_, n, channel| {
             f64::from(master[n * stride + channel])
@@ -428,16 +500,61 @@ impl Folded {
             .map_err(|why| Error::unsupported(Path::new("the fold"), why.to_string()))
     }
 
-    /// Fold the oldest block and code it with the core it was read with.
+    /// Fold the oldest block, and code the block before it with the core it
+    /// was read with, now that its elements run on into this one.
     fn code(&mut self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
         let Some(block) = self.fold()? else {
             return Ok(());
         };
-        let core: Vec<&[f32]> = block.carry.iter().map(Vec::as_slice).collect();
-        let signals: Vec<&[f32]> = self.folder.mixer.mixed.iter().map(Vec::as_slice).collect();
-        let result = coder.step(&core, &signals, self.folder.positions(), out);
-        self.folder.recycle(block);
+        for (element, mixed) in self.elements.iter_mut().zip(&self.folder.mixer.mixed) {
+            element[FRAME_SAMPLES..].copy_from_slice(mixed);
+        }
+        let result = self.step(coder, out);
+        // This block's elements and metadata, held for the next.
+        for element in &mut self.elements {
+            element.copy_within(FRAME_SAMPLES.., 0);
+        }
+        for ((render, &position), &mode) in self
+            .renders
+            .iter_mut()
+            .zip(self.folder.positions())
+            .zip(self.folder.modes())
+        {
+            *render = rendered(position, mode);
+        }
+        if let Some(done) = self.held.replace(block) {
+            self.folder.recycle(done);
+        }
         result
+    }
+
+    /// Code the last block held: past it there is nothing, so its elements
+    /// run on into silence.
+    fn last(&mut self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
+        for element in &mut self.elements {
+            element[FRAME_SAMPLES..].fill(0.0);
+        }
+        self.step(coder, out)?;
+        if let Some(done) = self.held.take() {
+            self.folder.recycle(done);
+        }
+        Ok(())
+    }
+
+    /// Code the block held, if there is one: its core, and its elements on
+    /// the core's clock, [`hz_joc::qmf::DELAY`] into them.
+    fn step(&self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
+        let Some(held) = &self.held else {
+            return Ok(());
+        };
+        const INTO: usize = hz_joc::qmf::DELAY;
+        let core: Vec<&[f32]> = held.carry.iter().map(Vec::as_slice).collect();
+        let signals: Vec<&[f32]> = self
+            .elements
+            .iter()
+            .map(|e| &e[INTO..INTO + FRAME_SAMPLES])
+            .collect();
+        coder.step(&core, &signals, &self.renders, out)
     }
 }
 
@@ -459,7 +576,7 @@ impl Coder {
             lfe,
             size: 0,
             placeholder: Vec::new(),
-            positions: [farthest(count), farthest(count)],
+            renders: [largest(count), largest(count)],
             core: vec![vec![0.0; FRAME_SAMPLES]; channels],
             probed: vec![vec![0.0; FRAME_SAMPLES]; channels],
             frames_in: 0,
@@ -471,9 +588,9 @@ impl Coder {
         // Room for the payloads the references carry, and never less than
         // the smallest one these elements can make, so that the budget can
         // always bring a payload under it. What the object metadata takes
-        // depends on where the elements are — one near the one before it is
-        // coded as a step from it — and the frame's size is the stream's, so
-        // it is measured with every position stated outright.
+        // depends on how the elements render — a size, a screen factor — and
+        // the frame's size is the stream's, so it is measured with every
+        // field that costs bits stated.
         let overhead = coder.overhead(0)?;
         let floor = overhead + smallest_payload(count);
         coder.size = (overhead + ROOM_PER_ELEMENT * count + 8).max(floor);
@@ -500,12 +617,12 @@ impl Coder {
         &mut self,
         core: &[&[f32]],
         signals: &[&[f32]],
-        positions: &[[f64; 3]],
+        renders: &[Render],
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        self.positions[(self.frames_in % 2) as usize].copy_from_slice(positions);
+        self.renders[(self.frames_in % 2) as usize].copy_from_slice(renders);
         if let Some(trace) = &mut self.trace {
-            trace.frame(signals, positions)?;
+            trace.frame(signals, renders)?;
         }
         self.probe.carry_skip_field(&self.placeholder);
         self.scratch.clear();
@@ -599,9 +716,11 @@ impl Coder {
     }
 
     /// Stream frame `frame`'s object metadata: one block, each element moving
-    /// across the frame to where it is at the frame's end — on the decoded
-    /// core's clock, [`DELAY`] behind the master's — as the reference streams
-    /// move theirs.
+    /// across the frame to where it is at the frame's end, as the reference
+    /// streams move theirs — timed on the clock of the objects a decoder
+    /// plays, [`LATENCY`] behind the master's: the metadata comes with its
+    /// access unit, and so does the audio it places. Each element rendered
+    /// as its feed says.
     fn oamd(&mut self, frame: u64) -> Result<Vec<u8>> {
         let mut objects = Vec::with_capacity(self.elements + 1);
         if self.lfe {
@@ -611,15 +730,11 @@ impl Coder {
                 render: None,
             });
         }
-        for &position in &self.positions[(frame % 2) as usize] {
+        for &render in &self.renders[(frame % 2) as usize] {
             objects.push(Object {
                 active: true,
                 gain: Gain::Unity,
-                render: Some(Render {
-                    position: Position::from_master(position),
-                    elevation: position[2].abs() > f64::EPSILON,
-                    ..Render::default()
-                }),
+                render: Some(render),
             });
         }
         ObjectAudioMetadata {
@@ -635,17 +750,20 @@ impl Coder {
     }
 }
 
-/// Positions for `count` elements no two neighbours of which are near
-/// enough for the object metadata to code one as a step from the other: the
-/// largest it makes of them.
-fn farthest(count: usize) -> Vec<[f64; 3]> {
+/// Renders for `count` elements that make the largest object metadata
+/// they can: every field that costs bits stated — a size, a screen factor.
+/// A position costs the same wherever it is: a block's is a step only from
+/// the block before it in the same payload, and these carry one.
+fn largest(count: usize) -> Vec<Render> {
     (0..count)
-        .map(|n| {
-            if n % 2 == 0 {
-                [-1.0, 1.0, 0.0]
-            } else {
-                [1.0, -1.0, 1.0]
-            }
+        .map(|_| Render {
+            position: Position::from_master([1.0, -1.0, 1.0]),
+            size: hz_meta::oamd::Size::Uniform(31),
+            screen: Some((7, 3)),
+            snap: true,
+            elevation: true,
+            zones: 7,
+            ..Render::default()
         })
         .collect()
 }
@@ -784,7 +902,8 @@ mod tests {
     }
 
     /// `frames` frames of noise on each of `elements` master channels, the
-    /// first two of them on the core's L and R, through a writer.
+    /// first two of them (where there are two) on the core's L and R,
+    /// through a writer.
     fn encode(elements: Vec<Element>, frames: usize) -> (Writer, Vec<u8>) {
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
@@ -799,7 +918,7 @@ mod tests {
                 .map(|ch| {
                     (0..FRAME_SAMPLES)
                         .map(|n| match ch {
-                            0 | 1 => input[n * width + ch],
+                            0 | 1 if ch < width => input[n * width + ch],
                             _ => 0.05 * noise(&mut seed),
                         })
                         .collect()
@@ -909,12 +1028,12 @@ mod tests {
         assert_eq!(sequences, expected, "one Evolution frame each syncframe");
     }
 
-    /// A fold's block is the span a frame of objects carries, on the decoded
-    /// core's clock: a master's sample `n` is the block stream's `n +
-    /// DELAY`, all of it — the weights of an object have unit power — and
-    /// the element that carries a lone sound ends where it is.
+    /// A fold's block is the span a frame of objects comes out as, on the
+    /// decoded objects' clock: a master's sample `n` is the block stream's
+    /// `n + LATENCY`, all of it — the weights of an object have unit power —
+    /// and the element that carries a lone sound ends where it is.
     #[test]
-    fn a_fold_reads_the_master_on_the_decoded_cores_clock() {
+    fn a_fold_reads_the_master_on_the_decoded_objects_clock() {
         const MEMBERS: usize = 16;
         const LOUD: usize = 3;
         const IMPULSE: usize = 1000;
@@ -956,13 +1075,110 @@ mod tests {
                 folded.folder.recycle(block);
             }
         }
-        let at = IMPULSE + DELAY;
+        let at = IMPULSE + LATENCY;
         let power: f64 = stream.iter().map(|s| f64::from(s[at]).powi(2)).sum();
         assert!((power - 1.0).abs() < 1e-6, "{power}");
-        for (n, _) in stream[0].iter().enumerate().take(2 * IMPULSE + DELAY) {
+        for (n, _) in stream[0].iter().enumerate().take(2 * IMPULSE + LATENCY) {
             if n != at {
                 assert!(stream.iter().all(|s| s[n] == 0.0), "{n}");
             }
+        }
+    }
+
+    /// A moving object is placed where it is on the clock of the objects a
+    /// decoder plays — [`LATENCY`] behind the master, not the core's
+    /// [`DELAY`] — and rendered as the master says: its size, snapping,
+    /// zones, screen and whether its height counts carried, not reset.
+    #[test]
+    fn an_object_is_placed_on_the_decoded_objects_clock_and_rendered_as_authored() {
+        const FRAMES: usize = 12;
+        let mode = hz_render::Mode {
+            snap: true,
+            zones: 1,
+            elevation: false,
+            screen: Some((3, 1)),
+        };
+        // From the left to the right, from sample 1536 over 15 360.
+        let keyframes = vec![
+            Keyframe {
+                sample_pos: 0,
+                position: [-1.0, 1.0, 0.75],
+                spread: 0.8,
+                mode,
+                ..Keyframe::default()
+            },
+            Keyframe {
+                sample_pos: 1536,
+                position: [1.0, 1.0, 0.75],
+                ramp_samples: 15_360,
+                spread: 0.8,
+                mode,
+                ..Keyframe::default()
+            },
+        ];
+        let (writer, stream) = encode(vec![Element::object(0, keyframes.clone())], FRAMES);
+        let mut frames = carried(&stream, writer.evolution_bytes());
+        frames.sort_by_key(|(_, joc)| joc.sequence);
+        assert_eq!(frames.len(), FRAMES);
+        let trajectory = Trajectory::new(&keyframes);
+        let mut hint = 0;
+        for (frame, (metadata, _)) in frames.iter().enumerate() {
+            let render = metadata.blocks[0].objects[1].render.unwrap();
+            let t = ((frame as u64 + 1) * FRAME_SAMPLES as u64).saturating_sub(LATENCY as u64);
+            let want = trajectory.segment(t, &mut hint).at(t).position;
+            assert_eq!(
+                render.position,
+                Position::from_master(want),
+                "frame {frame}"
+            );
+            assert_eq!(render.size, hz_meta::oamd::Size::Uniform(25), "size 0.8");
+            assert!(render.snap, "frame {frame}");
+            assert_eq!(render.zones, 1);
+            assert_eq!(render.screen, Some((3, 1)));
+            assert!(!render.elevation, "its height not to count, at z = 0.75");
+        }
+        // Frame 3's objects end at master sample 5311, a quarter of the way
+        // across: x code 15, where the core's clock (5888) would say 18.
+        let render = frames[3].0.blocks[0].objects[1].render.unwrap();
+        assert_eq!(render.position.x, 15);
+    }
+
+    /// A folded element renders as the class of what it carries: objects
+    /// that snap, folded with others that do not, keep an element that
+    /// snaps.
+    #[test]
+    fn a_folded_element_renders_as_its_class() {
+        const FRAMES: usize = 6;
+        let snapping = hz_render::Mode {
+            snap: true,
+            ..hz_render::Mode::default()
+        };
+        let elements: Vec<Element> = (0..20)
+            .map(|channel| {
+                let angle = channel as f64 / 20.0 * std::f64::consts::TAU;
+                Element::object(
+                    channel,
+                    vec![Keyframe {
+                        position: [angle.sin(), angle.cos(), 0.0],
+                        mode: if channel % 4 == 0 {
+                            snapping
+                        } else {
+                            hz_render::Mode::default()
+                        },
+                        ..Keyframe::default()
+                    }],
+                )
+            })
+            .collect();
+        let (writer, stream) = encode(elements, FRAMES);
+        assert!(writer.folder().is_some());
+        for (metadata, _) in carried(&stream, writer.evolution_bytes()) {
+            let renders: Vec<Render> = metadata.blocks[0].objects[1..]
+                .iter()
+                .map(|object| object.render.unwrap())
+                .collect();
+            assert!(renders.iter().any(|r| r.snap), "an element that snaps");
+            assert!(renders.iter().any(|r| !r.snap), "and one that does not");
         }
     }
 

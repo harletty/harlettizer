@@ -278,7 +278,7 @@ fn master_render(options: &Options) -> Result<Vec<f64>> {
 
 /// `signals`, sample `lag + n` of each the master's sample `n`, rendered on
 /// 7.1.4 for `frames` samples, each element ramping across its syncframe's
-/// block — the span of the master a frame's objects carry, [`hz_ac3::DELAY`]
+/// block — the span of the master a frame's objects come out as, [`LAG`]
 /// behind the frame — to where `positions` puts it at the block's end, as
 /// the encoder's weights ramp and a decoder's positions do.
 fn render(
@@ -290,7 +290,7 @@ fn render(
     let count = signals.len();
     let layout = Layout::surround_7_1_4();
     let mut following = Following::new(Mixdown::new(&layout).expect("7.1.4"));
-    let delay = hz_ac3::DELAY as u64;
+    let delay = LAG as u64;
     for element in 0..count {
         let keyframes: Vec<Keyframe> = positions
             .iter()

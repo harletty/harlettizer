@@ -24,6 +24,7 @@ use hz_cluster::scene::{Scene, Source as SceneSource};
 use hz_cluster::smooth::{Smoother, Smoothing};
 use hz_cluster::{Clusterer, Clustering, Object, Weighting};
 use hz_core::Result;
+use hz_render::{Keyframe, Mode};
 use std::collections::VecDeque;
 
 /// The clusterer, the window it is steered by, and the block it last placed.
@@ -104,8 +105,36 @@ pub enum Member {
     /// of its own there and is never clustered — see
     /// `hz_cluster::Object::pinned`; a free one is folded as any object is.
     Bed { position: [f64; 3], pinned: bool },
-    /// An object on its path, and where the walk along it stopped.
+    /// An object on its path, and where the walk along it stopped. Folded
+    /// as a free object, whatever the master says of how it renders.
     Moving(Path, usize),
+    /// An object whose rendering class the fold keeps apart, as the TrueHD
+    /// encode keeps it — see `hz_cluster::class` — so that the element
+    /// carrying it renders as it does.
+    Classed(Box<Classed>),
+}
+
+/// An object, its path and its updates: the next one due and the last in
+/// force, which says how it renders.
+pub struct Classed {
+    path: Path,
+    hint: usize,
+    keyframes: Vec<Keyframe>,
+    next: usize,
+    current: Keyframe,
+}
+
+impl Member {
+    /// An object whose class the fold keeps, from its updates.
+    pub fn classed(keyframes: Vec<Keyframe>) -> Self {
+        Self::Classed(Box::new(Classed {
+            path: Path::new(&keyframes),
+            hint: 0,
+            current: keyframes.first().copied().unwrap_or_default(),
+            keyframes,
+            next: 0,
+        }))
+    }
 }
 
 /// One block a [`Folder`] has read and not yet folded: each member's samples
@@ -123,21 +152,22 @@ pub struct Block<T> {
     /// long as the fold looks ahead.
     pub carry: T,
     signals: Vec<Vec<f32>>,
-    /// Where each member is, and where it is pinned when it is.
-    places: Vec<([f64; 3], Option<[f64; 3]>)>,
+    /// Where each member is, where it is pinned when it is, and how it
+    /// renders.
+    places: Vec<([f64; 3], Option<[f64; 3]>, Mode)>,
 }
 
 impl<T> Block<T> {
     /// Member `index` of this block, as a scene takes it.
     fn source(&self, index: usize) -> SceneSource {
-        let (position, pinned) = self.places[index];
+        let (position, pinned, mode) = self.places[index];
         SceneSource {
             position,
             pinned,
             mode: if pinned.is_some() {
                 hz_cluster::class::BED
             } else {
-                hz_render::Mode::default()
+                mode
             },
             ..SceneSource::default()
         }
@@ -244,15 +274,29 @@ impl<T: Default> Folder<T> {
             places.push(match member {
                 Member::Bed { position, pinned } => {
                     signal.extend((0..frames).map(|n| sample(carry, n, channel) as f32));
-                    (*position, pinned.then_some(*position))
+                    (*position, pinned.then_some(*position), Mode::default())
                 }
                 Member::Moving(path, hint) => {
-                    signal.extend((0..frames).map(|n| {
-                        let gain = path.gain(clock(at + n as i64), hint);
-                        (sample(carry, n, channel) * gain) as f32
-                    }));
                     let end = clock(at + frames as i64 - 1);
-                    (path.segment(end, hint).at(end).position, None)
+                    let position = gained(signal, path, hint, at, frames, end, |n| {
+                        sample(carry, n, channel)
+                    });
+                    (position, None, Mode::default())
+                }
+                Member::Classed(classed) => {
+                    let end = clock(at + frames as i64 - 1);
+                    let Classed {
+                        path,
+                        hint,
+                        keyframes,
+                        next,
+                        current,
+                    } = &mut **classed;
+                    let position = gained(signal, path, hint, at, frames, end, |n| {
+                        sample(carry, n, channel)
+                    });
+                    crate::path::advance(keyframes, next, current, end);
+                    (position, None, current.mode)
                 }
             });
         }
@@ -306,6 +350,32 @@ impl<T: Default> Folder<T> {
     pub fn positions(&self) -> &[[f64; 3]] {
         self.placer.previous().map_or(&[], |at| &at.positions[..])
     }
+
+    /// How each element renders, as of the block folded last: the class of
+    /// every member it carries.
+    pub fn modes(&self) -> &[Mode] {
+        self.placer.previous().map_or(&[], |at| &at.modes[..])
+    }
+}
+
+/// An object's `frames` samples from the master's sample `at`, `sample(n)`
+/// each, with its gain on them, into `signal`; where it is at `end`.
+fn gained(
+    signal: &mut Vec<f32>,
+    path: &Path,
+    hint: &mut usize,
+    at: i64,
+    frames: usize,
+    end: u64,
+    sample: impl Fn(usize) -> f64,
+) -> [f64; 3] {
+    // Before the programme an object is where it starts; its samples there
+    // are the writer's to make silent.
+    signal.extend((0..frames).map(|n| {
+        let gain = path.gain((at + n as i64).max(0) as u64, hint);
+        (sample(n) * gain) as f32
+    }));
+    path.segment(end, hint).at(end).position
 }
 
 #[cfg(test)]
