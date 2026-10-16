@@ -293,7 +293,7 @@ frame made smaller takes some 8 ms more, a quarter of its own duration.
 From a master, the 5.1 core is the programme rendered and folded as
 `harlettizer ac3` renders it, and every object and bed channel but the LFE is
 an element of its own — fifteen at most, what the reference streams carry; a
-master with more is refused until its objects can be clustered. Each syncframe
+master with more has them folded into fifteen (below). Each syncframe
 carries an Evolution frame in block 2's skip field, as the references do: the
 object metadata (payload 11, one block, every element moving across the frame
 to where it is at the frame's end — the references' `Long` ramp), then the
@@ -355,6 +355,87 @@ broadband sources overlap in the same speakers. Room is not what limits them:
 an allowance of 16, 24, 32 or 64 bytes an element moves the result by less
 than half a decibel, the larger frames taking their bytes from the core.
 
+## Folding a larger master
+
+A master with more than fifteen elements — real ones bring forty and more
+objects — has its objects and bed channels folded into fifteen by the same
+clustering the TrueHD and IAMF writers fold theirs with:
+`hz_programme::fold::Folder`, which `iamf --objects` now drives too (its
+output is byte for byte what it was). The core does not change: it is still
+the master's whole render, folded to 5.1. The fold decides what the stream
+carries as objects, and where the object metadata puts them.
+
+- **A block a syncframe, on the decoded objects' clock.** Block *k* is the
+  master's samples from *k*·1536 − 833 to (*k*+1)·1536 − 833. That is the
+  span frame *k*'s objects come out of a decoder as, and the span its object
+  metadata ramps their positions across (above). So the weights ramp across
+  the same span to the same positions a decoder's do. 1536 is a little
+  longer than the TrueHD encode's 1280; the IAMF writer already takes any
+  block up to 1280 that divides its unit.
+- **Two clocks.** The estimator takes a frame's elements on the core's
+  clock, 256 samples behind the master: 577 samples into the frame's block
+  and on into the next one. So a frame is coded once the block after it is
+  folded, and the last frame's elements run on into silence.
+- **The window ahead.** Each block is placed for the energies of the two
+  blocks after it (`hz_cluster::smooth::SMOOTHING`). So the fold holds three
+  frames back in all, each with the core rendered beside it, and the writer
+  drains them at the end. The stream still has a syncframe for every frame
+  that went in.
+- **The bed channels are free.** Pinning them would keep an element each, and
+  a 7.1.2 bed's nine would take most of the fifteen. The core already carries
+  them where they are. That is what `encode --beds auto` decides whenever a
+  fold is needed at all.
+- **Nothing is rounded or limited.** The elements are never coded as samples,
+  only rebuilt from the core, which is clamped on its own; a limiter would
+  pull them away from the scene the core was rendered from. The fold's floor
+  is the stream's dialnorm.
+- **Rendering classes are kept apart**, as the TrueHD fold keeps them
+  (`hz_cluster::class`): objects that snap, or are confined to zones, or
+  follow the screen, share an element only with their own kind. Each
+  element's metadata states its class's rendering. An object's size does
+  not survive the fold, as it does not in the TrueHD encode: an element is
+  a point.
+
+`HZ_JOC_TRACE=<dir>` writes what the stream was meant to carry:
+`element-<n>.f32`, each element's samples on the master's clock, and
+`positions.csv`, where each element is at the end of each frame's block, as
+the metadata codes it. `joc-check --elements <dir>` holds the decoded objects
+to those elements, not to the master's, and renders the scene on 7.1.4 three
+ways: the master's render (bed channels at their speakers, objects on the
+room's cube), the carried elements where the metadata puts them, and the
+decoded objects where the metadata puts them. The last two are held to the
+first. The first number is what the fold and the metadata's one position a
+frame cost; the second is what the stream costs in all.
+
+On the 40-object scenes and on `make-master --objects 30 --bed 7.1.2`
+(8 seconds), each master's elements folded into fifteen:
+
+| Master | Elements | Fold, mean / worst | Objects against the carried elements | Scene: carried elements | Scene: decoded objects |
+|---|---|---|---|---|---|
+| crowd40 | 40 → 15 | 0.029 / 0.31 | 7.1 dB | 23.2 dB | 11.6 dB |
+| broad40 | 40 → 15 | 0.018 / 0.30 | 3.3 dB | 23.5 dB | 7.5 dB |
+| bed712_40 | 49 → 15 | 0.061 / 0.85 | 4.6 dB | 16.2 dB | 6.4 dB |
+| class40, every third object snapping | 40 → 15 | 0.068 / 1.41 | 3.3 dB | 17.6 dB | 7.4 dB |
+| 30 tones, 7.1.2 bed | 39 → 15 | 0.071 / 0.79 | 8.1 dB | 16.6 dB | 9.7 dB |
+| 30 broadband, 7.1.2 bed | 39 → 15 | 0.046 / 1.15 | 5.1 dB | 18.3 dB | 6.6 dB |
+| 30 bursts, 7.1.2 bed | 39 → 15 | 0.030 / 1.13 | 6.1 dB | 20.1 dB | 7.2 dB |
+| *as they are, for scale:* | | | | | |
+| 10 objects switching on and off | 10 | — | 9.9 dB | 26.9 dB | 12.5 dB |
+| a 7.1.2 bed and 6 broadband objects | 15 | — | 7.3 dB | 31.5 dB | 8.1 dB |
+
+Every master decodes with fifteen objects and the LFE in every frame's
+metadata. These synthetic masters are loud: their 5.1 renders peak at 2.9 to
+5.4 times full scale, and the core is clamped. Copies 18 dB down, which clip
+nothing, move the objects by +0.1 to +1.6 dB and the decoded scene by +0.4 to
++1.8 dB. So the clipping is not what holds them down. The density is:
+fifteen broadband elements rebuilt from five channels. The decoded scenes of
+the folded masters, 6 to 12 dB, are where a fifteen-element master carried as
+it is lands (the last row, 8.1 dB). The fold's own cost is the TrueHD
+encode's at the same width: crowd40 into fifteen elements beside the LFE
+costs 0.026 on 1280-sample blocks and 0.029 here. On broad40 the two do not
+compare: the TrueHD fold weighs the master's object sizes, and this one, like
+IAMF's, judges points.
+
 ## Not done
 
 - Two data points a frame, which the references never use, and a steep slope
@@ -362,9 +443,12 @@ than half a decibel, the larger frames taking their bytes from the core.
 - Coarse quantisation and fewer parameter bands, which the budget could also
   trade for bits; the references use neither, and at a skip field's 511
   bytes nothing yet needs them.
-- Masters of more than fifteen elements: their objects clustered into
-  fifteen, as the TrueHD and IAMF writers cluster theirs, on frames of 1536
-  samples.
+- A fold shaped for joint object coding: the clustering places elements for
+  a listener, by the metric's presentations, not for how well five channels
+  give each one back. And fewer than fifteen elements, when fewer would
+  rebuild better, which nothing here measures yet.
+- An element's size in a fold, which the TrueHD encode does not state
+  either.
 - The programme's loudness and information payloads (1 and 2), which the
   references carry and these streams do not; and listening, on a receiver.
 - The extension configuration's data.
