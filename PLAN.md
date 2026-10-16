@@ -724,7 +724,10 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   up to fifteen elements, the gains fitted to the 5.1 core a decoder plays —
   `hz-ac3` reconstructs it — and carried with the object metadata in each
   syncframe's skip field; `cargo xtask joc-check` holds the decoded objects
-  to the master's.
+  to the master's. Each Evolution frame carries the four payloads the
+  references do, configured as theirs: the loudness (the core's true peak
+  every sixteenth frame) and the programme information, which `hz_meta::programme`
+  writes byte for byte as every reference payload is written.
 - **Larger masters folded into fifteen**: the objects and bed channels of a
   master with more, folded by `hz_programme::fold::Folder` (the IAMF writer's
   fold, moved there) a syncframe at a time, on the decoded objects' clock,

@@ -57,7 +57,8 @@ pub fn run(options: Options) -> Result<()> {
         report.print(input);
         let joc_failed =
             report.joc_rewritten != report.joc_payloads || report.joc_agreed != report.joc_payloads;
-        if (report.read_mismatches > 0 || joc_failed) && failed.is_none() {
+        let programme_failed = report.programme_rewritten != report.programme_payloads;
+        if (report.read_mismatches > 0 || joc_failed || programme_failed) && failed.is_none() {
             failed = Some(input.clone());
         }
     }
@@ -156,6 +157,11 @@ struct Report {
     oamd_payloads: usize,
     oamd_rewritten: usize,
     first_oamd_failure: Option<String>,
+    /// Loudness and programme information payloads, and those `hz-meta`
+    /// reads and writes back byte for byte.
+    programme_payloads: usize,
+    programme_rewritten: usize,
+    first_programme_failure: Option<String>,
 }
 
 /// Bytes read from a stream at a time.
@@ -303,6 +309,9 @@ fn survey(input: &Path, dump: Option<&Path>, frames: Option<usize>) -> Result<Re
                 if id == emdf::OAMD {
                     check_oamd(&mut report, index, &payload.bytes);
                 }
+                if id == emdf::LOUDNESS || id == emdf::PROGRAMME_INFORMATION {
+                    check_programme(&mut report, index, id, &payload.bytes);
+                }
                 match &payload.parsed {
                     ParsedEmdfPayloadData::Joc(joc) => {
                         *report.joc_downmix.entry(joc.downmix_config).or_default() += 1;
@@ -355,6 +364,29 @@ fn next_frame(
 
 /// Read a joint object coding payload with `hz-joc`, write it back, and hold
 /// what it read to what the oracle read.
+/// Whether `hz-meta` reads a loudness or programme information payload and
+/// writes it back byte for byte.
+fn check_programme(report: &mut Report, index: usize, id: u32, bytes: &[u8]) {
+    use hz_meta::programme::{Information, Loudness};
+    report.programme_payloads += 1;
+    let written = if id == emdf::LOUDNESS {
+        Loudness::read(bytes).map(|p| p.to_bytes())
+    } else {
+        Information::read(bytes).map(|p| p.to_bytes())
+    };
+    let failure = match written {
+        Ok(written) if written == bytes => {
+            report.programme_rewritten += 1;
+            return;
+        }
+        Ok(written) => format!("payload {id} {:02x?} written back as {written:02x?}", bytes),
+        Err(e) => format!("payload {id} {bytes:02x?} unread: {e}"),
+    };
+    report
+        .first_programme_failure
+        .get_or_insert_with(|| format!("syncframe {index}: {failure}"));
+}
+
 /// Whether `hz-meta` reads an object metadata payload and writes it back
 /// byte for byte — what an encoder carrying its own needs to trust.
 fn check_oamd(report: &mut Report, index: usize, bytes: &[u8]) {
@@ -730,6 +762,15 @@ impl Report {
         }
         if !self.oamd_objects.is_empty() {
             println!("  oamd         {} objects", histogram(&self.oamd_objects));
+        }
+        if self.programme_payloads > 0 {
+            println!(
+                "  programme    {}/{} loudness and information payloads rewritten byte for byte by hz-meta",
+                self.programme_rewritten, self.programme_payloads
+            );
+            if let Some(first) = &self.first_programme_failure {
+                println!("               first failure: {first}");
+            }
         }
         if self.oamd_payloads > 0 {
             println!(

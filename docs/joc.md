@@ -294,11 +294,26 @@ From a master, the 5.1 core is the programme rendered and folded as
 `harlettizer ac3` renders it, and every object and bed channel but the LFE is
 an element of its own — fifteen at most, what the reference streams carry; a
 master with more has them folded into fifteen (below). Each syncframe
-carries an Evolution frame in block 2's skip field, as the references do: the
-object metadata (payload 11, one block, every element moving across the frame
-to where it is at the frame's end — the references' `Long` ramp), then the
-joint object coding payload (14), group nought, kept, the second
-frame-aligned.
+carries an Evolution frame in block 2's skip field with the payloads the
+references carry, in their order and configured as theirs are:
+
+- the programme's loudness (payload 1, for the frame's 1536 samples, kept):
+  every sixteenth frame the core's true peak since the last statement, as the
+  references state theirs, and nothing else — no measurement practice is
+  claimed, and no integrated loudness, which has to match the stream's
+  dialnorm, and the dialnorm is the user's (`--dialnorm`), not measured;
+- the programme information (payload 2, discarded by a decoder that does not
+  know it): nothing done to the audio before coding — no surround
+  attenuation, no 90° phase shift, no LFE filter — and no compression
+  profile, since the stream carries no compression words;
+- the object metadata (payload 11, one block, every element moving across the
+  frame to where it is at the frame's end — the references' `Long` ramp);
+- the joint object coding payload (14).
+
+The last two are in group nought and kept, the joint object coding
+frame-aligned. `hz_meta::programme` reads and writes the first two, and
+`cargo xtask eac3` holds it to every one the reference streams carry —
+20 284 payloads, each written back byte for byte — and fails when one is not.
 
 The metadata is timed on the clock of the objects a decoder plays, not the
 core's: they come out the core's 256 samples and joint object coding's 577
@@ -449,6 +464,8 @@ IAMF's, judges points.
   rebuild better, which nothing here measures yet.
 - An element's size in a fold, which the TrueHD encode does not state
   either.
-- The programme's loudness and information payloads (1 and 2), which the
-  references carry and these streams do not; and listening, on a receiver.
+- The programme's integrated loudness, gated on level and on speech, which
+  the references state every thirty-two frames: it has to match the stream's
+  dialnorm, so it waits on a pass that measures the programme before coding
+  and on how the dialnorm is then set. And listening, on a receiver.
 - The extension configuration's data.

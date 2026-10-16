@@ -97,6 +97,16 @@ impl TruePeak {
         }
     }
 
+    /// The largest true peak on any channel since the last take, as a linear
+    /// magnitude, and the peaks started again — the interpolator's history
+    /// kept, so that the next stretch's first samples are reconstructed as
+    /// they would have been.
+    pub fn take(&mut self) -> f64 {
+        let peak = self.peak();
+        self.peaks.fill(0.0);
+        peak
+    }
+
     /// The largest true peak on any channel, as a linear magnitude.
     pub fn peak(&self) -> f64 {
         self.peaks.iter().copied().fold(0.0, f64::max)
@@ -170,6 +180,30 @@ fn blackman_harris(n: usize, length: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A take hands back the peak of the stretch since the last, and starts
+    /// again: a loud stretch, then a quiet one, each measured on its own.
+    #[test]
+    fn a_take_measures_the_stretch_since_the_last() {
+        let tone = |amplitude: f32| -> Vec<f32> {
+            // Faded in and out, so that no edge rings past the tone.
+            (0..4800)
+                .map(|n| {
+                    let fade = (std::f32::consts::PI * n as f32 / 4800.0).sin().powi(2);
+                    amplitude * fade * (n as f32 * 0.05).sin()
+                })
+                .collect()
+        };
+        let mut meter = TruePeak::new(1);
+        meter.push(&tone(0.9));
+        let loud = meter.take();
+        meter.push(&tone(0.1));
+        let quiet = meter.take();
+        assert!((loud - 0.9).abs() < 0.018, "{loud}");
+        assert!((quiet - 0.1).abs() < 0.002, "{quiet}");
+        assert_eq!(meter.peak(), 0.0);
+    }
+
     use super::*;
 
     fn measure(channels: usize, samples: &[f32]) -> TruePeak {
