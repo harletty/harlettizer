@@ -17,6 +17,12 @@
 //! in turn is a 128-point complex FFT between two rotations. Written from that
 //! chain of identities rather than taken from anywhere, and held to the
 //! definition above by a test.
+//!
+//! And its inverse, the one a decoder runs (§7.9.4): a DCT-IV is its own
+//! inverse up to a scale, so the same FFT between the same rotations turns
+//! the coefficients back into the folded 256, which unfold to 512 whose
+//! aliasing the window and the overlap with the next block cancel — which a
+//! test checks by a round trip.
 
 use std::f64::consts::PI;
 
@@ -124,18 +130,48 @@ impl Mdct {
         const M: usize = BLOCK;
         const H: usize = M / 2;
         // Fold the four quarters (a, b, c, d) into the DCT-IV's input
-        // (−c_r − d, a − b_r), and pair it up into the FFT's complex input,
-        // rotating as it goes: u[2n] + i·u[M−1−2n].
-        let u = |i: usize| -> f32 {
-            if i < H {
+        // (−c_r − d, a − b_r).
+        let mut u = [0f32; BLOCK];
+        for (i, value) in u.iter_mut().enumerate() {
+            *value = if i < H {
                 -x[3 * H - 1 - i] - x[3 * H + i]
             } else {
                 let j = i - H;
                 x[j] - x[M - 1 - j]
-            }
-        };
+            };
+        }
+        self.dct4(&u, out, -2.0 / WINDOW as f32);
+    }
+
+    /// The 512 samples, before the window, that 256 coefficients stand for:
+    /// windowed and overlap-added with the next block's, the samples the
+    /// forward transform read.
+    pub fn inverse(&mut self, coefficients: &[f32; BLOCK], out: &mut [f32; WINDOW]) {
+        const M: usize = BLOCK;
+        const H: usize = M / 2;
+        // The DCT-IV again, scaled to undo the forward one: applied twice it
+        // gives back M/2 times its input, and forward scaled by −2/N.
+        let mut u = [0f32; BLOCK];
+        self.dct4(
+            coefficients,
+            &mut u,
+            -(WINDOW as f32) / (M as f32 / 2.0) / 2.0,
+        );
+        // Unfold: the quarters the fold summed, each with its alias.
+        for j in 0..H {
+            out[j] = u[H + j];
+            out[M - 1 - j] = -u[H + j];
+            out[3 * H - 1 - j] = -u[j];
+            out[3 * H + j] = -u[j];
+        }
+    }
+
+    /// The DCT-IV of `u`, times `scale`: the 256 paired up into the FFT's
+    /// complex input, rotated in, transformed and rotated out.
+    fn dct4(&mut self, u: &[f32; BLOCK], out: &mut [f32; BLOCK], scale: f32) {
+        const M: usize = BLOCK;
         for n in 0..QUARTER {
-            let (r, i) = (u(2 * n), u(M - 1 - 2 * n));
+            let (r, i) = (u[2 * n], u[M - 1 - 2 * n]);
             let (c, s) = self.pre[n];
             let slot = usize::from(self.reverse[n]);
             self.re[slot] = r * c - i * s;
@@ -144,7 +180,6 @@ impl Mdct {
 
         self.fft();
 
-        let scale = -2.0 / WINDOW as f32;
         for k in 0..QUARTER {
             let (c, s) = self.post[k];
             let (r, i) = (self.re[k], self.im[k]);
@@ -210,6 +245,52 @@ mod tests {
                 (f64::from(*value) - reference).abs() < 1e-5,
                 "bin {k}: {value} against {reference}"
             );
+        }
+    }
+
+    /// The inverse, windowed and overlap-added block by block, gives back what
+    /// the forward transform read.
+    #[test]
+    fn the_inverse_overlap_added_gives_the_input_back() {
+        let window = kbd_window();
+        let mut seed = 777u32;
+        let signal: Vec<f32> = (0..BLOCK * 12)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect();
+        let mut mdct = Mdct::new();
+        let mut output = vec![0f32; signal.len() + BLOCK];
+        let (mut windowed, mut coefficients, mut back) =
+            ([0f32; WINDOW], [0f32; BLOCK], [0f32; WINDOW]);
+        // Block b reads samples (b − 1)·256 .. (b + 1)·256.
+        for b in 0..signal.len() / BLOCK {
+            for i in 0..WINDOW {
+                let at = (b * BLOCK + i).checked_sub(BLOCK);
+                let x = at.and_then(|at| signal.get(at)).copied().unwrap_or(0.0);
+                let w = if i < BLOCK {
+                    window[i]
+                } else {
+                    window[WINDOW - 1 - i]
+                };
+                windowed[i] = x * w;
+            }
+            mdct.forward(&windowed, &mut coefficients);
+            mdct.inverse(&coefficients, &mut back);
+            for i in 0..WINDOW {
+                let w = if i < BLOCK {
+                    window[i]
+                } else {
+                    window[WINDOW - 1 - i]
+                };
+                output[b * BLOCK + i] += back[i] * w;
+            }
+        }
+        // Output sample n + 256 is input sample n, once two blocks cover it.
+        for n in BLOCK..signal.len() - BLOCK {
+            let (x, y) = (signal[n], output[n + BLOCK]);
+            assert!((x - y).abs() < 1e-5, "{n}: {y} for {x}");
         }
     }
 

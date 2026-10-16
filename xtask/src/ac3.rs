@@ -173,3 +173,119 @@ pub fn run(options: Options) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hz_ac3::{ChannelMode, Config, Encoder, FRAME_SAMPLES, Format, Metadata};
+
+    /// Every syncframe of `stream` decoded by the `eac3` crate, channel by
+    /// channel in WAV order.
+    fn decode(stream: &[u8]) -> Vec<Vec<f32>> {
+        let mut extractor = Extractor::default();
+        extractor.push_bytes(stream);
+        let mut decoder = PcmDecoder::new();
+        let mut channels: Vec<Vec<f32>> = Vec::new();
+        while let Some(frame) = extractor.next_frame().unwrap() {
+            let pushed = if frame.info().bitstream_id <= 10 {
+                decoder.push_legacy_ac3_access_unit(frame.as_bytes())
+            } else {
+                decoder.push_access_unit(frame.as_bytes())
+            }
+            .unwrap();
+            let pcm = pushed.pcm;
+            let mut planes: Vec<(usize, &Vec<f32>)> = pcm
+                .fullband_channel_order
+                .iter()
+                .zip(&pcm.fullband_channels)
+                .map(|(channel, samples)| (wav_rank(*channel), samples))
+                .collect();
+            if let Some(lfe) = &pcm.lfe_channel {
+                planes.push((wav_rank(BedChannel::LowFrequencyEffects), lfe));
+            }
+            planes.sort_by_key(|(rank, _)| *rank);
+            channels.resize(planes.len(), Vec::new());
+            for (out, (_, plane)) in channels.iter_mut().zip(planes) {
+                out.extend_from_slice(plane);
+            }
+        }
+        channels
+    }
+
+    /// What the encoder says a decoder will play is what the workspace's
+    /// decoder plays, frame by frame and channel by channel — with coupling,
+    /// with the LFE, with the stereo pair rematrixed, in both formats.
+    #[test]
+    fn the_reconstruction_is_what_the_decoder_plays() {
+        let cases = [
+            (Format::Eac3, ChannelMode::ThreeTwo, true, 384),
+            (Format::Ac3, ChannelMode::ThreeTwo, true, 448),
+            (Format::Ac3, ChannelMode::Stereo, false, 192),
+        ];
+        for (format, mode, lfe, kbps) in cases {
+            let channels = mode.full_bandwidth_channels() + usize::from(lfe);
+            let mut encoder = Encoder::new(Config {
+                format,
+                sample_rate: 48_000,
+                mode,
+                lfe,
+                bit_rate: Some(kbps),
+                coupling: true,
+                metadata: Metadata::default(),
+            })
+            .unwrap();
+            encoder.reconstruct();
+            const FRAMES: usize = 16;
+            let mut seed = 5u32;
+            let mut noise = || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            };
+            // Each channel its own tone over noise, the first two sharing
+            // most of theirs so that the pair rematrixes.
+            let input: Vec<Vec<f32>> = {
+                let shared: Vec<f32> = (0..FRAMES * FRAME_SAMPLES).map(|_| noise()).collect();
+                (0..channels)
+                    .map(|ch| {
+                        (0..FRAMES * FRAME_SAMPLES)
+                            .map(|n| {
+                                let tone = (n as f32 * 0.013 * (ch + 1) as f32).sin();
+                                let own = noise();
+                                0.3 * tone + 0.2 * own + if ch < 2 { 0.3 * shared[n] } else { 0.0 }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (mut stream, mut reconstructed) = (Vec::new(), vec![Vec::new(); channels]);
+            for k in 0..FRAMES {
+                let frame: Vec<&[f32]> = input
+                    .iter()
+                    .map(|ch| &ch[k * FRAME_SAMPLES..(k + 1) * FRAME_SAMPLES])
+                    .collect();
+                encoder.encode(&frame, &mut stream).unwrap();
+                for (ch, out) in reconstructed.iter_mut().enumerate() {
+                    out.extend_from_slice(encoder.decoded(ch).unwrap());
+                }
+            }
+            let coupled = encoder.coupled();
+            let decoded = decode(&stream);
+            assert_eq!(decoded.len(), channels);
+            let (mut signal, mut error, mut worst) = (0f64, 0f64, 0f32);
+            for (ours, theirs) in reconstructed.iter().zip(&decoded) {
+                assert_eq!(ours.len(), theirs.len());
+                for (a, b) in ours.iter().zip(theirs) {
+                    signal += f64::from(*b).powi(2);
+                    error += f64::from(a - b).powi(2);
+                    worst = worst.max((a - b).abs());
+                }
+            }
+            let agreement = 10.0 * (signal / error.max(1e-30)).log10();
+            eprintln!("{format:?} {mode:?} coupled {coupled}: {agreement:.1} dB, worst {worst:e}");
+            assert!(
+                agreement > 100.0,
+                "{format:?} {mode:?}: the reconstruction agrees with the decoder to {agreement:.1} dB"
+            );
+        }
+    }
+}
