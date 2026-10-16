@@ -78,7 +78,9 @@ sequence back to the master's own channels, bit for bit.
   each height folded into the 7.1 below it, the 7.1 coded losslessly beside a
   5.1 core and the heights losslessly beside it — every channel comes back bit
   for bit through the `dca` decoder, the 7.1 through FFmpeg, which reports the
-  DTS:X profile. Not yet played on a receiver. See [docs/dts.md](docs/dts.md).
+  DTS:X profile. Or DTS-HD Master Audio 7.1 or 5.1 alone, at 16 or 24 bits.
+  Raw or in Matroska (`A_DTS`). Not yet played on a receiver. See
+  [docs/dts.md](docs/dts.md).
 - **E-AC-3** — one independent substream at any rate up to 1024 kb/s, with an
   Evolution frame carried where reference streams carry theirs: a reference
   stream's objects ride on a core coded here and come back as close as the
@@ -305,15 +307,20 @@ compares with FFmpeg's and what it does not do yet are in
 ### `dts`
 
 ```bash
-harlettizer dts programme.atmos --out programme.dts                    # DTS-HD MA + DTS:X, 7.1.4
+harlettizer dts programme.atmos --out programme.mka                    # DTS-HD MA + DTS:X, 7.1.4, in Matroska
+harlettizer dts programme.atmos --out programme.dts                    # the same, a raw elementary stream
+harlettizer dts programme.atmos --out programme.mka --layout 5.1 --bits 16   # DTS-HD MA 5.1, 16-bit
 ```
 
 Renders the programme to 7.1.4 on the room's cube, as `iamf` does, and writes
-DTS-HD Master Audio with the DTS:X extension's standard profile as a raw
-elementary stream: the 7.1 with each height folded into its corner at −3 dB,
-lossless at 24 bits beside a 5.1 core, and the heights, lossless, beside it.
-A limiter keeps each corner with its height under full scale. 48 kHz only. How
-it is checked, what limits it, and how to try it on a receiver are in
+DTS-HD Master Audio with the DTS:X extension's standard profile: the 7.1 with
+each height folded into its corner at −3 dB, lossless at 24 bits beside a 5.1
+core, and the heights, lossless, beside it. A limiter keeps each corner with
+its height under full scale. `--layout 7.1` or `5.1` writes DTS-HD Master
+Audio alone, at 24 or 16 bits (`--bits`); a 5.1 is the 7.1 render folded as
+`ac3` folds it. The output is Matroska (`A_DTS`) when `--out` ends in `.mka`
+or `.mkv`, a raw elementary stream otherwise. 48 kHz only. How it is checked,
+what limits it, and how to try it on a receiver are in
 [docs/dts.md](docs/dts.md).
 
 ## Development
@@ -363,7 +370,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | [docs/encode.md](docs/encode.md) | The `encode` command: what a real programme did, the progress protocol, what `--fast` costs |
 | [docs/joc.md](docs/joc.md) | Joint object coding: the payload layer, how it is held to the reference streams, and the one shape every reference stream codes its objects in |
 | [docs/eac3.md](docs/eac3.md) | `ac3 --eac3`: the independent substream, where the objects go, how it compares with FFmpeg, and the graft of a reference stream's objects onto our core |
-| [docs/dts.md](docs/dts.md) | The `dts` command: the standard DTS:X profile, how it is checked, the navigation limit, and how to try it on a receiver |
+| [docs/dts.md](docs/dts.md) | The `dts` command: the standard DTS:X profile and the 5.1 and 7.1 beds, raw or in Matroska, how they are checked, the navigation limit, and how to try it on a receiver |
 | [docs/ac3.md](docs/ac3.md) | The `ac3` command: the render and fold, the encoder ported from FFmpeg, how it compares, and what is not done |
 | [docs/iamf.md](docs/iamf.md) | The `iamf` command: the bed and the v2.0 objects, the render, the loudness, the FLAC encoder, Opus, Matroska and MP4, the options, what checked each, and what is not done |
 | [docs/mlp-state.md](docs/mlp-state.md) | What the MLP encoder writes today — every constant and decision in force |

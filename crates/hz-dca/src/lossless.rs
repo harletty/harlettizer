@@ -228,6 +228,14 @@ pub enum Refused {
         frame: u64,
         cause: OutOfRange,
     },
+    /// A frame the stream cannot carry under its peak bit rate ceiling, even
+    /// with the decoder's smoothing buffer (`crate::peak`). It is not coded
+    /// coarser to fit; the stream ends before it.
+    PeakRate {
+        /// The input frame, counted from 0.
+        frame: u64,
+        cause: crate::peak::Overrun,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -260,6 +268,12 @@ impl std::fmt::Display for Refused {
                  located; not cut to fit",
                 frame * FRAME_SAMPLES as u64
             ),
+            Refused::PeakRate { frame, cause } => write!(
+                f,
+                "frame {frame} (from sample {}): {cause}; lossless data is not coded coarser \
+                 to fit",
+                frame * FRAME_SAMPLES as u64
+            ),
         }
     }
 }
@@ -268,7 +282,10 @@ impl Refused {
     /// The same refusal, of input frame `at`: for a caller that counts its
     /// input otherwise than the frames this encoder has coded.
     pub fn of_frame(mut self, at: u64) -> Self {
-        if let Refused::Fold { frame, .. } | Refused::Navigation { frame, .. } = &mut self {
+        if let Refused::Fold { frame, .. }
+        | Refused::Navigation { frame, .. }
+        | Refused::PeakRate { frame, .. } = &mut self
+        {
             *frame = at;
         }
         self
@@ -792,6 +809,18 @@ impl Encoder {
     /// The lossless frame last encoded.
     pub fn frame(&self) -> &[u8] {
         &self.frame
+    }
+
+    /// Bytes no frame of this encoder's passes. A 7.1.4's are bounded by
+    /// the navigation word, which cannot locate a block past its reach: the
+    /// frame is refused first. Any other's by the binary code the search
+    /// prices for every segment, which holds a sample in 32 bits at most,
+    /// with room for the headers and the navigation tables.
+    pub fn frame_bound(&self) -> usize {
+        match self.config.layout {
+            Layout::SevenPointOneFour => navigation::MAX_OFFSET + navigation::MAX_SIZE,
+            layout => layout.channels() * FRAME_SAMPLES * 4 + 4096,
+        }
     }
 
     /// How many channels the frame last encoded codes against the core.

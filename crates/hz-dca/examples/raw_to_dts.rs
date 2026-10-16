@@ -35,6 +35,7 @@ fn main() {
         adpcm: flag("ADPCM"),
         pcm_resolution_code: 0,
         lfe_history_quirk: flag("FFMPEG"),
+        dialnorm: 0,
     })
     .unwrap();
 

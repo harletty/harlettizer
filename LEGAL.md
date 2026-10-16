@@ -37,7 +37,8 @@ specifications.
 | Joint object coding on E-AC-3 | ETSI TS 103 420 |
 | AC-4 | ETSI TS 103 190-1 / -2 |
 | Loudness | ITU-R BS.1770-4, EBU R 128 / Tech 3341 |
-| DTS Coherent Acoustics: the core, the extension substream, the lossless extension | ETSI TS 102 114 V1.6.1 |
+| DTS Coherent Acoustics: the core (its dialogue normalisation included), the extension substream (its peak bit rate smoothing fields included), the lossless extension | ETSI TS 102 114 V1.6.1 |
+| Matroska: the container, and a DTS track (`A_DTS`) in it | IETF RFC 9559 (Matroska Media Container), and the Matroska codec mappings' `A_DTS` entry |
 | ADM | ITU-R BS.2076, EBU Tech 3285 Supplement 6 (BW64) |
 | Master file layout | The publicly published master-file specification |
 

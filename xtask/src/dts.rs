@@ -3,7 +3,11 @@
 //! ```text
 //! cargo xtask dts stream.dts [--frames N]
 //! cargo run -p xtask --features dca-oracle -- dts stream.dts
+//! cargo run -p xtask --features dca-oracle -- dts programme.mka
 //! ```
+//!
+//! A Matroska file (`.mka`, `.mkv`) is read through its `A_DTS` track: its
+//! blocks, one frame each, are the stream.
 //!
 //! Phase C0's acceptance: every core frame header and every extension
 //! substream header of a reference stream read by `hz-dca` and written again,
@@ -24,8 +28,9 @@ use hz_core::{Error, Result};
 use hz_dca::bits::Bits;
 use hz_dca::core::CoreHeader;
 use hz_dca::dtsx;
-use hz_dca::exss::{ChannelMapping, Coding, ExssHeader};
+use hz_dca::exss::{ChannelMapping, Coding, ExssHeader, XllSync};
 use hz_dca::navigation::{self, Navigation};
+use hz_dca::peak::{self, DecoderBuffer, Taken};
 use hz_dca::split;
 use hz_dca::xll;
 use std::collections::BTreeMap;
@@ -41,6 +46,11 @@ pub struct Options {
     /// Where to write the standard DTS:X profile's twelve channels before
     /// the fold, through the oracle and [`unfold`].
     pub unfold: Option<PathBuf>,
+    /// Where to write the rate, frame by frame, as CSV.
+    pub rate_log: Option<PathBuf>,
+    /// The ceiling the stream was encoded under, in bits a second: a frame
+    /// over it fails the run.
+    pub ceiling: Option<u32>,
 }
 
 /// Interleaved 32-bit PCM in WAV order — L, R, C, LFE, Ls, Rs for 5.1 —
@@ -429,6 +439,238 @@ struct Tally {
     tail_bits: BTreeMap<usize, usize>,
     first_difference: Option<String>,
     lossless: LosslessTally,
+    rate: RateTally,
+    /// (`vernum`, `dialnorm`) of each core header → frames, and each asset's
+    /// `nuDialNormCode` → substreams.
+    dialnorm: BTreeMap<(u8, u8), usize>,
+    asset_dialnorm: BTreeMap<Option<u8>, usize>,
+}
+
+/// The stream's rate frame by frame, and the lossless decoder's smoothing
+/// buffer fed with it (phase C4).
+#[derive(Default)]
+struct RateTally {
+    /// Bytes of each frame, core and substream together.
+    packets: Vec<u32>,
+    /// Bytes of lossless data each substream carries.
+    payloads: Vec<u32>,
+    /// The sync fields (buffer code, delay, whether the frame starts past the
+    /// data's first byte), or none, → substreams.
+    sync: BTreeMap<Option<(u8, u8, u32, bool)>, usize>,
+    buffer: DecoderBuffer,
+    decoded: usize,
+    delayed: usize,
+    starved: usize,
+    first_starved: Option<String>,
+    /// Substreams whose data is not exactly the frame decoded from them.
+    smoothed: usize,
+    /// Per substream with lossless data: the frame's bytes, the lossless
+    /// data's, the sync offset and delay when it states them, the frame
+    /// decoded with it, and what the buffer holds after.
+    log: Vec<RateRow>,
+}
+
+/// One substream in [`RateTally::log`].
+struct RateRow {
+    bytes: u32,
+    lossless: u32,
+    sync: Option<(u32, u32)>,
+    decoded: Option<u32>,
+    held: u32,
+}
+
+impl RateTally {
+    fn packet(&mut self, bytes: usize) {
+        self.packets.push(bytes as u32);
+    }
+
+    /// Feed one substream's lossless data to the decoder's buffer, and
+    /// return the frame it decodes with it, if any.
+    fn substream(&mut self, data: &[u8], sync: Option<&XllSync>) -> Option<&[u8]> {
+        self.payloads.push(data.len() as u32);
+        *self
+            .sync
+            .entry(sync.map(|s| {
+                (
+                    s.peak_buffer_code,
+                    s.delay_bits,
+                    s.delay_frames,
+                    s.sync_offset > 0,
+                )
+            }))
+            .or_default() += 1;
+        let taken = self.buffer.push(data, sync);
+        self.log.push(RateRow {
+            bytes: self.packets.last().copied().unwrap_or(0),
+            lossless: data.len() as u32,
+            sync: sync.map(|s| (s.sync_offset, s.delay_frames)),
+            decoded: match taken {
+                Ok(Taken::Frame(size)) => Some(size as u32),
+                _ => None,
+            },
+            held: self.buffer.held() as u32,
+        });
+        match taken {
+            Ok(Taken::Frame(size)) => {
+                self.decoded += 1;
+                self.smoothed += usize::from(size != data.len());
+                return Some(self.buffer.frame());
+            }
+            Ok(Taken::Delayed) => self.delayed += 1,
+            Err(why) => {
+                self.starved += 1;
+                self.first_starved.get_or_insert_with(|| {
+                    format!("substream {}: {why:?}", self.payloads.len() - 1)
+                });
+            }
+        }
+        None
+    }
+
+    /// One line per substream with lossless data: the frame's bytes, the lossless data its substream
+    /// carries, the sync offset and delay stated (empty when absent), the
+    /// lossless frame decoded with it (empty when none) and what the
+    /// decoder's buffer holds after.
+    fn write_log(&self, path: &std::path::Path) -> Result<()> {
+        let mut csv = String::from("frame,bytes,lossless,sync_offset,delay,decoded,held\n");
+        for (n, row) in self.log.iter().enumerate() {
+            let (offset, delay) = row.sync.map_or((String::new(), String::new()), |(o, d)| {
+                (o.to_string(), d.to_string())
+            });
+            let decoded = row.decoded.map_or(String::new(), |d| d.to_string());
+            let RateRow {
+                bytes,
+                lossless,
+                held,
+                ..
+            } = row;
+            csv += &format!("{n},{bytes},{lossless},{offset},{delay},{decoded},{held}\n");
+        }
+        std::fs::write(path, csv).map_err(|e| Error::io(path, e))
+    }
+
+    /// What the decoder's buffer model says is wrong with the stream: a
+    /// substream that leaves it without its frame, a stream that sends
+    /// frames ahead without stating a buffer or holds more than the buffer
+    /// it states, and frames over `ceiling`'s budget when one is given.
+    fn failures(&self, samples: u32, rate: u32, ceiling: Option<u32>) -> Vec<String> {
+        let mut failures = Vec::new();
+        if self.starved > 0 {
+            failures.push(format!(
+                "{} substreams that leave the decoder's smoothing buffer without the frame due",
+                self.starved
+            ));
+        }
+        let stated = self.sync.keys().flatten().map(|s| s.0).max();
+        match stated {
+            Some(0) | None if self.smoothed > 0 => failures.push(format!(
+                "{} substreams that carry other than their frame in a stream that states no \
+                 smoothing buffer",
+                self.smoothed
+            )),
+            Some(code) if code > 0 && self.buffer.peak() > peak::buffer_bytes(code) => failures
+                .push(format!(
+                    "a smoothing buffer holding {} bytes, over the {} the stream states",
+                    self.buffer.peak(),
+                    peak::buffer_bytes(code)
+                )),
+            _ => {}
+        }
+        if let Some(ceiling) = ceiling {
+            let budget = peak::frame_budget(ceiling, samples, rate);
+            let over = self
+                .packets
+                .iter()
+                .filter(|&&b| b as usize > budget)
+                .count();
+            if over > 0 {
+                failures.push(format!(
+                    "{over} frames over the {budget} bytes {ceiling} b/s allows"
+                ));
+            }
+        }
+        failures
+    }
+
+    /// The rate against [`peak::CEILING`], the lossless frames' sizes, the
+    /// sync fields, and the buffer: frames of `samples` at `rate` Hz.
+    fn report(&self, samples: u32, rate: u32, lossless: &[u32]) {
+        if self.packets.is_empty() {
+            return;
+        }
+        let frame_seconds = f64::from(samples) / f64::from(rate);
+        let mbps = |bytes: f64| bytes * 8.0 / frame_seconds / 1e6;
+        let largest = *self.packets.iter().max().unwrap_or(&0);
+        let mean =
+            self.packets.iter().map(|&b| f64::from(b)).sum::<f64>() / self.packets.len() as f64;
+        let budget = peak::frame_budget(peak::CEILING, samples, rate);
+        let over = self
+            .packets
+            .iter()
+            .filter(|&&b| b as usize > budget)
+            .count();
+        println!(
+            "  rate                   {:.3} Mb/s on average, {:.3} at the largest frame ({largest} \
+             bytes); {over} frames over {} bytes ({} Mb/s)",
+            mbps(mean),
+            mbps(f64::from(largest)),
+            budget,
+            f64::from(peak::CEILING) / 1e6
+        );
+        if !lossless.is_empty() {
+            let mut sorted = lossless.to_vec();
+            sorted.sort_unstable();
+            let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+            let mean = sorted.iter().map(|&b| f64::from(b)).sum::<f64>() / sorted.len() as f64;
+            let sd = (sorted
+                .iter()
+                .map(|&b| (f64::from(b) - mean).powi(2))
+                .sum::<f64>()
+                / sorted.len() as f64)
+                .sqrt();
+            let step = lossless
+                .windows(2)
+                .map(|w| w[1].abs_diff(w[0]))
+                .max()
+                .unwrap_or(0);
+            println!(
+                "  lossless frame sizes   min {} · p10 {} · median {} · p90 {} · p99 {} · max {}; \
+                 sd {:.0} ({:.1} % of the mean); largest change between frames {step}",
+                sorted[0],
+                at(0.1),
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                sorted[sorted.len() - 1],
+                sd,
+                100.0 * sd / mean
+            );
+        }
+        let sync: Vec<String> = self
+            .sync
+            .iter()
+            .map(|(s, n)| match s {
+                Some((code, bits, delay, offset)) => format!(
+                    "buffer code {code} delay {delay} ({bits} bits){} × {n}",
+                    if *offset { " offset > 0" } else { "" }
+                ),
+                None => format!("no sync × {n}"),
+            })
+            .collect();
+        println!("  lossless sync          {}", sync.join(", "));
+        println!(
+            "  smoothing buffer       {} frames decoded, {} delayed, {} starved; {} substreams \
+             carry other than the frame decoded; {} bytes held at most",
+            self.decoded,
+            self.delayed,
+            self.starved,
+            self.smoothed,
+            self.buffer.peak()
+        );
+        if let Some(why) = &self.first_starved {
+            println!("                         first starved: {why}");
+        }
+    }
 }
 
 /// The lossless frames' headers, read and written back.
@@ -453,6 +695,8 @@ struct LosslessTally {
     /// Bytes of the frames read, padding included, and of the largest.
     bytes: u64,
     largest: usize,
+    /// Every frame's bytes, in order.
+    sizes: Vec<u32>,
     /// The standard DTS:X profile's extension blocks.
     extension: ExtensionTally,
 }
@@ -475,29 +719,33 @@ struct ExtensionTally {
     /// Height sets by their PCM and storage resolutions.
     resolutions: BTreeMap<(u8, u8), usize>,
     largest: usize,
-    /// Where the last frame's block was, for the navigation word.
-    last: Option<Navigation>,
-    /// Navigation words, and those that point at the block found here.
+    /// Navigation words, and those that point at the block of the frame the
+    /// decoder takes out of its buffer with them.
     words: usize,
     words_agree: usize,
+}
+
+/// The DTS:X block of a lossless frame: at the first word after the bed's
+/// band data, when one starts there, and to the frame's end.
+fn block_after_bed(frame: &[u8], headers: &xll::Headers) -> Option<Navigation> {
+    let start = (headers.len() + headers.band_data_len()).next_multiple_of(4);
+    let block = frame
+        .get(start..)
+        .filter(|b| b.len() >= 4 && u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == dtsx::SYNC)?;
+    Some(Navigation {
+        offset: start,
+        size: block.len(),
+    })
 }
 
 impl ExtensionTally {
     /// Read the block, if `frame` has one, at the word after its bed.
     fn frame(&mut self, frame: &[u8], headers: &xll::Headers, at: usize) {
-        self.last = None;
-        let start = (headers.len() + headers.band_data_len()).next_multiple_of(4);
-        let Some(block) = frame
-            .get(start..)
-            .filter(|b| b.len() >= 4 && u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == dtsx::SYNC)
-        else {
+        let Some(found) = block_after_bed(frame, headers) else {
             return;
         };
+        let block = &frame[found.offset..];
         self.blocks += 1;
-        self.last = Some(Navigation {
-            offset: start,
-            size: block.len(),
-        });
         self.largest = self.largest.max(block.len());
         let common = &headers.common;
         match dtsx::Block::read(block, common) {
@@ -574,6 +822,7 @@ impl LosslessTally {
             }
             let frame = &self.pending[..size];
             self.frames += 1;
+            self.sizes.push(size as u32);
             self.bytes += size as u64;
             self.largest = self.largest.max(size);
             match xll::Headers::read(frame, one_to_one) {
@@ -616,8 +865,51 @@ impl LosslessTally {
     }
 }
 
+/// The stream an `A_DTS` track carries: its blocks one after the other,
+/// each of which has to be whole frames.
+fn demux(path: &std::path::Path, file: &[u8]) -> Result<Vec<u8>> {
+    use hz_matroska::{id, read};
+    let malformed = |e: read::Malformed| Error::malformed(path, e.0);
+    let (_, parts) = read::segment(file).map_err(malformed)?;
+    let tracks = read::only(&parts, id::TRACKS).map_err(malformed)?;
+    let mut number = None;
+    for entry in read::children(file, tracks.at, tracks.end).map_err(malformed)? {
+        let fields = read::children(file, entry.at, entry.end).map_err(malformed)?;
+        let codec = read::only(&fields, id::CODEC_ID).map_err(malformed)?;
+        if &file[codec.at..codec.end] == b"A_DTS" {
+            number = Some(read::uint(
+                file,
+                read::only(&fields, id::TRACK_NUMBER).map_err(malformed)?,
+            ));
+            break;
+        }
+    }
+    let number = number.ok_or_else(|| Error::malformed(path, "no A_DTS track"))?;
+    let blocks = read::blocks(file, number).map_err(malformed)?;
+    let padded = blocks
+        .iter()
+        .filter(|b| b.discard_padding.is_some())
+        .count();
+    println!(
+        "matroska: track {number}, A_DTS, {} blocks, {} of them stating padding",
+        blocks.len(),
+        padded
+    );
+    Ok(blocks.iter().flat_map(|b| b.frame).copied().collect())
+}
+
 pub fn run(options: Options) -> Result<()> {
-    let bytes = std::fs::read(&options.input).map_err(|e| Error::io(&options.input, e))?;
+    let file = std::fs::read(&options.input).map_err(|e| Error::io(&options.input, e))?;
+    let matroska = options
+        .input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mka") || e.eq_ignore_ascii_case("mkv"));
+    let bytes = if matroska {
+        demux(&options.input, &file)?
+    } else {
+        file
+    };
     let limit = options.frames.unwrap_or(usize::MAX);
     let mut tally = Tally::default();
     let mut first_core = None;
@@ -639,6 +931,17 @@ pub fn run(options: Options) -> Result<()> {
             ),
         ));
     }
+    if let Some(log) = &options.rate_log
+        && hz_io::paths::aliases(&options.input, log)?
+    {
+        return Err(Error::refused(
+            log,
+            format!(
+                "is {}, the stream whose rate it logs: writing it would destroy the stream",
+                options.input.display()
+            ),
+        ));
+    }
     #[cfg(not(feature = "dca-oracle"))]
     if options.unfold.is_some() {
         return Err(Error::refused(
@@ -650,6 +953,9 @@ pub fn run(options: Options) -> Result<()> {
     for frame in split::frames(&bytes).take(limit) {
         let frame = frame.map_err(|e| Error::malformed(&options.input, e.0))?;
         tally.frames += 1;
+        tally
+            .rate
+            .packet(frame.core.map_or(0, <[u8]>::len) + frame.exss.map_or(0, <[u8]>::len));
         let mut navigation = None;
         if let Some(core) = frame.core {
             let header = CoreHeader::read(core).map_err(|e| {
@@ -665,6 +971,10 @@ pub fn run(options: Options) -> Result<()> {
             }
             #[cfg(feature = "dca-oracle")]
             oracle.core(&header, core);
+            *tally
+                .dialnorm
+                .entry((header.encoder_revision, header.dialnorm_code))
+                .or_default() += 1;
             first_core.get_or_insert(header);
         }
         if let Some(exss) = frame.exss {
@@ -691,11 +1001,27 @@ pub fn run(options: Options) -> Result<()> {
                 _ => {}
             }
             navigation = navigate(&header, &mut tally);
-            lossless_asset(&header, exss, frame.at, &mut tally.lossless);
+            let lossless = lossless_asset(&header, exss);
+            if let Some((data, sync, one_to_one)) = lossless {
+                tally
+                    .lossless
+                    .asset(data, sync.map(|s| s.sync_offset), one_to_one, frame.at);
+            }
+            // The word describes the frame the decoder takes out of its
+            // buffer with this substream, which under peak-rate smoothing is
+            // not the frame the substream's data starts or completes.
+            let decoded = lossless.and_then(|(data, sync, one_to_one)| {
+                let frame = tally.rate.substream(data, sync)?;
+                let headers = xll::Headers::read(frame, one_to_one).ok()?;
+                block_after_bed(frame, &headers)
+            });
             if let Some(word) = navigation {
                 let extension = &mut tally.lossless.extension;
                 extension.words += 1;
-                extension.words_agree += usize::from(extension.last == Some(word));
+                extension.words_agree += usize::from(decoded == Some(word));
+            }
+            for asset in &header.assets {
+                *tally.asset_dialnorm.entry(asset.dialnorm_code).or_default() += 1;
             }
             first_exss.get_or_insert(header);
         }
@@ -724,6 +1050,30 @@ pub fn run(options: Options) -> Result<()> {
         "  core headers           {}/{} rewritten byte for byte",
         tally.cores_identical, tally.cores
     );
+    if !tally.dialnorm.is_empty() {
+        let core: Vec<String> = tally
+            .dialnorm
+            .iter()
+            .map(|((v, d), n)| format!("revision {v} code {d} × {n}"))
+            .collect();
+        let asset: Vec<String> = tally
+            .asset_dialnorm
+            .iter()
+            .map(|(d, n)| match d {
+                Some(d) => format!("code {d} × {n}"),
+                None => format!("absent × {n}"),
+            })
+            .collect();
+        println!(
+            "  dialnorm               core {}; asset {}",
+            core.join(", "),
+            if asset.is_empty() {
+                "none".to_string()
+            } else {
+                asset.join(", ")
+            }
+        );
+    }
     if let Some(exss) = &first_exss {
         describe(exss);
     }
@@ -809,7 +1159,14 @@ pub fn run(options: Options) -> Result<()> {
         }
         report_extension(&lossless.extension);
     }
-    let mut failures = Vec::new();
+    let (samples, rate) = first_core
+        .as_ref()
+        .map_or((512, 48000), |c| (c.samples(), c.sample_rate()));
+    tally.rate.report(samples, rate, &tally.lossless.sizes);
+    if let Some(path) = &options.rate_log {
+        tally.rate.write_log(path)?;
+    }
+    let mut failures = tally.rate.failures(samples, rate, options.ceiling);
     if tally.cores_identical != tally.cores || tally.substreams_identical != tally.substreams {
         failures.push("headers that do not rewrite byte for byte".to_string());
     }
@@ -944,10 +1301,18 @@ fn report_comparison(comparison: &Comparison) {
     );
 }
 
-/// Hand the first lossless asset's data to the lossless tally.
-fn lossless_asset(header: &ExssHeader, exss: &[u8], at: usize, tally: &mut LosslessTally) {
+/// The first lossless asset's data in a substream, its sync fields, and
+/// whether it maps its channels one to one.
+fn lossless_asset<'a>(
+    header: &'a ExssHeader,
+    exss: &'a [u8],
+) -> Option<(&'a [u8], Option<&'a XllSync>, bool)> {
     let mut offset = header.header_size as usize;
     for (asset, &size) in header.assets.iter().zip(&header.asset_sizes) {
+        let one_to_one = !matches!(
+            asset.statics.as_ref().map(|s| &s.mapping),
+            Some(ChannelMapping::Representation(_))
+        );
         if let Coding::Components {
             core,
             xbr,
@@ -965,29 +1330,16 @@ fn lossless_asset(header: &ExssHeader, exss: &[u8], at: usize, tally: &mut Lossl
                 + x96.unwrap_or(0)
                 + lbr.as_ref().map_or(0, |l| l.size);
             offset += before as usize;
-            let Some(data) = exss.get(offset..offset + x.size as usize) else {
-                return;
-            };
-            let one_to_one = !matches!(
-                asset.statics.as_ref().map(|s| &s.mapping),
-                Some(ChannelMapping::Representation(_))
-            );
-            tally.asset(data, x.sync.as_ref().map(|s| s.sync_offset), one_to_one, at);
-            return;
+            let data = exss.get(offset..offset + x.size as usize)?;
+            return Some((data, x.sync.as_ref(), one_to_one));
         }
         if let Coding::Lossless(x) = &asset.coding {
-            let Some(data) = exss.get(offset..offset + x.size as usize) else {
-                return;
-            };
-            let one_to_one = !matches!(
-                asset.statics.as_ref().map(|s| &s.mapping),
-                Some(ChannelMapping::Representation(_))
-            );
-            tally.asset(data, x.sync.as_ref().map(|s| s.sync_offset), one_to_one, at);
-            return;
+            let data = exss.get(offset..offset + x.size as usize)?;
+            return Some((data, x.sync.as_ref(), one_to_one));
         }
         offset += size as usize;
     }
+    None
 }
 
 /// The navigation word in the lossless asset's descriptor tail, if there is
@@ -1582,6 +1934,8 @@ mod tests {
             frames: None,
             reference: None,
             unfold: None,
+            rate_log: None,
+            ceiling: None,
         });
         std::fs::remove_dir_all(&dir).unwrap();
         result
@@ -1709,6 +2063,8 @@ mod tests {
             frames: None,
             reference: None,
             unfold: Some(link),
+            rate_log: None,
+            ceiling: None,
         });
         let after = std::fs::read(&input).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1717,6 +2073,88 @@ mod tests {
             .to_string();
         assert!(message.contains("destroy"), "{message}");
         assert_eq!(after, stream);
+    }
+
+    /// `--rate-log` never writes over the stream it reads either: not by its
+    /// own name, not through a link to it.
+    #[test]
+    fn a_rate_log_onto_its_own_stream_is_refused() {
+        let dir = std::env::temp_dir().join(format!("hz-dts-log-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("stream.dts");
+        let (stream, _) = height_stream();
+        std::fs::write(&input, &stream).unwrap();
+        let link = dir.join("rate.csv");
+        std::fs::hard_link(&input, &link).unwrap();
+        for log in [input.clone(), link] {
+            let result = super::run(super::Options {
+                input: input.clone(),
+                frames: None,
+                reference: None,
+                unfold: None,
+                rate_log: Some(log.clone()),
+                ceiling: None,
+            });
+            let message = result
+                .expect_err("a rate log onto its own stream")
+                .to_string();
+            assert!(message.contains("destroy"), "{}: {message}", log.display());
+            assert_eq!(std::fs::read(&input).unwrap(), stream);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Matroska file's `A_DTS` track is read as the stream its blocks
+    /// carry: a frame a block, as `harlettizer dts` writes it, gives back
+    /// the raw stream byte for byte, and the command reads it.
+    #[test]
+    fn a_matroska_track_is_read_as_the_stream_it_carries() {
+        use hz_matroska::{Muxer, Track};
+        let (stream, _) = height_stream();
+        let mut file = std::io::Cursor::new(Vec::new());
+        let track = Track {
+            codec_id: "A_DTS",
+            codec_private: None,
+            sample_rate: 48_000,
+            frame: 512,
+            channels: 8,
+            bits: Some(24),
+            codec_delay: None,
+            seek_pre_roll: None,
+            uid: 1,
+            writing_app: "test",
+        };
+        let (mut muxer, _) = Muxer::start(&mut file, &track).unwrap();
+        let mut frames = 0;
+        for (n, frame) in hz_dca::split::frames(&stream).enumerate() {
+            let frame = frame.unwrap();
+            let len = frame.core.map_or(0, <[u8]>::len) + frame.exss.map_or(0, <[u8]>::len);
+            muxer
+                .block(&mut file, n as u64, &stream[frame.at..frame.at + len], 0)
+                .unwrap();
+            frames += 1;
+        }
+        muxer.finish(&mut file, frames * 512).unwrap();
+        let file = file.into_inner();
+        let path = std::path::Path::new("stream.mka");
+        assert_eq!(super::demux(path, &file).unwrap(), stream);
+
+        let dir = std::env::temp_dir().join(format!("hz-dts-matroska-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("stream.mka");
+        std::fs::write(&input, &file).unwrap();
+        let result = super::run(super::Options {
+            input,
+            frames: None,
+            reference: None,
+            unfold: None,
+            rate_log: None,
+            ceiling: None,
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
     }
 
     /// Each frame is unfolded with the fold its own matrix states: a stream
@@ -1753,6 +2191,8 @@ mod tests {
             frames: None,
             reference: None,
             unfold: Some(out.clone()),
+            rate_log: None,
+            ceiling: None,
         });
         let unfolded = std::fs::read(&out);
         std::fs::remove_dir_all(&dir).unwrap();

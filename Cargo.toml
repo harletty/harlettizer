@@ -2,8 +2,9 @@
 #
 # Crates are added phase by phase (see PLAN.md). The dependency rule is that
 # the codec crates (hz-ac3, hz-mlp, hz-dca, hz-ac4, hz-iamf) never depend on each other; they
-# all sit on hz-core / hz-analysis / hz-render, and only hz-cli knows all of
-# them. What every writer does before its own format — reading a master,
+# all sit on hz-core / hz-analysis / hz-render (and hz-matroska, the container
+# a codec's frames go into, which knows none of them), and only hz-cli knows
+# all of them. What every writer does before its own format — reading a master,
 # its tracks and paths, rendering, mixing, overlaying — is hz-programme, which
 # knows no codec crate either.
 [workspace]
@@ -18,6 +19,7 @@ members = [
     "crates/hz-iamf",
     "crates/hz-joc",
     "crates/hz-io",
+    "crates/hz-matroska",
     "crates/hz-meta",
     "crates/hz-mlp",
     "crates/hz-programme",
@@ -42,6 +44,7 @@ hz-iamf = { path = "crates/hz-iamf" }
 hz-joc = { path = "crates/hz-joc" }
 hz-analysis = { path = "crates/hz-analysis" }
 hz-io = { path = "crates/hz-io" }
+hz-matroska = { path = "crates/hz-matroska" }
 hz-meta = { path = "crates/hz-meta" }
 hz-mlp = { path = "crates/hz-mlp" }
 hz-programme = { path = "crates/hz-programme" }

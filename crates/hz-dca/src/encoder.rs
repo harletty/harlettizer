@@ -132,6 +132,11 @@ pub struct Config {
     /// else does. (FFmpeg also reads one sample before its input buffer for
     /// this; that sample is taken as zero.)
     pub lfe_history_quirk: bool,
+    /// The dialogue normalisation the header states, in dB of attenuation,
+    /// 0 to 31: a decoder that applies it scales its output by `-dialnorm`
+    /// dB. Neither FFmpeg nor `dca` applies it. 0, as the reference streams
+    /// carry it, states none.
+    pub dialnorm: u8,
 }
 
 impl Config {
@@ -145,7 +150,20 @@ impl Config {
             adpcm: false,
             pcm_resolution_code: 0,
             lfe_history_quirk: false,
+            dialnorm: 0,
         }
+    }
+}
+
+/// The header's encoder revision and dialogue normalisation code for
+/// `dialnorm` dB, 0 to 31 (ETSI TS 102 114 table 5-20): revision 7 states
+/// 0 to 15 dB, revision 6 states 16 to 31. Revision 7 is also what the
+/// header says with none, so a stream without dialnorm is unchanged.
+pub fn dialnorm_fields(dialnorm: u8) -> Option<(u8, u8)> {
+    match dialnorm {
+        0..=15 => Some((7, dialnorm)),
+        16..=31 => Some((6, dialnorm - 16)),
+        _ => None,
     }
 }
 
@@ -351,6 +369,12 @@ impl Encoder {
                 config.pcm_resolution_code
             )));
         }
+        if dialnorm_fields(config.dialnorm).is_none() {
+            return Err(Unsupported(format!(
+                "a dialnorm of {} dB is outside the 0 to 31 dB a core header states",
+                config.dialnorm
+            )));
+        }
         let bit_rate_code = BIT_RATES
             .iter()
             .position(|&rate| rate >= config.bit_rate)
@@ -441,6 +465,8 @@ impl Encoder {
     /// The header every frame carries.
     pub fn header(&self) -> CoreHeader {
         let s = &self.state;
+        let (revision, dialnorm_code) =
+            dialnorm_fields(self.config.dialnorm).expect("the dialnorm is checked on creation");
         CoreHeader {
             normal_frame: true,
             crc_present: false,
@@ -460,12 +486,12 @@ impl Encoder {
             predictor_history: true,
             header_crc: None,
             filter_perfect: false,
-            encoder_revision: 7,
+            encoder_revision: revision,
             copy_history: 0,
             pcm_resolution_code: self.config.pcm_resolution_code,
             sumdiff_front: false,
             sumdiff_surround: false,
-            dialnorm_code: 0,
+            dialnorm_code,
         }
     }
 
@@ -1602,6 +1628,38 @@ pub(crate) mod tests {
                 Err(_) => assert!(matches!(code, 4 | 7 | 8), "code {code} refused"),
             }
         }
+    }
+
+    /// The dialnorm is the header's revision and code as table 5-20 pairs
+    /// them: 0 to 15 dB under revision 7, 16 to 31 under revision 6; nothing
+    /// else in the frame changes.
+    #[test]
+    fn dialnorm_is_stated_in_the_header() {
+        let silence = [0; FRAME_SAMPLES * 6];
+        let frame = |dialnorm| {
+            let mut encoder = Encoder::new(Config {
+                dialnorm,
+                ..Config::reference_five_one()
+            })?;
+            let mut out = Vec::new();
+            encoder.encode(&silence, &mut out);
+            Ok::<_, Unsupported>(out)
+        };
+        let none = frame(0).unwrap();
+        for (dialnorm, revision, code) in
+            [(0, 7, 0), (1, 7, 1), (15, 7, 15), (16, 6, 0), (31, 6, 15)]
+        {
+            let out = frame(dialnorm).unwrap();
+            let header = CoreHeader::read(&out).unwrap();
+            assert_eq!(
+                (header.encoder_revision, header.dialnorm_code),
+                (revision, code),
+                "{dialnorm} dB"
+            );
+            let len = header.len();
+            assert_eq!(out[len..], none[len..], "{dialnorm} dB");
+        }
+        assert!(frame(32).is_err());
     }
 
     /// Rate code 3 is 96 kb/s, not lossless: the steps are the lossy ones,
