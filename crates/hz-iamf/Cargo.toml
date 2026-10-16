@@ -8,10 +8,11 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# Dependency-free apart from the shared bit writer, like every codec crate
-# here: see hz-mlp's manifest for why.
+# Dependency-free apart from the shared bit writer and the Matroska muxer,
+# like every codec crate here: see hz-mlp's manifest for why.
 [dependencies]
 hz-core.workspace = true
+hz-matroska.workspace = true
 
 [build-dependencies]
 pkg-config = { version = "0.3", optional = true }

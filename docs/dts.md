@@ -1,16 +1,41 @@
 # DTS:X output
 
 ```bash
-harlettizer dts programme.atmos --out programme.dts            # DTS-HD MA + DTS:X, 7.1.4
+harlettizer dts programme.atmos --out programme.mka            # DTS-HD MA + DTS:X, 7.1.4, in Matroska
+harlettizer dts programme.atmos --out programme.dts            # the same, a raw elementary stream
 harlettizer dts programme.atmos --out programme.dts --adpcm    # the core with subband prediction
+harlettizer dts programme.atmos --out programme.mka --layout 7.1             # DTS-HD MA 7.1, 24-bit
+harlettizer dts programme.atmos --out programme.mka --layout 5.1 --bits 16   # DTS-HD MA 5.1, 16-bit
 ```
 
 Takes a master set or an ADM BW64 file at 48 kHz and writes DTS-HD Master
-Audio with the DTS:X extension's **standard profile**, a fixed 7.1.4, as a raw
-elementary stream. This is phase C3 of Track C (see [PLAN.md](../PLAN.md)):
-the bitstream is done and checked through two decoders; it has **not yet been
-played on a receiver**, which is the one check that says a licensed decoder
-accepts it (below).
+Audio with the DTS:X extension's **standard profile**, a fixed 7.1.4 — or,
+with `--layout`, DTS-HD Master Audio 7.1 or 5.1 alone, at 24 or 16 bits. This
+is phases C3 and C5 of Track C (see [PLAN.md](../PLAN.md)): the bitstream is
+done and checked through two decoders; it has **not yet been played on a
+receiver**, which is the one check that says a licensed decoder accepts it
+(below).
+
+## Layouts and containers
+
+| `--layout` | What is coded | `--bits` |
+|---|---|---|
+| `7.1.4` (default) | the standard DTS:X profile, below | 24 |
+| `7.1` | the 7.1 lossless beside the 5.1 core made from it, the 5.1 fold embedded, as phase C2 codes it | 24 or 16 |
+| `5.1` | the 5.1 lossless beside a core of itself. The room's cube has no place for a surround at ±110°, so the master is rendered on 7.1 and folded as `ac3` folds it | 24 or 16 |
+
+The output is a **raw elementary stream** — each frame its core, then its
+extension substream — or, when `--out` ends in `.mka` or `.mkv`, the one track
+of a **Matroska** file, `A_DTS`: the same frames, a block each. The track has
+no private data (every frame states its own shape); `Channels` is what a
+decoder of the lossless layer presents, eight for a 7.1.4, and `BitDepth` the
+lossless layer's, as `mkvmerge` states them for the same stream. The last
+block states the padding that fills the last frame as `DiscardPadding`, so a
+player that applies it — FFmpeg does — hands out exactly the master's length;
+the raw stream has nowhere to say it and decodes to whole frames. The muxer is
+`hz-matroska`, the one IAMF's `.mka` uses.
+
+`--progress` reports on standard error as every encode does.
 
 ## What is written
 
@@ -39,6 +64,30 @@ The substream header is the reference streams' in every field, down to the
 padding that ends it on a 32-bit word.
 
 ## How it is checked
+
+What `harlettizer dts` wrote, raw or `.mka`:
+
+```bash
+cargo run --release -p xtask --features dca-oracle -- dts programme.mka
+ffprobe programme.mka              # dts, DTS-HD MA + DTS:X, 7.1
+mkvmerge --identify programme.mka  # audio (DTS-HD Master Audio)
+```
+
+`xtask dts` reads an `.mka` through its `A_DTS` track: it rewrites every
+header byte for byte, finds the navigation word on every 7.1.4 frame, and
+decodes every frame through `dca`. On a 20-second synthetic master — eleven
+objects over a 7.1.2 bed, `cargo xtask make-master --objects 11 --bed 7.1.2
+--seconds 20` — each of the three layouts in both containers: the `.mka`'s
+blocks are the `.dts` byte for byte (`mkvextract` agrees); every header
+rewrites; `dca` decodes all 1,875 frames, presenting the height profile on
+every 7.1.4 one; and the decode, re-encoded with `dts-encode` below — which
+holds `dca` and FFmpeg to its input bit for bit — gives back the command's
+stream byte for byte. `crates/hz-cli/tests/dts.rs` does the same on small masters at every
+layout and depth, and, where FFmpeg is installed, holds its decode of the
+`.mka` to the master: the 7.1 bit for bit, the 7.1.4's composite the master's
+heights folded into its corners, exactly the master's length.
+
+What any stream carries, from raw PCM:
 
 ```bash
 cargo run -p xtask --features dca-oracle -- dts-encode in.s32 --channels 12 --lossless 24 --out out.dts
@@ -157,15 +206,26 @@ heights where they belong. The other is (d): listening.
    cargo run --release -p xtask --features dca-oracle -- dts-encode ref714.s32 --channels 12 --lossless 24 --out ours.dts
    ```
 
-   and one from a master:
+   and one from a master, in Matroska:
 
    ```bash
-   harlettizer dts programme.atmos --out programme.dts
+   harlettizer dts programme.atmos --out programme.mka
    ```
 
-2. Play each through a player that passes DTS-HD through untouched, for
-   example `mpv --audio-spdif=dts-hd --audio-channels=7.1 ours.dts`, or after
-   `mkvmerge -o ours.mkv ours.dts` from any player that bitstreams.
+2. Play each through a player that passes DTS-HD through untouched. With mpv
+   over HDMI, straight to the HDMI output so that nothing resamples or mixes
+   it (`mpv --audio-device=help` lists the devices):
+
+   ```bash
+   mpv --ao=alsa --audio-device=alsa/hdmi:CARD=…,DEV=0 --audio-spdif=dts-hd --audio-channels=7.1 programme.mka
+   ```
+
+   `--audio-channels=7.1` lets mpv open the eight-channel 192 kHz link a
+   DTS-HD stream needs; with less it falls back to the core. Any other player
+   that bitstreams Matroska will do. Without a receiver, the same command
+   with `--ao=pcm --ao-pcm-file=check.raw --ao-pcm-waveheader=no` writes what
+   would go down the cable: one IEC 61937 DTS-HD burst (data type 0x11) per
+   frame, at 192 kHz on eight channels.
 3. The receiver should show **DTS:X**, not DTS-HD MA (which would mean it
    played the 7.1 alone, heights in the corners) and not DTS (the core alone).
 4. Listen for the heights from the height speakers and nowhere else.
@@ -177,11 +237,9 @@ heights where they belong. The other is (d): listening.
 
 ## Not done
 
-- Matroska output and the usual progress lines are phase C5. Until then,
-  `mkvmerge` wraps the raw stream.
-- Peak-rate smoothing and dialnorm in the core header are phase C4. Every
-  lossless frame sits whole in its own substream, so the substreams vary in
-  size.
+- `harlettizer dts` takes neither a ceiling nor a dialnorm: it encodes at the
+  default 24.5 Mb/s, where no frame needs smoothing, and states no dialnorm.
+  `dts-encode` sets both (above).
 - The heights are always declared 24-bit. The reference encoder declares 22
   on some quiet frames.
 - Objects: the alternate profiles, mode 1 only, are phase C6. It starts once
