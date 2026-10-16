@@ -988,7 +988,7 @@ What C2a did:
 - 🔴 **Not written in C2a**, none of it needed for lossless: hybrid Rice codes
   (isolated outliers in binary), the MSB/LSB split, the stereo downmix a
   primary set can carry (the reference streams carry none), and peak-rate
-  smoothing (C4). The first two would save bits on some material; C2b, the
+  smoothing (written in C4). The first two would save bits on some material; C2b, the
   residual against the core, is where the bitrate is.
 
 What C2b did:
@@ -1225,7 +1225,7 @@ What C3 did:
   recipe: re-encode a reference stream's own 7.1.4 and play the two side by
   side, so that any difference is ours.
 
-#### Phase C4 — Peak bitrate
+#### Phase C4 — Peak bitrate — **done**
 
 - Peak-bitrate smoothing as the reference streams do it (their XLL frames
   vary widely in size from one frame to the next), under a ceiling of
@@ -1234,6 +1234,138 @@ What C3 did:
 - **Accept when**: a whole title stays under the ceiling in the decoder's
   buffer model and stays bit-exact.
 - **Size**: about a week. **Risk**: low to medium.
+
+What C4 measured:
+
+- **How smoothing works, in both decoders.** A substream's lossless data
+  is a run of bytes from one stream of lossless frames laid end to end. A
+  decoder with nothing buffered decodes it in place, from its first byte or
+  from the sync offset the asset states (buffering it instead when a delay
+  is stated), and keeps what follows the frame; with something buffered, it
+  appends the run, counts the delay down and takes one frame out (FFmpeg's
+  `dca_xll.c`, which the `dca` crate follows; 240 kB at most). So a large
+  frame can travel partly in the substreams before its own, and no
+  substream needs more than the channel allows. `hz_dca::peak::DecoderBuffer`
+  keeps that buffer; `cargo xtask dts` now feeds it every substream, reports
+  the rate, the frame sizes, the sync fields and what it held
+  (`--rate-log` writes it frame by frame), and fails a stream on a
+  substream that starves it, on sending ahead without stating a buffer, or
+  on holding more than the buffer stated.
+- **The four standard-profile reference streams never smooth.** Every
+  lossless frame sits whole in its own substream, the sync present with
+  offset 0, delay 0 and buffer code 0. They vary widely and peak far under
+  the ceiling:
+
+  | Standard-profile reference stream | average | largest frame | lossless frames: median / p99 / max, bytes | spread (sd / mean) |
+  |---|---|---|---|---|
+  | stream 1 | 7.33 Mb/s | 11.21 Mb/s | 9,256 / 11,968 / 12,896 | 49.0 % |
+  | stream 2 | 6.94 Mb/s | 8.88 Mb/s | 7,276 / 9,312 / 9,792 | 13.2 % |
+  | stream 3 | 6.20 Mb/s | 10.21 Mb/s | 6,560 / 11,056 / 11,560 | 46.0 % |
+  | stream 4 | 7.70 Mb/s | 10.66 Mb/s | 8,828 / 11,332 / 12,160 | 30.2 % |
+
+- **Feature-length streams do, and say how.** Of the 63 lossless streams
+  in the local corpus, 28 state buffer code 0 and never send a frame ahead;
+  34 state code 8 — a 128 kB buffer — on every frame, whether they use it
+  or not, and 14 of those send frames ahead (one more, a splice, states
+  both). The longest, a standard-profile
+  feature of 1,125,840 frames, was measured frame by frame:
+  - the schedule is the **latest** one: a frame goes whole in its own
+    substream unless a later one cannot fit its own; then the substreams
+    just before carry its excess, the first in part and the rest each at a
+    fixed cap (12,936 bytes a frame there, 9.7 Mb/s), until the buffer has
+    it. 40,882 substreams carry other than their own frame, in 1,428 runs
+    of up to 1,130 frames; the buffer never holds more than 130,940 bytes
+    of its 131,072. Across the corpus the fullest holds 130,988;
+  - a substream in which a frame starts gives its offset, and as the delay
+    **the number of substreams until that frame is due** — on all
+    1,123,831 substreams that state one. Where no frame starts (2,009
+    substreams) the sync is absent;
+  - the delay's width is one bit up to a delay of 1, then one more than the
+    bits of the delay less one (2 in 2 bits, 3–4 in 3, 5–8 in 4, 9–16 in 5,
+    17–18 in 6: every delay in the corpus);
+  - the navigation word describes the frame the decoder takes out of its
+    buffer with that substream, not the one the substream's data starts —
+    1,175,121 of 1,175,121 words across the corpus. `cargo xtask dts`
+    compared it with the reassembled frame before, and so missed 17,320 on
+    that stream; it now compares it with the decoder model's.
+- **Dialnorm**: every core of the corpus states revision 7, code 0 —
+  0 dB, none — and no asset states its own.
+
+What C4 did:
+
+- ✅ **`hz_dca::peak::Smoother`**: that schedule, from the frames' sizes
+  alone. Each substream carries what the frames waiting need by their own
+  substreams if every later substream carries all the ceiling allows, and
+  at least a byte; one byte of room is kept to move a boundary off a later
+  frame's first byte, where a decoder joining there would decode that
+  frame in place, early (the feature does not bother: fifteen of its
+  substreams start on one, stating the delay). The sync offset and delay are the feature's;
+  the stated buffer is `peak::Config::buffer_code`, code 8 by default as
+  there. `master` queues the frames encoded — core, lossless frame,
+  navigation word — and sends each once the smoother has decided it, the
+  queues keeping their memory from frame to frame. Nothing is held where
+  nothing can need it: when no frame the lossless layer can write
+  passes its substream's room (`lossless::Encoder::frame_bound` — a 7.1.4's
+  bounded by the navigation word, any other's by the binary code that holds
+  a sample in 32 bits), the stream states buffer code 0, as the reference
+  streams do, and every frame goes out as soon as it is encoded. **At the
+  default 24.5 Mb/s that is every layout**: the room is about 30,600 bytes, the
+  largest frame 20,480 (7.1) or 16,400 (7.1.4). Otherwise the encoder looks
+  `lookahead` frames ahead, 1,024 by default (eleven seconds).
+- ✅ **The domain**: a frame that cannot reach the decoder in time is
+  refused with `Refused::PeakRate`, which names the first such frame and
+  its first sample, and says whether the substreams up to it cannot carry
+  it under the ceiling (with how many bytes over) or carrying it would
+  overfill the stated buffer. The stream ends before it; lossless data is
+  never coded coarser. The first frame cannot be helped by any before it.
+- ✅ **Dialnorm**: `encoder::Config::dialnorm`, 0 to 31 dB, written as the
+  revision and code ETSI TS 102 114 table 5-20 pairs (7 and 0–15, then 6
+  and 0–15); 0 by default, which is the header as before. Neither FFmpeg
+  nor `dca` applies it, so it changes no comparison. No dynamic range
+  control.
+- ✅ **`dts-encode`** takes `--ceiling` (bits a second, 24.5 Mb/s),
+  `--buffer` (code, 8) and `--dialnorm` (dB, 0), prints the largest frame,
+  the frames sent ahead and the buffer held, and `dts` fails the stream on
+  a frame over the ceiling or a buffer starved or overfull.
+- ✅ **Whole titles, bit for bit.** The four reference streams' 7.1 beds
+  (24 bits) and 7.1.4, 34,311 frames each way, through `dca` (the 7.1.4:
+  composite, heights and unfold) and FFmpeg (`-err_detect crccheck`), every
+  header rewriting byte for byte and every navigation word found:
+
+  | | 7.1, 24.5 Mb/s | 7.1, lowered | 7.1.4, 24.5 Mb/s | 7.1.4, lowered |
+  |---|---|---|---|---|
+  | stream 1 | 7.21 Mb/s at most | 7 Mb/s: 45 frames ahead, 8,280 B held | 10.94 | 10 Mb/s: 615 ahead, 34,080 B |
+  | stream 2 | 6.05 | 6 Mb/s: 7 ahead, 6,066 B | 8.68 | 8 Mb/s: 103 ahead, 24,182 B |
+  | stream 3 | 6.72 | 6 Mb/s: 206 ahead, 64,991 B | 9.95 | 9 Mb/s: 183 ahead, 82,614 B |
+  | stream 4 | 7.12 | 6 Mb/s: 7,343 ahead, 96,694 B | 10.41 | 10 Mb/s: 71 ahead, 12,436 B |
+
+  Every frame under its ceiling, to the byte (7,999 of 8,000 at 6 Mb/s),
+  the buffer starved nowhere. Lower still, the domain answers instead:
+  stream 1's 7.1 at 6 Mb/s and its 7.1.4 at 9 are refused at frames 1,935
+  and 1,945 (the 1,025 substreams up to them 933 and 1,397 bytes short),
+  stream 4's 7.1.4 at 9 at frame 15,706 (131,231 bytes held of 131,072).
+- ✅ **A decoder joining mid-run.** Cut at substreams that start inside a
+  frame, FFmpeg decodes the core alone for exactly the stated delay and
+  then every frame bit for bit; the crate's tests check the same for every
+  substream of a smoothed stream through `DecoderBuffer`.
+- ✅ **The worst case.** Full-scale 24-bit white noise in all eight
+  channels of a 7.1 is 10.9 Mb/s at its largest frame: under the default
+  ceiling, whole frames, bit-exact. At 9 Mb/s, a quarter-second burst of it
+  between tones is smoothed (37 frames ahead, 49 kB held) and bit-exact
+  through both decoders; the noise alone is refused at frame 0. Ten
+  seconds of it in two-second cycles with half-second bursts fit 9 Mb/s
+  (300 frames ahead, 87 kB held) and are refused at 8 (frame 92, the
+  buffer). In a 7.1.4, where the navigation word refuses louder noise
+  (C3), bursts at 2⁻¹⁰ of full scale are smoothed under 8 and 7.5 Mb/s,
+  bit-exact. `white_noise_bursts_are_smoothed_under_the_ceiling_or_refused`
+  holds the 1-second cases; the crate's own tests hold the schedule, the
+  joins, the refusals and the default's stating no buffer without either
+  decoder.
+- 🔴 **Not done**: an initial delay at the stream's start, which would let
+  the first frames be spread too but has a decoder present them from the
+  core meanwhile — not lossless; and a buffer stated on streams that never
+  need it, which the feature-length streams do and the reference streams
+  do not.
 
 #### Phase C5 — Command line and containers — **done; the receiver check is C3's (c)**
 
