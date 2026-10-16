@@ -159,6 +159,24 @@ the limiter and in how many blocks it acted. A synthetic 40-object scene
 peaked at 3.11 and was held; an 11-object master peaked at 0.56 and the
 limiter never acted.
 
+## Peak bit rate
+
+The stream is held under a ceiling, the core and every header included:
+24.5 Mb/s by default (`hz_dca::peak::Config`). A lossless frame goes whole in
+its own substream, as the reference streams have every one. Only a frame too
+large for its own substream is sent partly ahead, in the substreams just
+before it, into the decoder's smoothing buffer — as late as it can be, the
+schedule measured on the feature-length streams that smooth — and the stream
+then states that buffer: 128 kB by default, as they do. At 24.5 Mb/s no frame
+the encoder can write is that large (a 7.1.4 is bounded by the navigation
+word, 16,400 bytes, against about 30,600 of room), so the stream states no
+buffer and every frame goes out as it is encoded. A frame that cannot reach
+the decoder in time even so is refused with `Refused::PeakRate`, named, and
+never coded coarser. `dts-encode --ceiling`, `--buffer` and `--dialnorm` set
+the ceiling, the buffer and the core header's dialogue normalisation; `cargo
+xtask dts` feeds every substream to the buffer as FFmpeg and `dca` keep it, and
+reports the rate and what the buffer held (`--rate-log` frame by frame).
+
 ## Fields pinned to what the streams carry
 
 No published document describes the extension. These are written at the
@@ -219,9 +237,9 @@ heights where they belong. The other is (d): listening.
 
 ## Not done
 
-- Peak-rate smoothing and dialnorm in the core header are phase C4. Every
-  lossless frame sits whole in its own substream, so the substreams vary in
-  size.
+- `harlettizer dts` takes neither a ceiling nor a dialnorm: it encodes at the
+  default 24.5 Mb/s, where no frame needs smoothing, and states no dialnorm.
+  `dts-encode` sets both (above).
 - The heights are always declared 24-bit. The reference encoder declares 22
   on some quiet frames.
 - Objects: the alternate profiles, mode 1 only, are phase C6. It starts once

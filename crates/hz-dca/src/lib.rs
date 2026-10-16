@@ -38,6 +38,12 @@
 //!
 //! - [`dtsx`]: the extension block — the fold matrix, the height set — and
 //!   the fold; [`lossless`] and [`master`] write it.
+//!
+//! Phase C4 holds the stream under a peak bit rate ceiling:
+//!
+//! - [`peak`]: the decoder's smoothing buffer, as both decoders keep it, and
+//!   the schedule that sends a frame too large for its substream partly
+//!   ahead into it; [`master`] sends its substreams through it.
 
 pub mod adpcm;
 pub mod bits;
@@ -52,6 +58,7 @@ pub mod lossless;
 pub mod master;
 pub mod mdct;
 pub mod navigation;
+pub mod peak;
 pub mod split;
 pub mod tables;
 pub mod xll;
