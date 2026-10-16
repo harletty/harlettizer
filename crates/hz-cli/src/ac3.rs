@@ -267,11 +267,9 @@ pub fn run(config: Config) -> Result<()> {
             progress.at(at);
         }
         // Past the input's end, the frames keep coming until the decoder's
-        // output has caught up with it: its last samples are DELAY behind,
-        // and a final frame that is nearly full has not that much silence
-        // in it to carry them out.
+        // output has caught up with it — see [`lag`].
         let ended = got < FRAME_SAMPLES;
-        if ended && syncframes * FRAME_SAMPLES as u64 >= at + DELAY as u64 {
+        if ended && caught_up(syncframes, at, lag(config.joc)) {
             break;
         }
     }
@@ -387,9 +385,46 @@ pub fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Samples a decoder's last output is behind the input that went in: the
+/// core's [`DELAY`], and with joint object coding the objects' own on top,
+/// the QMF banks a decoder rebuilds them through. A final frame that is
+/// nearly full has not that much silence in it to carry them out.
+fn lag(joc: bool) -> u64 {
+    (DELAY + if joc { hz_joc::qmf::DELAY } else { 0 }) as u64
+}
+
+/// Whether `syncframes` frames carry a decoder's output past the last of
+/// `at` samples of input, `lag` behind.
+fn caught_up(syncframes: u64, at: u64, lag: u64) -> bool {
+    syncframes * FRAME_SAMPLES as u64 >= at + lag
+}
+
 /// Where each frame of core goes: an encoder, or the joint object coding
 /// writer that drives two.
 enum Sink {
     Plain(Box<Encoder>),
     Joc(Box<crate::joc::Writer>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream runs on until a decoder has played the input's last
+    /// sample: a core's, the encoder's delay behind; an object's, the joint
+    /// object coding latency behind that — 1000 samples take one syncframe
+    /// for the core, and two once objects have to come out of it as well.
+    #[test]
+    fn a_stream_runs_on_until_the_objects_have_caught_up() {
+        assert!(caught_up(1, 1000, lag(false)));
+        assert!(!caught_up(1, 1000, lag(true)));
+        assert!(caught_up(2, 1000, lag(true)));
+        for at in [1u64, 1000, 1536, 1537, 3000, 48_000] {
+            let mut syncframes = at.div_ceil(FRAME_SAMPLES as u64);
+            while !caught_up(syncframes, at, lag(true)) {
+                syncframes += 1;
+            }
+            assert!(syncframes * FRAME_SAMPLES as u64 >= at + 256 + 577, "{at}");
+        }
+    }
 }

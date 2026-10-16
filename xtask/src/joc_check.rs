@@ -44,6 +44,9 @@ pub struct Options {
 /// object coding's.
 const LAG: usize = hz_ac3::DELAY + eac3::JOC_LATENCY_SAMPLES;
 const FRAME: usize = hz_ac3::FRAME_SAMPLES;
+/// Syncframes left out at each end: at the start while the decoder's
+/// history fills, at the end past the master's.
+const TRIM: usize = 2;
 
 pub fn run(options: Options) -> Result<()> {
     let decoded = decode_objects(&options.stream)?;
@@ -65,6 +68,16 @@ pub fn run(options: Options) -> Result<()> {
         ));
     }
     let frames = decoded.first().map_or(0, Vec::len) / FRAME;
+    if frames <= 2 * TRIM {
+        return Err(Error::unsupported(
+            &options.stream,
+            format!(
+                "{frames} syncframes, and the first and last {TRIM} are left out: \
+                 {} at least to hold anything to the master",
+                2 * TRIM + 1
+            ),
+        ));
+    }
     println!(
         "{}: {} objects over {frames} syncframes, against {}",
         options.stream.display(),
@@ -73,7 +86,7 @@ pub fn run(options: Options) -> Result<()> {
     );
     // The first two frames, while the decoder's history fills, and the last
     // two, past the master's end, are left out.
-    let (start, end) = (2 * FRAME, frames.saturating_sub(2) * FRAME);
+    let (start, end) = (TRIM * FRAME, (frames - TRIM) * FRAME);
     let (mut signal, mut error) = (0f64, 0f64);
     let mut by_element = Vec::new();
     for (object, element) in decoded.iter().zip(&elements) {
@@ -121,13 +134,19 @@ pub fn run(options: Options) -> Result<()> {
     if let Some(dir) = &options.elements {
         let positions = positions(&dir.join("positions.csv"), elements.len())?;
         let master = master_render(&options)?;
+        // The master can end inside the frames scored: the scene is held
+        // to it only as far as it goes.
+        let end = end.min(master.len() / WIDTH);
+        if end <= start {
+            println!("  scene        the master ends before the frames left to score");
+            return Ok(());
+        }
         let carried = render(&elements, &positions, 0, master.len() / WIDTH);
         let rebuilt: Vec<Vec<f64>> = decoded
             .iter()
             .map(|object| object.iter().map(|&y| f64::from(y)).collect())
             .collect();
         let rebuilt = render(&rebuilt, &positions, LAG, master.len() / WIDTH);
-        let (start, end) = (start, end.min(master.len() / WIDTH));
         let range = start * WIDTH..end * WIDTH;
         let against = |scene: &[f64]| {
             let (mut s, mut e) = (0f64, 0f64);
