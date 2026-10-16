@@ -884,6 +884,17 @@ pub fn run(options: Options) -> Result<()> {
             ),
         ));
     }
+    if let Some(log) = &options.rate_log
+        && hz_io::paths::aliases(&options.input, log)?
+    {
+        return Err(Error::refused(
+            log,
+            format!(
+                "is {}, the stream whose rate it logs: writing it would destroy the stream",
+                options.input.display()
+            ),
+        ));
+    }
     #[cfg(not(feature = "dca-oracle"))]
     if options.unfold.is_some() {
         return Err(Error::refused(
@@ -2015,6 +2026,36 @@ mod tests {
             .to_string();
         assert!(message.contains("destroy"), "{message}");
         assert_eq!(after, stream);
+    }
+
+    /// `--rate-log` never writes over the stream it reads either: not by its
+    /// own name, not through a link to it.
+    #[test]
+    fn a_rate_log_onto_its_own_stream_is_refused() {
+        let dir = std::env::temp_dir().join(format!("hz-dts-log-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("stream.dts");
+        let (stream, _) = height_stream();
+        std::fs::write(&input, &stream).unwrap();
+        let link = dir.join("rate.csv");
+        std::fs::hard_link(&input, &link).unwrap();
+        for log in [input.clone(), link] {
+            let result = super::run(super::Options {
+                input: input.clone(),
+                frames: None,
+                reference: None,
+                unfold: None,
+                rate_log: Some(log.clone()),
+                ceiling: None,
+            });
+            let message = result
+                .expect_err("a rate log onto its own stream")
+                .to_string();
+            assert!(message.contains("destroy"), "{}: {message}", log.display());
+            assert_eq!(std::fs::read(&input).unwrap(), stream);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Each frame is unfolded with the fold its own matrix states: a stream

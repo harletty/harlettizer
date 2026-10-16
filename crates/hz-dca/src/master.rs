@@ -87,6 +87,14 @@ impl Config {
     }
 }
 
+/// The largest substream the wide size field describes, and the largest
+/// header its 12-bit header size does.
+const WIDEST_SUBSTREAM: usize = 1 << 20;
+const MAX_HEADER: usize = 1 << 12;
+
+/// The most frames the encoder looks ahead: about twelve minutes.
+const MAX_LOOKAHEAD: usize = 1 << 16;
+
 /// How the stream has used its ceiling so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rate {
@@ -256,8 +264,27 @@ impl Encoder {
                 peak.buffer_code
             )));
         }
+        if peak.lookahead > MAX_LOOKAHEAD {
+            return Err(Unsupported(format!(
+                "a lookahead of {} frames: {MAX_LOOKAHEAD} at most",
+                peak.lookahead
+            )));
+        }
         let budget = peak::frame_budget(peak.ceiling, FRAME_SAMPLES as u32, 48000);
-        let largest = budget.min(1 << 20) as u32;
+        let unsupported = |overhead: usize| {
+            Unsupported(format!(
+                "a ceiling of {} b/s: {budget} bytes a frame, which the core and the headers \
+                 ({overhead} bytes) leave no room in for the lossless layer",
+                peak.ceiling
+            ))
+        };
+        if budget < core.frame_size() + 2 {
+            return Err(unsupported(core.frame_size()));
+        }
+        // The most lossless data a substream can carry: what the budget
+        // leaves beside the core, and no more than the wide size field
+        // describes with the largest header around it.
+        let largest = (budget - core.frame_size()).min(WIDEST_SUBSTREAM - MAX_HEADER) as u32;
         let mut widest = exss.clone();
         widest.asset_sizes[0] = largest;
         if let Coding::Components { xll: Some(x), .. } = &mut widest.assets[0].coding {
@@ -274,13 +301,9 @@ impl Encoder {
             widest.assets[0].tail = tail(0);
         }
         let overhead = core.frame_size() + header(&mut widest, largest).len();
-        let room = budget.saturating_sub(overhead);
+        let room = budget.saturating_sub(overhead).min(largest as usize);
         if room < 2 {
-            return Err(Unsupported(format!(
-                "a ceiling of {} b/s: {budget} bytes a frame, which the core and the headers \
-                 ({overhead} bytes) leave no room in for the lossless layer",
-                peak.ceiling
-            )));
+            return Err(unsupported(overhead));
         }
         // Smoothing only where a frame can need it.
         let smoothing = peak.buffer_code > 0 && lossless.frame_bound() > room;
@@ -833,9 +856,24 @@ mod tests {
             assert_eq!(encoder.rate().buffer, 0, "{layout:?}");
             assert!(encoder.lossless.frame_bound() + 2012 + 48 < encoder.rate().budget);
         }
+        // No room beside the core — none at all, or not even for the
+        // headers — is refused, not panicked on.
+        for ceiling in [0, 1, 749, 750, 1_500_000, 1_520_000] {
+            let mut config = Config::reference(Layout::SevenPointOneFour, 24);
+            config.peak.ceiling = ceiling;
+            assert!(Encoder::new(config).is_err(), "{ceiling} b/s");
+        }
+        // A ceiling past what a substream's size field describes caps the
+        // room at what it does.
+        for ceiling in [800_000_000, u32::MAX] {
+            let mut config = Config::reference(Layout::SevenPointOne, 24);
+            config.peak.ceiling = ceiling;
+            let encoder = Encoder::new(config).expect("a ceiling past any frame");
+            assert_eq!(encoder.rate().buffer, 0, "{ceiling} b/s");
+        }
         let mut config = Config::reference(Layout::SevenPointOne, 24);
-        config.peak.ceiling = 1_500_000;
-        assert!(Encoder::new(config).is_err(), "no room beside the core");
+        config.peak.lookahead = usize::MAX;
+        assert!(Encoder::new(config).is_err(), "an endless lookahead");
     }
 
     /// A corner its height takes past 24 bits is refused, naming the input

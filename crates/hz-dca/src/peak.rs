@@ -124,6 +124,11 @@ impl DecoderBuffer {
                     Some(s) if (s.sync_offset as usize) < data.len() => {
                         let from = &data[s.sync_offset as usize..];
                         if s.delay_frames > 0 {
+                            // Buffered as FFmpeg's `copy_to_pbr` buffers it:
+                            // no more than the buffer holds.
+                            if from.len() > MAX_BUFFER {
+                                return Err(Starved::Overflow { held: from.len() });
+                            }
                             self.held.extend_from_slice(from);
                             self.delay = s.delay_frames;
                             self.peak = self.peak.max(self.held.len());
@@ -142,13 +147,18 @@ impl DecoderBuffer {
                     held: data.len(),
                 });
             }
+            let rest = &data[size..];
+            if rest.len() > MAX_BUFFER {
+                return Err(Starved::Overflow { held: rest.len() });
+            }
             self.frame.clear();
             self.frame.extend_from_slice(&data[..size]);
-            self.held.extend_from_slice(&data[size..]);
+            self.held.extend_from_slice(rest);
             return Ok(Taken::Frame(size));
         }
-        if data.len() > MAX_BUFFER - self.held.len() {
-            let held = self.held.len() + data.len();
+        // What is held never passes the buffer, so the sum cannot wrap.
+        let held = self.held.len() + data.len();
+        if held > MAX_BUFFER {
             self.clear();
             return Err(Starved::Overflow { held });
         }
@@ -533,6 +543,56 @@ mod tests {
         }
         assert_eq!(at, stream.len());
         Ok(out)
+    }
+
+    /// Data a decoder cannot hold is refused wherever it would be buffered —
+    /// a delayed start, what follows a frame decoded in place, an append —
+    /// and the buffer never holds more than it can.
+    #[test]
+    fn the_buffer_never_holds_more_than_it_can() {
+        let delayed = XllSync {
+            peak_buffer_code: 15,
+            delay_bits: 1,
+            delay_frames: 1,
+            sync_offset: 1,
+        };
+        let mut buffer = DecoderBuffer::new();
+        let oversized = vec![0; MAX_BUFFER + 2];
+        assert_eq!(
+            buffer.push(&oversized, Some(&delayed)),
+            Err(Starved::Overflow {
+                held: MAX_BUFFER + 1
+            })
+        );
+        assert_eq!(buffer.held(), 0);
+        assert_eq!(
+            buffer.push(&oversized, Some(&delayed)),
+            Err(Starved::Overflow {
+                held: MAX_BUFFER + 1
+            })
+        );
+        // A frame decoded in place with more after it than the buffer holds.
+        let mut data = frame(0, 100);
+        data.resize(100 + MAX_BUFFER + 1, 0);
+        assert_eq!(
+            buffer.push(&data, None),
+            Err(Starved::Overflow {
+                held: MAX_BUFFER + 1
+            })
+        );
+        assert_eq!(buffer.held(), 0);
+        // Filled to the brim, then one byte more.
+        let mut data = frame(0, 100);
+        data.resize(100 + MAX_BUFFER, 0);
+        assert_eq!(buffer.push(&data, None), Ok(Taken::Frame(100)));
+        assert_eq!(buffer.held(), MAX_BUFFER);
+        assert_eq!(
+            buffer.push(&[0], None),
+            Err(Starved::Overflow {
+                held: MAX_BUFFER + 1
+            })
+        );
+        assert_eq!(buffer.held(), 0);
     }
 
     /// Every substream's data goes through the decoder's buffer, and the
