@@ -2509,7 +2509,7 @@ fn gain_of(linear: f64) -> Gain {
 }
 
 /// Object size, which the master carries as a width from 0 to 1.
-fn size_of(spread: f64) -> Size {
+pub(crate) fn size_of(spread: f64) -> Size {
     if spread <= 0.0 {
         return Size::Point;
     }

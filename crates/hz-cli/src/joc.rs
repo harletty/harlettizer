@@ -27,7 +27,8 @@ use hz_core::{Error, Result};
 use hz_joc::estimate::Estimator;
 use hz_meta::emdf;
 use hz_meta::oamd::{Block, Gain, Object, ObjectAudioMetadata, Position, Ramp, Render};
-use hz_programme::path::Path as Trajectory;
+use hz_programme::path::{self, Path as Trajectory};
+use hz_render::Keyframe;
 use std::path::{Path, PathBuf};
 
 /// Elements a payload carries at most, as the reference streams do.
@@ -38,6 +39,10 @@ const SKIP_LIMIT: usize = 511;
 /// reference streams' run about eleven on average and twenty at most; past
 /// this, the payload's budget quantises gains coarser.
 const ROOM_PER_ELEMENT: usize = 16;
+/// Samples a decoder's objects lag the master by: the core's delay, then
+/// joint object coding's own (its QMF banks'). The stream has to run this far
+/// past the master's end, and the object metadata is timed on this clock.
+pub const LATENCY: usize = DELAY + hz_joc::qmf::DELAY;
 /// The core's channels joint object coding reconstructs from, in WAV order:
 /// L, R, C, Ls, Rs.
 const CORE: [usize; 5] = [0, 1, 2, 4, 5];
@@ -48,6 +53,11 @@ pub enum Element {
         channel: usize,
         path: Trajectory,
         hint: usize,
+        /// Its updates, the next one due and the last one in force: what
+        /// its size and rendering are, which do not ramp.
+        keyframes: Vec<Keyframe>,
+        next: usize,
+        current: Keyframe,
     },
     Bed {
         channel: usize,
@@ -56,6 +66,18 @@ pub enum Element {
 }
 
 impl Element {
+    /// An object, from its updates.
+    pub fn object(channel: usize, keyframes: Vec<Keyframe>) -> Self {
+        Self::Object {
+            channel,
+            path: Trajectory::new(&keyframes),
+            hint: 0,
+            current: keyframes.first().copied().unwrap_or_default(),
+            keyframes,
+            next: 0,
+        }
+    }
+
     fn channel(&self) -> usize {
         match self {
             Self::Object { channel, .. } | Self::Bed { channel, .. } => *channel,
@@ -295,11 +317,14 @@ impl Writer {
     }
 
     /// Stream frame `frame`'s object metadata: one block, each element moving
-    /// across the frame to where it is at the frame's end — on the decoded
-    /// core's clock, [`DELAY`] behind the master's — as the reference streams
-    /// move theirs.
+    /// across the frame to where it is at the frame's end, as the reference
+    /// streams move theirs — timed on the clock of the objects a decoder
+    /// plays, [`LATENCY`] behind the master's: the metadata comes with its
+    /// access unit, and so does the audio it places. Each object rendered as
+    /// the master says: its size, and whether it snaps, which zones confine
+    /// it, how it follows the screen and whether its height counts.
     fn oamd(&mut self, frame: u64) -> Result<Vec<u8>> {
-        let t = ((frame + 1) * FRAME_SAMPLES as u64).saturating_sub(DELAY as u64);
+        let t = ((frame + 1) * FRAME_SAMPLES as u64).saturating_sub(LATENCY as u64);
         let mut objects = Vec::with_capacity(self.elements.len() + 1);
         if self.lfe {
             objects.push(Object {
@@ -310,14 +335,35 @@ impl Writer {
         }
         for element in &mut self.elements {
             let (position, _) = element.state(t);
+            let raised = position[2].abs() > f64::EPSILON;
+            let render = match element {
+                Element::Object {
+                    keyframes,
+                    next,
+                    current,
+                    ..
+                } => {
+                    path::advance(keyframes, next, current, t);
+                    Render {
+                        position: Position::from_master(position),
+                        size: crate::encode::size_of(current.spread),
+                        elevation: current.mode.elevation && raised,
+                        zones: current.mode.zones,
+                        screen: current.mode.screen,
+                        snap: current.mode.snap,
+                        ..Render::default()
+                    }
+                }
+                Element::Bed { .. } => Render {
+                    position: Position::from_master(position),
+                    elevation: raised,
+                    ..Render::default()
+                },
+            };
             objects.push(Object {
                 active: true,
                 gain: Gain::Unity,
-                render: Some(Render {
-                    position: Position::from_master(position),
-                    elevation: position[2].abs() > f64::EPSILON,
-                    ..Render::default()
-                }),
+                render: Some(render),
             });
         }
         ObjectAudioMetadata {
@@ -545,6 +591,71 @@ mod tests {
         }
         let expected: std::collections::BTreeSet<u16> = (0..FRAMES as u16).collect();
         assert_eq!(sequences, expected, "one Evolution frame each syncframe");
+    }
+
+    /// A moving object is placed where it is on the clock of the objects a
+    /// decoder plays — [`LATENCY`] behind the master, not the core's
+    /// [`DELAY`] — and rendered as the master says: its size, snapping,
+    /// zones, screen and whether its height counts carried, not reset.
+    #[test]
+    fn an_object_is_placed_on_the_decoded_objects_clock_and_rendered_as_authored() {
+        let mode = hz_render::Mode {
+            snap: true,
+            zones: 1,
+            elevation: false,
+            screen: Some((3, 1)),
+        };
+        // From the left to the right, from sample 1536 over 15 360.
+        let keyframes = vec![
+            Keyframe {
+                sample_pos: 0,
+                position: [-1.0, 1.0, 0.75],
+                spread: 0.8,
+                mode,
+                ..Keyframe::default()
+            },
+            Keyframe {
+                sample_pos: 1536,
+                position: [1.0, 1.0, 0.75],
+                ramp_samples: 15_360,
+                spread: 0.8,
+                mode,
+                ..Keyframe::default()
+            },
+        ];
+        let config = hz_ac3::Config {
+            format: hz_ac3::Format::Eac3,
+            sample_rate: 48_000,
+            mode: hz_ac3::ChannelMode::ThreeTwo,
+            lfe: true,
+            bit_rate: Some(448),
+            coupling: true,
+            metadata: hz_ac3::Metadata::default(),
+        };
+        let elements = vec![Element::object(0, keyframes.clone())];
+        let mut writer = Writer::new(config, elements, false, &PathBuf::from("t.ec3")).unwrap();
+        let trajectory = Trajectory::new(&keyframes);
+        let mut hint = 0;
+        for frame in 0..12u64 {
+            let metadata = ObjectAudioMetadata::read(&writer.oamd(frame).unwrap()).unwrap();
+            let render = metadata.blocks[0].objects[0].render.unwrap();
+            let t = ((frame + 1) * FRAME_SAMPLES as u64).saturating_sub(LATENCY as u64);
+            let want = trajectory.segment(t, &mut hint).at(t).position;
+            assert_eq!(
+                render.position,
+                Position::from_master(want),
+                "frame {frame}"
+            );
+            assert_eq!(render.size, hz_meta::oamd::Size::Uniform(25), "size 0.8");
+            assert!(render.snap, "frame {frame}");
+            assert_eq!(render.zones, 1);
+            assert_eq!(render.screen, Some((3, 1)));
+            assert!(!render.elevation, "its height not to count, at z = 0.75");
+        }
+        // Frame 3's objects end at master sample 5311, a quarter of the way
+        // across: x code 15, where the core's clock (5888) would say 18.
+        let metadata = ObjectAudioMetadata::read(&writer.oamd(3).unwrap()).unwrap();
+        assert_eq!(metadata.blocks[0].objects[0].render.unwrap().position.x, 15);
     }
 
     /// The smallest payload is the floor the budget can always reach: a

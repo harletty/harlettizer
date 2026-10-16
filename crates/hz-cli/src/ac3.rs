@@ -129,11 +129,7 @@ pub fn run(config: Config) -> Result<()> {
             }
             Part::Object { channel, keyframes } => {
                 following.object(channel, &keyframes);
-                elements.push(crate::joc::Element::Object {
-                    channel,
-                    path: hz_programme::path::Path::new(&keyframes),
-                    hint: 0,
-                });
+                elements.push(crate::joc::Element::object(channel, keyframes));
                 objects += 1;
             }
         }
@@ -194,6 +190,11 @@ pub fn run(config: Config) -> Result<()> {
     let mut frame = Vec::new();
     let (mut clipped, mut peak) = (0u64, 0f64);
 
+    let lag = if config.joc {
+        crate::joc::LATENCY
+    } else {
+        DELAY
+    };
     let mut at = 0u64;
     let mut syncframes = 0u64;
     loop {
@@ -267,11 +268,12 @@ pub fn run(config: Config) -> Result<()> {
             progress.at(at);
         }
         // Past the input's end, the frames keep coming until the decoder's
-        // output has caught up with it: its last samples are DELAY behind,
-        // and a final frame that is nearly full has not that much silence
-        // in it to carry them out.
+        // output has caught up with it: its last samples are DELAY behind —
+        // and with objects, joint object coding's latency further — and a
+        // final frame that is nearly full has not that much silence in it to
+        // carry them out.
         let ended = got < FRAME_SAMPLES;
-        if ended && syncframes * FRAME_SAMPLES as u64 >= at + DELAY as u64 {
+        if ended && syncframes >= syncframes_to_cover(at, lag) {
             break;
         }
     }
@@ -361,9 +363,34 @@ pub fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Syncframes that carry `samples` of input all the way out of a decoder
+/// whose output lags its input by `lag`.
+fn syncframes_to_cover(samples: u64, lag: usize) -> u64 {
+    (samples + lag as u64).div_ceil(FRAME_SAMPLES as u64)
+}
+
 /// Where each frame of core goes: an encoder, or the joint object coding
 /// writer that drives two.
 enum Sink {
     Plain(Box<Encoder>),
     Joc(Box<crate::joc::Writer>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame's padding that carries the core's delay out need not carry the
+    /// objects' too: 1280 samples fit one syncframe with the core's 256
+    /// behind, but the objects' 833 need a second, or the last 577 samples
+    /// of the programme are lost to them.
+    #[test]
+    fn the_stream_runs_until_the_objects_are_out() {
+        assert_eq!(syncframes_to_cover(1280, DELAY), 1);
+        assert_eq!(syncframes_to_cover(1280, crate::joc::LATENCY), 2);
+        assert_eq!(crate::joc::LATENCY, DELAY + 577);
+        assert_eq!(syncframes_to_cover(1536 - 833, crate::joc::LATENCY), 1);
+        assert_eq!(syncframes_to_cover(1536 - 832, crate::joc::LATENCY), 2);
+        assert_eq!(syncframes_to_cover(0, DELAY), 1);
+    }
 }

@@ -300,6 +300,19 @@ to where it is at the frame's end — the references' `Long` ramp), then the
 joint object coding payload (14), group nought, kept, the second
 frame-aligned.
 
+The metadata is timed on the clock of the objects a decoder plays, not the
+core's: they come out the core's 256 samples and joint object coding's 577
+behind the master, and the metadata comes with the access unit that carries
+them, so a frame's positions are the master's 833 samples before its end.
+Timed on the core's clock, as the first version was, a moving object was
+placed 577 samples ahead of its sound. Each object is rendered as the master
+says — its size, and whether it snaps, which zones confine it, how it follows
+the screen and whether its height counts, mapped as the TrueHD writer maps
+them — where the first version reset them all. And the stream runs until the
+objects are out, the 833 samples covered, not only the core's 256: a
+programme of 1280 samples takes two syncframes, where one lost its last 577
+to the objects.
+
 The gains are fitted to the core a decoder plays, which `hz-ac3` reconstructs
 (docs/ac3.md). Two things are in the way of fitting it and carrying the result
 in the same frame: a frame's fit looks half a frame ahead, into a core not yet
@@ -331,7 +344,7 @@ samples — taken out:
 | synthetic, 4 objects and a bed channel | 5 | 133 bytes | 26.3 dB (47.7, 30.8, 24.1, 22.5, 28.4) |
 | synthetic, 10 broadband objects | 10 | 233 bytes | 7.1 dB |
 | synthetic, 10 objects switching on and off | 10 | 233 bytes | 9.9 dB |
-| synthetic, a 7.1.2 bed and 6 broadband objects | 15 | 332 bytes | 7.2 dB |
+| synthetic, a 7.1.2 bed and 6 broadband objects | 15 | 333 bytes | 7.2 dB |
 
 The workspace decoder reads every frame's object metadata with the elements
 the master has, and the LFE. These are not the reference comparisons above:
