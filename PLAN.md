@@ -719,8 +719,12 @@ E-AC-3 needs. Port from FFmpeg `ac3enc`, then Rust-ify.
   reference steps, at the same slot, gaining 3 to 4 dB on the stepped frames
   of film. A budget keeps each payload within what the skip field leaves it,
   quantising gains for bits only where a frame is over (`--skip-limit`
-  exercises it: the 60-second film loses 0.02 dB at 330 bytes). Next: fit
-  to a core rendered from a master.
+  exercises it: the 60-second film loses 0.02 dB at 330 bytes).
+- **Objects of our own** (`harlettizer ac3 --eac3 --joc`): from a master of
+  up to fifteen elements, the gains fitted to the 5.1 core a decoder plays —
+  `hz-ac3` reconstructs it — and carried with the object metadata in each
+  syncframe's skip field; `cargo xtask joc-check` holds the decoded objects
+  to the master's. Next: cluster larger masters into fifteen elements.
 
 
 - TS 103 420 defines the *bitstream*, not the encoder. The new work is

@@ -9,6 +9,9 @@
 //! ±110°, and the fold is what a 5.1 listener of the same master hears from
 //! the lossless stream. The loudness is measured on what is coded, before the
 //! codec, and reported beside the dialnorm the stream states.
+//!
+//! With `--joc` the objects do survive: E-AC-3 carries them beside the 5.1
+//! core by joint object coding ([`crate::joc`]).
 
 use hz_ac3::{ChannelMode, DELAY, Encoder, FRAME_SAMPLES};
 use hz_analysis::loudness::{ChannelWeight, Meter};
@@ -37,6 +40,8 @@ pub struct Config {
     pub coupling: bool,
     /// Write one independent E-AC-3 substream rather than AC-3.
     pub eac3: bool,
+    /// With `eac3` and 5.1, carry the objects by joint object coding.
+    pub joc: bool,
     pub progress: bool,
 }
 
@@ -75,6 +80,14 @@ pub fn run(config: Config) -> Result<()> {
         }
     };
     let lfe_speaker = rendered.index_of("LFE1");
+    if config.joc && (!config.eac3 || layout.name != "5.1") {
+        return Err(Error::unsupported(
+            path,
+            "joint object coding without E-AC-3 on 5.1; it rebuilds objects from a 5.1 core",
+        ));
+    }
+    let mut elements = Vec::new();
+    let mut master_lfe = false;
 
     // Every track to a source of the mixdown, as `iamf` routes them.
     let mut following = Following::new(Mixdown::new(&rendered)?);
@@ -86,6 +99,7 @@ pub fn run(config: Config) -> Result<()> {
                     .mixdown()
                     .speaker(channel, lfe_speaker.expect("7.1 has an LFE"));
                 routed += 1;
+                master_lfe = true;
                 // Stereo has no LFE, and the fold leaves it out, as a decoder
                 // folding 5.1 to stereo does.
                 dropped += usize::from(!layout.has("LFE1"));
@@ -96,6 +110,7 @@ pub fn run(config: Config) -> Result<()> {
                 position,
             } => {
                 let label = hz_core::speakers::by_master_name(name).map_or(name, |s| s.label);
+                elements.push(crate::joc::Element::Bed { channel, position });
                 let mixdown = following.mixdown();
                 if let Some(speaker) = rendered.index_of(label) {
                     mixdown.speaker(channel, speaker);
@@ -114,6 +129,7 @@ pub fn run(config: Config) -> Result<()> {
             }
             Part::Object { channel, keyframes } => {
                 following.object(channel, &keyframes);
+                elements.push(crate::joc::Element::object(channel, keyframes));
                 objects += 1;
             }
         }
@@ -122,7 +138,7 @@ pub fn run(config: Config) -> Result<()> {
         return Err(Error::unsupported(path, "nothing in it to render"));
     }
 
-    let mut encoder = Encoder::new(hz_ac3::Config {
+    let codec = hz_ac3::Config {
         format: if config.eac3 {
             hz_ac3::Format::Eac3
         } else {
@@ -137,8 +153,20 @@ pub fn run(config: Config) -> Result<()> {
             dialnorm: config.dialnorm,
             ..hz_ac3::Metadata::default()
         },
-    })
-    .map_err(|e| Error::unsupported(&config.out, e.0))?;
+    };
+    let element_count = elements.len();
+    let mut sink = if config.joc {
+        Sink::Joc(Box::new(crate::joc::Writer::new(
+            codec,
+            elements,
+            master_lfe,
+            &config.out,
+        )?))
+    } else {
+        Sink::Plain(Box::new(
+            Encoder::new(codec).map_err(|e| Error::unsupported(&config.out, e.0))?,
+        ))
+    };
     let out_file = std::fs::File::create(&config.out).map_err(|e| Error::io(&config.out, e))?;
     let mut out = std::io::BufWriter::new(out_file);
 
@@ -162,6 +190,11 @@ pub fn run(config: Config) -> Result<()> {
     let mut frame = Vec::new();
     let (mut clipped, mut peak) = (0u64, 0f64);
 
+    let lag = if config.joc {
+        crate::joc::LATENCY
+    } else {
+        DELAY
+    };
     let mut at = 0u64;
     let mut syncframes = 0u64;
     loop {
@@ -213,9 +246,19 @@ pub fn run(config: Config) -> Result<()> {
         for (r, plane) in refs.iter_mut().zip(&planar) {
             *r = plane;
         }
-        encoder
-            .encode(&refs[..width], &mut frame)
-            .map_err(|e| Error::refused(&config.out, e.0))?;
+        match &mut sink {
+            Sink::Plain(encoder) => encoder
+                .encode(&refs[..width], &mut frame)
+                .map_err(|e| Error::refused(&config.out, e.0))?,
+            Sink::Joc(writer) => writer.frame(
+                &refs[..width],
+                &input[..FRAME_SAMPLES * stride],
+                stride,
+                got,
+                at,
+                &mut frame,
+            )?,
+        }
         out.write_all(&frame)
             .map_err(|e| Error::io(&config.out, e))?;
         syncframes += 1;
@@ -225,13 +268,20 @@ pub fn run(config: Config) -> Result<()> {
             progress.at(at);
         }
         // Past the input's end, the frames keep coming until the decoder's
-        // output has caught up with it: its last samples are DELAY behind,
-        // and a final frame that is nearly full has not that much silence
-        // in it to carry them out.
+        // output has caught up with it: its last samples are DELAY behind —
+        // and with objects, joint object coding's latency further — and a
+        // final frame that is nearly full has not that much silence in it to
+        // carry them out.
         let ended = got < FRAME_SAMPLES;
-        if ended && syncframes * FRAME_SAMPLES as u64 >= at + DELAY as u64 {
+        if ended && syncframes >= syncframes_to_cover(at, lag) {
             break;
         }
+    }
+    if let Sink::Joc(writer) = &mut sink {
+        frame.clear();
+        writer.finish(&mut frame)?;
+        out.write_all(&frame)
+            .map_err(|e| Error::io(&config.out, e))?;
     }
     out.flush().map_err(|e| Error::io(&config.out, e))?;
     if at == 0 {
@@ -265,6 +315,10 @@ pub fn run(config: Config) -> Result<()> {
         parts.join(", "),
         layout.name
     );
+    let (encoder, syncframes) = match &sink {
+        Sink::Plain(encoder) => (encoder.as_ref(), syncframes),
+        Sink::Joc(writer) => (writer.encoder(), writer.written()),
+    };
     println!(
         "  encoded      {syncframes} syncframes, {at} samples, {} at {} kb/s{}",
         if config.eac3 { "E-AC-3" } else { "AC-3" },
@@ -275,6 +329,17 @@ pub fn run(config: Config) -> Result<()> {
             ""
         }
     );
+    if let Sink::Joc(writer) = &sink {
+        println!(
+            "  objects      {element_count} carried by joint object coding, fitted to the core \
+             a decoder plays; every Evolution frame {} bytes{}",
+            writer.evolution_bytes(),
+            match writer.squeezed() {
+                0 => String::new(),
+                n => format!(", {n} payloads quantised coarser to fit"),
+            }
+        );
+    }
     println!(
         "  loudness     {} on {}, the stream stating a dialnorm of {}",
         crate::iamf::lkfs(meter.integrated()),
@@ -296,4 +361,36 @@ pub fn run(config: Config) -> Result<()> {
         .len();
     println!("  wrote        {}, {bytes} bytes", config.out.display());
     Ok(())
+}
+
+/// Syncframes that carry `samples` of input all the way out of a decoder
+/// whose output lags its input by `lag`.
+fn syncframes_to_cover(samples: u64, lag: usize) -> u64 {
+    (samples + lag as u64).div_ceil(FRAME_SAMPLES as u64)
+}
+
+/// Where each frame of core goes: an encoder, or the joint object coding
+/// writer that drives two.
+enum Sink {
+    Plain(Box<Encoder>),
+    Joc(Box<crate::joc::Writer>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame's padding that carries the core's delay out need not carry the
+    /// objects' too: 1280 samples fit one syncframe with the core's 256
+    /// behind, but the objects' 833 need a second, or the last 577 samples
+    /// of the programme are lost to them.
+    #[test]
+    fn the_stream_runs_until_the_objects_are_out() {
+        assert_eq!(syncframes_to_cover(1280, DELAY), 1);
+        assert_eq!(syncframes_to_cover(1280, crate::joc::LATENCY), 2);
+        assert_eq!(crate::joc::LATENCY, DELAY + 577);
+        assert_eq!(syncframes_to_cover(1536 - 833, crate::joc::LATENCY), 1);
+        assert_eq!(syncframes_to_cover(1536 - 832, crate::joc::LATENCY), 2);
+        assert_eq!(syncframes_to_cover(0, DELAY), 1);
+    }
 }

@@ -6,6 +6,7 @@ mod dts;
 mod encode;
 mod iamf;
 mod iamf_objects;
+mod joc;
 
 use clap::{Parser, Subcommand};
 use hz_programme::mix::{self, Headroom, Mixing};
@@ -306,6 +307,12 @@ enum Command {
         /// frame can carry (`--bitrate` in kb/s, up to 1024 at 48 kHz).
         #[arg(long)]
         eac3: bool,
+
+        /// With `--eac3` and 5.1: carry the master's objects and bed channels
+        /// as objects too, by joint object coding beside the core, their
+        /// positions in the object metadata — at most fifteen of them.
+        #[arg(long, requires = "eac3")]
+        joc: bool,
 
         /// Report progress on standard error.
         #[arg(long)]
@@ -831,6 +838,7 @@ fn main() -> ExitCode {
             dialnorm,
             no_coupling,
             eac3,
+            joc,
             progress,
         } => {
             let layout = match layout.as_str() {
@@ -852,6 +860,7 @@ fn main() -> ExitCode {
                     dialnorm,
                     coupling: !no_coupling,
                     eac3,
+                    joc,
                     progress,
                 })
             })

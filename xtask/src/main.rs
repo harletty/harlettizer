@@ -20,6 +20,8 @@ mod eac3;
 mod ffmpeg_check;
 #[cfg(feature = "eac3-oracle")]
 mod graft;
+#[cfg(feature = "eac3-oracle")]
+mod joc_check;
 mod loudness;
 mod make_master;
 mod mlp;
@@ -583,6 +585,21 @@ enum Command {
         pcm: Option<PathBuf>,
     },
 
+    /// Decode the objects of an `harlettizer ac3 --eac3 --joc` stream
+    /// through the `eac3` crate and compare each with its element of the
+    /// master. Needs `--features eac3-oracle`.
+    JocCheck {
+        stream: PathBuf,
+
+        /// The master the stream was made from.
+        #[arg(long, value_name = "PATH")]
+        master: PathBuf,
+
+        /// Where a master's mono WAVs sit, when not beside it.
+        #[arg(long, value_name = "PATH")]
+        mono_prefix: Option<PathBuf>,
+    },
+
     /// Re-encode a reference E-AC-3 stream's 5.1 core with `hz-ac3`, carry
     /// each frame's Evolution frame across in block 2's skip field, and
     /// compare the objects the workspace decoder rebuilds from both. Needs
@@ -1033,6 +1050,22 @@ fn main() -> ExitCode {
         Command::Graft { .. } => Err(hz_core::Error::Unsupported {
             path: PathBuf::new(),
             detail: "built without the E-AC-3 oracle: run `cargo run -p xtask --features eac3-oracle -- graft …`"
+                .into(),
+        }),
+        #[cfg(feature = "eac3-oracle")]
+        Command::JocCheck {
+            stream,
+            master,
+            mono_prefix,
+        } => joc_check::run(joc_check::Options {
+            stream,
+            master,
+            mono_prefix,
+        }),
+        #[cfg(not(feature = "eac3-oracle"))]
+        Command::JocCheck { .. } => Err(hz_core::Error::Unsupported {
+            path: PathBuf::new(),
+            detail: "built without the E-AC-3 oracle: run `cargo run -p xtask --features eac3-oracle -- joc-check …`"
                 .into(),
         }),
         #[cfg(feature = "eac3-oracle")]

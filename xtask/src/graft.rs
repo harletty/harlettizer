@@ -177,12 +177,15 @@ fn read_reference(path: &Path) -> Result<Reference> {
 
 /// Every object channel of every frame a stream reconstructs, and its core,
 /// concatenated.
-struct Objects {
-    objects: Vec<Vec<f32>>,
+pub struct Objects {
+    pub objects: Vec<Vec<f32>>,
+    /// Per syncframe, the elements its object metadata names, as the
+    /// workspace decoder reads it; nought where it carries none.
+    pub oamd: Vec<usize>,
     core: Vec<f32>,
 }
 
-fn decode_objects(path: &Path) -> Result<Objects> {
+pub fn decode_objects(path: &Path) -> Result<Objects> {
     let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
     decode_objects_of(path, &bytes)
 }
@@ -192,6 +195,7 @@ fn decode_objects_of(path: &Path, bytes: &[u8]) -> Result<Objects> {
     let mut decoder = ObjectPcmDecoder::new();
     let mut objects: Vec<Vec<f32>> = Vec::new();
     let mut core = Vec::new();
+    let mut oamd = Vec::new();
     for (index, frame) in frames_of(path, bytes)?.iter().enumerate() {
         let Some(pushed) = decoder
             .push_access_unit(frame)
@@ -203,6 +207,7 @@ fn decode_objects_of(path: &Path, bytes: &[u8]) -> Result<Objects> {
             ));
         };
         let pcm = pushed.pcm;
+        oamd.push(pcm.oamd_payloads.first().map_or(0, |(o, _)| o.object_count));
         if objects.is_empty() {
             objects = vec![Vec::new(); pcm.object_count()];
         }
@@ -213,7 +218,11 @@ fn decode_objects_of(path: &Path, bytes: &[u8]) -> Result<Objects> {
             core.extend_from_slice(samples);
         }
     }
-    Ok(Objects { objects, core })
+    Ok(Objects {
+        objects,
+        oamd,
+        core,
+    })
 }
 
 /// The unspliced runs of frames: a new run wherever the joint object coding
