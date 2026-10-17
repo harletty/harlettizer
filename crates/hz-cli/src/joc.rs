@@ -1023,15 +1023,13 @@ mod tests {
         assert_eq!((stated.upmix, stated.active_channels), (None, None));
     }
 
-    /// A transient at the end of an interval is counted in it, not in the
-    /// next: the meter's reconstruction runs behind, and the interval closes
-    /// only once it has caught up. A unit impulse three samples before frame
-    /// 15 ends, silence everywhere else: frame 15 states it, near 0 dBTP, and
-    /// frame 31 the silence after, all but its ringing. Closed at the frame's
-    /// last sample, as the first version closed it, they came out as −39 and
-    /// 0 dBTP.
-    #[test]
-    fn a_transient_at_an_intervals_end_is_counted_in_it() {
+    /// The true peak each interval states of a unit impulse at `sample` of
+    /// frame `frame`, silence everywhere else, over 33 frames: frame 15 and
+    /// frame 31, by the sequence counter.
+    fn peaks_stated_of_an_impulse(
+        frame: usize,
+        sample: usize,
+    ) -> std::collections::BTreeMap<u16, f64> {
         const FRAMES: usize = 33;
         let out = PathBuf::from("test.ec3");
         let mut writer = Writer::new(config(), beds(2), true, Some(2), &out).unwrap();
@@ -1039,8 +1037,8 @@ mod tests {
         let input = vec![0f32; 2 * FRAME_SAMPLES];
         for k in 0..FRAMES {
             let mut core = vec![vec![0f32; FRAME_SAMPLES]; 6];
-            if k == 15 {
-                core[0][FRAME_SAMPLES - 3] = 1.0;
+            if k == frame {
+                core[0][sample] = 1.0;
             }
             let refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
             writer
@@ -1064,16 +1062,41 @@ mod tests {
             }
         }
         assert_eq!(stated.keys().copied().collect::<Vec<_>>(), [15, 31]);
-        assert!(
-            stated[&15] > -1.0,
-            "the impulse's interval: {} dBTP",
-            stated[&15]
-        );
-        assert!(
-            stated[&31] < -20.0,
-            "the silence after it: {} dBTP",
-            stated[&31]
-        );
+        stated
+    }
+
+    /// A transient at the end of an interval is counted in it, not in the
+    /// next: the meter's reconstruction runs behind, and the interval closes
+    /// only once it has caught up. A unit impulse on frame 15's last sample,
+    /// or three before it: frame 15 states it, near 0 dBTP, and frame 31 the
+    /// silence after, all but its ringing. Closed at the frame's last sample,
+    /// as the first version closed it, the three-before case came out at −39
+    /// and 0 dBTP; closed a sample short of the meter's latency, the
+    /// last-sample case still put 0 dBTP in frame 31.
+    #[test]
+    fn a_transient_at_an_intervals_end_is_counted_in_it() {
+        // The ringing is louder the nearer the impulse is to the boundary.
+        for (sample, ringing) in [(FRAME_SAMPLES - 3, -20.0), (FRAME_SAMPLES - 1, -10.0)] {
+            let stated = peaks_stated_of_an_impulse(15, sample);
+            assert!(
+                stated[&15] > -1.0,
+                "sample {sample}, the impulse's interval: {} dBTP",
+                stated[&15]
+            );
+            assert!(
+                stated[&31] < ringing,
+                "sample {sample}, the silence after it: {} dBTP",
+                stated[&31]
+            );
+        }
+    }
+
+    /// A transient at the start of an interval is counted in it: on frame
+    /// 16's first sample, frame 31 states it.
+    #[test]
+    fn a_transient_at_an_intervals_start_is_counted_in_it() {
+        let stated = peaks_stated_of_an_impulse(16, 0);
+        assert!(stated[&31] > -1.0, "its interval: {} dBTP", stated[&31]);
     }
 
     /// The downmix declared is the fold made: the spread fold's surrounds are

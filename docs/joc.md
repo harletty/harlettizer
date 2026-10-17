@@ -300,7 +300,7 @@ references carry, in their order and configured as theirs are:
 - the programme's loudness (payload 1, for the frame's 1536 samples, kept):
   every sixteenth frame the core's true peak since the last statement, as the
   references state theirs — the interval closed only once the meter's
-  reconstruction, five samples behind, has caught up with its end, or a
+  reconstruction, six samples behind, has caught up with its end, or a
   transient there is counted in the next — and nothing else — no measurement practice is
   claimed, and no integrated loudness, which has to match the stream's
   dialnorm, and the dialnorm is the user's (`--dialnorm`), not measured;

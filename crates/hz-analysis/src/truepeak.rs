@@ -25,12 +25,15 @@ const PHASES: usize = 4;
 /// Taps per phase. Twelve puts the stop-band far enough down that the
 /// measurement is limited by the window rather than by the length.
 const TAPS_PER_PHASE: usize = 12;
-/// Samples the meter's reconstruction runs behind what is pushed: a
-/// sample's peak, and the values between it and the one before, are
-/// measured once this many more have come. A stretch measured on its own
-/// ([`TruePeak::take`]) has to run this far into the next before it closes,
-/// or a transient at its end is counted in the next.
-pub const LATENCY: usize = TAPS_PER_PHASE / 2 - 1;
+/// Samples the meter's reconstruction runs behind what is pushed. The
+/// prototype's centre is 5,875 samples back, so a push measures four points
+/// between 5,875 and 5,125 samples before the newest: once this many more
+/// have come, every point up to the next sample is measured, the eighth of a
+/// sample on either side of a sample's own instant among them. A stretch
+/// measured on its own ([`TruePeak::take`]) has to run this far into the
+/// next before it closes; a sample short, a transient on its last sample
+/// leaves half its peak to the next.
+pub const LATENCY: usize = TAPS_PER_PHASE / 2;
 
 /// Tracks the true peak of an interleaved signal, per channel.
 #[derive(Debug, Clone)]
@@ -187,18 +190,29 @@ fn blackman_harris(n: usize, length: usize) -> f64 {
 #[cfg(test)]
 mod tests {
 
-    /// A sample's peak is measured [`LATENCY`] samples after it is pushed,
-    /// not before.
+    /// A sample's reconstruction is measured whole [`LATENCY`] samples after
+    /// it, and what is measured after that is only the ringing: an impulse,
+    /// [`LATENCY`] samples after it, a take, and the next stretch well under
+    /// it. A sample sooner, the next stretch has the other side of its peak.
     #[test]
-    fn a_peak_is_measured_latency_samples_late() {
-        let mut meter = TruePeak::new(1);
-        let at = 20;
-        for n in 0..at + LATENCY {
-            meter.push(&[if n == at { 1.0 } else { 0.0 }]);
-        }
-        assert!(meter.peak() < 0.5, "early: {}", meter.peak());
-        meter.push(&[0.0]);
-        assert!(meter.peak() > 0.9, "on time: {}", meter.peak());
+    fn a_sample_is_measured_whole_latency_samples_after_it() {
+        let measure = |after: usize| {
+            let mut meter = TruePeak::new(1);
+            let at = 20;
+            for n in 0..=at + after {
+                meter.push(&[if n == at { 1.0 } else { 0.0 }]);
+            }
+            let peak = meter.take();
+            for _ in 0..2 * TAPS_PER_PHASE {
+                meter.push(&[0.0]);
+            }
+            (peak, meter.peak())
+        };
+        let (peak, rest) = measure(LATENCY);
+        assert!(peak > 0.9, "its own stretch: {peak}");
+        assert!(rest < 0.2, "the next: {rest}");
+        let (_, rest) = measure(LATENCY - 1);
+        assert!(rest > 0.9, "a sample sooner, the next: {rest}");
     }
 
     /// A take hands back the peak of the stretch since the last, and starts
