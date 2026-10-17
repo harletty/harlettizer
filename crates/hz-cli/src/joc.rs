@@ -23,7 +23,7 @@
 //! master's whole render either way.
 
 use hz_ac3::{DELAY, Encoder, FRAME_SAMPLES};
-use hz_analysis::truepeak::TruePeak;
+use hz_analysis::truepeak::{self, TruePeak};
 use hz_core::bits::BitWriter;
 use hz_core::{Error, Result};
 use hz_joc::estimate::Estimator;
@@ -295,10 +295,13 @@ impl Writer {
     /// A writer for the master's `elements`, its LFE carried by the core's
     /// own when `lfe`. More than [`MAX_ELEMENTS`] are folded into that many,
     /// at `config`'s sample rate and dialnorm — see [`Folded`].
+    /// `downmix`: the `dmixtyp` the programme information declares for the
+    /// fold that made the core ([`downmix_type`]).
     pub fn new(
         config: hz_ac3::Config,
         elements: Vec<Element>,
         lfe: bool,
+        downmix: Option<u8>,
         out: &Path,
     ) -> Result<Self> {
         let count = elements.len();
@@ -321,7 +324,7 @@ impl Writer {
         };
         Ok(Self {
             feed,
-            coder: Coder::new(config, carried, lfe, out)?,
+            coder: Coder::new(config, carried, lfe, downmix, out)?,
         })
     }
 
@@ -570,7 +573,13 @@ impl Folded {
 }
 
 impl Coder {
-    fn new(config: hz_ac3::Config, count: usize, lfe: bool, out: &Path) -> Result<Self> {
+    fn new(
+        config: hz_ac3::Config,
+        count: usize,
+        lfe: bool,
+        downmix: Option<u8>,
+        out: &Path,
+    ) -> Result<Self> {
         let encoder = || {
             let mut encoder =
                 Encoder::new(config).map_err(|e| Error::unsupported(out, e.0.clone()))?;
@@ -595,7 +604,7 @@ impl Coder {
             scratch: Vec::new(),
             peak: TruePeak::new(channels),
             interleaved: vec![0.0; channels * FRAME_SAMPLES],
-            information: information(),
+            information: information(downmix),
             trace: Trace::open(count)?,
             out: out.to_path_buf(),
         };
@@ -638,6 +647,17 @@ impl Coder {
         if let Some(trace) = &mut self.trace {
             trace.frame(signals, renders)?;
         }
+        // The meter closes the frame before's interval when it is written,
+        // below, and its reconstruction runs behind: so the first samples of
+        // this frame go in first, and the rest after.
+        let channels = core.len();
+        for (ch, plane) in core.iter().enumerate() {
+            for (n, &sample) in plane.iter().enumerate() {
+                self.interleaved[n * channels + ch] = sample;
+            }
+        }
+        self.peak
+            .push(&self.interleaved[..truepeak::LATENCY * channels]);
         self.probe.carry_skip_field(&self.placeholder);
         self.scratch.clear();
         self.probe
@@ -659,15 +679,10 @@ impl Coder {
             kept.copy_from_slice(core[ch]);
             probed.copy_from_slice(self.probe.decoded(ch).expect("reconstructing"));
         }
-        // Measured after the frame before was written: when frame `k` is,
-        // the meter has frames up to it and no further.
-        let channels = core.len();
-        for (ch, plane) in core.iter().enumerate() {
-            for (n, &sample) in plane.iter().enumerate() {
-                self.interleaved[n * channels + ch] = sample;
-            }
-        }
-        self.peak.push(&self.interleaved);
+        // When frame `k` is written, the meter has frames up to it and the
+        // next frame's first samples, its reconstruction of frame `k` done.
+        self.peak
+            .push(&self.interleaved[truepeak::LATENCY * channels..]);
         self.frames_in += 1;
         Ok(())
     }
@@ -681,6 +696,12 @@ impl Coder {
             return Ok(());
         }
         self.estimator.budget = self.room(self.frames_in - 1)?;
+        // Past the programme's end is silence: the meter's reconstruction
+        // of the last frame runs out into it.
+        let channels = self.core.len();
+        self.interleaved[..truepeak::LATENCY * channels].fill(0.0);
+        self.peak
+            .push(&self.interleaved[..truepeak::LATENCY * channels]);
         if let Some(joc) = self.estimator.finish() {
             self.write(&joc.to_bytes(), out)?;
         }
@@ -846,17 +867,32 @@ fn smallest_payload(count: usize) -> usize {
     .len()
 }
 
-/// What every frame states of the programme: what was done to it before
-/// coding — nothing: no surround attenuation, no phase shift, no LFE filter —
-/// and the profile its compression words were computed with, none, since it
-/// carries none.
-fn information() -> Vec<u8> {
+/// What every frame states of the programme: how its 5.1 core was folded
+/// down, when the fold is one the Annex names (`dmixtyp`); what else was done
+/// to it before coding — nothing: no surround attenuation, no phase shift, no
+/// LFE filter — and the profile its compression words were computed with,
+/// none, since it carries none.
+fn information(downmix: Option<u8>) -> Vec<u8> {
     Information {
+        downmix,
         preprocessing: Some(Preprocessing::default()),
         compression_profiles: Some((0, 0)),
         ..Information::default()
     }
     .to_bytes()
+}
+
+/// The `dmixtyp` a 3/2 core folded from the 7.1 render by `mode` declares
+/// (TS 102 366 table H.3.9), where the fold is one it names. The spread
+/// fold, each rear surround on its own side at √3/2 and the far side at a
+/// half, is type 2: Ls' = Ls + (−1,2 dB)·Lrs + (−6,2 dB)·Rrs. The same-side
+/// fold, the rears at unity, is none of them, and declares nothing rather
+/// than the wrong one.
+pub fn downmix_type(mode: hz_render::fold::FoldMode) -> Option<u8> {
+    match mode {
+        hz_render::fold::FoldMode::Spread => Some(2),
+        hz_render::fold::FoldMode::SameSide => None,
+    }
 }
 
 /// An Evolution frame behind its sync word, carrying the programme's
@@ -943,7 +979,7 @@ mod tests {
     /// kept, the last frame-aligned — padded or not.
     #[test]
     fn an_evolution_frame_reads_back_as_the_references_carry_theirs() {
-        let (loudness, information) = (vec![9u8, 8], information());
+        let (loudness, information) = (vec![9u8, 8], information(Some(2)));
         let (oamd, joc) = (vec![1u8, 2, 3], vec![4u8, 5, 6, 7]);
         let mut frame = evolution_frame(&loudness, &information, &oamd, &joc);
         for padded in [false, true] {
@@ -983,10 +1019,88 @@ mod tests {
             "no compression words"
         );
         assert_eq!(stated.preprocessing, Some(Preprocessing::default()));
-        assert_eq!(
-            (stated.downmix, stated.upmix, stated.active_channels),
-            (None, None, None)
+        assert_eq!(stated.downmix, Some(2), "folded from 7.1, type 2");
+        assert_eq!((stated.upmix, stated.active_channels), (None, None));
+    }
+
+    /// A transient at the end of an interval is counted in it, not in the
+    /// next: the meter's reconstruction runs behind, and the interval closes
+    /// only once it has caught up. A unit impulse three samples before frame
+    /// 15 ends, silence everywhere else: frame 15 states it, near 0 dBTP, and
+    /// frame 31 the silence after, all but its ringing. Closed at the frame's
+    /// last sample, as the first version closed it, they came out as −39 and
+    /// 0 dBTP.
+    #[test]
+    fn a_transient_at_an_intervals_end_is_counted_in_it() {
+        const FRAMES: usize = 33;
+        let out = PathBuf::from("test.ec3");
+        let mut writer = Writer::new(config(), beds(2), true, Some(2), &out).unwrap();
+        let mut stream = Vec::new();
+        let input = vec![0f32; 2 * FRAME_SAMPLES];
+        for k in 0..FRAMES {
+            let mut core = vec![vec![0f32; FRAME_SAMPLES]; 6];
+            if k == 15 {
+                core[0][FRAME_SAMPLES - 3] = 1.0;
+            }
+            let refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+            writer
+                .frame(
+                    &refs,
+                    &input,
+                    2,
+                    FRAME_SAMPLES,
+                    (k * FRAME_SAMPLES) as u64,
+                    &mut stream,
+                )
+                .unwrap();
+        }
+        writer.finish(&mut stream).unwrap();
+        let mut stated = std::collections::BTreeMap::new();
+        for frame in evolution_frames(&stream, writer.evolution_bytes()) {
+            let joc = hz_joc::read(&frame.payloads[3].bytes).unwrap();
+            let loudness = Loudness::read(&frame.payloads[0].bytes).unwrap();
+            if let Some(peak) = loudness.true_peak {
+                stated.insert(joc.sequence, hz_meta::programme::true_peak_db(peak));
+            }
+        }
+        assert_eq!(stated.keys().copied().collect::<Vec<_>>(), [15, 31]);
+        assert!(
+            stated[&15] > -1.0,
+            "the impulse's interval: {} dBTP",
+            stated[&15]
         );
+        assert!(
+            stated[&31] < -20.0,
+            "the silence after it: {} dBTP",
+            stated[&31]
+        );
+    }
+
+    /// The downmix declared is the fold made: the spread fold's surrounds are
+    /// table H.3.9's type 2 — the near rear at −1,2 dB and the far at −6,2,
+    /// to the tenth the table states them — and the same-side fold, the
+    /// rears at unity, is none of the five and declares none.
+    #[test]
+    fn the_downmix_declared_is_the_fold_made() {
+        use hz_render::fold::{FoldMode, presentation_matrix};
+        let five_one = hz_render::Layout::surround_5_1();
+        let seven_one = hz_render::Layout::surround_7_1();
+        let matrix = presentation_matrix(&five_one, FoldMode::Spread)
+            .unwrap()
+            .unwrap();
+        let gain = |from: &str, to: &str| {
+            let i = seven_one.index_of(from).unwrap();
+            let j = five_one.index_of(to).unwrap();
+            20.0 * matrix[i][j].log10()
+        };
+        assert_eq!(downmix_type(FoldMode::Spread), Some(2));
+        assert!((gain("M+090", "M+110") - 0.0).abs() < 0.05, "Ls itself");
+        assert!((gain("M+135", "M+110") + 1.2).abs() < 0.1, "the near rear");
+        assert!((gain("M-135", "M+110") + 6.2).abs() < 0.2, "the far rear");
+        for front in ["M+030", "M-030", "M+000", "LFE1"] {
+            assert!(gain(front, front).abs() < 1e-9, "{front} unchanged");
+        }
+        assert_eq!(downmix_type(FoldMode::SameSide), None);
     }
 
     fn config() -> hz_ac3::Config {
@@ -1027,7 +1141,7 @@ mod tests {
         let mut kept = Vec::new();
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
-        let mut writer = Writer::new(config(), elements, true, &out).unwrap();
+        let mut writer = Writer::new(config(), elements, true, Some(2), &out).unwrap();
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for k in 0..frames {
@@ -1160,7 +1274,7 @@ mod tests {
         for frame in evolution_frames(&stream, writer.evolution_bytes()) {
             let joc = hz_joc::read(&frame.payloads[3].bytes).unwrap();
             let loudness = Loudness::read(&frame.payloads[0].bytes).unwrap();
-            assert_eq!(frame.payloads[1].bytes, information());
+            assert_eq!(frame.payloads[1].bytes, information(Some(2)));
             assert_eq!(loudness.practice, 0, "no practice claimed");
             assert_eq!(loudness.relative_gated, None, "no integrated loudness");
             stated.insert(joc.sequence, loudness.true_peak);

@@ -299,13 +299,18 @@ references carry, in their order and configured as theirs are:
 
 - the programme's loudness (payload 1, for the frame's 1536 samples, kept):
   every sixteenth frame the core's true peak since the last statement, as the
-  references state theirs, and nothing else — no measurement practice is
+  references state theirs — the interval closed only once the meter's
+  reconstruction, five samples behind, has caught up with its end, or a
+  transient there is counted in the next — and nothing else — no measurement practice is
   claimed, and no integrated loudness, which has to match the stream's
   dialnorm, and the dialnorm is the user's (`--dialnorm`), not measured;
 - the programme information (payload 2, discarded by a decoder that does not
-  know it): nothing done to the audio before coding — no surround
-  attenuation, no 90° phase shift, no LFE filter — and no compression
-  profile, since the stream carries no compression words;
+  know it): how the core was folded down from the 7.1 render — the spread
+  fold, each rear surround on its own side at −1,25 dB and the far at −6,0,
+  is table H.3.9's type 2, which a test holds to the fold's coefficients —
+  nothing else done to the audio — no surround attenuation, no 90° phase
+  shift, no LFE filter — and no compression profile, since the stream
+  carries no compression words;
 - the object metadata (payload 11, one block, every element moving across the
   frame to where it is at the frame's end — the references' `Long` ramp);
 - the joint object coding payload (14).

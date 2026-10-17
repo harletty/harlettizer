@@ -25,6 +25,12 @@ const PHASES: usize = 4;
 /// Taps per phase. Twelve puts the stop-band far enough down that the
 /// measurement is limited by the window rather than by the length.
 const TAPS_PER_PHASE: usize = 12;
+/// Samples the meter's reconstruction runs behind what is pushed: a
+/// sample's peak, and the values between it and the one before, are
+/// measured once this many more have come. A stretch measured on its own
+/// ([`TruePeak::take`]) has to run this far into the next before it closes,
+/// or a transient at its end is counted in the next.
+pub const LATENCY: usize = TAPS_PER_PHASE / 2 - 1;
 
 /// Tracks the true peak of an interleaved signal, per channel.
 #[derive(Debug, Clone)]
@@ -180,6 +186,20 @@ fn blackman_harris(n: usize, length: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sample's peak is measured [`LATENCY`] samples after it is pushed,
+    /// not before.
+    #[test]
+    fn a_peak_is_measured_latency_samples_late() {
+        let mut meter = TruePeak::new(1);
+        let at = 20;
+        for n in 0..at + LATENCY {
+            meter.push(&[if n == at { 1.0 } else { 0.0 }]);
+        }
+        assert!(meter.peak() < 0.5, "early: {}", meter.peak());
+        meter.push(&[0.0]);
+        assert!(meter.peak() > 0.9, "on time: {}", meter.peak());
+    }
 
     /// A take hands back the peak of the stretch since the last, and starts
     /// again: a loud stretch, then a quiet one, each measured on its own.
