@@ -160,6 +160,7 @@ pub fn run(config: Config) -> Result<()> {
             codec,
             elements,
             master_lfe,
+            crate::joc::downmix_type(FoldMode::default()),
             &config.out,
         )?))
     } else {

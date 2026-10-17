@@ -15,5 +15,6 @@
 
 pub mod emdf;
 pub mod oamd;
+pub mod programme;
 
 pub use oamd::ObjectAudioMetadata;

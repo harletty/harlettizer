@@ -25,6 +25,15 @@ const PHASES: usize = 4;
 /// Taps per phase. Twelve puts the stop-band far enough down that the
 /// measurement is limited by the window rather than by the length.
 const TAPS_PER_PHASE: usize = 12;
+/// Samples the meter's reconstruction runs behind what is pushed. The
+/// prototype's centre is 5,875 samples back, so a push measures four points
+/// between 5,875 and 5,125 samples before the newest: once this many more
+/// have come, every point up to the next sample is measured, the eighth of a
+/// sample on either side of a sample's own instant among them. A stretch
+/// measured on its own ([`TruePeak::take`]) has to run this far into the
+/// next before it closes; a sample short, a transient on its last sample
+/// leaves half its peak to the next.
+pub const LATENCY: usize = TAPS_PER_PHASE / 2;
 
 /// Tracks the true peak of an interleaved signal, per channel.
 #[derive(Debug, Clone)]
@@ -95,6 +104,16 @@ impl TruePeak {
                 }
             }
         }
+    }
+
+    /// The largest true peak on any channel since the last take, as a linear
+    /// magnitude, and the peaks started again — the interpolator's history
+    /// kept, so that the next stretch's first samples are reconstructed as
+    /// they would have been.
+    pub fn take(&mut self) -> f64 {
+        let peak = self.peak();
+        self.peaks.fill(0.0);
+        peak
     }
 
     /// The largest true peak on any channel, as a linear magnitude.
@@ -170,6 +189,55 @@ fn blackman_harris(n: usize, length: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sample's reconstruction is measured whole [`LATENCY`] samples after
+    /// it, and what is measured after that is only the ringing: an impulse,
+    /// [`LATENCY`] samples after it, a take, and the next stretch well under
+    /// it. A sample sooner, the next stretch has the other side of its peak.
+    #[test]
+    fn a_sample_is_measured_whole_latency_samples_after_it() {
+        let measure = |after: usize| {
+            let mut meter = TruePeak::new(1);
+            let at = 20;
+            for n in 0..=at + after {
+                meter.push(&[if n == at { 1.0 } else { 0.0 }]);
+            }
+            let peak = meter.take();
+            for _ in 0..2 * TAPS_PER_PHASE {
+                meter.push(&[0.0]);
+            }
+            (peak, meter.peak())
+        };
+        let (peak, rest) = measure(LATENCY);
+        assert!(peak > 0.9, "its own stretch: {peak}");
+        assert!(rest < 0.2, "the next: {rest}");
+        let (_, rest) = measure(LATENCY - 1);
+        assert!(rest > 0.9, "a sample sooner, the next: {rest}");
+    }
+
+    /// A take hands back the peak of the stretch since the last, and starts
+    /// again: a loud stretch, then a quiet one, each measured on its own.
+    #[test]
+    fn a_take_measures_the_stretch_since_the_last() {
+        let tone = |amplitude: f32| -> Vec<f32> {
+            // Faded in and out, so that no edge rings past the tone.
+            (0..4800)
+                .map(|n| {
+                    let fade = (std::f32::consts::PI * n as f32 / 4800.0).sin().powi(2);
+                    amplitude * fade * (n as f32 * 0.05).sin()
+                })
+                .collect()
+        };
+        let mut meter = TruePeak::new(1);
+        meter.push(&tone(0.9));
+        let loud = meter.take();
+        meter.push(&tone(0.1));
+        let quiet = meter.take();
+        assert!((loud - 0.9).abs() < 0.018, "{loud}");
+        assert!((quiet - 0.1).abs() < 0.002, "{quiet}");
+        assert_eq!(meter.peak(), 0.0);
+    }
+
     use super::*;
 
     fn measure(channels: usize, samples: &[f32]) -> TruePeak {

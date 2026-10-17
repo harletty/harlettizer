@@ -23,11 +23,13 @@
 //! master's whole render either way.
 
 use hz_ac3::{DELAY, Encoder, FRAME_SAMPLES};
+use hz_analysis::truepeak::{self, TruePeak};
 use hz_core::bits::BitWriter;
 use hz_core::{Error, Result};
 use hz_joc::estimate::Estimator;
 use hz_meta::emdf;
 use hz_meta::oamd::{Block, Gain, Object, ObjectAudioMetadata, Position, Ramp, Render};
+use hz_meta::programme::{Information, Loudness, Preprocessing, true_peak_code};
 use hz_programme::fold::{self, Folder, Member};
 use hz_programme::mix::{Headroom, Mixing};
 use hz_programme::path::{self, Path as Trajectory};
@@ -182,6 +184,10 @@ struct Folded {
     renders: Vec<Render>,
 }
 
+/// Frames from one statement of the true peak to the next, as the reference
+/// streams state theirs.
+const TRUE_PEAK_EVERY: u64 = 16;
+
 /// The two encoders and the estimator, and what passes between them.
 struct Coder {
     probe: Encoder,
@@ -203,6 +209,11 @@ struct Coder {
     frames_in: u64,
     written: u64,
     scratch: Vec<u8>,
+    /// The true peak of the core since it was last stated, the core
+    /// interleaved for it, and the programme information every frame states.
+    peak: TruePeak,
+    interleaved: Vec<f32>,
+    information: Vec<u8>,
     trace: Option<Trace>,
     out: PathBuf,
 }
@@ -284,10 +295,13 @@ impl Writer {
     /// A writer for the master's `elements`, its LFE carried by the core's
     /// own when `lfe`. More than [`MAX_ELEMENTS`] are folded into that many,
     /// at `config`'s sample rate and dialnorm — see [`Folded`].
+    /// `downmix`: the `dmixtyp` the programme information declares for the
+    /// fold that made the core ([`downmix_type`]).
     pub fn new(
         config: hz_ac3::Config,
         elements: Vec<Element>,
         lfe: bool,
+        downmix: Option<u8>,
         out: &Path,
     ) -> Result<Self> {
         let count = elements.len();
@@ -310,7 +324,7 @@ impl Writer {
         };
         Ok(Self {
             feed,
-            coder: Coder::new(config, carried, lfe, out)?,
+            coder: Coder::new(config, carried, lfe, downmix, out)?,
         })
     }
 
@@ -559,7 +573,13 @@ impl Folded {
 }
 
 impl Coder {
-    fn new(config: hz_ac3::Config, count: usize, lfe: bool, out: &Path) -> Result<Self> {
+    fn new(
+        config: hz_ac3::Config,
+        count: usize,
+        lfe: bool,
+        downmix: Option<u8>,
+        out: &Path,
+    ) -> Result<Self> {
         let encoder = || {
             let mut encoder =
                 Encoder::new(config).map_err(|e| Error::unsupported(out, e.0.clone()))?;
@@ -582,6 +602,9 @@ impl Coder {
             frames_in: 0,
             written: 0,
             scratch: Vec::new(),
+            peak: TruePeak::new(channels),
+            interleaved: vec![0.0; channels * FRAME_SAMPLES],
+            information: information(downmix),
             trace: Trace::open(count)?,
             out: out.to_path_buf(),
         };
@@ -590,8 +613,8 @@ impl Coder {
         // always bring a payload under it. What the object metadata takes
         // depends on how the elements render — a size, a screen factor — and
         // the frame's size is the stream's, so it is measured with every
-        // field that costs bits stated.
-        let overhead = coder.overhead(0)?;
+        // field that costs bits stated — the true peak among them.
+        let overhead = coder.overhead(TRUE_PEAK_EVERY - 1)?;
         let floor = overhead + smallest_payload(count);
         coder.size = (overhead + ROOM_PER_ELEMENT * count + 8).max(floor);
         if coder.size > SKIP_LIMIT {
@@ -624,6 +647,17 @@ impl Coder {
         if let Some(trace) = &mut self.trace {
             trace.frame(signals, renders)?;
         }
+        // The meter closes the frame before's interval when it is written,
+        // below, and its reconstruction runs behind: so the first samples of
+        // this frame go in first, and the rest after.
+        let channels = core.len();
+        for (ch, plane) in core.iter().enumerate() {
+            for (n, &sample) in plane.iter().enumerate() {
+                self.interleaved[n * channels + ch] = sample;
+            }
+        }
+        self.peak
+            .push(&self.interleaved[..truepeak::LATENCY * channels]);
         self.probe.carry_skip_field(&self.placeholder);
         self.scratch.clear();
         self.probe
@@ -645,6 +679,10 @@ impl Coder {
             kept.copy_from_slice(core[ch]);
             probed.copy_from_slice(self.probe.decoded(ch).expect("reconstructing"));
         }
+        // When frame `k` is written, the meter has frames up to it and the
+        // next frame's first samples, its reconstruction of frame `k` done.
+        self.peak
+            .push(&self.interleaved[truepeak::LATENCY * channels..]);
         self.frames_in += 1;
         Ok(())
     }
@@ -658,6 +696,12 @@ impl Coder {
             return Ok(());
         }
         self.estimator.budget = self.room(self.frames_in - 1)?;
+        // Past the programme's end is silence: the meter's reconstruction
+        // of the last frame runs out into it.
+        let channels = self.core.len();
+        self.interleaved[..truepeak::LATENCY * channels].fill(0.0);
+        self.peak
+            .push(&self.interleaved[..truepeak::LATENCY * channels]);
         if let Some(joc) = self.estimator.finish() {
             self.write(&joc.to_bytes(), out)?;
         }
@@ -670,7 +714,8 @@ impl Coder {
     fn write(&mut self, joc: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let frame = self.written;
         let oamd = self.oamd(frame)?;
-        let mut evolution = evolution_frame(&oamd, joc);
+        let loudness = self.loudness(frame, true);
+        let mut evolution = evolution_frame(&loudness, &self.information, &oamd, joc);
         if evolution.len() > self.size {
             return Err(Error::refused(
                 &self.out,
@@ -712,7 +757,38 @@ impl Coder {
     /// object coding payload, the payload's size field at its longest.
     fn overhead(&mut self, frame: u64) -> Result<usize> {
         let placeholder = [0u8; 256];
-        Ok(evolution_frame(&self.oamd(frame)?, &placeholder).len() - placeholder.len())
+        let (loudness, oamd) = (self.loudness(frame, false), self.oamd(frame)?);
+        Ok(
+            evolution_frame(&loudness, &self.information, &oamd, &placeholder).len()
+                - placeholder.len(),
+        )
+    }
+
+    /// Stream frame `frame`'s loudness payload. Every [`TRUE_PEAK_EVERY`]th
+    /// frame states the core's true peak since the one before — measured,
+    /// and the meter started again, when `measure`; a stand-in of the same
+    /// size when only its size is wanted. No practice is claimed, and no
+    /// integrated loudness: one has to match the stream's dialnorm, which is
+    /// the user's.
+    fn loudness(&mut self, frame: u64, measure: bool) -> Vec<u8> {
+        let stated = (frame + 1).is_multiple_of(TRUE_PEAK_EVERY);
+        let true_peak = stated.then(|| {
+            if measure {
+                let peak = self.peak.take();
+                true_peak_code(if peak > 0.0 {
+                    20.0 * peak.log10()
+                } else {
+                    f64::NEG_INFINITY
+                })
+            } else {
+                0
+            }
+        });
+        Loudness {
+            true_peak,
+            ..Loudness::default()
+        }
+        .to_bytes()
     }
 
     /// Stream frame `frame`'s object metadata: one block, each element moving
@@ -791,11 +867,41 @@ fn smallest_payload(count: usize) -> usize {
     .len()
 }
 
-/// An Evolution frame behind its sync word, carrying `oamd` and `joc` as the
-/// reference streams carry theirs: group nought, kept by a decoder that does
-/// not know them, the joint object coding frame-aligned; protected as they
-/// are.
-fn evolution_frame(oamd: &[u8], joc: &[u8]) -> Vec<u8> {
+/// What every frame states of the programme: how its 5.1 core was folded
+/// down, when the fold is one the Annex names (`dmixtyp`); what else was done
+/// to it before coding — nothing: no surround attenuation, no phase shift, no
+/// LFE filter — and the profile its compression words were computed with,
+/// none, since it carries none.
+fn information(downmix: Option<u8>) -> Vec<u8> {
+    Information {
+        downmix,
+        preprocessing: Some(Preprocessing::default()),
+        compression_profiles: Some((0, 0)),
+        ..Information::default()
+    }
+    .to_bytes()
+}
+
+/// The `dmixtyp` a 3/2 core folded from the 7.1 render by `mode` declares
+/// (TS 102 366 table H.3.9), where the fold is one it names. The spread
+/// fold, each rear surround on its own side at √3/2 and the far side at a
+/// half, is type 2: Ls' = Ls + (−1,2 dB)·Lrs + (−6,2 dB)·Rrs. The same-side
+/// fold, the rears at unity, is none of them, and declares nothing rather
+/// than the wrong one.
+pub fn downmix_type(mode: hz_render::fold::FoldMode) -> Option<u8> {
+    match mode {
+        hz_render::fold::FoldMode::Spread => Some(2),
+        hz_render::fold::FoldMode::SameSide => None,
+    }
+}
+
+/// An Evolution frame behind its sync word, carrying the programme's
+/// loudness and information, `oamd` and `joc`, in that order, as the
+/// reference streams carry theirs: the loudness for the frame's 1536 samples
+/// and kept, the information discarded by a decoder that does not know it,
+/// the object metadata and joint object coding in group nought and kept, the
+/// joint object coding frame-aligned; protected as they are.
+fn evolution_frame(loudness: &[u8], information: &[u8], oamd: &[u8], joc: &[u8]) -> Vec<u8> {
     let retain = |frame_aligned| {
         Some(emdf::Retain {
             frame_aligned,
@@ -810,6 +916,23 @@ fn evolution_frame(oamd: &[u8], joc: &[u8]) -> Vec<u8> {
         retain: retain(frame_aligned),
     };
     let payloads = [
+        emdf::Payload {
+            id: emdf::LOUDNESS,
+            bytes: loudness,
+            sample_offset: 0,
+            config: emdf::Config {
+                duration: Some(FRAME_SAMPLES as u32),
+                group: None,
+                codec_data: None,
+                retain: retain(None),
+            },
+        },
+        emdf::Payload {
+            id: emdf::PROGRAMME_INFORMATION,
+            bytes: information,
+            sample_offset: 0,
+            config: emdf::Config::default(),
+        },
         emdf::Payload {
             id: emdf::OAMD,
             bytes: oamd,
@@ -851,12 +974,14 @@ mod tests {
     }
 
     /// The Evolution frame reads back as the reference streams' do: the
-    /// object metadata then the joint object coding, group nought, kept, the
-    /// second frame-aligned — padded or not.
+    /// loudness for the frame and kept, the information discarded if unknown,
+    /// then the object metadata and the joint object coding, group nought,
+    /// kept, the last frame-aligned — padded or not.
     #[test]
     fn an_evolution_frame_reads_back_as_the_references_carry_theirs() {
+        let (loudness, information) = (vec![9u8, 8], information(Some(2)));
         let (oamd, joc) = (vec![1u8, 2, 3], vec![4u8, 5, 6, 7]);
-        let mut frame = evolution_frame(&oamd, &joc);
+        let mut frame = evolution_frame(&loudness, &information, &oamd, &joc);
         for padded in [false, true] {
             if padded {
                 let size = frame.len() + 40;
@@ -864,16 +989,141 @@ mod tests {
             }
             let (read, _) = emdf::read_synced(&frame, 0).expect("an Evolution frame");
             let ids: Vec<u32> = read.payloads.iter().map(|p| p.id).collect();
-            assert_eq!(ids, [emdf::OAMD, emdf::JOC]);
-            assert_eq!(read.payloads[0].bytes, oamd);
-            assert_eq!(read.payloads[1].bytes, joc);
-            for (payload, aligned) in read.payloads.iter().zip([None, Some((false, false))]) {
-                assert_eq!(payload.sample_offset, None);
+            assert_eq!(
+                ids,
+                [
+                    emdf::LOUDNESS,
+                    emdf::PROGRAMME_INFORMATION,
+                    emdf::OAMD,
+                    emdf::JOC
+                ]
+            );
+            let bytes: Vec<&[u8]> = read.payloads.iter().map(|p| p.bytes.as_slice()).collect();
+            assert_eq!(bytes, [&loudness[..], &information, &oamd, &joc]);
+            assert!(read.payloads.iter().all(|p| p.sample_offset.is_none()));
+            let loudness = &read.payloads[0].config;
+            assert_eq!(loudness.duration, Some(1536));
+            assert_eq!(loudness.retain.expect("kept").frame_aligned, None);
+            assert_eq!(read.payloads[1].config.retain, None, "discarded if unknown");
+            for (payload, aligned) in read.payloads[2..].iter().zip([None, Some((false, false))]) {
                 assert_eq!(payload.config.group, Some(0));
                 let retain = payload.config.retain.expect("kept");
                 assert_eq!(retain.frame_aligned, aligned);
             }
         }
+        // What the programme information states.
+        let stated = Information::read(&information).unwrap();
+        assert_eq!(
+            stated.compression_profiles,
+            Some((0, 0)),
+            "no compression words"
+        );
+        assert_eq!(stated.preprocessing, Some(Preprocessing::default()));
+        assert_eq!(stated.downmix, Some(2), "folded from 7.1, type 2");
+        assert_eq!((stated.upmix, stated.active_channels), (None, None));
+    }
+
+    /// The true peak each interval states of a unit impulse at `sample` of
+    /// frame `frame`, silence everywhere else, over 33 frames: frame 15 and
+    /// frame 31, by the sequence counter.
+    fn peaks_stated_of_an_impulse(
+        frame: usize,
+        sample: usize,
+    ) -> std::collections::BTreeMap<u16, f64> {
+        const FRAMES: usize = 33;
+        let out = PathBuf::from("test.ec3");
+        let mut writer = Writer::new(config(), beds(2), true, Some(2), &out).unwrap();
+        let mut stream = Vec::new();
+        let input = vec![0f32; 2 * FRAME_SAMPLES];
+        for k in 0..FRAMES {
+            let mut core = vec![vec![0f32; FRAME_SAMPLES]; 6];
+            if k == frame {
+                core[0][sample] = 1.0;
+            }
+            let refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+            writer
+                .frame(
+                    &refs,
+                    &input,
+                    2,
+                    FRAME_SAMPLES,
+                    (k * FRAME_SAMPLES) as u64,
+                    &mut stream,
+                )
+                .unwrap();
+        }
+        writer.finish(&mut stream).unwrap();
+        let mut stated = std::collections::BTreeMap::new();
+        for frame in evolution_frames(&stream, writer.evolution_bytes()) {
+            let joc = hz_joc::read(&frame.payloads[3].bytes).unwrap();
+            let loudness = Loudness::read(&frame.payloads[0].bytes).unwrap();
+            if let Some(peak) = loudness.true_peak {
+                stated.insert(joc.sequence, hz_meta::programme::true_peak_db(peak));
+            }
+        }
+        assert_eq!(stated.keys().copied().collect::<Vec<_>>(), [15, 31]);
+        stated
+    }
+
+    /// A transient at the end of an interval is counted in it, not in the
+    /// next: the meter's reconstruction runs behind, and the interval closes
+    /// only once it has caught up. A unit impulse on frame 15's last sample,
+    /// or three before it: frame 15 states it, near 0 dBTP, and frame 31 the
+    /// silence after, all but its ringing. Closed at the frame's last sample,
+    /// as the first version closed it, the three-before case came out at −39
+    /// and 0 dBTP; closed a sample short of the meter's latency, the
+    /// last-sample case still put 0 dBTP in frame 31.
+    #[test]
+    fn a_transient_at_an_intervals_end_is_counted_in_it() {
+        // The ringing is louder the nearer the impulse is to the boundary.
+        for (sample, ringing) in [(FRAME_SAMPLES - 3, -20.0), (FRAME_SAMPLES - 1, -10.0)] {
+            let stated = peaks_stated_of_an_impulse(15, sample);
+            assert!(
+                stated[&15] > -1.0,
+                "sample {sample}, the impulse's interval: {} dBTP",
+                stated[&15]
+            );
+            assert!(
+                stated[&31] < ringing,
+                "sample {sample}, the silence after it: {} dBTP",
+                stated[&31]
+            );
+        }
+    }
+
+    /// A transient at the start of an interval is counted in it: on frame
+    /// 16's first sample, frame 31 states it.
+    #[test]
+    fn a_transient_at_an_intervals_start_is_counted_in_it() {
+        let stated = peaks_stated_of_an_impulse(16, 0);
+        assert!(stated[&31] > -1.0, "its interval: {} dBTP", stated[&31]);
+    }
+
+    /// The downmix declared is the fold made: the spread fold's surrounds are
+    /// table H.3.9's type 2 — the near rear at −1,2 dB and the far at −6,2,
+    /// to the tenth the table states them — and the same-side fold, the
+    /// rears at unity, is none of the five and declares none.
+    #[test]
+    fn the_downmix_declared_is_the_fold_made() {
+        use hz_render::fold::{FoldMode, presentation_matrix};
+        let five_one = hz_render::Layout::surround_5_1();
+        let seven_one = hz_render::Layout::surround_7_1();
+        let matrix = presentation_matrix(&five_one, FoldMode::Spread)
+            .unwrap()
+            .unwrap();
+        let gain = |from: &str, to: &str| {
+            let i = seven_one.index_of(from).unwrap();
+            let j = five_one.index_of(to).unwrap();
+            20.0 * matrix[i][j].log10()
+        };
+        assert_eq!(downmix_type(FoldMode::Spread), Some(2));
+        assert!((gain("M+090", "M+110") - 0.0).abs() < 0.05, "Ls itself");
+        assert!((gain("M+135", "M+110") + 1.2).abs() < 0.1, "the near rear");
+        assert!((gain("M-135", "M+110") + 6.2).abs() < 0.2, "the far rear");
+        for front in ["M+030", "M-030", "M+000", "LFE1"] {
+            assert!(gain(front, front).abs() < 1e-9, "{front} unchanged");
+        }
+        assert_eq!(downmix_type(FoldMode::SameSide), None);
     }
 
     fn config() -> hz_ac3::Config {
@@ -905,9 +1155,16 @@ mod tests {
     /// first two of them (where there are two) on the core's L and R,
     /// through a writer.
     fn encode(elements: Vec<Element>, frames: usize) -> (Writer, Vec<u8>) {
+        let (writer, stream, _) = encode_keeping_core(elements, frames);
+        (writer, stream)
+    }
+
+    /// [`encode`], and the core that went in, interleaved.
+    fn encode_keeping_core(elements: Vec<Element>, frames: usize) -> (Writer, Vec<u8>, Vec<f32>) {
+        let mut kept = Vec::new();
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
-        let mut writer = Writer::new(config(), elements, true, &out).unwrap();
+        let mut writer = Writer::new(config(), elements, true, Some(2), &out).unwrap();
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for k in 0..frames {
@@ -924,6 +1181,9 @@ mod tests {
                         .collect()
                 })
                 .collect();
+            for n in 0..FRAME_SAMPLES {
+                kept.extend(core.iter().map(|plane| plane[n]));
+            }
             let refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
             writer
                 .frame(
@@ -937,13 +1197,27 @@ mod tests {
                 .unwrap();
         }
         writer.finish(&mut stream).unwrap();
-        (writer, stream)
+        (writer, stream, kept)
     }
 
     /// Every Evolution frame of `size` bytes in `stream`, found by its sync
     /// word — a skip field is not byte-aligned in the frame, so at each of
     /// the eight bit alignments — and what it carries.
     fn carried(stream: &[u8], size: usize) -> Vec<(ObjectAudioMetadata, hz_joc::Joc)> {
+        evolution_frames(stream, size)
+            .into_iter()
+            .map(|frame| {
+                (
+                    ObjectAudioMetadata::read(&frame.payloads[2].bytes).unwrap(),
+                    hz_joc::read(&frame.payloads[3].bytes).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every Evolution frame of `size` bytes in `stream`, carrying the four
+    /// payloads every frame does.
+    fn evolution_frames(stream: &[u8], size: usize) -> Vec<emdf::Frame> {
         let sync = emdf::SYNC_WORD.to_be_bytes();
         let mut found = Vec::new();
         for shift in 0..8 {
@@ -965,14 +1239,19 @@ mod tests {
                     continue;
                 };
                 let ids: Vec<u32> = frame.payloads.iter().map(|p| p.id).collect();
-                if ids != [emdf::OAMD, emdf::JOC] {
+                if ids
+                    != [
+                        emdf::LOUDNESS,
+                        emdf::PROGRAMME_INFORMATION,
+                        emdf::OAMD,
+                        emdf::JOC,
+                    ]
+                {
                     continue;
                 }
                 let length = usize::from(u16::from_be_bytes([bytes[start + 2], bytes[start + 3]]));
                 assert_eq!(length + 4, size, "every Evolution frame the one size");
-                let metadata = ObjectAudioMetadata::read(&frame.payloads[0].bytes).unwrap();
-                let joc = hz_joc::read(&frame.payloads[1].bytes).unwrap();
-                found.push((metadata, joc));
+                found.push(frame);
                 at = start + size;
             }
         }
@@ -1005,6 +1284,35 @@ mod tests {
         }
         let expected: std::collections::BTreeSet<u16> = (0..FRAMES as u16).collect();
         assert_eq!(sequences, expected, "one Evolution frame each syncframe");
+    }
+
+    /// Every frame states the programme information, and every sixteenth the
+    /// core's true peak since the last statement — the peak of exactly the
+    /// frames up to it — and nothing else of the loudness.
+    #[test]
+    fn every_sixteenth_frame_states_the_true_peak_since_the_last() {
+        const FRAMES: usize = 18;
+        let (writer, stream, core) = encode_keeping_core(beds(2), FRAMES);
+        let mut stated = std::collections::BTreeMap::new();
+        for frame in evolution_frames(&stream, writer.evolution_bytes()) {
+            let joc = hz_joc::read(&frame.payloads[3].bytes).unwrap();
+            let loudness = Loudness::read(&frame.payloads[0].bytes).unwrap();
+            assert_eq!(frame.payloads[1].bytes, information(Some(2)));
+            assert_eq!(loudness.practice, 0, "no practice claimed");
+            assert_eq!(loudness.relative_gated, None, "no integrated loudness");
+            stated.insert(joc.sequence, loudness.true_peak);
+        }
+        assert_eq!(stated.len(), FRAMES);
+        let mut meter = TruePeak::new(6);
+        meter.push(&core[..16 * FRAME_SAMPLES * 6]);
+        let want = true_peak_code(meter.peak_db());
+        for (sequence, peak) in stated {
+            if sequence == 15 {
+                assert_eq!(peak, Some(want), "the peak of frames 0 to 15");
+            } else {
+                assert_eq!(peak, None, "frame {sequence}");
+            }
+        }
     }
 
     /// A master with more elements than a payload carries is folded into
