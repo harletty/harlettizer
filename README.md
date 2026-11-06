@@ -110,6 +110,18 @@ Rust 1.87 or later. Pure Rust: no C toolchain, no vendor SDK, no git
 dependency. The one exception is opt-in: `--features opus` links the system's
 libopus for `iamf --codec opus`; see [docs/iamf.md](docs/iamf.md#opus).
 
+For a copy other tools can rely on, on Linux or macOS:
+
+```bash
+scripts/install-local.sh   # build main with Opus, install ~/.local/bin/harlettizer
+```
+
+It builds what `--features opus` builds, in release, and puts it in
+`$PREFIX/bin` (`PREFIX` is `~/.local` unless set), replacing the old copy only
+once the new one starts. Something that names that copy keeps working when a
+checkout's `target/` is cleaned or rebuilt. It installs `main` and nothing else
+unless given `--any-branch`, and refuses uncommitted changes the same way.
+
 Each release also carries the built binary for Linux (x86-64), Windows
 (x86-64) and macOS (Apple silicon), zipped with the licences it ships under.
 Those binaries have Opus, with libopus linked statically: nothing to install
