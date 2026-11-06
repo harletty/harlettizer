@@ -10,6 +10,7 @@
 # Built in release with the `opus` feature, for `iamf --codec opus`: it links
 # the system's libopus, which needs its development files to build (see
 # docs/iamf.md#opus; OPUS_LIB_DIR and OPUS_STATIC reach the build as they are).
+# python3 reads Cargo's build messages, to find where it put the program.
 #
 # Installs into $PREFIX (default ~/.local):
 #   bin/harlettizer
@@ -17,6 +18,12 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
+# A relative PREFIX is read from where the script was started, not from the
+# checkout it moves to.
+case "$PREFIX" in
+  /*) ;;
+  *) PREFIX="$PWD/$PREFIX" ;;
+esac
 
 any_branch=0
 case "${1:-}" in
@@ -42,12 +49,34 @@ if [ "$any_branch" = 0 ]; then
 fi
 version="$(git describe --always --dirty)"
 
-cargo build --release --locked -p hz-cli --features opus
-# Wherever cargo's configuration puts target/.
-target="$(cargo metadata --format-version 1 --no-deps |
-  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
-built="${target:-$REPO/target}/release/harlettizer"
-[ -x "$built" ] || { echo "the build left no $built" >&2; exit 1; }
+# The program is where Cargo says it put it: a target-dir or a build target in
+# a Cargo configuration moves it out of target/release. Its messages are JSON,
+# read by a JSON parser, since that directory may be named with any character
+# a file name can hold.
+command -v python3 >/dev/null || {
+  echo "python3 is needed to read Cargo's build messages" >&2
+  exit 1
+}
+messages="$(cargo build --release --locked -p hz-cli --features opus \
+  --message-format=json-render-diagnostics)"
+built=""
+IFS= read -r -d '' built < <(
+  printf '%s\n' "$messages" | python3 -I -c '
+import json, sys
+built = ""
+for line in sys.stdin:
+    if not line.startswith("{"):
+        continue
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m.get("executable") \
+            and "bin" in m["target"]["kind"] and m["target"]["name"] == "harlettizer":
+        built = m["executable"]
+sys.stdout.write(built + "\0")
+') || true
+if [ -z "$built" ] || [ ! -f "$built" ]; then
+  echo "cargo did not report a harlettizer it built; nothing installed" >&2
+  exit 1
+fi
 
 bin="$PREFIX/bin/harlettizer"
 install -d "$PREFIX/bin"
@@ -62,7 +91,7 @@ if ! "$bin.new" --version >/dev/null; then
 fi
 mv -f "$bin.new" "$bin"
 
-echo "installed harlettizer $version ($branch) as $bin"
+echo "installed harlettizer $version ($branch) as $bin, built in $(dirname "$built")"
 found="$(command -v harlettizer || true)"
 if [ "$found" != "$bin" ]; then
   echo "note: harlettizer on PATH is ${found:-nothing}, not $bin;" \
