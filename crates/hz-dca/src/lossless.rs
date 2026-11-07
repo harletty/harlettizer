@@ -54,7 +54,12 @@
 //!    shared, or the previous segment's parameters again.
 //!
 //! Steps 1 to 5 work in buffers made when the encoder is built; what is
-//! rebuilt each frame is the header model, a few hundred bytes.
+//! rebuilt each frame is the header model, a few hundred bytes. They depend
+//! on nothing but the frame: all a frame takes from the one before is the
+//! width its size is written at, which moves the header the size counts and
+//! is settled last. So frames can be coded on several encoders at once
+//! ([`Encoder::code_apart`]) and settled in order on one
+//! ([`Encoder::settle_coded`]), to the byte the stream one encoder writes.
 
 use crate::bits::Bits;
 use crate::core_decode::CoreDecoder;
@@ -392,8 +397,20 @@ pub struct Encoder {
     search: Search,
     /// The DTS:X extension of a 7.1.4.
     heights: Option<Heights>,
+    /// Channels the frame last coded codes against the core.
+    against_core: u32,
     /// Frames encoded.
     frames: u64,
+}
+
+/// A frame one encoder coded and another is to settle: its headers short of
+/// the frame's size, its segments, and a 7.1.4's block headers and height
+/// data. See [`Encoder::code_apart`].
+pub struct Coded {
+    headers: Headers,
+    data: BitWriter,
+    heights: Option<(dtsx::Block, BitWriter)>,
+    against_core: u32,
 }
 
 /// The DTS:X extension's standard profile: the heights, the block they go
@@ -698,6 +715,7 @@ impl Encoder {
             .then(|| Heights::new(config.scalable_lsbs));
         Ok(Self {
             heights,
+            against_core: 0,
             frames: 0,
             core: vec![0; FRAME_SAMPLES * 6],
             previous: vec![Parameters::default(); sets.len()],
@@ -825,10 +843,7 @@ impl Encoder {
 
     /// How many channels the frame last encoded codes against the core.
     pub fn against_core(&self) -> u32 {
-        self.sets
-            .iter()
-            .map(|set| (((1 << set.channels()) - 1) & !set.full).count_ones())
-            .sum()
+        self.against_core
     }
 
     /// Refuse a frame the configured resolution cannot carry, or — a 7.1.4
@@ -879,13 +894,92 @@ impl Encoder {
     /// # Panics
     /// If `pcm` is not exactly one frame.
     pub fn encode(&mut self, pcm: &[i32], core: Option<&CoreDecoder>) -> Result<&[u8], Refused> {
+        assert_eq!(
+            pcm.len(),
+            FRAME_SAMPLES * self.config.layout.channels(),
+            "a frame is {FRAME_SAMPLES} samples of each channel"
+        );
+        self.check(pcm)?;
+        self.code(pcm, core);
+        self.settle()
+    }
+
+    /// A frame's worth of buffers for [`Encoder::code_apart`] to code into
+    /// and [`Encoder::settle_coded`] to take from — made once, then passed
+    /// back and forth, since each call swaps its own buffers for these.
+    pub fn coded(&self) -> Coded {
+        Coded {
+            headers: self.headers.clone(),
+            data: BitWriter::with_capacity(self.data.bytes().len().max(FRAME_SAMPLES * 8 * 4)),
+            heights: self.heights.as_ref().map(|h| {
+                (
+                    h.block.clone(),
+                    BitWriter::with_capacity(FRAME_SAMPLES * 4 * 4),
+                )
+            }),
+            against_core: 0,
+        }
+    }
+
+    /// Code one frame as [`Encoder::encode`] does, short of its size, into
+    /// `into` — for another encoder of the same configuration to settle
+    /// ([`Encoder::settle_coded`]) and send. The frames before decide only
+    /// how a frame's size is written, so frames coded apart on as many
+    /// encoders as there are threads, then settled in order on one, are the
+    /// frames that one encoder would have encoded alone, to the byte.
+    ///
+    /// The frame is not checked: [`Encoder::check`] it first, as
+    /// [`Encoder::encode`] does.
+    ///
+    /// # Panics
+    /// If `pcm` is not exactly one frame, or `into` was not made by an
+    /// encoder of this one's layout.
+    pub fn code_apart(&mut self, pcm: &[i32], core: Option<&CoreDecoder>, into: &mut Coded) {
+        self.code(pcm, core);
+        std::mem::swap(&mut self.headers, &mut into.headers);
+        std::mem::swap(&mut self.data, &mut into.data);
+        if let Some(heights) = &mut self.heights {
+            let (block, data) = into.heights.as_mut().expect("coded for a 7.1.4");
+            std::mem::swap(&mut heights.block, block);
+            std::mem::swap(&mut heights.data, data);
+        }
+        into.against_core = self.against_core;
+    }
+
+    /// Settle and write a frame another encoder coded
+    /// ([`Encoder::code_apart`]), as the next of this encoder's frames:
+    /// sized from where the frame before left the size's width, and counted
+    /// as this encoder's. `from` is left holding buffers to code into again.
+    ///
+    /// # Panics
+    /// If `from` was not made by an encoder of this one's layout.
+    pub fn settle_coded(&mut self, from: &mut Coded) -> Result<&[u8], Refused> {
+        // The one thing a frame takes from the frame before: the size's
+        // width the settling below starts from.
+        let size = self.headers.common.frame_size;
+        let width = self.headers.common.frame_size_bits;
+        std::mem::swap(&mut self.headers, &mut from.headers);
+        self.headers.common.frame_size = size;
+        self.headers.common.frame_size_bits = width;
+        std::mem::swap(&mut self.data, &mut from.data);
+        if let Some(heights) = &mut self.heights {
+            let (block, data) = from.heights.as_mut().expect("coded for a 7.1.4");
+            std::mem::swap(&mut heights.block, block);
+            std::mem::swap(&mut heights.data, data);
+        }
+        self.against_core = from.against_core;
+        self.settle()
+    }
+
+    /// Steps 1 to 5 of a frame, and its segments written: everything about
+    /// it that does not depend on the frames before.
+    fn code(&mut self, pcm: &[i32], core: Option<&CoreDecoder>) {
         let channels = self.config.layout.channels();
         assert_eq!(
             pcm.len(),
             FRAME_SAMPLES * channels,
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
-        self.check(pcm)?;
         let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
         let parameter_bits = self.parameter_bits;
         match &mut self.heights {
@@ -930,9 +1024,12 @@ impl Encoder {
                 predict(set, ch, parameter_bits, segment_samples, &mut self.search);
             }
         }
-        self.assemble()?;
-        self.frames += 1;
-        Ok(&self.frame)
+        self.against_core = self
+            .sets
+            .iter()
+            .map(|set| (((1 << set.channels()) - 1) & !set.full).count_ones())
+            .sum();
+        self.write_segments();
     }
 
     /// Mix each rear into the first set as the decoder will take it out.
@@ -1001,7 +1098,9 @@ impl Encoder {
     /// Lay the frame out: headers sized to the band data, the data, and
     /// zeroes to the next 32-bit word — then, for a 7.1.4, the extension
     /// block, which ends the frame.
-    fn assemble(&mut self) -> Result<(), Refused> {
+    /// The frame's segments, and the headers that describe them, short of
+    /// the frame's size.
+    fn write_segments(&mut self) {
         let segments = 1usize << self.config.segments_log2;
         let segment_samples = FRAME_SAMPLES >> self.config.segments_log2;
         let parameter_bits = self.parameter_bits;
@@ -1058,11 +1157,22 @@ impl Encoder {
         let common = &mut self.headers.common;
         common.reserved = Bits::new();
         common.segment_size_bits = bits_for(largest - 1).max(1) as u8;
+        if let Some(heights) = &mut self.heights {
+            let header = &mut heights.block.heights.set;
+            header.bands[0].clone_from(&heights.set.band);
+            header.reserved = Bits::new();
+        }
+    }
+
+    /// Size the frame [`Encoder::write_segments`] left and write it whole,
+    /// counting it: the last of a frame's steps, and the only one that
+    /// depends on the frame before — the width of the frame's size, which
+    /// moves the header the size counts, is settled from the width the
+    /// frame before was written at.
+    fn settle(&mut self) -> Result<&[u8], Refused> {
+        let common = &self.headers.common;
         let block = match &mut self.heights {
             Some(heights) => {
-                let header = &mut heights.block.heights.set;
-                header.bands[0].clone_from(&heights.set.band);
-                header.reserved = Bits::new();
                 heights
                     .block
                     .heights
@@ -1120,7 +1230,8 @@ impl Encoder {
                 });
             }
         }
-        Ok(())
+        self.frames += 1;
+        Ok(&self.frame)
     }
 }
 

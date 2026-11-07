@@ -270,7 +270,12 @@ pub fn run(config: Config) -> Result<()> {
 
     let mut dca = DcaConfig::reference(config.layout, config.bits);
     dca.core.adpcm = config.adpcm;
-    let mut encoder = Encoder::new(dca).map_err(|e| Error::unsupported(&config.out, e.0))?;
+    // The lossless layer on threads of its own, the core and the render on
+    // this one: the same stream, to the byte, several times sooner.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+    let mut encoder = Encoder::new(dca)
+        .map_err(|e| Error::unsupported(&config.out, e.0))?
+        .with_threads(threads);
     let mut sink = Sink::create(&config.out, config.layout, config.bits)?;
 
     let total = config
@@ -347,14 +352,17 @@ pub fn run(config: Config) -> Result<()> {
         }
         for frame in pcm[..samples * width].chunks_exact(FRAME_SAMPLES * width) {
             stream.clear();
-            if let Err(e) = encoder.encode(frame, &mut stream) {
-                refused = Some(e);
-                break 'blocks;
-            }
-            // The first call sends nothing: the core runs a frame ahead.
+            let encoded = encoder.encode(frame, &mut stream);
+            // The first call sends nothing: the core runs a frame ahead. A
+            // refusal still hands back the frames before it that the threads
+            // had not yet given out.
             sent += sink
                 .frames(&stream, 0)
                 .map_err(|e| Error::io(&config.out, e))?;
+            if let Err(e) = encoded {
+                refused = Some(e);
+                break 'blocks;
+            }
         }
         at += got as u64;
         if let Some(progress) = progress.as_mut() {
@@ -379,7 +387,14 @@ pub fn run(config: Config) -> Result<()> {
                     .frames(&stream, padding as usize)
                     .map_err(|e| Error::io(&config.out, e))?;
             }
-            Err(e) => refused = Some(e),
+            Err(e) => {
+                // The frames before the refused one, which the threads still
+                // had in hand.
+                sent += sink
+                    .frames(&stream, 0)
+                    .map_err(|e| Error::io(&config.out, e))?;
+                refused = Some(e);
+            }
         }
     }
     // What was sent before a refusal is left written, a Matroska file
