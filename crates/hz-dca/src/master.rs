@@ -151,12 +151,15 @@ pub struct Encoder {
     pool: Option<Pool>,
 }
 
-/// A lossless frame to code on a thread of the pool: the input frame, the
-/// core's reconstruction of it, and its core frame, which stays with it to
-/// go out beside it. It comes back with the frame coded into `coded`.
+/// An input frame on its way through the pool: to the core's thread with
+/// the core's input made from it, then, once the next frame's core has
+/// reconstructed it, to a thread that codes its lossless frame, with the
+/// reconstruction and its core frame, which stays with it to go out beside
+/// it. It comes back with the frame coded into `coded`.
 struct Job {
     index: u64,
     pcm: Vec<i32>,
+    core_input: Vec<i32>,
     /// The reconstruction, and whether the frame is coded against it.
     core: Box<CoreDecoder>,
     against: bool,
@@ -164,33 +167,107 @@ struct Job {
     coded: lossless::Coded,
 }
 
+/// What the core's thread is handed.
+enum Ahead {
+    /// An input frame, with the core's input made from it.
+    Frame(Box<Job>),
+    /// The end of the input: the core's input made from silence, for the
+    /// frame waiting.
+    Finish(Vec<i32>),
+}
+
+/// The core running a frame ahead of the lossless layer on a thread of its
+/// own, as [`Encoder::encode`] runs it on the caller's: each input frame's
+/// core reconstructs the frame before it, which goes on to be coded.
+struct Front {
+    core: encoder::Encoder,
+    decoder: CoreDecoder,
+    core_frame: Vec<u8>,
+    /// The input frame waiting for the core frame that decodes to it.
+    waiting: Option<Box<Job>>,
+    /// Frames handed on to be coded: the index of the next.
+    index: u64,
+    layout: Layout,
+}
+
+impl Front {
+    fn run(mut self, inbox: mpsc::Receiver<Ahead>, jobs: mpsc::Sender<Box<Job>>) {
+        for ahead in inbox {
+            self.core_frame.clear();
+            let next = match ahead {
+                Ahead::Frame(job) => {
+                    self.core.encode(&job.core_input, &mut self.core_frame);
+                    Some(job)
+                }
+                // Handed only while a frame is waiting.
+                Ahead::Finish(silence) => {
+                    self.core.encode(&silence, &mut self.core_frame);
+                    None
+                }
+            };
+            let Some(mut job) = std::mem::replace(&mut self.waiting, next) else {
+                // As in `Encoder::encode`: the first core frame decodes to
+                // the silence before the input.
+                self.core.restart_prediction();
+                continue;
+            };
+            self.decoder.decode(&self.core);
+            job.index = self.index;
+            job.against = against_core_at(self.index, self.layout);
+            if job.against {
+                job.core.as_mut().clone_from(&self.decoder);
+            }
+            job.core_frame.clear();
+            job.core_frame.extend_from_slice(&self.core_frame);
+            if jobs.send(job).is_err() {
+                return;
+            }
+            self.index += 1;
+        }
+    }
+}
+
 /// Threads that code lossless frames apart ([`lossless::Encoder::code_apart`])
-/// for the encoder to settle in order. A frame's coding depends on nothing
-/// before it but the width its size is written at, which settling decides,
-/// so the stream is the one the encoder writes alone, to the byte.
+/// for the encoder to settle in order, and the core's thread that hands them
+/// the frames. A frame's coding depends on nothing before it but the width
+/// its size is written at, which settling decides, so the stream is the one
+/// the encoder writes alone, to the byte.
 struct Pool {
-    jobs: Option<mpsc::Sender<Job>>,
-    done: mpsc::Receiver<Job>,
+    /// The core's thread and its queue.
+    ahead: Option<mpsc::Sender<Ahead>>,
+    front: Option<std::thread::JoinHandle<()>>,
+    done: mpsc::Receiver<Box<Job>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Frames handed to the pool so far: the index of the next.
     queued: u64,
     /// Frames back from the pool and not yet settled, from the next to
     /// settle on: a frame can come back before the one ahead of it.
-    back: VecDeque<Option<Job>>,
+    back: VecDeque<Option<Box<Job>>>,
     /// Frames handed out and not yet settled.
     in_flight: usize,
     /// The most frames handed out at once.
     most: usize,
-    /// Jobs settled, to code the next frames into.
-    spare: Vec<Job>,
+    /// Jobs settled, to code the next frames into. Each keeps its box: a
+    /// job goes through the queues by pointer, and its box with it.
+    #[allow(clippy::vec_box)]
+    spare: Vec<Box<Job>>,
 }
 
 impl Pool {
-    /// `threads` threads, each with a lossless encoder of `config`; `None`
-    /// when not one of them can be started.
-    fn new(threads: usize, config: &lossless::Config) -> Option<Self> {
-        let (jobs, inbox) = mpsc::channel::<Job>();
-        let (outbox, done) = mpsc::channel::<Job>();
+    /// `threads` threads, each with a lossless encoder of `config`, and a
+    /// thread for a core of `core`; `None` when the core's or not one of the
+    /// others can be started.
+    fn new(threads: usize, config: &lossless::Config, core: &encoder::Config) -> Option<Self> {
+        let front = Front {
+            core: encoder::Encoder::new(core.clone()).ok()?,
+            decoder: CoreDecoder::new(),
+            core_frame: Vec::new(),
+            waiting: None,
+            index: 0,
+            layout: config.layout,
+        };
+        let (jobs, inbox) = mpsc::channel::<Box<Job>>();
+        let (outbox, done) = mpsc::channel::<Box<Job>>();
         let inbox = Arc::new(Mutex::new(inbox));
         let mut workers = Vec::with_capacity(threads);
         for n in 0..threads {
@@ -224,9 +301,17 @@ impl Pool {
         if workers.is_empty() {
             return None;
         }
+        let (ahead, frames) = mpsc::channel::<Ahead>();
+        // Should the core's thread not start, its queue to the others closes
+        // with it, and they end.
+        let front = std::thread::Builder::new()
+            .name("core".into())
+            .spawn(move || front.run(frames, jobs))
+            .ok()?;
         let most = 2 * workers.len() + 2;
         Some(Self {
-            jobs: Some(jobs),
+            ahead: Some(ahead),
+            front: Some(front),
             done,
             workers,
             queued: 0,
@@ -238,7 +323,7 @@ impl Pool {
     }
 
     /// Put a frame back from the pool in its place.
-    fn place(&mut self, job: Job, settled: u64) {
+    fn place(&mut self, job: Box<Job>, settled: u64) {
         let at = (job.index - settled) as usize;
         if self.back.len() <= at {
             self.back.resize_with(at + 1, || None);
@@ -249,8 +334,12 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // Closing the queue is what tells the threads to stop.
-        self.jobs = None;
+        // Closing the core's queue is what tells its thread to stop, and its
+        // stopping closes the others'.
+        self.ahead = None;
+        if let Some(front) = self.front.take() {
+            let _ = front.join();
+        }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
@@ -264,6 +353,18 @@ enum Until {
     Room,
     /// Until every frame before this one is settled.
     Settled(u64),
+}
+
+/// Whether the lossless frame `index` of a `layout` may code channels
+/// against the core.
+///
+/// FFmpeg's decoder treats the first frame of a stream that codes channels
+/// against the core in more than one channel set as one to recover from,
+/// and presents it from the core alone (as it does after a seek). A first
+/// frame that codes every channel as itself has nothing to recover, so the
+/// stream decodes losslessly from its first sample.
+fn against_core_at(index: u64, layout: Layout) -> bool {
+    index > 0 || layout == Layout::FivePointOne
 }
 
 /// Fit `exss` around `size` bytes of data: narrow fields where the whole
@@ -460,22 +561,28 @@ impl Encoder {
         })
     }
 
-    /// Code the lossless frames on `threads` threads of their own, the core
-    /// staying on the caller's: the lossless layer is most of the work, and
-    /// a frame of it depends on nothing before it but the width its size is
-    /// written at, which is settled on the caller's thread, in order. The
-    /// stream is the same to the byte; the frames come out of
-    /// [`Encoder::encode`] later, up to twice as many calls behind the input
-    /// as there are threads. Nought, the default, codes them on the caller's
-    /// thread; a pool that cannot be started codes them there too.
+    /// Code the lossless frames on `threads` threads of their own, and the
+    /// core on one more: the lossless layer is most of the work, and a frame
+    /// of it depends on nothing before it but the width its size is written
+    /// at, which is settled on the caller's thread, in order; the core,
+    /// which carries its prediction from frame to frame, runs ahead of them
+    /// in order on its own. The stream is the same to the byte; the frames
+    /// come out of [`Encoder::encode`] later, up to twice as many calls
+    /// behind the input as there are threads. Nought, the default, codes
+    /// everything on the caller's thread; threads that cannot be started do
+    /// too, and so does an encoder that has had a frame already: the threads
+    /// are chosen before the stream starts.
     ///
     /// With threads, a frame refused once it is coded — for the navigation
     /// word as for the peak rate — ends the stream, and the frames the
     /// threads had in hand after it are not sent. A frame [`Encoder::encode`]
     /// refuses before coding it moves nothing on, threads or not.
     pub fn with_threads(mut self, threads: usize) -> Self {
+        if self.pool.is_some() || self.waiting || self.frames > 0 {
+            return self;
+        }
         self.pool = (threads > 0)
-            .then(|| Pool::new(threads, self.lossless.config()))
+            .then(|| Pool::new(threads, self.lossless.config(), self.core.config()))
             .flatten();
         self
     }
@@ -518,6 +625,12 @@ impl Encoder {
             }
             return Err(refused);
         }
+        if self.pool.is_some() {
+            let job = self.job(pcm);
+            self.hand_out(Ahead::Frame(job));
+            self.waiting = true;
+            return self.settle_back(out, Until::Room);
+        }
         self.core_frame.clear();
         self.core
             .encode(self.lossless.core_input(pcm), &mut self.core_frame);
@@ -526,9 +639,6 @@ impl Encoder {
             // input: it is not sent, and the stream's decoder starts its
             // subband prediction on the next from silence.
             self.core.restart_prediction();
-        } else if self.pool.is_some() {
-            self.hand_out();
-            self.settle_back(out, Until::Room)?;
         } else {
             let mark = out.len();
             if let Err(refused) = self.send(out) {
@@ -549,18 +659,14 @@ impl Encoder {
         if let Some(refused) = &self.ended {
             return Err(refused.clone());
         }
-        if self.waiting {
-            let silence = vec![0; self.pending.len()];
-            self.core_frame.clear();
-            self.core
-                .encode(self.lossless.core_input(&silence), &mut self.core_frame);
-        }
+        let silence = self.waiting.then(|| vec![0; self.pending.len()]);
         if self.pool.is_some() {
             // The frames before the last went out in the calls after each;
             // the last, and the rest of the stream, are this call's.
             let last = self.handed_out();
-            if self.waiting {
-                self.hand_out();
+            if let Some(silence) = silence {
+                let input = self.lossless.core_input(&silence).to_vec();
+                self.hand_out(Ahead::Finish(input));
                 self.waiting = false;
             }
             self.settle_back(out, Until::Settled(last))?;
@@ -575,7 +681,10 @@ impl Encoder {
             return finished;
         }
         let mark = out.len();
-        let finished = if self.waiting {
+        let finished = if let Some(silence) = silence {
+            self.core_frame.clear();
+            self.core
+                .encode(self.lossless.core_input(&silence), &mut self.core_frame);
             self.send(out).inspect(|()| self.waiting = false)
         } else {
             Ok(())
@@ -592,63 +701,55 @@ impl Encoder {
         self.pool.as_ref().map_or(self.frames, |pool| pool.queued)
     }
 
-    /// Whether the lossless frame `index` may code channels against the
-    /// core.
-    ///
-    /// FFmpeg's decoder treats the first frame of a stream that codes
-    /// channels against the core in more than one channel set as one to
-    /// recover from, and presents it from the core alone (as it does after a
-    /// seek). A first frame that codes every channel as itself has nothing
-    /// to recover, so the stream decodes losslessly from its first sample.
-    fn against_core_at(&self, index: u64) -> bool {
-        index > 0 || self.lossless.config().layout == Layout::FivePointOne
-    }
-
     /// Encode the stream's frame for the pending input — the core frame last
     /// encoded and the lossless frame — put it in the queue, and send what
     /// is ready.
     fn send(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
         self.decoder.decode(&self.core);
-        let core = self.against_core_at(self.frames).then_some(&self.decoder);
-        self.lossless.encode(&self.pending, core)?;
+        let against = against_core_at(self.frames, self.lossless.config().layout);
+        self.lossless
+            .encode(&self.pending, against.then_some(&self.decoder))?;
         let core_frame = std::mem::take(&mut self.core_frame);
         let queued = self.queue(&core_frame, out);
         self.core_frame = core_frame;
         queued
     }
 
-    /// Hand the pending input to the pool to code, with the core frame last
-    /// encoded and the core's reconstruction of the input.
-    fn hand_out(&mut self) {
-        self.decoder.decode(&self.core);
+    /// A job for the input frame `pcm`, with the core's input made from it.
+    fn job(&mut self, pcm: &[i32]) -> Box<Job> {
         let pool = self.pool.as_mut().expect("handing out to the pool");
-        let index = pool.queued;
-        let spare = pool.spare.pop();
-        let mut job = spare.unwrap_or_else(|| Job {
-            index: 0,
-            pcm: Vec::with_capacity(self.pending.len()),
-            core: Box::new(CoreDecoder::new()),
-            against: false,
-            core_frame: Vec::with_capacity(self.core_frame.len()),
-            coded: self.lossless.coded(),
+        let mut job = pool.spare.pop().unwrap_or_else(|| {
+            Box::new(Job {
+                index: 0,
+                pcm: Vec::with_capacity(pcm.len()),
+                core_input: Vec::new(),
+                core: Box::new(CoreDecoder::new()),
+                against: false,
+                core_frame: Vec::with_capacity(self.core.frame_size()),
+                coded: self.lossless.coded(),
+            })
         });
-        job.index = index;
         job.pcm.clear();
-        job.pcm.extend_from_slice(&self.pending);
-        job.against = self.against_core_at(index);
-        if job.against {
-            job.core.as_mut().clone_from(&self.decoder);
-        }
-        job.core_frame.clear();
-        job.core_frame.extend_from_slice(&self.core_frame);
+        job.pcm.extend_from_slice(pcm);
+        job.core_input.clear();
+        job.core_input
+            .extend_from_slice(self.lossless.core_input(pcm));
+        job
+    }
+
+    /// Hand `ahead` to the core's thread: once a frame is waiting, the core
+    /// it makes reconstructs that frame, which goes on to be coded.
+    fn hand_out(&mut self, ahead: Ahead) {
         let pool = self.pool.as_mut().expect("handing out to the pool");
-        pool.jobs
+        pool.ahead
             .as_ref()
-            .expect("the pool is open while the encoder is")
-            .send(job)
-            .expect("the pool's threads are running");
-        pool.queued += 1;
-        pool.in_flight += 1;
+            .expect("the core's thread is open while the encoder is")
+            .send(ahead)
+            .expect("the core's thread is running");
+        if self.waiting {
+            pool.queued += 1;
+            pool.in_flight += 1;
+        }
     }
 
     /// Settle, in order, the frames the pool has coded, and send what is
@@ -1047,6 +1148,15 @@ mod tests {
             (Config::reference(Layout::FivePointOne, 16), {
                 tones(6, 9).iter().map(|s| s & !0xffff).collect()
             }),
+            // The core's subband prediction, which its first frame restarts.
+            (
+                {
+                    let mut config = Config::reference(Layout::FivePointOne, 24);
+                    config.core.adpcm = true;
+                    config
+                },
+                tones(6, 12),
+            ),
             (
                 Config::reference(Layout::SevenPointOne, 24),
                 bursts(8, 30, 2),
@@ -1128,6 +1238,28 @@ mod tests {
                 "no case refused with {refused:?}"
             );
         }
+    }
+
+    /// Threads asked for once the stream has started change nothing: the
+    /// core has a frame in hand that a core of their own would not.
+    #[test]
+    fn threads_asked_for_late_change_nothing() {
+        let config = Config::reference(Layout::FivePointOne, 24);
+        let pcm = tones(6, 8);
+        let alone = encode_on(config.clone(), &pcm, 0);
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let mut frames = pcm.chunks(FRAME_SAMPLES * 6);
+        for frame in frames.by_ref().take(2) {
+            encoder.encode(frame, &mut stream).unwrap();
+        }
+        let mut encoder = encoder.with_threads(3);
+        assert!(encoder.pool.is_none());
+        for frame in frames {
+            encoder.encode(frame, &mut stream).unwrap();
+        }
+        encoder.finish(&mut stream).unwrap();
+        assert!(stream == alone.0, "the stream");
     }
 
     /// Each frame's bytes, and its substream's lossless data, sync fields

@@ -241,20 +241,22 @@ The lossless layer is most of the work — the predictor search alone is two
 thirds of it — and a lossless frame depends on nothing before it but the
 width its size is written at. So `harlettizer dts` codes those frames on
 every thread but one (`hz_dca::master::Encoder::with_threads`) and settles
-them in order on the caller's, where the core and the render stay: the core
-carries its prediction from frame to frame. The stream is the same to the
-byte as one thread writes it, refusals included.
+them in order on the caller's, where the render stays. The core carries its
+prediction from frame to frame, so it runs in order too, on a thread of its
+own, ahead of the others: it hands each input frame on with the core frame
+that reconstructs it. The stream is the same to the byte as one thread
+writes it, refusals included.
 
 Thirty seconds of a twelve-waveform programme, on sixteen cores:
 
 | `--layout` | one thread | threads | × real time |
 |---|---|---|---|
-| `7.1.4` | 4.97 s | 1.31 s | 23 |
-| `5.1` | 3.83 s | 1.11 s | 27 |
+| `7.1.4` | 4.98 s | 0.99 s | 30 |
+| `5.1` | 3.85 s | 0.99 s | 30 |
 
-What is left on the caller's thread — the core encoder, about three quarters
-of it, and the render — is now the whole of the wall time; the core on a
-thread of its own is what would take it further.
+The core's thread is now the whole of the wall time, whatever the layout:
+the core encoder is nine tenths of it, the decoder that reconstructs it the
+rest. Going further means coding the core itself faster, frame after frame.
 
 ## Not done
 
