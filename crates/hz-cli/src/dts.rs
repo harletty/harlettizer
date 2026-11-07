@@ -270,8 +270,9 @@ pub fn run(config: Config) -> Result<()> {
 
     let mut dca = DcaConfig::reference(config.layout, config.bits);
     dca.core.adpcm = config.adpcm;
-    // The lossless layer on threads of its own, the core and the render on
-    // this one: the same stream, to the byte, several times sooner.
+    // The lossless layer on every thread but one, the core on one more, and
+    // the render on this one, which mostly waits for them: the same stream,
+    // to the byte, several times sooner.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
     let mut encoder = Encoder::new(dca)
         .map_err(|e| Error::unsupported(&config.out, e.0))?
