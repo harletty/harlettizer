@@ -20,13 +20,14 @@ hz-ac3.workspace = true
 hz-dca.workspace = true
 hz-iamf.workspace = true
 hz-io.workspace = true
-hz-joc.workspace = true
+hz-joc = { workspace = true, features = ["parallel"] }
 hz-matroska.workspace = true
 hz-meta.workspace = true
 hz-mlp = { workspace = true, features = ["parallel"] }
 hz-programme.workspace = true
 hz-render.workspace = true
 clap.workspace = true
+rayon.workspace = true
 
 [features]
 # `iamf --codec opus`, through the system's libopus; see hz-iamf.

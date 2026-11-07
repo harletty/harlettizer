@@ -45,7 +45,35 @@ pub struct Config {
     pub progress: bool,
 }
 
+/// The threads a joint object coding encode runs on, at most. A frame's
+/// work comes in pieces of an object or a band each, a dozen or so at a
+/// time, and the encoder's own steps between them are one thread's: past
+/// eight, more threads wait more than they work — the encode no sooner, the
+/// processor busier.
+const JOC_THREADS: usize = 8;
+
 pub fn run(config: Config) -> Result<()> {
+    if !config.joc {
+        return encode(config);
+    }
+    // Joint object coding fits a frame's objects, and the downmix's side of
+    // their equations, at once (`hz-joc`'s `parallel` feature): on a pool of
+    // its own that the whole encode runs in, so that the thread driving it
+    // works in the pool between its own steps. The same stream, to the byte.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(JOC_THREADS));
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|n| format!("joc-{n}"))
+        // The stack the encode has on the main thread.
+        .stack_size(8 << 20)
+        .build()
+    {
+        Ok(pool) => pool.install(|| encode(config)),
+        Err(_) => encode(config),
+    }
+}
+
+fn encode(config: Config) -> Result<()> {
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still

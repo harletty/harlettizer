@@ -456,6 +456,33 @@ costs 0.026 on 1280-sample blocks and 0.029 here. On broad40 the two do not
 compare: the TrueHD fold weighs the master's object sizes, and this one, like
 IAMF's, judges points.
 
+## Speed
+
+Within a frame the estimator's work comes apart. Each downmix channel and
+object goes through its own analysis bank, and each channel's share of each
+band through its own synthesis bank. Each entry of the normal equations is a
+sum of its own. Each object is fitted from what the decoder holds for it,
+against the downmix's side of the equations that every object shares. Each
+object's codes are traded for bits apart from every other's at a given λ.
+Only the budget's search for λ ties a frame's objects together, and only the
+decoder's held gains tie a frame to the next. So with `hz-joc`'s `parallel`
+feature these pieces run at once on rayon's threads. Each still takes its
+sums in the order one thread takes them, and the payloads are the same to
+the byte.
+
+`harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most eight
+threads. Past eight, a frame's pieces are too few to share out, and the
+encoder's own steps between them are one thread's: more threads wait more
+than they work. On sixteen cores, against one thread:
+
+| programme | elements | one thread | eight threads | CPU time |
+|---|---|---|---|---|
+| twelve waveforms, 30 s | 11 | 3.02 s | 1.10 s | +18 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 3.61 s | 1.06 s | +30 % |
+
+What is left on the encode's own thread — the E-AC-3 core, coded twice a
+frame, and the true peak — is now most of the wall time.
+
 ## Not done
 
 - Two data points a frame, which the references never use, and a steep slope
