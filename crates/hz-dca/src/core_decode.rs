@@ -60,6 +60,7 @@ struct Synthesis {
 }
 
 /// The core decoder's state, and the frame it last reconstructed.
+#[derive(Clone)]
 pub struct CoreDecoder {
     /// Per coded channel and subband: the four samples the frame's ADPCM
     /// starts from, then the frame's sixteen.

@@ -56,6 +56,7 @@ use crate::lossless::{self, Layout};
 use crate::navigation::Navigation;
 use crate::peak::{self, Smoother};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, mpsc};
 
 pub use crate::encoder::Unsupported;
 pub use crate::lossless::Refused;
@@ -145,6 +146,124 @@ pub struct Encoder {
     rate: Rate,
     /// Once a frame cannot be carried, the stream has ended: the refusal.
     ended: Option<Refused>,
+    /// The threads the lossless frames are coded on, when they are not
+    /// coded on the caller's ([`Encoder::with_threads`]).
+    pool: Option<Pool>,
+}
+
+/// A lossless frame to code on a thread of the pool: the input frame, the
+/// core's reconstruction of it, and its core frame, which stays with it to
+/// go out beside it. It comes back with the frame coded into `coded`.
+struct Job {
+    index: u64,
+    pcm: Vec<i32>,
+    /// The reconstruction, and whether the frame is coded against it.
+    core: Box<CoreDecoder>,
+    against: bool,
+    core_frame: Vec<u8>,
+    coded: lossless::Coded,
+}
+
+/// Threads that code lossless frames apart ([`lossless::Encoder::code_apart`])
+/// for the encoder to settle in order. A frame's coding depends on nothing
+/// before it but the width its size is written at, which settling decides,
+/// so the stream is the one the encoder writes alone, to the byte.
+struct Pool {
+    jobs: Option<mpsc::Sender<Job>>,
+    done: mpsc::Receiver<Job>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    /// Frames handed to the pool so far: the index of the next.
+    queued: u64,
+    /// Frames back from the pool and not yet settled, from the next to
+    /// settle on: a frame can come back before the one ahead of it.
+    back: VecDeque<Option<Job>>,
+    /// Frames handed out and not yet settled.
+    in_flight: usize,
+    /// The most frames handed out at once.
+    most: usize,
+    /// Jobs settled, to code the next frames into.
+    spare: Vec<Job>,
+}
+
+impl Pool {
+    /// `threads` threads, each with a lossless encoder of `config`; `None`
+    /// when not one of them can be started.
+    fn new(threads: usize, config: &lossless::Config) -> Option<Self> {
+        let (jobs, inbox) = mpsc::channel::<Job>();
+        let (outbox, done) = mpsc::channel::<Job>();
+        let inbox = Arc::new(Mutex::new(inbox));
+        let mut workers = Vec::with_capacity(threads);
+        for n in 0..threads {
+            let Ok(mut encoder) = lossless::Encoder::new(config.clone()) else {
+                break;
+            };
+            let inbox = Arc::clone(&inbox);
+            let outbox = outbox.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("lossless-{n}"))
+                .spawn(move || {
+                    loop {
+                        // The lock is held only to take a job: the others
+                        // would be waiting for one anyway.
+                        let next = inbox.lock().map(|inbox| inbox.recv());
+                        let Ok(Ok(mut job)) = next else {
+                            return;
+                        };
+                        let core = job.against.then_some(&*job.core);
+                        encoder.code_apart(&job.pcm, core, &mut job.coded);
+                        if outbox.send(job).is_err() {
+                            return;
+                        }
+                    }
+                });
+            match spawned {
+                Ok(handle) => workers.push(handle),
+                Err(_) => break,
+            }
+        }
+        if workers.is_empty() {
+            return None;
+        }
+        let most = 2 * workers.len() + 2;
+        Some(Self {
+            jobs: Some(jobs),
+            done,
+            workers,
+            queued: 0,
+            back: VecDeque::new(),
+            in_flight: 0,
+            most,
+            spare: Vec::new(),
+        })
+    }
+
+    /// Put a frame back from the pool in its place.
+    fn place(&mut self, job: Job, settled: u64) {
+        let at = (job.index - settled) as usize;
+        if self.back.len() <= at {
+            self.back.resize_with(at + 1, || None);
+        }
+        self.back[at] = Some(job);
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Closing the queue is what tells the threads to stop.
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// How far [`Encoder::settle_back`] goes before it returns.
+#[derive(Clone, Copy)]
+enum Until {
+    /// Until no more frames are out than the pool takes at once.
+    Room,
+    /// Until every frame before this one is settled.
+    Settled(u64),
 }
 
 /// Fit `exss` around `size` bytes of data: narrow fields where the whole
@@ -334,10 +453,31 @@ impl Encoder {
             buffer_code,
             rate,
             ended: None,
+            pool: None,
             core,
             lossless,
             exss,
         })
+    }
+
+    /// Code the lossless frames on `threads` threads of their own, the core
+    /// staying on the caller's: the lossless layer is most of the work, and
+    /// a frame of it depends on nothing before it but the width its size is
+    /// written at, which is settled on the caller's thread, in order. The
+    /// stream is the same to the byte; the frames come out of
+    /// [`Encoder::encode`] later, up to twice as many calls behind the input
+    /// as there are threads. Nought, the default, codes them on the caller's
+    /// thread; a pool that cannot be started codes them there too.
+    ///
+    /// With threads, a frame refused once it is coded — for the navigation
+    /// word as for the peak rate — ends the stream, and the frames the
+    /// threads had in hand after it are not sent. A frame [`Encoder::encode`]
+    /// refuses before coding it moves nothing on, threads or not.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.pool = (threads > 0)
+            .then(|| Pool::new(threads, self.lossless.config()))
+            .flatten();
+        self
     }
 
     /// Take one frame — [`FRAME_SAMPLES`] samples of every channel,
@@ -345,10 +485,15 @@ impl Encoder {
     /// configured resolution are zero — and append to `out` the stream's
     /// frames that are ready: the frame before this one, since the core runs
     /// a frame ahead (nothing on the first call), and, where the stream may
-    /// smooth, only once the encoder has looked far enough past it.
+    /// smooth, only once the encoder has looked far enough past it — or,
+    /// with threads ([`Encoder::with_threads`]), once they have coded it.
     /// [`Encoder::finish`] sends the rest.
     ///
-    /// After [`Refused::PeakRate`] the stream has ended: every later call
+    /// A refusal leaves in `out` nothing of the refused frame's own, and,
+    /// with threads, the frames before it that the calls before would have
+    /// handed back without them: the frames written before a refusal are the
+    /// same either way. After [`Refused::PeakRate`] the stream has ended, and
+    /// with threads after any refusal of a coded frame: every later call
     /// returns the same refusal.
     ///
     /// # Panics
@@ -364,9 +509,15 @@ impl Encoder {
         }
         // Refused before anything moves on, naming the input frame: the
         // lossless layer has coded the frames sent, not the one waiting.
-        self.lossless
-            .check(pcm)
-            .map_err(|e| e.of_frame(self.frames + u64::from(self.waiting)))?;
+        if let Err(refused) = self.lossless.check(pcm) {
+            let refused = refused.of_frame(self.handed_out() + u64::from(self.waiting));
+            if self.pool.is_some() {
+                // Every frame handed out goes out first, as each would have
+                // in the call after it.
+                self.settle_back(out, Until::Settled(self.handed_out()))?;
+            }
+            return Err(refused);
+        }
         self.core_frame.clear();
         self.core
             .encode(self.lossless.core_input(pcm), &mut self.core_frame);
@@ -375,8 +526,15 @@ impl Encoder {
             // input: it is not sent, and the stream's decoder starts its
             // subband prediction on the next from silence.
             self.core.restart_prediction();
+        } else if self.pool.is_some() {
+            self.hand_out();
+            self.settle_back(out, Until::Room)?;
         } else {
-            self.send(out)?;
+            let mark = out.len();
+            if let Err(refused) = self.send(out) {
+                out.truncate(mark);
+                return Err(refused);
+            }
         }
         self.pending.copy_from_slice(pcm);
         self.waiting = true;
@@ -384,7 +542,9 @@ impl Encoder {
     }
 
     /// Encode the frame still waiting, with a core made from silence, and
-    /// send every frame not yet sent.
+    /// send every frame not yet sent. A refusal leaves in `out`, as
+    /// [`Encoder::encode`]'s does, the frames that would have gone out by the
+    /// last call to it, and nothing of this one's own.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
         if let Some(refused) = &self.ended {
             return Err(refused.clone());
@@ -394,10 +554,54 @@ impl Encoder {
             self.core_frame.clear();
             self.core
                 .encode(self.lossless.core_input(&silence), &mut self.core_frame);
-            self.send(out)?;
-            self.waiting = false;
         }
-        self.emit(out, true)
+        if self.pool.is_some() {
+            // The frames before the last went out in the calls after each;
+            // the last, and the rest of the stream, are this call's.
+            let last = self.handed_out();
+            if self.waiting {
+                self.hand_out();
+                self.waiting = false;
+            }
+            self.settle_back(out, Until::Settled(last))?;
+            let mark = out.len();
+            let all = self.handed_out();
+            let finished = self
+                .settle_back(out, Until::Settled(all))
+                .and_then(|()| self.emit(out, true));
+            if finished.is_err() {
+                out.truncate(mark);
+            }
+            return finished;
+        }
+        let mark = out.len();
+        let finished = if self.waiting {
+            self.send(out).inspect(|()| self.waiting = false)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| self.emit(out, true));
+        if finished.is_err() {
+            out.truncate(mark);
+        }
+        finished
+    }
+
+    /// Frames handed to the lossless layer so far: the index of the next.
+    fn handed_out(&self) -> u64 {
+        self.pool.as_ref().map_or(self.frames, |pool| pool.queued)
+    }
+
+    /// Whether the lossless frame `index` may code channels against the
+    /// core.
+    ///
+    /// FFmpeg's decoder treats the first frame of a stream that codes
+    /// channels against the core in more than one channel set as one to
+    /// recover from, and presents it from the core alone (as it does after a
+    /// seek). A first frame that codes every channel as itself has nothing
+    /// to recover, so the stream decodes losslessly from its first sample.
+    fn against_core_at(&self, index: u64) -> bool {
+        index > 0 || self.lossless.config().layout == Layout::FivePointOne
     }
 
     /// Encode the stream's frame for the pending input — the core frame last
@@ -405,15 +609,108 @@ impl Encoder {
     /// is ready.
     fn send(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
         self.decoder.decode(&self.core);
-        // FFmpeg's decoder treats the first frame of a stream that codes
-        // channels against the core in more than one channel set as one to
-        // recover from, and presents it from the core alone (as it does
-        // after a seek). A first frame that codes every channel as itself
-        // has nothing to recover, so the stream decodes losslessly from its
-        // first sample.
-        let several_sets = self.lossless.config().layout != Layout::FivePointOne;
-        let core = (self.frames > 0 || !several_sets).then_some(&self.decoder);
-        let frame = self.lossless.encode(&self.pending, core)?;
+        let core = self.against_core_at(self.frames).then_some(&self.decoder);
+        self.lossless.encode(&self.pending, core)?;
+        let core_frame = std::mem::take(&mut self.core_frame);
+        let queued = self.queue(&core_frame, out);
+        self.core_frame = core_frame;
+        queued
+    }
+
+    /// Hand the pending input to the pool to code, with the core frame last
+    /// encoded and the core's reconstruction of the input.
+    fn hand_out(&mut self) {
+        self.decoder.decode(&self.core);
+        let pool = self.pool.as_mut().expect("handing out to the pool");
+        let index = pool.queued;
+        let spare = pool.spare.pop();
+        let mut job = spare.unwrap_or_else(|| Job {
+            index: 0,
+            pcm: Vec::with_capacity(self.pending.len()),
+            core: Box::new(CoreDecoder::new()),
+            against: false,
+            core_frame: Vec::with_capacity(self.core_frame.len()),
+            coded: self.lossless.coded(),
+        });
+        job.index = index;
+        job.pcm.clear();
+        job.pcm.extend_from_slice(&self.pending);
+        job.against = self.against_core_at(index);
+        if job.against {
+            job.core.as_mut().clone_from(&self.decoder);
+        }
+        job.core_frame.clear();
+        job.core_frame.extend_from_slice(&self.core_frame);
+        let pool = self.pool.as_mut().expect("handing out to the pool");
+        pool.jobs
+            .as_ref()
+            .expect("the pool is open while the encoder is")
+            .send(job)
+            .expect("the pool's threads are running");
+        pool.queued += 1;
+        pool.in_flight += 1;
+    }
+
+    /// Settle, in order, the frames the pool has coded, and send what is
+    /// ready — waiting for the pool until `until`. A frame refused leaves
+    /// `out` as the frames before it left it, and ends the stream.
+    fn settle_back(&mut self, out: &mut Vec<u8>, until: Until) -> Result<(), Refused> {
+        loop {
+            let settled = self.frames;
+            let pool = self.pool.as_mut().expect("settling from the pool");
+            while let Ok(job) = pool.done.try_recv() {
+                pool.place(job, settled);
+            }
+            while let Some(Some(_)) = self.pool.as_ref().and_then(|p| p.back.front()) {
+                let pool = self.pool.as_mut().expect("settling from the pool");
+                let mut job = pool
+                    .back
+                    .pop_front()
+                    .flatten()
+                    .expect("the next frame is back");
+                pool.in_flight -= 1;
+                let mark = out.len();
+                let sent = self.settle(&mut job, out);
+                self.pool
+                    .as_mut()
+                    .expect("settling from the pool")
+                    .spare
+                    .push(job);
+                if let Err(refused) = sent {
+                    out.truncate(mark);
+                    self.ended = Some(refused.clone());
+                    return Err(refused);
+                }
+            }
+            let settled = self.frames;
+            let pool = self.pool.as_mut().expect("settling from the pool");
+            let enough = match until {
+                Until::Room => pool.in_flight <= pool.most,
+                Until::Settled(frames) => settled >= frames,
+            };
+            if enough {
+                return Ok(());
+            }
+            let job = pool
+                .done
+                .recv()
+                .expect("the pool's threads give back every frame");
+            pool.place(job, settled);
+        }
+    }
+
+    /// Settle a frame the pool coded, put it in the queue beside its core
+    /// frame, and send what is ready.
+    fn settle(&mut self, job: &mut Job, out: &mut Vec<u8>) -> Result<(), Refused> {
+        debug_assert_eq!(job.index, self.frames, "frames are settled in order");
+        self.lossless.settle_coded(&mut job.coded)?;
+        self.queue(&job.core_frame, out)
+    }
+
+    /// Put the lossless frame last written in the queue beside `core_frame`,
+    /// and send what is ready.
+    fn queue(&mut self, core_frame: &[u8], out: &mut Vec<u8>) -> Result<(), Refused> {
+        let frame = self.lossless.frame();
         let size = frame.len();
         self.lossless_stream.extend(frame);
         let word = self.lossless.extension().map(|navigation: Navigation| {
@@ -424,7 +721,7 @@ impl Encoder {
                 .expect("the lossless encoder refuses a block it cannot navigate")
         });
         self.words.push_back(word);
-        self.cores.extend(&self.core_frame);
+        self.cores.extend(core_frame);
         self.smoother.push(size);
         self.frames += 1;
         self.lossless_bytes += size as u64;
@@ -696,16 +993,141 @@ mod tests {
     }
 
     fn encode(config: Config, pcm: &[i32]) -> (Vec<u8>, Result<(), Refused>, Rate) {
+        let (stream, result, rate, _) = encode_on(config, pcm, 0);
+        (stream, result, rate)
+    }
+
+    /// As [`encode`], the lossless frames on `threads` threads, with what
+    /// the encoder counted: lossless bytes, channels against the core, and
+    /// the extension's reach.
+    #[allow(clippy::type_complexity)]
+    fn encode_on(
+        config: Config,
+        pcm: &[i32],
+        threads: usize,
+    ) -> (
+        Vec<u8>,
+        Result<(), Refused>,
+        Rate,
+        (u64, u64, Option<(usize, usize)>),
+    ) {
         let channels = config.lossless.layout.channels();
-        let mut encoder = Encoder::new(config).unwrap();
+        let mut encoder = Encoder::new(config).unwrap().with_threads(threads);
+        let counted = |encoder: &Encoder| {
+            (
+                encoder.lossless_bytes(),
+                encoder.against_core(),
+                encoder.extension_reach(),
+            )
+        };
         let mut stream = Vec::new();
         for frame in pcm.chunks(FRAME_SAMPLES * channels) {
             if let Err(e) = encoder.encode(frame, &mut stream) {
-                return (stream, Err(e), encoder.rate());
+                return (stream, Err(e), encoder.rate(), counted(&encoder));
             }
         }
         let result = encoder.finish(&mut stream);
-        (stream, result, encoder.rate())
+        (stream, result, encoder.rate(), counted(&encoder))
+    }
+
+    /// The lossless frames coded on threads and settled in order are the
+    /// stream coded on one, to the byte — smoothed, refused, or neither —
+    /// and a refusal leaves the same frames written before it.
+    #[test]
+    fn threads_write_the_stream_one_thread_writes() {
+        let smoothed = |layout: Layout, ceiling: u32| {
+            let mut config = Config::reference(layout, 24);
+            config.peak.ceiling = ceiling;
+            config.peak.buffer_code = 1;
+            config.peak.lookahead = 4;
+            config
+        };
+        let cases = [
+            (Config::reference(Layout::FivePointOne, 24), tones(6, 25)),
+            (Config::reference(Layout::FivePointOne, 16), {
+                tones(6, 9).iter().map(|s| s & !0xffff).collect()
+            }),
+            (
+                Config::reference(Layout::SevenPointOne, 24),
+                bursts(8, 30, 2),
+            ),
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 30, 10),
+            ),
+            // Refused for the peak rate, with frames sent ahead before it.
+            (smoothed(Layout::SevenPointOne, 7_000_000), bursts(8, 30, 0)),
+            // Refused for the peak rate once the input has ended, by the
+            // flush.
+            (smoothed(Layout::SevenPointOne, 7_000_000), bursts(8, 13, 0)),
+            // Sent ahead, and not refused.
+            (
+                {
+                    let mut config = Config::reference(Layout::SevenPointOne, 24);
+                    config.peak.ceiling = 8_500_000;
+                    config.peak.lookahead = 16;
+                    config
+                },
+                bursts(8, 40, 0),
+            ),
+            // A corner past 24 bits with its height: refused by the check.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 30, 0),
+            ),
+            // A bed too large for the navigation word to reach past.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 30, 1),
+            ),
+        ];
+        let mut refusals = Vec::new();
+        let mut sent_ahead = false;
+        for (case, (config, pcm)) in cases.into_iter().enumerate() {
+            let alone = encode_on(config.clone(), &pcm, 0);
+            match &alone.1 {
+                Err(e) => refusals.push(std::mem::discriminant(e)),
+                Ok(()) => sent_ahead |= alone.2.ahead > 0,
+            }
+            for threads in [1, 3, 8] {
+                let spread = encode_on(config.clone(), &pcm, threads);
+                assert!(
+                    spread.0 == alone.0,
+                    "case {case}, {threads} threads: the stream"
+                );
+                assert_eq!(spread.1, alone.1, "case {case}, {threads} threads");
+                if alone.1.is_ok() {
+                    assert_eq!(spread.2, alone.2, "case {case}, {threads} threads");
+                    assert_eq!(spread.3, alone.3, "case {case}, {threads} threads");
+                }
+            }
+        }
+        assert!(sent_ahead, "no case sent a frame ahead and went on");
+        // Every way a frame is refused was taken.
+        for refused in [
+            Refused::Fold {
+                frame: 0,
+                channel: 0,
+                sample: 0,
+                value: 0,
+            },
+            Refused::Navigation {
+                frame: 0,
+                cause: crate::navigation::OutOfRange::Offset(0),
+            },
+            Refused::PeakRate {
+                frame: 0,
+                cause: peak::Overrun::Buffer {
+                    held: 0,
+                    capacity: 0,
+                },
+            },
+        ] {
+            assert!(
+                refusals.contains(&std::mem::discriminant(&refused)),
+                "no case refused with {refused:?}"
+            );
+        }
     }
 
     /// Each frame's bytes, and its substream's lossless data, sync fields

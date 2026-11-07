@@ -235,6 +235,27 @@ heights where they belong. The other is (d): listening.
    receiver's DTS:X processing off, the heights should come from the corners
    at −3 dB.
 
+## Speed
+
+The lossless layer is most of the work — the predictor search alone is two
+thirds of it — and a lossless frame depends on nothing before it but the
+width its size is written at. So `harlettizer dts` codes those frames on
+every thread but one (`hz_dca::master::Encoder::with_threads`) and settles
+them in order on the caller's, where the core and the render stay: the core
+carries its prediction from frame to frame. The stream is the same to the
+byte as one thread writes it, refusals included.
+
+Thirty seconds of a twelve-waveform programme, on sixteen cores:
+
+| `--layout` | one thread | threads | × real time |
+|---|---|---|---|
+| `7.1.4` | 4.97 s | 1.31 s | 23 |
+| `5.1` | 3.83 s | 1.11 s | 27 |
+
+What is left on the caller's thread — the core encoder, about three quarters
+of it, and the render — is now the whole of the wall time; the core on a
+thread of its own is what would take it further.
+
 ## Not done
 
 - `harlettizer dts` takes neither a ceiling nor a dialnorm: it encodes at the
