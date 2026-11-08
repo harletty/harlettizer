@@ -227,6 +227,12 @@ impl Crew {
             let (_, e) = batch.failed.take().expect("just seen");
             return Err(e);
         }
+        if i >= batch.ends.len() {
+            // Asked again past a failure already handed over.
+            return Err(io::Error::other(
+                "a substream before it in this unit could not be coded",
+            ));
+        }
         let start = if i == 0 { 0 } else { batch.ends[i - 1] };
         Ok(&batch.payload[start..batch.ends[i]])
     }

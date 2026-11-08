@@ -473,8 +473,14 @@ impl<W: Write + Seek> Writer<W> {
     /// written, and fails where it would have.
     ///
     /// The coding stays on the caller's thread with `threads` under two, for
-    /// LPCM — copying samples is no work to share — and where a thread cannot
-    /// be started.
+    /// a sequence of one substream, for LPCM — copying samples is no work to
+    /// share — and where a thread cannot be started. There are never more
+    /// threads than substreams.
+    ///
+    /// A push that fails leaves the writer spent, threads or not: push
+    /// nothing more, and do not finish it. On one thread the substreams after
+    /// the one that failed have not coded that unit; on threads, those of the
+    /// other shares have, so a stateful codec's state differs from there on.
     pub fn with_threads(mut self, threads: usize) -> Self {
         let hands = threads.min(self.substreams.len());
         let coding = std::mem::replace(&mut self.coding, Coding::Here(Coder::Lpcm));
@@ -1631,9 +1637,11 @@ mod tests {
 
     /// Each unit's substreams coded on threads write what one thread writes:
     /// a 7.1.4 bed's seven substreams, and twenty — ids past eighteen, one
-    /// object moving — beside an LFE; standalone and in Matroska; a short
-    /// last unit and Opus's flush; on two threads, three, seven, and more
-    /// than there are substreams.
+    /// object moving — beside an LFE; standalone and in Matroska; on two
+    /// threads, three, seven, and more than there are substreams. The
+    /// programme ends in a short unit with room for Opus's delay, in one
+    /// without — the delay flushed in a unit of its own, placed by the blocks
+    /// `push_last` is given — and on a whole unit, flushed by `finish`.
     #[test]
     fn substreams_on_threads_write_what_one_thread_writes() {
         use crate::layout::LFE;
@@ -1649,50 +1657,65 @@ mod tests {
             true_peak: -1.0,
         };
         for codec in codecs {
-            let frame = if matches!(codec, Codec::Opus { .. }) {
-                960
-            } else {
-                256
-            };
+            let opus = matches!(codec, Codec::Opus { .. });
+            let frame = if opus { 960 } else { 256 };
+            // Ending with room for a delay of 312, without, and whole.
+            let endings = [(frame / 3, false), (frame - 100, true), (frame, true)];
             for elements in [vec![Element::Channels(SEVEN_ONE_FOUR)], objects.clone()] {
                 let width: usize = elements.iter().map(Element::channels).sum();
-                let samples = programme(width, 5 * frame + frame / 3);
-                for matroska in [false, true] {
-                    let write = |threads: usize| {
-                        let config = Config {
-                            elements: elements.clone(),
-                            frame,
-                            ..config(codec)
-                        };
-                        let out = Cursor::new(Vec::new());
-                        let writer = if matroska {
-                            Writer::matroska(out, config, "test")
-                        } else {
-                            Writer::new(out, config)
-                        };
-                        let mut writer = writer.unwrap().with_threads(threads);
-                        assert_eq!(
-                            writer.threaded(),
-                            threads > 1 && codec != Codec::Lpcm,
-                            "{codec:?} on {threads}"
-                        );
-                        for (n, unit) in samples.chunks(frame * width).enumerate() {
-                            let subblocks = [step([n as f64 / 10.0 - 0.2, 1.0, 0.0], frame as u32)];
-                            let block = PositionBlock {
-                                element: 3,
-                                subblocks: &subblocks,
+                for (last, flushed) in endings {
+                    let samples = programme(width, 5 * frame + last);
+                    for matroska in [false, true] {
+                        let write = |threads: usize| {
+                            let config = Config {
+                                elements: elements.clone(),
+                                frame,
+                                ..config(codec)
                             };
-                            let blocks = if width > 12 { &[block][..] } else { &[] };
-                            writer.push(unit, blocks).unwrap();
+                            let out = Cursor::new(Vec::new());
+                            let writer = if matroska {
+                                Writer::matroska(out, config, "test")
+                            } else {
+                                Writer::new(out, config)
+                            };
+                            let mut writer = writer.unwrap().with_threads(threads);
+                            assert_eq!(
+                                writer.threaded(),
+                                threads > 1 && codec != Codec::Lpcm,
+                                "{codec:?} on {threads}"
+                            );
+                            let units = samples.chunks(frame * width).count();
+                            for (n, unit) in samples.chunks(frame * width).enumerate() {
+                                let at = |n: usize| [n as f64 / 10.0 - 0.2, 1.0, 0.0];
+                                let here = [step(at(n), frame as u32)];
+                                let next = [step(at(n + 1), frame as u32)];
+                                let block = |subblocks| PositionBlock {
+                                    element: 3,
+                                    subblocks,
+                                };
+                                let moving = width > 12;
+                                let blocks = if moving { vec![block(&here)] } else { vec![] };
+                                if n + 1 == units && last < frame {
+                                    let after = if moving { vec![block(&next)] } else { vec![] };
+                                    writer.push_last(unit, &blocks, &after).unwrap();
+                                } else {
+                                    writer.push(unit, &blocks).unwrap();
+                                }
+                            }
+                            writer.finish([loudness; 2]).unwrap().into_inner()
+                        };
+                        let alone = write(1);
+                        if !matroska {
+                            let units = obus(&alone).iter().filter(|o| o.0 == 4).count();
+                            assert_eq!(units, 6 + usize::from(opus && flushed), "{codec:?}");
                         }
-                        writer.finish([loudness; 2]).unwrap().into_inner()
-                    };
-                    let alone = write(1);
-                    for threads in [2, 3, 7, 64] {
-                        assert!(
-                            write(threads) == alone,
-                            "{codec:?}, {width} channels, Matroska {matroska}: {threads} threads"
-                        );
+                        for threads in [2, 3, 7, 64] {
+                            assert!(
+                                write(threads) == alone,
+                                "{codec:?}, {width} channels, ending {last}, Matroska \
+                                 {matroska}: {threads} threads"
+                            );
+                        }
                     }
                 }
             }

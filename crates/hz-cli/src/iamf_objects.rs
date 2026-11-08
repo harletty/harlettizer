@@ -69,6 +69,8 @@ use hz_programme::source::Source;
 use hz_programme::{Part, parts_of};
 use hz_render::{Keyframe, Layout, Mixdown};
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Samples between two traced positions.
 const TRACE_INTERVAL: usize = 256;
@@ -1784,22 +1786,23 @@ fn profile_name(elements: &[Element]) -> &'static str {
 /// The writer on a thread of its own, a unit or more behind the feed, as a
 /// folding `encode`'s encoder runs behind its fold: the two want different
 /// things and neither waits on the other for anything but the samples. Once
-/// a push has failed it writes nothing more, and says so with every unit it
-/// hands back.
+/// a push has failed it writes nothing more, and raises `stopped` for the
+/// feed to see before it reads another unit: at once where it runs on the
+/// feed's own thread, as a single thread stops.
 struct Writing {
     writer: Output,
     /// Interleaved samples a frame.
     width: usize,
     failed: Option<std::io::Error>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Stage for Writing {
     type In = Unit;
-    /// The unit, to be filled again, and whether every push so far was
-    /// written.
-    type Out = (Unit, bool);
+    /// The unit, to be filled again.
+    type Out = Unit;
 
-    fn run(&mut self, unit: Unit) -> (Unit, bool) {
+    fn run(&mut self, unit: Unit) -> Unit {
         if self.failed.is_none() {
             let blocks = stated(&unit.blocks[..unit.stated]);
             let samples = &unit.samples[..unit.frames * self.width];
@@ -1809,10 +1812,12 @@ impl Stage for Writing {
             } else {
                 self.writer.push(samples, &blocks)
             };
-            self.failed = pushed.err();
+            if let Err(e) = pushed {
+                self.failed = Some(e);
+                self.stopped.store(true, Ordering::Release);
+            }
         }
-        let written = self.failed.is_none();
-        (unit, written)
+        unit
     }
 }
 
@@ -1935,11 +1940,13 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let mut trace = Trace::open(width)?;
     let mut one = Vec::new();
 
+    let stopped = Arc::new(AtomicBool::new(false));
     let mut writing = Lane::new(
         Writing {
             writer,
             width,
             failed: None,
+            stopped: Arc::clone(&stopped),
         },
         "iamf-writer",
         threads,
@@ -1961,16 +1968,13 @@ fn drive(job: Drive<'_>) -> Result<()> {
             let mut at = 0u64;
             let mut unit_index = 0u64;
             while at < total {
+                // A writer that has failed ends the encode there.
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
                 // A unit to fill: one not yet handed over, or the oldest
-                // written — and none once the writer has failed, which ends
-                // the encode there.
-                let mut unit = match spare.pop() {
-                    Some(unit) => unit,
-                    None => match writing.recv() {
-                        (unit, true) => unit,
-                        (_, false) => break,
-                    },
-                };
+                // written.
+                let mut unit = spare.pop().unwrap_or_else(|| writing.recv());
                 let want = (total - at).min(frame as u64) as usize;
                 let got = feed.fill(
                     &mut source,
@@ -2149,11 +2153,14 @@ fn drive(job: Drive<'_>) -> Result<()> {
         // Every unit handed over written, or the failure that stopped it.
         (writing.into_stage(), looped)
     };
-    let at = looped?;
+    // A push that failed came before anything the feed met after handing
+    // that unit over, so it is what a single thread stops at: the feed's own
+    // failure, a read or the trace's, only when every push was written.
     let writer = match writing.failed {
         Some(e) => return Err(Error::io(&config.out, e)),
         None => writing.writer,
     };
+    let at = looped?;
     if at == 0 {
         return Err(Error::unsupported(path, "no audio to encode"));
     }

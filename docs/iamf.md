@@ -597,9 +597,10 @@ encoder of its own. So `harlettizer iamf` codes each unit's substreams on up
 to eight threads of their own, a share of them each, and lays the frames out
 in the order it always does once every share is back. Each substream is coded
 by the same calls, in the same order, as on one thread, so the sequence is
-the same to the byte. A 7.1.4 bed's seven substreams take seven threads; a
-coupled pair counts for two mono substreams when they are shared out. LPCM
-stays on one: copying samples is no work to share.
+the same to the byte. There are never more threads than substreams, nor
+than cores: a 7.1.4 bed's seven substreams take seven on seven cores or
+more. A coupled pair counts for two mono substreams when they are shared
+out. LPCM stays on one thread: copying samples is no work to share.
 
 The loudness and true peak a mix presentation states are measured on a
 thread of their own, a unit or more behind, on the samples a decoder hands

@@ -571,20 +571,19 @@ mod tests {
         cases
     }
 
-    /// `input` coded into `dir` as `case` says, the measurement and the
+    /// `input` coded into `out` as `case` says, the measurement and the
     /// substreams — and with objects the writer — on threads of their own
-    /// when `threads`: how the encode ended, and what it wrote.
-    fn coded(
+    /// when `threads`: how the encode ended.
+    fn encoded(
         input: &Path,
-        dir: &Path,
+        out: PathBuf,
         case: &Case,
         threads: bool,
-    ) -> (std::result::Result<(), String>, Vec<u8>) {
-        let (name, codec, frame, voices, extension) = *case;
-        let out = dir.join(format!("{name}-{threads}.{extension}"));
+    ) -> std::result::Result<(), String> {
+        let (_, codec, frame, voices, _) = *case;
         let config = Config {
             input: input.to_path_buf(),
-            out: out.clone(),
+            out,
             frames: None,
             mono_prefix: None,
             codec,
@@ -599,7 +598,19 @@ mod tests {
             overlaying: overlay::Options::default(),
             mixing: Mixing::default(),
         };
-        let ended = run_on(config, threads).map_err(|e| e.to_string());
+        run_on(config, threads).map_err(|e| e.to_string())
+    }
+
+    /// [`encoded`] into `dir`: how the encode ended, and what it wrote.
+    fn coded(
+        input: &Path,
+        dir: &Path,
+        case: &Case,
+        threads: bool,
+    ) -> (std::result::Result<(), String>, Vec<u8>) {
+        let (name, .., extension) = *case;
+        let out = dir.join(format!("{name}-{threads}.{extension}"));
+        let ended = encoded(input, out.clone(), case, threads);
         (ended, std::fs::read(&out).unwrap())
     }
 
@@ -679,6 +690,47 @@ mod tests {
                 let (threaded, beside) = coded(&input, &dir, &case, true);
                 assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
                 assert!(alone == beside, "{name}, run {run}: the same units left");
+            }
+        }
+    }
+
+    /// A write that fails — the output a full device — stops the encode
+    /// where one thread stops, on threads as on one: at the first push that
+    /// fails, before the read that would fail in the fourth unit. Units of
+    /// 1024 FLAC or LPCM samples outgrow the output's buffer at the first
+    /// push; Opus packets fill it a few units in, so there either may come
+    /// first, but the same one on threads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_that_fails_stops_the_encode_where_one_thread_stops() {
+        const CUT: usize = 3 * 1024 + 300;
+        let dir = fixtures::scratch("iamf", "full");
+        let input = fixtures::master(&dir, SAMPLES);
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        let full = PathBuf::from("/dev/full");
+        for case in cases() {
+            let (name, codec, frame, ..) = case;
+            let inline = encoded(&input, full.clone(), &case, false);
+            assert!(inline.is_err(), "{name}");
+            if frame == 1024 && !matches!(codec, Codec::Opus { .. }) {
+                assert!(
+                    inline
+                        .as_ref()
+                        .is_err_and(|e| e.contains("No space left on device")),
+                    "{name}: the write first, as one thread meets it: {inline:?}"
+                );
+            }
+            for run in 0..8 {
+                let threaded = encoded(&input, full.clone(), &case, true);
+                assert_eq!(threaded, inline, "{name}, run {run}");
             }
         }
     }
