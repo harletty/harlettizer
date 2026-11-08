@@ -602,6 +602,33 @@ sixteen cores:
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.45 s | 0.41 s | +5 % |
 | 40 objects, 4 s | 40 → 15 | 0.23 s | 0.20 s | +4 % |
 
+A release build runs on any x86-64 CPU, so its vectors hold two `f64`.
+Where the CPU has AVX2, the normal equations' sums and the trade's search
+run a second build of the same code, made for AVX2, whose vectors hold
+four: the system four rows at a time where the first build takes two, so
+that as many vectors of sums are under way at once (`upper`); its
+right-hand side two runs at a time (`against`); the trade's eight
+candidates in two vectors where they were four (`Trellis::trade_plain`).
+Each sum is still its own, its products taken and added in the same order,
+and nothing fuses a product into a sum (the build is for AVX2, not FMA,
+and Rust fuses none by itself), so every entry and gain that is a number
+is the same to the bit, and every code the same. A NaN is a NaN in both
+builds, but where two meet in a sum, which one the sum keeps is the
+build's to choose. Only a target can bring one, from a master's gain that
+is NaN, infinite or loud enough to overflow, and no code depends on its
+bits: a NaN gain quantises to the level nought, and in the trade every
+candidate of its band has the same NaN for an error. The standard library
+asks the CPU once which build to run; every other CPU and architecture
+runs the first. The steep decision's solves were no faster built for AVX2
+— a system's steps come one after another, not in lanes — and are left as
+they were. On sixteen cores, with AVX2:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.49 s | 0.46 s | −6 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.84 s | 0.76 s | −9 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.52 s | 1.44 s | −7 % |
+
 Each slot through each bank is a 64-point DFT between two rotations, taken
 the radix-2 way: the input put in bit-reversed order, then six stages of 32
 butterflies, each pairing two places by a twiddle. Taken one at a time, each
