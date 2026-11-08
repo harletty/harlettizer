@@ -827,8 +827,12 @@ fn run_on(config: Config, threads: bool) -> Result<()> {
         //
         // Where no thread can be started (a task limit), the producer runs on
         // this one instead and hands each span to the writer as it folds it:
-        // the same spans folded, the same payloads and units written, and the
-        // same error first when one fails — only nothing is ahead.
+        // the same payloads and units written, and the same error first when
+        // one fails — only nothing is ahead. And the same spans folded, which
+        // an overlay's report records block by block: a writer that fails
+        // lets the producer fold one more span and drops it, because on its
+        // thread the producer has the second buffer and folds the span after
+        // the failed one into it before it finds the writer gone.
         Some(fold) => {
             let (spans, from_fold) = std::sync::mpsc::sync_channel::<Result<Produced>>(1);
             let (free, spare) = std::sync::mpsc::channel::<Vec<i32>>();
@@ -1209,17 +1213,10 @@ fn run_on(config: Config, threads: bool) -> Result<()> {
                     let _ = free.send(produced.samples);
                     Ok(true)
                 };
-                // The writer's end of the hand-over, which keeps what stopped
-                // it: the spans in the order they were folded, and the
-                // producer's own failure after the last of them.
+                // What stopped the writer, if anything did: the spans come in
+                // the order they were folded, and the producer's own failure
+                // after the last of them.
                 let mut failed = None;
-                let mut hand = |produced| match write(produced) {
-                    Ok(more) => more,
-                    Err(why) => {
-                        failed = Some(why);
-                        false
-                    }
-                };
                 // The producer on a thread of its own, one span ahead; or
                 // still here, where none could be started.
                 let left = crate::lane::beside(scope, threads, produce, move |mut produce| {
@@ -1228,14 +1225,37 @@ fn run_on(config: Config, threads: bool) -> Result<()> {
                 match left {
                     None => {
                         while let Ok(produced) = from_fold.recv() {
-                            if !hand(produced) {
-                                break;
+                            match write(produced) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(why) => {
+                                    failed = Some(why);
+                                    break;
+                                }
                             }
                         }
                     }
                     // No thread: each span is written as soon as it is
-                    // folded, and the producer stops when the writer does.
-                    Some(mut produce) => produce(&mut hand),
+                    // folded. Where the writer is done the producer stops at
+                    // once; where it failed, one span later. On its thread
+                    // the producer folds the span after the failed one into
+                    // its second buffer — handed back before the failed span
+                    // was taken, so there whether or not the writer still
+                    // is — unless the read it waits for fails first. What
+                    // it hands next, that span or what stopped its read or
+                    // fold, goes nowhere, as a send to a writer gone does.
+                    Some(mut produce) => produce(&mut |produced| {
+                        if failed.is_some() {
+                            return false;
+                        }
+                        match write(produced) {
+                            Ok(more) => more,
+                            Err(why) => {
+                                failed = Some(why);
+                                true
+                            }
+                        }
+                    }),
                 }
                 // Whichever end stopped first, the other is waiting on a
                 // channel: dropping both is what lets the producer finish
@@ -4705,44 +4725,56 @@ mod thread_tests {
         }
     }
 
+    /// What an encode left: how it ended, the stream, and an overlay's
+    /// report of every block it folded (empty without one).
+    type Left = (std::result::Result<(), String>, Vec<u8>, Vec<u8>);
+
     /// `input` encoded as `case` says to `out`, its spans folded on a thread
-    /// of their own when `threads`, on the writer's otherwise: how the encode
-    /// ended.
+    /// of their own when `threads`, on the writer's otherwise, and an
+    /// overlay reporting each block it folds to a file in `dir`: what it
+    /// left, the stream read back from `out` when `read_out`.
     fn encoded(
         input: &Path,
+        dir: &Path,
         out: &Path,
         case: &Case,
         threads: bool,
-    ) -> std::result::Result<(), String> {
-        run_on(config(input, out, case), threads).map_err(|e| e.to_string())
+        read_out: bool,
+    ) -> Left {
+        let report = dir.join(format!("{}.report", case.name));
+        let mut config = config(input, out, case);
+        if case.overlay.is_some() {
+            config.overlaying.report = Some(report.clone());
+        }
+        let ended = run_on(config, threads).map_err(|e| e.to_string());
+        let stream = if read_out {
+            std::fs::read(out).unwrap()
+        } else {
+            Vec::new()
+        };
+        (ended, stream, std::fs::read(&report).unwrap_or_default())
     }
 
-    /// [`encoded`] into `dir`: how it ended, and what it wrote. On threads
-    /// or not, to the same file, which an error may name.
-    fn coded(
-        input: &Path,
-        dir: &Path,
-        case: &Case,
-        threads: bool,
-    ) -> (std::result::Result<(), String>, Vec<u8>) {
+    /// [`encoded`] into `dir`. On threads or not, to the same files, which
+    /// an error may name.
+    fn coded(input: &Path, dir: &Path, case: &Case, threads: bool) -> Left {
         let out = dir.join(format!("{}.thd", case.name));
-        let ended = encoded(input, &out, case, threads);
-        (ended, std::fs::read(&out).unwrap())
+        encoded(input, dir, &out, case, threads, true)
     }
 
     /// A folding encode's spans folded on the writer's thread — which is
     /// where they are folded when no thread can be started — code to what
     /// they code folded on a thread of their own, a span ahead: the same
-    /// bytes, clustered, with presentations, stopped short and overlaid; and
-    /// an overlay outside its bounds refused the same way, once the same
-    /// stream is written.
+    /// bytes, clustered, with presentations, stopped short and overlaid,
+    /// and the same blocks reported; and an overlay outside its bounds
+    /// refused the same way, once the same stream is written.
     #[test]
     fn a_fold_on_the_writers_thread_codes_what_its_own_thread_codes() {
         let dir = crate::fixtures::scratch("encode", "fold");
-        let input = crate::fixtures::master_of(&dir, SAMPLES, OBJECTS);
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
         for case in cases() {
             let name = case.name;
-            let [(inline, alone), (threaded, beside)] =
+            let [(inline, alone, told), (threaded, beside, retold)] =
                 [false, true].map(|threads| coded(&input, &dir, &case, threads));
             if case.guarded {
                 let refused = inline.as_ref().expect_err("refused");
@@ -4753,20 +4785,22 @@ mod thread_tests {
             assert_eq!(threaded, inline, "{name}: said the same way");
             assert!(!alone.is_empty(), "{name}: a stream");
             assert!(alone == beside, "{name}: the same stream on one thread");
+            assert_eq!(told.is_empty(), case.overlay.is_none(), "{name}: a report");
+            assert!(told == retold, "{name}: the same blocks folded");
         }
     }
 
     /// Audio that ends before its header says, in the twenty-third span: the
     /// encode stops there with the same error on one thread as with the fold
     /// on its own, and leaves the same stream behind — what was folded
-    /// before the failed read written, and nothing after it. A fold ahead of
-    /// the writer that left more or less behind by how far it got is given
-    /// a few runs to show it.
+    /// before the failed read written, and nothing after it — and the same
+    /// blocks reported. A fold ahead of the writer that left more or less
+    /// behind by how far it got is given a few runs to show it.
     #[test]
     fn a_read_that_fails_stops_a_fold_where_one_thread_stops() {
         const CUT: usize = 22 * SPAN + 300;
         let dir = crate::fixtures::scratch("encode", "cut");
-        let input = crate::fixtures::master_of(&dir, SAMPLES, OBJECTS);
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
         let whole: Vec<Vec<u8>> = cases()
             .iter()
             .map(|case| coded(&input, &dir, case, false).1)
@@ -4788,7 +4822,7 @@ mod thread_tests {
             .filter(|(case, _)| case.frames.is_none())
         {
             let name = case.name;
-            let (inline, alone) = coded(&input, &dir, case, false);
+            let (inline, alone, told) = coded(&input, &dir, case, false);
             assert!(inline.is_err(), "{name}: the read fails");
             assert!(
                 !alone.is_empty(),
@@ -4796,28 +4830,37 @@ mod thread_tests {
             );
             assert!(alone.len() < whole.len(), "{name}: and no more");
             for run in 0..8 {
-                let (threaded, beside) = coded(&input, &dir, case, true);
+                let (threaded, beside, retold) = coded(&input, &dir, case, true);
                 assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
                 assert!(alone == beside, "{name}, run {run}: the same stream left");
+                assert!(told == retold, "{name}, run {run}: the same blocks folded");
             }
         }
     }
 
     /// A stream that cannot be written stops the encode with the same error
-    /// whether the fold is on its own thread or the writer's — which then
-    /// folds nothing more, rather than reading on to the end.
+    /// whether the fold is on its own thread or the writer's, and with the
+    /// same blocks folded: an overlay's report the same to the byte. The
+    /// span after the one that failed is in it, folded by the fold on its
+    /// thread into the buffer it holds before it finds the writer gone, and
+    /// by the fold on the writer's because it goes on one span for that;
+    /// nothing after it is.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_write_that_fails_stops_a_fold_where_one_thread_stops() {
+    fn a_write_that_fails_stops_a_fold_where_its_thread_stops() {
         let dir = crate::fixtures::scratch("encode", "full");
-        let input = crate::fixtures::master_of(&dir, SAMPLES, OBJECTS);
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
         let full = Path::new("/dev/full");
         for case in cases() {
             let name = case.name;
-            let inline = encoded(&input, full, &case, false);
+            let (inline, _, told) = encoded(&input, &dir, full, &case, false, false);
             assert!(inline.is_err(), "{name}: the write fails");
-            let threaded = encoded(&input, full, &case, true);
-            assert_eq!(threaded, inline, "{name}: said the same way");
+            assert_eq!(told.is_empty(), case.overlay.is_none(), "{name}: a report");
+            for run in 0..4 {
+                let (threaded, _, retold) = encoded(&input, &dir, full, &case, true, false);
+                assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
+                assert!(told == retold, "{name}, run {run}: the same blocks folded");
+            }
         }
     }
 }
