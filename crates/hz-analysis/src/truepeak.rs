@@ -35,23 +35,26 @@ const TAPS_PER_PHASE: usize = 12;
 /// leaves half its peak to the next.
 pub const LATENCY: usize = TAPS_PER_PHASE / 2;
 
+/// Samples of a channel a sample's reconstruction reads from before it.
+const KEEP: usize = TAPS_PER_PHASE - 1;
+
+/// Samples of a channel reconstructed at once, a lane each.
+const LANES: usize = 8;
+
 /// Tracks the true peak of an interleaved signal, per channel.
 #[derive(Debug, Clone)]
 pub struct TruePeak {
     /// Phase-major and **reversed** within a phase, so that a phase's taps
-    /// line up with the history below in the order it holds them.
+    /// line up with a window of the signal oldest first.
     taps: [f64; PHASES * TAPS_PER_PHASE],
-    /// Per channel, the last `TAPS_PER_PHASE` samples, **twice**.
-    ///
-    /// Every sample is written at `at` and again at `at + TAPS_PER_PHASE`, so
-    /// the window of the last twelve is always one contiguous slice however
-    /// far the ring has wrapped. The alternative is a modulo per tap per phase
-    /// per channel per sample — forty-eight of them a sample — and this is the
-    /// measurement that runs over every sample of a programme.
-    history: Vec<f64>,
+    /// Per channel, its last [`KEEP`] samples, oldest first: all a sample
+    /// still to come needs of what came before it. Noughts before the first.
+    tails: Vec<f64>,
     channels: usize,
-    at: usize,
     peaks: Vec<f64>,
+    /// One channel of a push, after its tail: kept, so that a push allocates
+    /// nothing once one as long has been made.
+    line: Vec<f64>,
 }
 
 impl TruePeak {
@@ -60,49 +63,52 @@ impl TruePeak {
         let mut taps = [0.0f64; PHASES * TAPS_PER_PHASE];
         for phase in 0..PHASES {
             for tap in 0..TAPS_PER_PHASE {
-                // Reversed: the history holds its window oldest first and the
-                // taps are stated newest first.
+                // Reversed: a window is oldest first and the taps are stated
+                // newest first.
                 taps[phase * TAPS_PER_PHASE + TAPS_PER_PHASE - 1 - tap] =
                     designed[phase * TAPS_PER_PHASE + tap];
             }
         }
         Self {
             taps,
-            history: vec![0.0; channels * 2 * TAPS_PER_PHASE],
+            tails: vec![0.0; channels * KEEP],
             channels,
-            at: 0,
             peaks: vec![0.0; channels],
+            line: Vec::new(),
         }
     }
 
-    /// Feed interleaved samples, normalised so full scale is ±1.
+    /// Feed interleaved samples, normalised so full scale is ±1. A frame cut
+    /// short at the end is not measured.
+    ///
+    /// Each point is the sum, over the twelve samples up to the one it
+    /// follows, oldest first, of sample times tap, the products added in that
+    /// order to what [`Iterator::sum`] starts from. A channel's samples are
+    /// reconstructed [`LANES`] at a time, each its own sum in that order, so
+    /// every point is what reconstructing them one at a time makes of it, to
+    /// the bit; and the largest magnitude of them is the largest whichever
+    /// order they are compared in. NaN is never one, as before.
     pub fn push(&mut self, interleaved: &[f32]) {
         if self.channels == 0 {
             return;
         }
-        for frame in interleaved.chunks_exact(self.channels) {
-            for (channel, &sample) in frame.iter().enumerate() {
-                let base = channel * 2 * TAPS_PER_PHASE;
-                let value = f64::from(sample);
-                self.history[base + self.at] = value;
-                self.history[base + self.at + TAPS_PER_PHASE] = value;
+        let frames = interleaved.len() / self.channels;
+        if frames == 0 {
+            return;
+        }
+        self.line.resize(KEEP + frames, 0.0);
+        let line = &mut self.line[..KEEP + frames];
+        let tails = self.tails.chunks_exact_mut(KEEP);
+        for (channel, (tail, peak)) in tails.zip(&mut self.peaks).enumerate() {
+            line[..KEEP].copy_from_slice(tail);
+            for (x, frame) in line[KEEP..]
+                .iter_mut()
+                .zip(interleaved.chunks_exact(self.channels))
+            {
+                *x = f64::from(frame[channel]);
             }
-            self.at = (self.at + 1) % TAPS_PER_PHASE;
-
-            for channel in 0..self.channels {
-                let base = channel * 2 * TAPS_PER_PHASE;
-                // `at` has advanced past the newest sample, so the twelve most
-                // recent are `at` onwards, oldest first — contiguous because
-                // every sample is in the buffer twice.
-                let window = &self.history[base + self.at..base + self.at + TAPS_PER_PHASE];
-                for phase in self.taps.chunks_exact(TAPS_PER_PHASE) {
-                    let sum: f64 = window.iter().zip(phase).map(|(a, b)| a * b).sum();
-                    let magnitude = sum.abs();
-                    if magnitude > self.peaks[channel] {
-                        self.peaks[channel] = magnitude;
-                    }
-                }
-            }
+            *peak = loudest(&self.taps, line, *peak);
+            tail.copy_from_slice(&line[frames..]);
         }
     }
 
@@ -135,6 +141,50 @@ impl TruePeak {
     pub fn channel_peak(&self, channel: usize) -> f64 {
         self.peaks.get(channel).copied().unwrap_or(0.0)
     }
+}
+
+/// The largest of `peak` and the magnitude of every phase's point after
+/// each sample of `line` but its first [`KEEP`], which are the ones before.
+fn loudest(taps: &[f64; PHASES * TAPS_PER_PHASE], line: &[f64], peak: f64) -> f64 {
+    let points = line.len() - KEEP;
+    let nought: f64 = std::iter::empty::<f64>().sum();
+    let whole = points - points % LANES;
+    // Each lane's largest, the peak so far among them.
+    let mut lanes = [peak; LANES];
+    for n in (0..whole).step_by(LANES) {
+        for phase in taps.chunks_exact(TAPS_PER_PHASE) {
+            let mut sums = [nought; LANES];
+            for (k, &tap) in phase.iter().enumerate() {
+                let samples: &[f64; LANES] = line[n + k..n + k + LANES]
+                    .try_into()
+                    .expect("a lane a sample");
+                for (sum, &sample) in sums.iter_mut().zip(samples) {
+                    *sum += sample * tap;
+                }
+            }
+            for (largest, sum) in lanes.iter_mut().zip(sums) {
+                let magnitude = sum.abs();
+                if magnitude > *largest {
+                    *largest = magnitude;
+                }
+            }
+        }
+    }
+    let mut peak = lanes
+        .into_iter()
+        .fold(peak, |peak, lane| if lane > peak { lane } else { peak });
+    // The samples a whole set of lanes leaves, one at a time.
+    for n in whole..points {
+        let window = &line[n..n + TAPS_PER_PHASE];
+        for phase in taps.chunks_exact(TAPS_PER_PHASE) {
+            let sum: f64 = window.iter().zip(phase).map(|(a, b)| a * b).sum();
+            let magnitude = sum.abs();
+            if magnitude > peak {
+                peak = magnitude;
+            }
+        }
+    }
+    peak
 }
 
 /// A 4-phase interpolating low-pass: a sinc at the original Nyquist,
@@ -407,6 +457,155 @@ mod window_tests {
                 "channel {channel}: {} against {peak}",
                 fast.channel_peak(channel),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod before_tests {
+    use super::*;
+
+    /// The meter as it was before its samples were reconstructed a set of
+    /// lanes at a time, kept word for word: one sample after another, each
+    /// channel's last twelve in a doubled ring.
+    struct Before {
+        taps: [f64; PHASES * TAPS_PER_PHASE],
+        history: Vec<f64>,
+        channels: usize,
+        at: usize,
+        peaks: Vec<f64>,
+    }
+
+    impl Before {
+        fn new(channels: usize) -> Self {
+            let designed = design();
+            let mut taps = [0.0f64; PHASES * TAPS_PER_PHASE];
+            for phase in 0..PHASES {
+                for tap in 0..TAPS_PER_PHASE {
+                    taps[phase * TAPS_PER_PHASE + TAPS_PER_PHASE - 1 - tap] =
+                        designed[phase * TAPS_PER_PHASE + tap];
+                }
+            }
+            Self {
+                taps,
+                history: vec![0.0; channels * 2 * TAPS_PER_PHASE],
+                channels,
+                at: 0,
+                peaks: vec![0.0; channels],
+            }
+        }
+
+        fn push(&mut self, interleaved: &[f32]) {
+            if self.channels == 0 {
+                return;
+            }
+            for frame in interleaved.chunks_exact(self.channels) {
+                for (channel, &sample) in frame.iter().enumerate() {
+                    let base = channel * 2 * TAPS_PER_PHASE;
+                    let value = f64::from(sample);
+                    self.history[base + self.at] = value;
+                    self.history[base + self.at + TAPS_PER_PHASE] = value;
+                }
+                self.at = (self.at + 1) % TAPS_PER_PHASE;
+
+                for channel in 0..self.channels {
+                    let base = channel * 2 * TAPS_PER_PHASE;
+                    let window = &self.history[base + self.at..base + self.at + TAPS_PER_PHASE];
+                    for phase in self.taps.chunks_exact(TAPS_PER_PHASE) {
+                        let sum: f64 = window.iter().zip(phase).map(|(a, b)| a * b).sum();
+                        let magnitude = sum.abs();
+                        if magnitude > self.peaks[channel] {
+                            self.peaks[channel] = magnitude;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn take(&mut self) -> f64 {
+            let peak = self.peaks.iter().copied().fold(0.0, f64::max);
+            self.peaks.fill(0.0);
+            peak
+        }
+    }
+
+    /// A sample of noise, at full scale or far under it, a square or a
+    /// tone; and with `odd`, now and then one of the values a meter has to
+    /// get through: noughts of either sign, subnormals, the largest and
+    /// infinite, NaN.
+    fn sample(state: &mut u64, n: usize, odd: bool) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        let noise = ((*state >> 40) as i32 as f32) / 8_388_608.0 - 1.0;
+        let pick = if odd { (*state >> 20) % 400 } else { 400 };
+        match pick {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f32::from_bits(1 + (*state as u32 & 0x7f_ffff)),
+            3 => -f32::MIN_POSITIVE / 3.0,
+            4 => f32::MAX,
+            5 => -f32::MAX,
+            6 => f32::INFINITY,
+            7 => f32::NEG_INFINITY,
+            8 => f32::NAN,
+            _ => match n / 997 % 4 {
+                0 => noise,
+                1 => noise * 1e-30,
+                2 => noise.signum(),
+                _ => (n as f32 * 0.37).sin() * 0.999,
+            },
+        }
+    }
+
+    /// Reconstructed a set of lanes at a time, the meter reads what it read
+    /// one sample after another, to the bit: every channel's peak after
+    /// every push, and every take — one channel to fourteen, pushes of no
+    /// frame, one, part of a frame, a set of lanes and some, thousands; a
+    /// take now and then; and samples that are noise, quiet, square or a
+    /// tone, and on every third channel count now and then a value no
+    /// signal has. (Once a channel has met an infinity its peak stays there,
+    /// so the other counts carry the comparison.)
+    #[test]
+    fn the_meter_reads_what_it_read_one_sample_after_another_to_the_bit() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for channels in 1..=14 {
+            let mut meter = TruePeak::new(channels);
+            let mut before = Before::new(channels);
+            let mut n = 0;
+            for push in 0..60 {
+                let frames = match push % 7 {
+                    0 => 0,
+                    1 => 1,
+                    2 => LANES - 1,
+                    3 => LANES + 3,
+                    4 => KEEP - 2,
+                    5 => 4096,
+                    _ => (state >> 33) as usize % 2000,
+                };
+                // Now and then a frame cut short, which neither measures.
+                let cut = usize::from(push % 5 == 0 && channels > 1);
+                let samples: Vec<f32> = (0..frames * channels + cut)
+                    .map(|i| sample(&mut state, n + i / channels, channels % 3 == 0))
+                    .collect();
+                n += frames;
+                meter.push(&samples);
+                before.push(&samples);
+                for channel in 0..channels {
+                    assert_eq!(
+                        meter.channel_peak(channel).to_bits(),
+                        before.peaks[channel].to_bits(),
+                        "{channels} channels, push {push}, channel {channel}"
+                    );
+                }
+                if push % 9 == 4 {
+                    assert_eq!(
+                        meter.take().to_bits(),
+                        before.take().to_bits(),
+                        "{channels} channels, take after push {push}"
+                    );
+                }
+            }
         }
     }
 }
