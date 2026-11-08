@@ -141,6 +141,23 @@ const LANES: usize = 8;
 /// basis: within a run, so that the rows start in the same one.
 const TILE: usize = 2;
 const _: () = assert!(LANES.is_multiple_of(TILE) && BANDS.is_multiple_of(TILE));
+/// [`TILE`] where the CPU has AVX2. A vector then holds four sums, so a
+/// row's run is two vectors where it was four, and four rows keep as many
+/// vectors of sums going at once as two did.
+const WIDE_TILE: usize = 4;
+const _: () = assert!(LANES.is_multiple_of(WIDE_TILE) && BANDS.is_multiple_of(WIDE_TILE));
+
+/// Whether the CPU has AVX2, for the kernels built a second time for it.
+/// The standard library asks the CPU once and keeps the answer. On any
+/// other architecture, never.
+#[cfg(target_arch = "x86_64")]
+fn avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn avx2() -> bool {
+    false
+}
 
 fn band_of(subband: usize) -> usize {
     BAND_START
@@ -832,21 +849,19 @@ fn synthesis_system(
 ) {
     let m = n * BANDS;
     let rows = window(weighted, from, m);
-    // The upper triangle a few rows at a time, a run of their entries at
-    // once from the run the diagonal is in; then the lower from it.
-    chunks_mut!(gram[..m * m], TILE * m)
+    // The upper triangle a few rows at a time; then the lower from it.
+    let wide_kernels = avx2();
+    let tile = if wide_kernels { WIDE_TILE } else { TILE };
+    chunks_mut!(gram[..m * m], tile * m)
         .enumerate()
-        .for_each(|(tile, out)| {
-            let i = tile * TILE;
-            for run in (i / LANES * LANES..m).step_by(LANES) {
-                let sums = sums(rows, wide(m), run, |_, sample| {
-                    std::array::from_fn::<_, TILE, _>(|r| sample[i + r])
-                });
-                for (r, (row, sums)) in out.chunks_exact_mut(m).zip(&sums).enumerate() {
-                    let (first, end) = (run.max(i + r), (run + LANES).min(m));
-                    row[first..end].copy_from_slice(&sums[first - run..end - run]);
-                }
+        .for_each(|(k, out)| {
+            #[cfg(target_arch = "x86_64")]
+            if wide_kernels {
+                // SAFETY: the CPU has AVX2 (`avx2`), the one feature
+                // `upper_avx2` is built for.
+                return unsafe { upper_avx2(rows, m, k * WIDE_TILE, out) };
             }
+            upper::<TILE>(rows, m, k * TILE, out)
         });
     for i in 0..m {
         for j in i + 1..m {
@@ -1566,7 +1581,30 @@ impl Trellis {
     /// cost is needed only on the path the codes take, and is found there
     /// again, by the same sums and comparisons in the same order: the first
     /// that costs the least.
+    ///
+    /// Where the CPU has AVX2, [`Self::trade_plain_in_lanes`] built for it:
+    /// a vector holds four lanes where the baseline build's hold two, each
+    /// lane the same sums and comparisons in the same order.
     fn trade_plain(&self, prices: &Prices) -> [u16; BANDS] {
+        #[cfg(target_arch = "x86_64")]
+        if avx2() {
+            // SAFETY: the CPU has AVX2 (`avx2`), the one feature
+            // `trade_plain_avx2` is built for.
+            return unsafe { self.trade_plain_avx2(prices) };
+        }
+        self.trade_plain_in_lanes(prices)
+    }
+
+    /// [`Self::trade_plain_in_lanes`] built for AVX2, and not FMA.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    fn trade_plain_avx2(&self, prices: &Prices) -> [u16; BANDS] {
+        self.trade_plain_in_lanes(prices)
+    }
+
+    /// [`Self::trade_plain`] itself, inlined into each build of it.
+    #[inline(always)]
+    fn trade_plain_in_lanes(&self, prices: &Prices) -> [u16; BANDS] {
         let mut cost = [[0f64; MOST]; BANDS];
         let first = self.counts[0];
         for ((cost, &error), &level) in cost[0][..first]
@@ -1682,34 +1720,99 @@ fn window(weighted: &[f64], from: usize, m: usize) -> &[f64] {
     &weighted[from * wide(m)..]
 }
 
-/// The right-hand side of the fit by synthesis on the window from `from`
-/// samples into it: each of the basis's `m` signals against `target`, into
-/// `rhs`.
-fn against(weighted: &[f64], from: usize, m: usize, target: &[f64], rhs: &mut [f64]) {
-    let (rows, target) = (window(weighted, from, m), &target[from..]);
-    for run in (0..m).step_by(LANES) {
-        let [sums] = sums(rows, wide(m), run, |t, _| [target[t]]);
-        let end = (run + LANES).min(m);
-        rhs[run..end].copy_from_slice(&sums[..end - run]);
+/// The entries of rows `i` to `i + T` of the fit's normal equations on and
+/// above the diagonal, into `out`, those rows of it: a run of each row's
+/// entries at once from the run the diagonal is in. Each entry is the sum
+/// [`sums`] takes, however many rows are taken beside it.
+#[inline(always)]
+fn upper<const T: usize>(rows: &[f64], m: usize, i: usize, out: &mut [f64]) {
+    for run in (i / LANES * LANES..m).step_by(LANES) {
+        let sums = sums::<T, LANES>(rows, wide(m), run, |_, sample| {
+            std::array::from_fn(|r| sample[i + r])
+        });
+        for (r, (row, sums)) in out.chunks_exact_mut(m).zip(&sums).enumerate() {
+            let (first, end) = (run.max(i + r), (run + LANES).min(m));
+            row[first..end].copy_from_slice(&sums[first - run..end - run]);
+        }
     }
 }
 
-/// The [`LANES`] columns of `rows` from `run`, each times each of the `R`
-/// values `by` takes of its row — from the row's sample and the row —
-/// summed down the rows: each sum its own, its products taken and added in
-/// the order [`dot`] takes them, and from where it starts, so that each is
-/// the dot of the two to the bit. Side by side, the sums do not wait on each
-/// other, and the `R` share each run they read.
+/// [`upper`] built for AVX2, [`WIDE_TILE`] rows at a time — and not FMA,
+/// so that nothing could fuse a product into a sum; Rust fuses none by
+/// itself either.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn upper_avx2(rows: &[f64], m: usize, i: usize, out: &mut [f64]) {
+    upper::<WIDE_TILE>(rows, m, i, out)
+}
+
+/// The right-hand side of the fit by synthesis on the window from `from`
+/// samples into it: each of the basis's `m` signals against `target`, into
+/// `rhs`. Where the CPU has AVX2, two runs at once.
+fn against(weighted: &[f64], from: usize, m: usize, target: &[f64], rhs: &mut [f64]) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        // SAFETY: the CPU has AVX2 (`avx2`), the one feature `against_avx2`
+        // is built for.
+        return unsafe { against_avx2(weighted, from, m, target, rhs) };
+    }
+    against_in_runs::<LANES>(weighted, from, m, target, rhs)
+}
+
+/// [`against`] built for AVX2, and not FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn against_avx2(weighted: &[f64], from: usize, m: usize, target: &[f64], rhs: &mut [f64]) {
+    against_in_runs::<{ 2 * LANES }>(weighted, from, m, target, rhs)
+}
+
+/// [`against`], `C` entries at once where `C` are left in a row of the
+/// basis, else [`LANES`]. Each entry is the sum [`sums`] takes, however many
+/// are taken beside it.
 #[inline(always)]
-fn sums<const R: usize>(
+fn against_in_runs<const C: usize>(
+    weighted: &[f64],
+    from: usize,
+    m: usize,
+    target: &[f64],
+    rhs: &mut [f64],
+) {
+    let (rows, target, wide) = (window(weighted, from, m), &target[from..], wide(m));
+    let by = |t: usize, _: &[f64]| [target[t]];
+    let mut store = |run: usize, sums: &[f64]| {
+        let end = (run + sums.len()).min(m);
+        rhs[run..end].copy_from_slice(&sums[..end - run]);
+    };
+    let mut run = 0;
+    while run < m {
+        if run + C <= wide {
+            let [sums] = sums::<1, C>(rows, wide, run, by);
+            store(run, &sums);
+            run += C;
+        } else {
+            let [sums] = sums::<1, LANES>(rows, wide, run, by);
+            store(run, &sums);
+            run += LANES;
+        }
+    }
+}
+
+/// The `C` columns of `rows` from `run`, each times each of the `R` values
+/// `by` takes of its row — from the row's sample and the row — summed down
+/// the rows: each sum its own, its products taken and added in the order
+/// [`dot`] takes them, and from where it starts, so that each is the dot of
+/// the two to the bit. Side by side, the sums do not wait on each other, and
+/// the `R` share each run they read.
+#[inline(always)]
+fn sums<const R: usize, const C: usize>(
     rows: &[f64],
     wide: usize,
     run: usize,
     by: impl Fn(usize, &[f64]) -> [f64; R],
-) -> [[f64; LANES]; R] {
-    let mut sums = [[std::iter::empty::<f64>().sum::<f64>(); LANES]; R];
+) -> [[f64; C]; R] {
+    let mut sums = [[std::iter::empty::<f64>().sum::<f64>(); C]; R];
     for (t, row) in rows.chunks_exact(wide).enumerate() {
-        let column: &[f64; LANES] = row[run..run + LANES].try_into().expect("whole runs");
+        let column: &[f64; C] = row[run..run + C].try_into().expect("whole runs");
         for (sums, a) in sums.iter_mut().zip(by(t, row)) {
             for (sum, &b) in sums.iter_mut().zip(column) {
                 *sum += a * b;
@@ -2829,6 +2932,77 @@ mod tests {
         );
     }
 
+    /// Where the CPU has AVX2, the plain search built for it takes the codes
+    /// the baseline build takes: gains about a level, against the ends of
+    /// the quantiser's range and on half steps, so that costs tie; weights
+    /// of nought, subnormal, ordinary and infinite; λ from nought and the
+    /// least subnormal to past where every code is nought, and infinite.
+    /// Every case is plain, the search's one. A CPU without AVX2 has
+    /// nothing to compare.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_build_trades_as_the_baseline_build_does() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("no AVX2 on this CPU: nothing to compare");
+            return;
+        }
+        let mut seed = 5u32;
+        let step = f64::from(STEP);
+        let mut trellis = Trellis::default();
+        let mut searched = 0;
+        for case in 0..1500 {
+            let centre = (f64::from(noise(&mut seed)) * 40.0).round();
+            let wanted: [f64; BANDS] = std::array::from_fn(|band| {
+                let own = match case % 4 {
+                    0 | 1 => centre + (f64::from(noise(&mut seed)) * 30.0).round(),
+                    2 => {
+                        (90.0 + f64::from(noise(&mut seed)) * 24.0).round() * [1.0, -1.0][band % 2]
+                    }
+                    _ => centre,
+                };
+                let off = match (case + band) % 3 {
+                    0 => 0.5,
+                    1 => 0.0,
+                    _ => f64::from(noise(&mut seed)),
+                };
+                (own + off) * step
+            });
+            let weight: [f64; BANDS] = std::array::from_fn(|band| match (case / 4 + band) % 9 {
+                0 => 0.0,
+                1 => f64::from_bits(1 + (seed >> 4) as u64),
+                2 => f64::from(noise(&mut seed)).abs() * 1e-9,
+                3 if case % 5 == 0 => f64::INFINITY,
+                _ => f64::from(noise(&mut seed)) + 0.6,
+            });
+            trellis.lay(&wanted, &weight);
+            for lambda in [
+                0.0,
+                5e-324,
+                1e-9,
+                1e-4,
+                3e-3,
+                0.02,
+                0.1,
+                0.7,
+                4.0,
+                1e6,
+                f64::INFINITY,
+            ] {
+                let lambda = lambda * (1.0 + f64::from(noise(&mut seed)).abs() * 0.01);
+                let prices = Prices::new(lambda);
+                if !(trellis.plain && prices.plain) {
+                    continue;
+                }
+                let baseline = trellis.trade_plain_in_lanes(&prices);
+                // SAFETY: the CPU has AVX2, asked above.
+                let wide = unsafe { trellis.trade_plain_avx2(&prices) };
+                assert_eq!(wide, baseline, "case {case}, λ {lambda}");
+                searched += 1;
+            }
+        }
+        assert!(searched > 12_000, "{searched} searched");
+    }
+
     /// The trellis trades as the search before it did, code for code: λ
     /// from nought to past where every code is nought, gains past the
     /// quantiser's range either way, bands that weigh nothing — where every
@@ -3031,6 +3205,100 @@ mod tests {
                 assert_eq!(bits(&rhs), bits(&rhs_by_dots), "{n} channels from {from}");
             }
         }
+    }
+
+    /// Values of the basis or a target, by `kind`: noise in every bit of
+    /// the mantissa, so that its products round as the estimator's do, and
+    /// in some kinds now and then one that no signal the estimator meets
+    /// has — a nought of either sign, a subnormal, one whose products
+    /// overflow, an infinity of either sign, a NaN of either sign and of any
+    /// payload — or all of them noughts below nought.
+    #[cfg(target_arch = "x86_64")]
+    fn odd(seed: &mut u32, kind: usize) -> f64 {
+        let x = std::f64::consts::PI * f64::from(noise(seed));
+        let now = *seed >> 8 & 0x3f == 0;
+        let bits = u64::from(*seed) << 32 | u64::from(seed.rotate_left(16));
+        match kind % 8 {
+            1 if now => [-0.0, 0.0][(*seed >> 3) as usize % 2],
+            2 if now => f64::from_bits(bits & 0x000f_ffff_ffff_ffff | 1) * x.signum(),
+            3 => -0.0,
+            4 if now => 1e300 * x,
+            5 if now => [f64::INFINITY, f64::NEG_INFINITY][(*seed >> 3) as usize % 2],
+            6 if now => f64::from_bits(0x7ff8_0000_0000_0000 | bits & 0x8007_ffff_ffff_ffff),
+            _ => x,
+        }
+    }
+
+    /// Where the CPU has AVX2, the fit's sums are the same from the builds
+    /// for it as from the baseline build, to the bit: the system's upper
+    /// triangle, [`WIDE_TILE`] rows at a time against [`TILE`], and the
+    /// right-hand side two runs at a time against one, on every number of
+    /// channels and a window from any sample, on noise and on signals that
+    /// carry values no signal has. Where those make a NaN, both builds make
+    /// one; which NaN, when two meet in a sum, Rust leaves to the build, so
+    /// a NaN is compared as a NaN. The estimator never meets one — its basis
+    /// and its targets are integer samples, filtered. A CPU without AVX2
+    /// has nothing to compare.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_builds_take_the_sums_the_baseline_build_takes() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("no AVX2 on this CPU: nothing to compare");
+            return;
+        }
+        let same = |a: &[f64], b: &[f64]| {
+            a.iter()
+                .zip(b)
+                .all(|(a, b)| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan())
+        };
+        let mut seed = 77u32;
+        let (mut finite, mut odd_finite, mut nan) = (0, 0, 0);
+        for n in 1..=MAX_CHANNELS {
+            let m = n * BANDS;
+            for (case, from) in [0, 1, 7, 700, FRAME - 1, FRAME].into_iter().enumerate() {
+                // Noise alone, then each signal of a kind by its column; the
+                // padding past `m` in each row noise too, which neither
+                // build reads.
+                let kind = |c: usize| if case % 2 == 0 { 0 } else { c + case };
+                let weighted: Vec<f64> = (0..FRAME * wide(m))
+                    .map(|i| odd(&mut seed, kind(i % wide(m))))
+                    .collect();
+                let target: Vec<f64> = (0..FRAME).map(|_| odd(&mut seed, kind(m))).collect();
+                let rows = window(&weighted, from, m);
+                // Whatever the tiles leave below the diagonal, the same.
+                let (mut baseline, mut wide_gram) = (vec![7.0; m * m], vec![7.0; m * m]);
+                for (k, out) in baseline.chunks_mut(TILE * m).enumerate() {
+                    upper::<TILE>(rows, m, k * TILE, out);
+                }
+                for (k, out) in wide_gram.chunks_mut(WIDE_TILE * m).enumerate() {
+                    // SAFETY: the CPU has AVX2, asked above.
+                    unsafe { upper_avx2(rows, m, k * WIDE_TILE, out) };
+                }
+                assert!(
+                    same(&wide_gram, &baseline),
+                    "{n} channels from {from}, case {case}: the system"
+                );
+                let (mut baseline_rhs, mut wide_rhs) = (vec![7.0; m], vec![7.0; m]);
+                against_in_runs::<LANES>(&weighted, from, m, &target, &mut baseline_rhs);
+                // SAFETY: the CPU has AVX2, asked above.
+                unsafe { against_avx2(&weighted, from, m, &target, &mut wide_rhs) };
+                assert!(
+                    same(&wide_rhs, &baseline_rhs),
+                    "{n} channels from {from}, case {case}: the right-hand side"
+                );
+                for &x in baseline.iter().chain(&baseline_rhs) {
+                    match (x.is_finite(), case % 2) {
+                        (true, 0) => finite += 1,
+                        (true, _) => odd_finite += 1,
+                        _ => nan += usize::from(x.is_nan()),
+                    }
+                }
+            }
+        }
+        assert!(
+            finite > 10_000 && odd_finite > 4_000 && nan > 1_000,
+            "{finite} sums of noise, {odd_finite} finite and {nan} NaN of odd values"
+        );
     }
 
     /// The small solve as it was: the right-hand side eliminated beside the

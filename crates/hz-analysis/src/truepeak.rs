@@ -148,19 +148,47 @@ impl TruePeak {
 
 /// The largest of `peak` and the magnitude of every phase's point after
 /// each sample of `line` but its first [`KEEP`], which are the ones before.
+///
+/// Where the CPU has AVX2, [`loudest_in_lanes`] built for it: a vector
+/// holds four lanes where the baseline build's hold two. Each lane is the
+/// same products added in the same order, so every point is the same to the
+/// bit, and so is the loudest. Without AVX2, and on every other
+/// architecture, the baseline build.
 fn loudest(taps: &[f64; PHASES * TAPS_PER_PHASE], line: &[f64], peak: f64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2, the one feature `loudest_avx2` is built
+        // for. The standard library asks the CPU once and keeps the answer.
+        return unsafe { loudest_avx2(taps, line, peak) };
+    }
+    loudest_in_lanes(taps, line, peak)
+}
+
+/// [`loudest_in_lanes`] built for AVX2 — and not FMA, so that nothing could
+/// fuse a product into a sum; Rust fuses none by itself either.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn loudest_avx2(taps: &[f64; PHASES * TAPS_PER_PHASE], line: &[f64], peak: f64) -> f64 {
+    loudest_in_lanes(taps, line, peak)
+}
+
+/// [`loudest`] itself, inlined into each build of it.
+#[inline(always)]
+fn loudest_in_lanes(taps: &[f64; PHASES * TAPS_PER_PHASE], line: &[f64], peak: f64) -> f64 {
     let points = line.len() - KEEP;
     let nought: f64 = std::iter::empty::<f64>().sum();
     let whole = points - points % LANES;
     // Each lane's largest, the peak so far among them.
     let mut lanes = [peak; LANES];
     for n in (0..whole).step_by(LANES) {
+        // All that the set of lanes reads, so that each tap's samples are
+        // known to be in it.
+        let window = &line[n..n + LANES + KEEP];
         for phase in taps.chunks_exact(TAPS_PER_PHASE) {
             let mut sums = [nought; LANES];
             for (k, &tap) in phase.iter().enumerate() {
-                let samples: &[f64; LANES] = line[n + k..n + k + LANES]
-                    .try_into()
-                    .expect("a lane a sample");
+                let samples: &[f64; LANES] =
+                    window[k..k + LANES].try_into().expect("a lane a sample");
                 for (sum, &sample) in sums.iter_mut().zip(samples) {
                     *sum += sample * tap;
                 }
@@ -610,6 +638,43 @@ mod before_tests {
                 }
             }
         }
+    }
+
+    /// Where the CPU has AVX2, the loudest point the build for it finds in
+    /// a line is the one the baseline build finds, to the bit: lines of no
+    /// point to five sets of lanes and some, from a peak of nought or above,
+    /// on samples that are noise, quiet, square or a tone, and on one line
+    /// in three now and then a value no signal has. A CPU without AVX2 has
+    /// nothing to compare.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_build_finds_the_loudest_the_baseline_finds_to_the_bit() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("no AVX2 on this CPU: nothing to compare");
+            return;
+        }
+        let taps = TruePeak::new(1).taps;
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        let (mut n, mut lines) = (0, 0);
+        for case in 0..6000 {
+            let points = case % (5 * LANES + 4);
+            let odd = case % 3 == 0;
+            let line: Vec<f64> = (0..KEEP + points)
+                .map(|i| f64::from(sample(&mut state, n + i, odd)))
+                .collect();
+            n += points;
+            let peak = [0.0, 0.3, 1e-300][case % 3];
+            let baseline = loudest_in_lanes(&taps, &line, peak);
+            // SAFETY: the CPU has AVX2, asked above.
+            let wide = unsafe { loudest_avx2(&taps, &line, peak) };
+            assert_eq!(
+                wide.to_bits(),
+                baseline.to_bits(),
+                "case {case}: {points} points from {peak}"
+            );
+            lines += usize::from(baseline > peak && baseline.is_finite());
+        }
+        assert!(lines > 4000, "{lines} lines whose loudest was a point");
     }
 }
 
