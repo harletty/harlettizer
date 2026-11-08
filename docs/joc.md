@@ -602,6 +602,31 @@ sixteen cores:
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.45 s | 0.41 s | +5 % |
 | 40 objects, 4 s | 40 → 15 | 0.23 s | 0.20 s | +4 % |
 
+Each slot through each bank is a 64-point DFT between two rotations, taken
+the radix-2 way: the input put in bit-reversed order, then six stages of 32
+butterflies, each pairing two places by a twiddle. Taken one at a time, each
+butterfly waited on its loads and their bounds checks, and the banks' DFTs
+were the largest single item of a frame's work. Read as sixteen rows of
+four, an input's lane in its row is the top two bits of its bit-reversed
+place, so each butterfly of the first four stages pairs two rows, four
+places at once by one twiddle. Then four rows at a time are turned, so that
+each butterfly of the last two stages pairs two of them by four consecutive
+twiddles, and the output comes out in order (`qmf::dft`). Every butterfly is
+still the plain DFT's, its products, sums and twiddle the same, and every
+place goes through its stages in the same order, so every band is the same
+to the bit. The tests keep the plain DFT and both banks as they were, and
+hold these to them on signed zeros, infinities and NaN too. The banks hand
+the DFT their input in order, rather than scattered into bit-reversed
+places, and write their histories through slices checked once. On sixteen
+cores:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.43 s | 0.40 s | −8 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.77 s | 0.73 s | −4 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.33 s | 1.26 s | −5 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.26 s | 0.24 s | −4 % |
+
 What is left on the encode's own thread is the budget's search for λ, a
 step at a time, and, where there is no fold, each element's samples read
 out of the master for the estimator.
