@@ -234,6 +234,10 @@ pub struct Coding {
 /// 0.18 on its own.
 const SECOND_FILTERS: [&[f64]; 4] = [&[0.83], &[1.5, 0.6], &[1.8, 0.85], &[1.72, 0.77]];
 
+/// The most trials [`pick_second`] runs for one channel: the mode with no
+/// second filter, and every design.
+pub(crate) const MOST_TRIALS: usize = 1 + SECOND_FILTERS.len();
+
 /// How much of a channel's coded past each [`crate::encoder`] history keeps:
 /// an interval or so, which is the context every filter decision in the next
 /// one starts from.
@@ -290,13 +294,9 @@ pub fn pick_second(
     effort: Effort,
     restart: u64,
 ) -> Option<usize> {
-    if history.len() < TRIAL_BLOCKS * crate::format::MAX_BLOCK.min(40) + FIT_CONTEXT {
-        return None;
-    }
-    let candidates: &[usize] = match effort {
-        Effort::Full => &[0, 1, 2, 3],
-        Effort::Fast if restart % 2 == 1 => return current,
-        Effort::Fast => &[FAST_DESIGN],
+    let candidates = match second_trials(history.len(), current, effort, restart) {
+        Ok(candidates) => candidates,
+        Err(answer) => return answer,
     };
     // The five trials are independent — each codes the same history in one
     // mode — and there are only twelve channels to spread over thirty-two
@@ -318,7 +318,35 @@ pub fn pick_second(
         .chain(candidates.iter().map(|index| Some(*index)))
         .map(|mode| trial(history, mode))
         .collect();
+    cheapest_second(candidates, &costs)
+}
 
+/// The designs [`pick_second`] codes a history of `len` samples in, after the
+/// mode with no second filter — or, where it codes nothing, its answer.
+///
+/// Apart so that a caller with several channels to decide can run every
+/// channel's trials as one list, rather than a channel's at a time: see
+/// `Encoder::decide_second_filters`.
+pub(crate) fn second_trials(
+    len: usize,
+    current: Option<usize>,
+    effort: Effort,
+    restart: u64,
+) -> Result<&'static [usize], Option<usize>> {
+    if len < TRIAL_BLOCKS * crate::format::MAX_BLOCK.min(40) + FIT_CONTEXT {
+        return Err(None);
+    }
+    match effort {
+        Effort::Full => Ok(&[0, 1, 2, 3]),
+        Effort::Fast if restart % 2 == 1 => Err(current),
+        Effort::Fast => Ok(&[FAST_DESIGN]),
+    }
+}
+
+/// Which of [`second_trials`]' designs the trials chose: `costs[0]` is the
+/// mode with no second filter and `costs[1..]` the designs in their order, and
+/// a design has to beat everything before it by the margin.
+pub(crate) fn cheapest_second(candidates: &[usize], costs: &[usize]) -> Option<usize> {
     let mut best = None;
     let mut best_cost = costs[0];
     for (&index, &cost) in candidates.iter().zip(&costs[1..]) {
@@ -340,7 +368,7 @@ pub fn pick_second(
 /// What the last blocks of `history` cost coded in one mode, as the block
 /// search codes them: each from the state the one before left, the filter
 /// kept between them.
-fn trial(history: &[i32], second: Option<usize>) -> usize {
+pub(crate) fn trial(history: &[i32], second: Option<usize>) -> usize {
     let block = crate::format::MAX_BLOCK.min(40);
     // Arrays rather than a vector per block: this runs over forty-odd blocks
     // per channel per restart, in every mode.
@@ -1583,5 +1611,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `pick_second` as it was before its trials could be run as one list
+    /// across channels, kept as what the pieces it is now made of have to
+    /// agree with — one trial after another, the same strict `<`. Verbatim,
+    /// the margin's division included.
+    #[allow(clippy::manual_checked_ops)]
+    fn pick_second_as_it_was(
+        history: &[i32],
+        current: Option<usize>,
+        effort: Effort,
+        restart: u64,
+    ) -> Option<usize> {
+        if history.len() < TRIAL_BLOCKS * crate::format::MAX_BLOCK.min(40) + FIT_CONTEXT {
+            return None;
+        }
+        let candidates: &[usize] = match effort {
+            Effort::Full => &[0, 1, 2, 3],
+            Effort::Fast if restart % 2 == 1 => return current,
+            Effort::Fast => &[FAST_DESIGN],
+        };
+        let costs: Vec<usize> = std::iter::once(None)
+            .chain(candidates.iter().map(|index| Some(*index)))
+            .map(|mode| trial(history, mode))
+            .collect();
+        let mut best = None;
+        let mut best_cost = costs[0];
+        for (&index, &cost) in candidates.iter().zip(&costs[1..]) {
+            if cost
+                + if TRIAL_MARGIN == 0 {
+                    0
+                } else {
+                    cost / TRIAL_MARGIN
+                }
+                < best_cost
+            {
+                best_cost = cost;
+                best = Some(index);
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn the_second_filter_is_picked_as_it_was_before_its_trials_came_apart() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let needed = TRIAL_BLOCKS * crate::format::MAX_BLOCK.min(40) + FIT_CONTEXT;
+        let poles = [
+            (1.8, 0.85),
+            (1.5, 0.6),
+            (0.9, 0.1),
+            (1.72, 0.77),
+            (0.0, 0.0),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (case, (a, b)) in poles.iter().enumerate() {
+            for length in [needed - 1, needed, needed + 37] {
+                let loud = f64::from(1u32 << (4 + 3 * case as u32));
+                let (mut one, mut two) = (0.0f64, 0.0f64);
+                let history: Vec<i32> = (0..length)
+                    .map(|_| {
+                        let excite = ((next() >> 52) as f64 - 2048.0) * loud / 2048.0;
+                        let value = a * one - b * two + excite;
+                        two = one;
+                        one = value;
+                        value.round().clamp(-8_388_608.0, 8_388_607.0) as i32
+                    })
+                    .collect();
+                for effort in [Effort::Full, Effort::Fast] {
+                    for restart in 0..2u64 {
+                        for current in [None, Some(0), Some(3)] {
+                            let now = pick_second(&history, current, effort, restart);
+                            let was = pick_second_as_it_was(&history, current, effort, restart);
+                            assert_eq!(
+                                now, was,
+                                "poles {a} {b}, {length} samples, {effort:?}, restart {restart}"
+                            );
+                            seen.insert(now);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.len() >= 3, "the picks should differ: {seen:?}");
+
+        // Silence costs the same in every mode, and a tie goes to the mode
+        // before it: no second filter at all.
+        let silent = vec![0i32; needed + 40];
+        for effort in [Effort::Full, Effort::Fast] {
+            for restart in 0..2u64 {
+                let now = pick_second(&silent, Some(2), effort, restart);
+                let was = pick_second_as_it_was(&silent, Some(2), effort, restart);
+                assert_eq!(now, was, "silence, {effort:?}, restart {restart}");
+            }
+        }
+        assert_eq!(pick_second(&silent, Some(2), Effort::Full, 0), None);
     }
 }

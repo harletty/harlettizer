@@ -178,6 +178,13 @@ const RANK_SAMPLES: usize = 2048;
 /// enough that each still holds a thousand samples.
 const MATRIX_SEGMENTS: usize = 4;
 
+/// How many runs of units the decided matrices are applied in, across the
+/// pool. Measured on a thirty-second programme at twelve elements: a unit a
+/// task, 0.74 s; four runs to thirty-two, 0.72 to 0.74 s, so it is the waking
+/// of a thread per unit that costs and not how the runs are cut.
+#[cfg(feature = "parallel")]
+const APPLY_RUNS: usize = 8;
+
 /// One access unit's samples, waiting for its interval to fill.
 ///
 /// The payload travels with them. What rides in a unit's extra data describes
@@ -235,6 +242,15 @@ impl Default for Decided {
 /// through a thirty-two thread pool against 1.86 s through a six-thread one,
 /// for exactly the same work.
 ///
+/// Two threads a channel, never fewer than one channel's trials and never
+/// more than the machine has: the widest thing it runs is the second-filter
+/// trials, five a channel and four of them long, and every thread past what
+/// they fill is one more to wake at each pass and to spin when it ends. Measured against thirty-two threads,
+/// on a thirty-second programme at twelve elements: 0.69 s against 0.68 at
+/// twenty-four, and 1.04 s against 0.98 carrying folds, for 4 % and 13 % less
+/// CPU; a stereo and a 5.1 fixture are as fast or faster at four and twelve
+/// threads, for a fifth less.
+///
 /// Without the feature it is a unit, and every `install` below is the closure
 /// called where it stands.
 #[cfg(feature = "parallel")]
@@ -248,15 +264,13 @@ struct Threads;
 impl Threads {
     #[cfg(feature = "parallel")]
     fn new(channels: usize) -> Self {
-        // One channel has nothing to spread, and a pool that cannot be built
+        // Even one channel has its second-filter trials to spread, which it
+        // used to hand to the global pool; and a pool that cannot be built
         // is not a failure: the search runs where it stands.
-        if channels < 2 {
-            return Self(None);
-        }
         let cores = std::thread::available_parallelism().map_or(channels, |n| n.get());
         Self(
             rayon::ThreadPoolBuilder::new()
-                .num_threads(cores)
+                .num_threads((2 * channels).max(filter::MOST_TRIALS).min(cores))
                 .build()
                 .ok(),
         )
@@ -299,6 +313,43 @@ impl Threads {
     fn map<T, R>(&self, items: &[T], f: impl Fn(&T) -> R) -> Vec<R> {
         items.iter().map(f).collect()
     }
+
+    /// `f` over every item, handed to whichever thread is free next in the
+    /// items' order, and the results in that order.
+    ///
+    /// For a list of long, independent jobs ordered longest first: the pool
+    /// splits a list in halves and steals halves, which starts the last jobs
+    /// as early as the first. Taken from one counter instead, every thread
+    /// takes the longest job left, and one that is slow to start takes fewer
+    /// of them. What each job returns does not depend on which thread ran it
+    /// or when, so neither does anything decided from the results.
+    #[cfg(feature = "parallel")]
+    fn longest_first<T: Sync>(&self, items: &[T], f: impl Fn(&T) -> usize + Sync) -> Vec<usize> {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Some(pool) = &self.0 else {
+            return items.iter().map(f).collect();
+        };
+        let next = AtomicUsize::new(0);
+        let results: Vec<AtomicUsize> = items.iter().map(|_| AtomicUsize::new(0)).collect();
+        pool.install(|| {
+            (0..rayon::current_num_threads().min(items.len()))
+                .into_par_iter()
+                .for_each(|_| {
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(at) else { break };
+                        results[at].store(f(item), Ordering::Relaxed);
+                    }
+                });
+        });
+        results.into_iter().map(AtomicUsize::into_inner).collect()
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn longest_first<T>(&self, items: &[T], f: impl Fn(&T) -> usize) -> Vec<usize> {
+        items.iter().map(f).collect()
+    }
 }
 
 /// What one access unit says about itself, decided before it is written.
@@ -322,9 +373,128 @@ struct Written {
 /// What the first pass over a unit measured: the check each substream will
 /// certify, and each channel's dead bits — or none for a channel silent all
 /// unit, which takes the shift in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Measured {
     check: [u32; MAX_SUBSTREAMS],
     wasted: [Option<u8>; crate::format::MAX_CHANNELS],
+}
+
+/// An interval taken into the codec's domain by the first pass over it: its
+/// units de-interleaved through the permutation, each unit's channels side by
+/// side, what each unit measured, and the widest sample that went in.
+///
+/// Made by [`Planning::plan`], on the thread that works the interval out,
+/// because the pass reads nothing but the interval's own samples and what its
+/// plan decided — the permutation and the shifts it holds. It was the first
+/// thing the preparing did, and on a pool that had gone to sleep while the
+/// interval was read it cost three times what it costs on one thread. One
+/// buffer goes with each interval and comes back once it is prepared.
+#[derive(Debug, Default)]
+struct TakenIn {
+    /// Unit-major: each unit's channels side by side, so that a unit is one
+    /// chunk a thread can own. A short unit's tail is zero, which is the
+    /// silence the format says it carries.
+    scratch: Vec<i32>,
+    measured: Vec<Measured>,
+    /// The largest magnitude of any sample that went in, in the codec's
+    /// twenty-four bits.
+    widest: u32,
+    /// Whether this is the interval about to be prepared, taken in under its
+    /// own plan, rather than buffers to take it in with.
+    ready: bool,
+}
+
+/// What the first pass over an interval reads.
+struct Intake<'a> {
+    coded: &'a Coded,
+    channels: usize,
+    shift: u32,
+    permutation: &'a [usize],
+    interval_shift: Option<&'a [u8]>,
+}
+
+impl Intake<'_> {
+    /// Every unit of `held` into `into`, one after another, and the widest
+    /// sample among them.
+    fn take_in(&self, held: &[Held], into: &mut TakenIn) {
+        into.ready = false;
+        let stride = self.channels * self.coded.frame_size;
+        into.scratch.clear();
+        into.scratch.resize(held.len() * stride, 0);
+        into.measured.clear();
+        into.measured.extend(
+            into.scratch
+                .chunks_mut(stride)
+                .zip(held)
+                .map(|(chunk, unit)| self.unit_in(unit, chunk)),
+        );
+        // Of what went in, not of the channels as they are stored: those have
+        // their dead bits off and the cascade on, and a decoder's full output
+        // is the elements at their own width.
+        into.widest = held
+            .iter()
+            .flat_map(|unit| unit.samples[..unit.frames * self.channels].iter())
+            .fold(0u32, |m, sample| {
+                m.max((sample << self.shift).unsigned_abs())
+            });
+    }
+
+    /// One unit into the codec's domain: de-interleaved through the
+    /// permutation, the check the *next* restart header will carry folded
+    /// per substream — each one certifies every channel up to its own last —
+    /// and each channel's dead bits measured.
+    fn unit_in(&self, unit: &Held, chunk: &mut [i32]) -> Measured {
+        let width = self.coded.frame_size;
+        let channels = self.channels;
+        // Each channel's samples folded on their own first, and each
+        // substream's check made from the channels it certifies afterwards:
+        // an exclusive or is the same whichever order its terms come in, and
+        // this way a sample is folded once rather than once per substream.
+        let mut folded = [0u32; crate::format::MAX_CHANNELS];
+        for (channel, (slot, element)) in folded
+            .iter_mut()
+            .zip(&self.permutation[..channels])
+            .enumerate()
+        {
+            let from = self.coded.order[*element];
+            let plane = &mut chunk[channel * width..channel * width + unit.frames];
+            for (frame, stored) in plane.iter_mut().enumerate() {
+                let sample = unit.samples[frame * channels + from] << self.shift;
+                *stored = sample;
+                *slot ^= sample as u32;
+            }
+            // The shift wraps at eight channels. Below that it is just the
+            // channel index, which is why it went unnoticed until there were
+            // sixteen of them — where shifting a 24-bit value by fifteen
+            // leaves the accumulator.
+            *slot = (*slot & 0x00ff_ffff) << (channel & 7);
+        }
+        let mut check = [0u32; MAX_SUBSTREAMS];
+        for (slot, range) in check
+            .iter_mut()
+            .zip(&self.coded.ranges)
+            .take(self.coded.substreams)
+        {
+            for contribution in folded.iter().take(channels.min(range.last + 1)) {
+                *slot ^= contribution;
+            }
+        }
+        // 🔴 Held, not measured, while presentations are stated. A restart
+        // header states the matrices once for a whole interval and they are
+        // written in the units the shifts make, so a unit that shifted
+        // differently would be decoded by matrices meant for another. Those
+        // shifts are settled before any of it is prepared — see
+        // [`Planning::settle_the_shifts`]. Otherwise a silent unit measures
+        // nothing, and takes what was in force before it.
+        let mut wasted = [None; crate::format::MAX_CHANNELS];
+        for (channel, slot) in wasted.iter_mut().enumerate().take(channels) {
+            *slot = match self.interval_shift {
+                Some(held) => held.get(channel).copied(),
+                None => wasted_bits(&chunk[channel * width..(channel + 1) * width]),
+            };
+        }
+        Measured { check, wasted }
+    }
 }
 
 /// The lossless check of one unit of an early substream's presentation: its
@@ -519,10 +689,11 @@ pub struct Encoder {
     /// The interval being held, and the buffers its units came back in.
     pending: Vec<Held>,
     spare: Vec<Held>,
-    /// The held interval's units, each one's channels side by side, while
-    /// they are prepared: one chunk per unit is what lets the units go across
-    /// the pool. Kept between intervals rather than allocated for each.
-    unit_scratch: Vec<i32>,
+    /// The buffers an interval was prepared in, once it is prepared, for the
+    /// next [`Planning`] to take an interval in with — see [`TakenIn`]. Two
+    /// are in use at once, one being prepared and one being taken in, and
+    /// they are kept between intervals rather than allocated for each.
+    unit_scratch: TakenIn,
     /// Per destination channel, the source sets the interval suggests, in
     /// increasing size, with the weights that fit them. Decided once an
     /// interval; costed by the unit that opens it.
@@ -743,22 +914,22 @@ impl Encoder {
             back: Some(IntervalDecider {
                 channels: config.channels,
                 coded,
-                // A pool of its own, of two threads for every three channels,
-                // and never fewer than four or than the channels there are: a
-                // stereo on one thread decided its two channels one after the
-                // other. Sharing the encoder's, the blocks took threads the
-                // preparing of the next interval was waiting for, and that is
-                // the longer of the two: five minutes of an overlay at twelve
+                // A pool of its own, of a thread a channel: a channel's blocks
+                // are decided one after another, so each walks its interval
+                // on one thread and a thread fewer than the channels is a
+                // second round for the ones left over. Sharing the encoder's,
+                // the blocks took threads the preparing of the next interval
+                // was waiting for: five minutes of an overlay at twelve
                 // channels took 11.3 s so, and on a pool of its own 13.5 s at
-                // three threads, 11.5 at four, 10.1 at six, 10.2 at eight
-                // and 10.7 at sixteen. With `--fast` the preparing is lighter
-                // and the blocks are the longer: 7.4 s at six, 7.2 at eight,
-                // 7.5 at twelve — and at full effort eight is as good as six.
-                threads: std::sync::Arc::new(Threads::exactly(
-                    (2 * config.channels)
-                        .div_ceil(3)
-                        .max(config.channels.min(4)),
-                )),
+                // three threads, 11.5 at four, 10.1 at six, 10.2 at eight and
+                // 10.7 at sixteen — which is why it was two threads for every
+                // three channels while the preparing was heavier than it is.
+                // Once the preparing stopped waking the encoder's pool for
+                // every small pass, a thread a channel took a thirty-second
+                // programme at twelve elements from 0.72 s to 0.69, and from
+                // 0.54 s to 0.49 at `--fast`, where the blocks are the longer
+                // half; a 5.1 fixture from 0.87 s to 0.61.
+                threads: std::sync::Arc::new(Threads::exactly(config.channels)),
                 interval_decided: vec![Vec::new(); config.channels],
                 interval_planes: vec![Vec::new(); config.channels],
                 interval_restart: vec![Decided::default(); config.channels],
@@ -781,7 +952,7 @@ impl Encoder {
             max_output_bits: crate::frame::CODEC_BITS as u8,
             pending: Vec::with_capacity(RESTART_INTERVAL as usize),
             spare: Vec::new(),
-            unit_scratch: Vec::new(),
+            unit_scratch: TakenIn::default(),
             candidates: vec![Vec::new(); config.channels],
             dynamic_range: [None; MAX_SUBSTREAMS],
             decorrelation: true,
@@ -1287,14 +1458,14 @@ impl Encoder {
         out
     }
 
-    /// A [`Planning`] for the next interval, with what it reads.
-    fn planning(&self) -> Planning {
+    /// A [`Planning`] for the next interval, with what it reads, and the
+    /// buffers the interval before last was prepared in to take it in with.
+    fn planning(&mut self) -> Planning {
         Planning {
             wants: self.wants.clone(),
             channels: self.channels,
-            coded: FrameSize {
-                frame_size: self.coded.frame_size,
-            },
+            coded: self.coded,
+            shift: self.shift,
             decorrelation: self.decorrelation,
             threads: std::sync::Arc::clone(&self.threads),
             interval_shift: None,
@@ -1303,13 +1474,15 @@ impl Encoder {
             assignment: Vec::new(),
             presentation_shift: Vec::new(),
             permutation: Vec::new(),
+            taken_in: std::mem::take(&mut self.unit_scratch),
             stats: Stats::default(),
             took: std::time::Duration::ZERO,
         }
     }
 
-    /// Take what was decided for an interval about to be written.
-    fn take_the_plan(&mut self, planning: Planning) {
+    /// Take what was decided for an interval about to be written, and the
+    /// interval as it was taken in under it.
+    fn take_the_plan(&mut self, planning: Planning) -> TakenIn {
         self.interval_shift = planning.interval_shift;
         self.arrangement = planning.arrangement;
         self.presentations = planning.presentations;
@@ -1322,6 +1495,7 @@ impl Encoder {
         if self.timed {
             self.phase_times[0] += planning.took;
         }
+        planning.taken_in
     }
 
     /// Decide an interval that is complete and worked out, and hand over
@@ -1332,10 +1506,19 @@ impl Encoder {
             planning,
             dynamic_range,
         } = deferred;
-        if self.since_restart == 0 {
-            self.take_the_plan(planning);
+        let mut taken_in = if self.since_restart == 0 {
+            self.take_the_plan(planning)
+        } else {
+            // A plan not taken was taken in, if at all, under a permutation
+            // and shifts that are not the ones in force.
+            let mut buffers = planning.taken_in;
+            buffers.ready = false;
+            buffers
+        };
+        if !taken_in.ready {
+            self.intake().take_in(&held, &mut taken_in);
         }
-        self.timed_phase(3, |encoder| encoder.prepare(&held));
+        self.timed_phase(3, |encoder| encoder.prepare(&held, taken_in));
         self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
         self.intervals_decided += 1;
         let channels = self.channels;
@@ -1389,7 +1572,14 @@ impl Encoder {
     /// Only the sources and the weights are decided here. Whether to use them
     /// at all is a question about coded size, and that is answered by the unit
     /// that opens the interval — see [`Encoder::choose_matrix`].
-    fn suggest_matrices(&mut self, units: usize) {
+    ///
+    /// When `judging`, each destination's candidates are also judged, by the
+    /// same thread and as soon as they exist — see [`Encoder::judge_matrix`],
+    /// which reads a destination's own candidates and nothing another
+    /// destination's suggesting writes. The two were a pass across the pool
+    /// each, and the slowest destination of one waited for the slowest of the
+    /// other.
+    fn suggest_matrices(&mut self, units: usize, judging: bool) -> Vec<Judged> {
         // Only the last substream of an object programme may state a step, and
         // only for a destination no earlier substream describes: a matrix
         // stated twice has to be stated the same way both times.
@@ -1418,9 +1608,11 @@ impl Encoder {
         // One destination's candidates are read from the whole interval and
         // written nowhere else, so the destinations are independent — and this
         // was the largest thing the encoder still did on one thread.
-        let interval = &self.prepared;
-        let frames = self.coded.frame_size;
-        let body = |dest: usize, into: &mut Vec<Candidate>| {
+        let mut candidates = std::mem::take(&mut self.candidates);
+        let this = &*self;
+        let interval = &this.prepared;
+        let frames = this.coded.frame_size;
+        let body = |dest: usize, into: &mut Vec<Candidate>| -> Judged {
             let (available, aimable) = bounds[dest];
             into.clear();
             let sources = Self::best_partners(interval, dest, available);
@@ -1451,22 +1643,40 @@ impl Encoder {
                     steps,
                 });
             }
+            if !judging || into.is_empty() {
+                return Judged::default();
+            }
+            let mut scratch = vec![0i32; frames];
+            this.judge_matrix(dest, into, &mut scratch)
         };
 
-        #[cfg(feature = "parallel")]
-        if let Some(pool) = &self.threads.0 {
-            use rayon::prelude::*;
-            pool.install(|| {
-                self.candidates
-                    .par_iter_mut()
+        let judged: Vec<Judged> = {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = &this.threads.0 {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    candidates
+                        .par_iter_mut()
+                        .enumerate()
+                        .map(|(dest, into)| body(dest, into))
+                        .collect()
+                })
+            } else {
+                candidates
+                    .iter_mut()
                     .enumerate()
-                    .for_each(|(dest, into)| body(dest, into));
-            });
-            return;
-        }
-        for (dest, into) in self.candidates.iter_mut().enumerate() {
-            body(dest, into);
-        }
+                    .map(|(dest, into)| body(dest, into))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            candidates
+                .iter_mut()
+                .enumerate()
+                .map(|(dest, into)| body(dest, into))
+                .collect()
+        };
+        self.candidates = candidates;
+        judged
     }
 
     /// A straight line through the weight over the interval.
@@ -1554,10 +1764,11 @@ impl Encoder {
         }
     }
 
-    /// Prepare every unit of the held interval: de-interleave it through the
-    /// permutation, take its dead bits off, take the cascade off, certify what
-    /// each substream puts out, decide the matrices on the whole of it, and
-    /// apply them.
+    /// Prepare every unit of the held interval, which [`Planning::plan`] has
+    /// already de-interleaved through the permutation, certified and measured
+    /// — see [`TakenIn`]: take its dead bits off, take the cascade off,
+    /// certify what each early substream puts out, decide the matrices on the
+    /// whole of it, and apply them.
     ///
     /// The units are independent of one another once each channel's dead-bit
     /// shift is known, so they go across the pool in two passes, one before
@@ -1570,7 +1781,7 @@ impl Encoder {
     /// seconds of twenty-five on four minutes of a programme — and gather the
     /// interval for the matrices a second time, with the cascade taken off
     /// twice.
-    fn prepare(&mut self, held: &[Held]) {
+    fn prepare(&mut self, held: &[Held], taken_in: TakenIn) {
         let width = self.coded.frame_size;
         let channels = self.channels;
         let units = held.len();
@@ -1583,42 +1794,15 @@ impl Encoder {
         self.prepared_checks.clear();
         self.prepared_checks.resize(units, [0; MAX_SUBSTREAMS]);
 
-        // Unit-major scratch: each unit's channels side by side, so that a
-        // unit is one chunk a thread can own. Zeroed, so a short unit's tail
-        // is the silence the format says it carries.
         let stride = channels * width;
-        let mut scratch = std::mem::take(&mut self.unit_scratch);
-        scratch.clear();
-        scratch.resize(units * stride, 0);
-
-        // Pass one: de-interleave, certify, and measure each channel's dead
-        // bits.
-        let measured: Vec<Measured> = {
-            let body = |(chunk, unit): (&mut [i32], &Held)| self.unit_in(unit, chunk);
-            #[cfg(feature = "parallel")]
-            if let Some(pool) = &self.threads.0 {
-                use rayon::prelude::*;
-                pool.install(|| {
-                    scratch
-                        .par_chunks_mut(stride)
-                        .zip(held.par_iter())
-                        .map(body)
-                        .collect()
-                })
-            } else {
-                scratch
-                    .chunks_mut(stride)
-                    .zip(held.iter())
-                    .map(body)
-                    .collect()
-            }
-            #[cfg(not(feature = "parallel"))]
-            scratch
-                .chunks_mut(stride)
-                .zip(held.iter())
-                .map(body)
-                .collect()
-        };
+        let TakenIn {
+            mut scratch,
+            measured,
+            widest,
+            ..
+        } = taken_in;
+        debug_assert_eq!(scratch.len(), units * stride);
+        debug_assert_eq!(measured.len(), units);
 
         // The shift a silent unit holds is the one in force before it, which
         // is the one thing about a unit that depends on the unit before.
@@ -1633,50 +1817,40 @@ impl Encoder {
         self.output_shift[..channels].copy_from_slice(&previous);
 
         // Pass two: the dead bits off, the cascade off, and what an early
-        // substream then puts out certified.
-        let certified: Vec<[u32; MAX_SUBSTREAMS]> = {
-            let shifts = &self.prepared_shifts;
-            let checks = &self.prepared_checks;
-            let body = |(index, chunk): (usize, &mut [i32])| {
-                self.unit_stored(
-                    chunk,
-                    &shifts[index * channels..(index + 1) * channels],
-                    held[index].frames,
-                    checks[index],
-                )
-            };
-            #[cfg(feature = "parallel")]
-            if let Some(pool) = &self.threads.0 {
-                use rayon::prelude::*;
-                pool.install(|| {
-                    scratch
-                        .par_chunks_mut(stride)
-                        .enumerate()
-                        .map(body)
-                        .collect()
-                })
-            } else {
-                scratch.chunks_mut(stride).enumerate().map(body).collect()
+        // substream then puts out certified — and each unit into `prepared`
+        // while it is still in the cache. On this thread, unit after unit:
+        // it is a few dead bits and a cascade a sample, and it was the pass
+        // that woke the pool after the interval had been read, which cost
+        // three times what doing it here does. The matrices further down
+        // wake it with work that is worth waking for.
+        let mut planes = std::mem::take(&mut self.prepared);
+        for (index, chunk) in scratch.chunks_mut(stride).enumerate() {
+            self.prepared_checks[index] = self.unit_stored(
+                chunk,
+                &self.prepared_shifts[index * channels..(index + 1) * channels],
+                held[index].frames,
+                self.prepared_checks[index],
+            );
+            for (plane, stored) in planes.iter_mut().zip(chunk.chunks(width)) {
+                plane[index * width..(index + 1) * width].copy_from_slice(stored);
             }
-            #[cfg(not(feature = "parallel"))]
-            scratch.chunks_mut(stride).enumerate().map(body).collect()
-        };
-        self.prepared_checks.copy_from_slice(&certified);
-        self.timed_phase(1, |encoder| encoder.gather(&scratch, stride));
+        }
+        self.prepared = planes;
 
         // The matrices, decided on the interval as it stands before them:
         // permuted, the dead bits off, the cascade off — the domain a decoder
         // applies them in, since it puts the dead bits back after them.
-        self.timed_phase(2, |encoder| encoder.suggest_matrices(units));
-        if self.since_restart == 0 {
-            self.timed_phase(4, |encoder| encoder.decide_matrices());
+        let deciding = self.since_restart == 0;
+        let judged = self.timed_phase(2, |encoder| encoder.suggest_matrices(units, deciding));
+        if deciding {
+            self.timed_phase(4, |encoder| encoder.decide_matrices(judged));
         }
 
         // Pass three: the matrices on, each unit at its own place on their
         // ramp.
         if !self.matrices.is_empty() {
             loop {
-                self.apply_the_matrices(&mut scratch, stride);
+                let over = self.apply_the_matrices(&mut scratch, stride);
                 // 🔴 And what they left has to fit the codec's domain. A
                 // decoder reconstructs a stored sample in twenty-four bits and
                 // refuses the stream past them, and a matrix is a
@@ -1687,7 +1861,6 @@ impl Encoder {
                 // has the last word. A matrix that fails it is dropped and
                 // the interval matrixed again with what is left, since a
                 // matrix reads the channels the dropped one wrote.
-                let over = self.over_the_domain(&scratch, stride);
                 let before = self.matrices.len();
                 let stats = &mut self.stats;
                 self.matrices.retain(|matrix| {
@@ -1709,7 +1882,13 @@ impl Encoder {
             }
             self.timed_phase(1, |encoder| encoder.gather(&scratch, stride));
         }
-        self.unit_scratch = scratch;
+        // Back for the interval after next to be taken into.
+        self.unit_scratch = TakenIn {
+            scratch,
+            measured,
+            widest,
+            ready: false,
+        };
 
         // What the restart header opening this interval may declare, now that
         // the interval exists: the largest shift any of its units takes, and
@@ -1732,15 +1911,6 @@ impl Encoder {
             .max()
             .unwrap_or(0)
             .max(stated);
-        // Of what went in, not of the channels as they are stored: those have
-        // their dead bits off and the cascade on, and a decoder's full output
-        // is the elements at their own width.
-        let widest = held
-            .iter()
-            .flat_map(|unit| unit.samples[..unit.frames * self.channels].iter())
-            .fold(0u32, |m, sample| {
-                m.max((sample << self.shift).unsigned_abs())
-            });
         self.max_output_bits =
             (33 - widest.leading_zeros()).clamp(1, crate::frame::CODEC_BITS) as u8;
     }
@@ -1770,45 +1940,60 @@ impl Encoder {
     }
 
     /// The decided matrices taken off the unit-major scratch, each unit at
-    /// its own place on their ramp.
-    fn apply_the_matrices(&self, scratch: &mut [i32], stride: usize) {
+    /// its own place on their ramp — and which channels then hold a sample
+    /// outside the domain a decoder reconstructs them in.
+    ///
+    /// Looked at by the thread that has just matrixed the unit, while it is
+    /// still in its cache: that used to be a pass of its own over the whole
+    /// interval, on one thread, after the pool had finished. Whether a channel
+    /// is over anywhere is whether it is over in any unit, which is the same
+    /// whichever order the units are asked in.
+    fn apply_the_matrices(&self, scratch: &mut [i32], stride: usize) -> Vec<bool> {
         let width = self.coded.frame_size;
+        let channels = self.channels;
         let matrices = &self.matrices;
+        let mut domains = [DOMAIN; crate::format::MAX_CHANNELS];
+        for (channel, domain) in domains.iter_mut().enumerate().take(channels) {
+            *domain = self.domain_of(channel);
+        }
         let body = |(index, chunk): (usize, &mut [i32])| {
             let mut planes: Vec<&mut [i32]> = chunk.chunks_mut(width).collect();
             matrix::apply_inverse(matrices, &mut planes, width, index);
+            let mut over = [false; crate::format::MAX_CHANNELS];
+            for ((slot, plane), domain) in over.iter_mut().zip(&planes).zip(&domains).take(channels)
+            {
+                *slot = plane
+                    .iter()
+                    .any(|sample| !(-*domain..*domain).contains(sample));
+            }
+            over
         };
-        #[cfg(feature = "parallel")]
-        if let Some(pool) = &self.threads.0 {
-            use rayon::prelude::*;
-            pool.install(|| {
-                scratch.par_chunks_mut(stride).enumerate().for_each(body);
-            });
-        } else {
-            scratch.chunks_mut(stride).enumerate().for_each(body);
-        }
-        #[cfg(not(feature = "parallel"))]
-        scratch.chunks_mut(stride).enumerate().for_each(body);
-    }
-
-    /// Which channels of the unit-major scratch hold a sample outside the
-    /// domain a decoder reconstructs them in.
-    fn over_the_domain(&self, scratch: &[i32], stride: usize) -> Vec<bool> {
-        let width = self.coded.frame_size;
-        let domains: Vec<i32> = (0..self.channels)
-            .map(|channel| self.domain_of(channel))
-            .collect();
-        let mut over = vec![false; self.channels];
-        for chunk in scratch.chunks(stride) {
-            for (channel, plane) in chunk.chunks(width).enumerate().take(self.channels) {
-                let domain = domains[channel];
-                if !over[channel]
-                    && plane
-                        .iter()
-                        .any(|sample| !(-domain..domain).contains(sample))
-                {
-                    over[channel] = true;
-                }
+        let per_unit: Vec<[bool; crate::format::MAX_CHANNELS]> = {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = &self.threads.0 {
+                use rayon::prelude::*;
+                // In eight runs of units rather than a unit a task: a unit is
+                // a few microseconds of work, and a task a unit woke every
+                // thread in the pool for it.
+                let run = (scratch.len() / stride).div_ceil(APPLY_RUNS).max(1);
+                pool.install(|| {
+                    scratch
+                        .par_chunks_mut(stride)
+                        .enumerate()
+                        .with_min_len(run)
+                        .map(body)
+                        .collect()
+                })
+            } else {
+                scratch.chunks_mut(stride).enumerate().map(body).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            scratch.chunks_mut(stride).enumerate().map(body).collect()
+        };
+        let mut over = vec![false; channels];
+        for unit in &per_unit {
+            for (slot, here) in over.iter_mut().zip(unit) {
+                *slot |= *here;
             }
         }
         over
@@ -1831,47 +2016,15 @@ impl Encoder {
         if wide { i32::MAX } else { DOMAIN }
     }
 
-    /// One unit into the codec's domain: de-interleaved through the
-    /// permutation, the check the *next* restart header will carry folded
-    /// per substream — each one certifies every channel up to its own last —
-    /// and each channel's dead bits measured.
-    fn unit_in(&self, unit: &Held, chunk: &mut [i32]) -> Measured {
-        let width = self.coded.frame_size;
-        let channels = self.channels;
-        let mut check = [0u32; MAX_SUBSTREAMS];
-        for frame in 0..unit.frames {
-            for channel in 0..channels {
-                let element = self.permutation[channel];
-                let sample =
-                    unit.samples[frame * channels + self.coded.order[element]] << self.shift;
-                chunk[channel * width + frame] = sample;
-                // The shift wraps at eight channels. Below that it is just
-                // the channel index, which is why it went unnoticed until
-                // there were sixteen of them — where shifting a 24-bit value
-                // by fifteen leaves the accumulator.
-                let contribution = ((sample as u32) & 0x00ff_ffff) << (channel & 7);
-                for (index, slot) in check.iter_mut().enumerate().take(self.coded.substreams) {
-                    if channel <= self.coded.ranges[index].last {
-                        *slot ^= contribution;
-                    }
-                }
-            }
+    /// What the first pass over an interval reads, as the encoder holds it.
+    fn intake(&self) -> Intake<'_> {
+        Intake {
+            coded: &self.coded,
+            channels: self.channels,
+            shift: self.shift,
+            permutation: &self.permutation,
+            interval_shift: self.interval_shift.as_deref(),
         }
-        // 🔴 Held, not measured, while presentations are stated. A restart
-        // header states the matrices once for a whole interval and they are
-        // written in the units the shifts make, so a unit that shifted
-        // differently would be decoded by matrices meant for another. Those
-        // shifts are settled before any of it is prepared — see
-        // [`Encoder::settle_the_shifts`]. Otherwise a silent unit measures
-        // nothing, and takes what was in force before it.
-        let mut wasted = [None; crate::format::MAX_CHANNELS];
-        for (channel, slot) in wasted.iter_mut().enumerate().take(channels) {
-            *slot = match &self.interval_shift {
-                Some(held) => held.get(channel).copied(),
-                None => wasted_bits(&chunk[channel * width..(channel + 1) * width]),
-            };
-        }
-        Measured { check, wasted }
     }
 
     /// One unit as it will be coded: its dead bits off, the cascade off —
@@ -1943,44 +2096,92 @@ impl Encoder {
         let restart = self.intervals_decided;
         let effort = self.effort;
 
-        let past = &self.past;
-        let prepared = &self.prepared;
-        let threads = &self.threads;
-        let modes = &mut self.second_mode;
+        // The fit needs a context before the first block it judges, and that
+        // is the previous interval's tail — the only thing about this
+        // decision that still looks backwards, and the same context every
+        // filter choice in the interval will start from.
+        let histories: Vec<Vec<i32>> = self
+            .past
+            .iter()
+            .zip(&self.prepared)
+            .map(|(past, prepared)| {
+                let behind = past.window();
+                let carried = behind.len().min(filter::FIT_CONTEXT);
+                let mut trial = Vec::with_capacity(carried + ahead);
+                trial.extend_from_slice(&behind[behind.len() - carried..]);
+                trial.extend_from_slice(&prepared[..ahead]);
+                trial
+            })
+            .collect();
+        let plans: Vec<Result<&'static [usize], Option<usize>>> = histories
+            .iter()
+            .zip(&self.second_mode)
+            .map(|(history, mode)| filter::second_trials(history.len(), *mode, effort, restart))
+            .collect();
 
         // One channel's decision reads that channel and nothing else, and it
         // is the most expensive thing the encoder does at a restart — it codes
-        // forty-odd blocks in every mode. It runs across the channels for the
-        // same reason the block search does.
-        let body = |channel: usize, mode: &mut Option<usize>| {
-            // The fit needs a context before the first block it judges, and
-            // that is the previous interval's tail — the only thing about this
-            // decision that still looks backwards, and the same context every
-            // filter choice in the interval will start from.
-            let behind = past[channel].window();
-            let carried = behind.len().min(filter::FIT_CONTEXT);
-            let mut trial = Vec::with_capacity(carried + ahead);
-            trial.extend_from_slice(&behind[behind.len() - carried..]);
-            trial.extend_from_slice(&prepared[channel][..ahead]);
-            *mode = filter::pick_second(&trial, *mode, effort, restart);
-        };
-
-        #[cfg(feature = "parallel")]
-        if let Some(pool) = &threads.0 {
-            use rayon::prelude::*;
-            pool.install(|| {
-                modes
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(channel, mode)| body(channel, mode));
-            });
-            return;
+        // forty-odd blocks in every mode. Every channel's trials go in one
+        // list, the designs before the mode with none, which codes the same
+        // blocks with no second filter to fit around and takes two thirds as
+        // long: twelve channels are sixty trials, and a pool handed the long
+        // ones first ends on the short ones, where a channel's five at a time
+        // left the last few threads a long trial each to finish alone. And
+        // run on the encoder's own pool or on this thread, never on any other
+        // pool, which the channel's own five were whenever this one could
+        // not be built.
+        let mut trials: Vec<(usize, Option<usize>)> = Vec::new();
+        let longest = plans
+            .iter()
+            .map(|plan| plan.map_or(0, <[usize]>::len))
+            .max()
+            .unwrap_or(0);
+        for rank in 0..longest {
+            for (channel, plan) in plans.iter().enumerate() {
+                if let Some(design) = plan.ok().and_then(|designs| designs.get(rank)) {
+                    trials.push((channel, Some(*design)));
+                }
+            }
         }
-        let _ = threads;
-        modes
-            .iter_mut()
-            .enumerate()
-            .for_each(|(channel, mode)| body(channel, mode));
+        for (channel, plan) in plans.iter().enumerate() {
+            if plan.is_ok() {
+                trials.push((channel, None));
+            }
+        }
+        let costs = self.threads.longest_first(&trials, |(channel, mode)| {
+            filter::trial(&histories[*channel], *mode)
+        });
+
+        // And reduced a channel at a time, in the designs' own order, which
+        // is the answer the channel's trials give one after another.
+        let mut channel_costs = Vec::new();
+        for (channel, (mode, plan)) in self.second_mode.iter_mut().zip(&plans).enumerate() {
+            *mode = match plan {
+                Err(answer) => *answer,
+                Ok(designs) => {
+                    channel_costs.clear();
+                    channel_costs.push(Self::cost_of(&trials, &costs, channel, None));
+                    for design in designs.iter() {
+                        channel_costs.push(Self::cost_of(&trials, &costs, channel, Some(*design)));
+                    }
+                    filter::cheapest_second(designs, &channel_costs)
+                }
+            };
+        }
+    }
+
+    /// What `channel`'s trial in `mode` cost, from the list they were run as.
+    fn cost_of(
+        trials: &[(usize, Option<usize>)],
+        costs: &[usize],
+        channel: usize,
+        mode: Option<usize>,
+    ) -> usize {
+        let at = trials
+            .iter()
+            .position(|trial| *trial == (channel, mode))
+            .expect("every trial a channel's decision reads was run");
+        costs[at]
     }
 
     /// Every early presentation's rows over what the channels hold, each at
@@ -2134,14 +2335,15 @@ impl Encoder {
     /// channel carries into a different signal, which the prediction filter's
     /// carried history and fit context are then wrong about for the next
     /// quarter of a second.
-    fn decide_matrices(&mut self) {
+    ///
+    /// `judged` is every destination's best candidate, judged at once by
+    /// [`Encoder::suggest_matrices`] — each against the interval and the first
+    /// unit as they stand, which no other destination's choice changes — and
+    /// here they are admitted in order under each substream's budget. Judging
+    /// them one after another was three seconds of twenty-five on one thread,
+    /// for four minutes of a programme.
+    fn decide_matrices(&mut self, judged: Vec<Judged>) {
         self.matrices.clear();
-        // Every destination judged at once — each against the interval and
-        // the first unit as they stand, which no other destination's choice
-        // changes — and then admitted in order under each substream's
-        // budget. Judging them one after another was three seconds of
-        // twenty-five on one thread, for four minutes of a programme.
-        let judged = self.judge_matrices();
         self.stats.matrices_refused += judged.iter().map(|judged| judged.refused).sum::<u64>();
         for index in 0..self.coded.substreams {
             let range = self.coded.ranges[index];
@@ -2159,25 +2361,6 @@ impl Encoder {
             }
         }
         self.aim_the_matrices();
-    }
-
-    /// The best candidate for every destination, or none where coding the
-    /// channel alone is cheaper, judged across the pool — and how many each
-    /// destination refused for the codec's domain.
-    fn judge_matrices(&self) -> Vec<Judged> {
-        let judge = |dest: usize| -> Judged {
-            if self.candidates[dest].is_empty() {
-                return Judged::default();
-            }
-            let mut scratch = vec![0i32; self.coded.frame_size];
-            self.judge_matrix(dest, &mut scratch)
-        };
-        #[cfg(feature = "parallel")]
-        if let Some(pool) = &self.threads.0 {
-            use rayon::prelude::*;
-            return pool.install(|| (0..self.channels).into_par_iter().map(judge).collect());
-        }
-        (0..self.channels).map(judge).collect()
     }
 }
 
@@ -2325,7 +2508,11 @@ impl Encoder {
     /// it has not decoded. That parses, every checksum verifies, and a decoder
     /// stopping at the six-channel presentation hands back a channel still
     /// matrixed.
-    fn judge_matrix(&self, dest: usize, scratch: &mut [i32]) -> Judged {
+    ///
+    /// `candidates` are the ones suggested for `dest`, handed in rather than
+    /// read from the encoder because they are still being suggested for the
+    /// other destinations when this runs.
+    fn judge_matrix(&self, dest: usize, candidates: &[Candidate], scratch: &mut [i32]) -> Judged {
         let frames = self.coded.frame_size;
         // A matrix is described once in every substream that can reach its
         // destination — the one that codes the channel, and every presentation
@@ -2374,11 +2561,11 @@ impl Encoder {
         let mut refused = 0u64;
         let domain = self.domain_of(dest);
         let mut matrixed: Vec<i32> = Vec::with_capacity(self.prepared[dest].len());
-        for index in 0..self.candidates[dest].len() {
+        for suggested in candidates {
             let Some(candidate) = Primitive::fit(
                 dest,
-                &self.candidates[dest][index].sources,
-                &self.candidates[dest][index].weights,
+                &suggested.sources,
+                &suggested.weights,
                 matrix::FRACTION,
             ) else {
                 continue;
@@ -2391,11 +2578,7 @@ impl Encoder {
             matrixed.clear();
             for frame in 0..self.prepared[dest].len() {
                 let mut sum = 0i64;
-                for (source, weight) in self.candidates[dest][index]
-                    .sources
-                    .iter()
-                    .zip(&self.candidates[dest][index].weights)
-                {
+                for (source, weight) in suggested.sources.iter().zip(&suggested.weights) {
                     sum += i64::from(*weight) * i64::from(self.prepared[*source][frame]);
                 }
                 matrixed.push(self.prepared[dest][frame] - (sum >> matrix::FRACTION) as i32);
@@ -2433,8 +2616,8 @@ impl Encoder {
                         .unwrap_or(0);
                     eprintln!(
                         "domain: dest {dest} sources {:?} weights {:?} worst {worst} over {count} of {} (dest peak {peak})",
-                        self.candidates[dest][index].sources,
-                        self.candidates[dest][index].weights,
+                        suggested.sources,
+                        suggested.weights,
                         matrixed.len()
                     );
                 }
@@ -2595,7 +2778,8 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
 
 /// What an interval's restart header will describe, decided from the interval
 /// alone: its shifts, the cascade that puts its folds in the channels, and the
-/// rows each early substream declares.
+/// rows each early substream declares — and then the interval taken into the
+/// codec's domain under them, which is the first pass of preparing it.
 ///
 /// A thing of its own so that the next interval's can be worked out while this
 /// one is being written. It reads nothing the writing changes — what was asked
@@ -2605,7 +2789,9 @@ pub(crate) fn end_of_stream(shorten_by: u16) -> [u32; 2] {
 struct Planning {
     wants: Vec<crate::hierarchy::Presentation>,
     channels: usize,
-    coded: FrameSize,
+    coded: Coded,
+    /// How far a sample is shifted up into the codec's twenty-four bits.
+    shift: u32,
     decorrelation: bool,
     threads: std::sync::Arc<Threads>,
     interval_shift: Option<Vec<u8>>,
@@ -2614,15 +2800,12 @@ struct Planning {
     assignment: Vec<Vec<u8>>,
     presentation_shift: Vec<Vec<u8>>,
     permutation: Vec<usize>,
+    /// The interval taken in under what was decided: handed in empty, or with
+    /// the buffers an interval before it was prepared in, and filled.
+    taken_in: TakenIn,
     stats: Stats,
     /// How long deciding took, for `HZ_TIME`.
     took: std::time::Duration,
-}
-
-/// The one thing about the stream's shape [`Planning`] reads.
-#[derive(Debug, Clone, Copy)]
-struct FrameSize {
-    frame_size: usize,
 }
 
 /// An interval that is complete and not yet written: its units, what was
@@ -2641,8 +2824,35 @@ impl Planning {
         let start = std::time::Instant::now();
         self.settle_the_shifts(held);
         self.build_the_presentations(held);
+        // Only where there are no folds to build: building them is as long
+        // as the preparing beside it, and taking the interval in here then
+        // makes this the longer of the two. Measured on thirty seconds at
+        // twelve elements carrying folds: the building 0.64 s alone and 0.73
+        // with it, the preparing 0.71 s without it — so there it stays with
+        // the preparing, which takes it in as it always did.
+        if self.wants.is_empty() {
+            self.take_in(held);
+            self.taken_in.ready = true;
+        }
         self.took = start.elapsed();
         self
+    }
+
+    /// The interval into the codec's domain, under the permutation and the
+    /// shifts just decided — on this thread, alone: a unit is a few hundred
+    /// samples and an interval a fraction of a millisecond, and the preparing
+    /// beside it has the pool.
+    fn take_in(&mut self, held: &[Held]) {
+        let mut into = std::mem::take(&mut self.taken_in);
+        Intake {
+            coded: &self.coded,
+            channels: self.channels,
+            shift: self.shift,
+            permutation: &self.permutation,
+            interval_shift: self.interval_shift.as_deref(),
+        }
+        .take_in(held, &mut into);
+        self.taken_in = into;
     }
 
     /// The shifts this interval will hold, or none where it holds none.
@@ -4272,5 +4482,435 @@ mod shift_tests {
         // The field is four bits and signed, so seven.
         let samples: Vec<i32> = (1..8).map(|v| v << 20).collect();
         assert_eq!(wasted_bits(&samples), Some(crate::frame::MAX_OUTPUT_SHIFT));
+    }
+}
+
+/// The preparing of an interval, against what it was before it was moved and
+/// merged: the first pass now made by [`Planning`], the domain check made by
+/// the threads that matrix, the matrices judged as they are suggested, and the
+/// second filters' trials run as one list. None of it may change a decision,
+/// so each is checked against the code it replaced, kept here as it was.
+#[cfg(test)]
+mod front_tests {
+    use super::*;
+    use crate::format::SampleBits;
+
+    /// A deterministic source of numbers, so these need no crate.
+    struct Noise(u64);
+
+    impl Noise {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        /// A signed value of `bits` bits, its low `dead` bits clear.
+        fn sample(&mut self, bits: u32, dead: u32) -> i32 {
+            let value = (self.next() >> (64 - bits)) as i64 - (1i64 << (bits - 1));
+            ((value >> dead) << dead) as i32
+        }
+    }
+
+    fn encoder(channels: usize, bits: SampleBits) -> Encoder {
+        Encoder::new(Config {
+            sample_rate: 48_000,
+            channels,
+            bits,
+        })
+        .unwrap()
+    }
+
+    /// The first pass over a unit as `Encoder::unit_in` made it.
+    fn unit_in_as_it_was(
+        coded: &Coded,
+        channels: usize,
+        shift: u32,
+        permutation: &[usize],
+        interval_shift: &Option<Vec<u8>>,
+        unit: &Held,
+        chunk: &mut [i32],
+    ) -> Measured {
+        let width = coded.frame_size;
+        let mut check = [0u32; MAX_SUBSTREAMS];
+        for frame in 0..unit.frames {
+            for channel in 0..channels {
+                let element = permutation[channel];
+                let sample = unit.samples[frame * channels + coded.order[element]] << shift;
+                chunk[channel * width + frame] = sample;
+                let contribution = ((sample as u32) & 0x00ff_ffff) << (channel & 7);
+                for (index, slot) in check.iter_mut().enumerate().take(coded.substreams) {
+                    if channel <= coded.ranges[index].last {
+                        *slot ^= contribution;
+                    }
+                }
+            }
+        }
+        let mut wasted = [None; crate::format::MAX_CHANNELS];
+        for (channel, slot) in wasted.iter_mut().enumerate().take(channels) {
+            *slot = match interval_shift {
+                Some(held) => held.get(channel).copied(),
+                None => wasted_bits(&chunk[channel * width..(channel + 1) * width]),
+            };
+        }
+        Measured { check, wasted }
+    }
+
+    /// Units of `channels` with every kind of channel the first pass treats
+    /// differently: silent, with dead bits, and full; the last one short.
+    fn units(noise: &mut Noise, channels: usize, frame: usize, bits: u32) -> Vec<Held> {
+        let count = 5;
+        (0..count)
+            .map(|index| {
+                let frames = if index + 1 == count {
+                    frame / 2 + 3
+                } else {
+                    frame
+                };
+                let mut samples = vec![0i32; frame * channels];
+                for channel in 0..channels {
+                    let kind = noise.below(4);
+                    let dead = noise.below(6) as u32;
+                    for slot in 0..frames {
+                        samples[slot * channels + channel] = match kind {
+                            0 => 0,
+                            1 => noise.sample(bits, dead),
+                            _ => noise.sample(bits, 0),
+                        };
+                    }
+                }
+                Held {
+                    samples,
+                    frames,
+                    padding: frame - frames,
+                    ..Held::default()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_first_pass_is_what_the_encoder_made_before_it_moved() {
+        let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
+        for channels in [2usize, 6, 8, 9, 12, 14, 16] {
+            for (bits, width) in [(SampleBits::TwentyFour, 24), (SampleBits::Sixteen, 16)] {
+                let encoder = encoder(channels, bits);
+                let frame = encoder.coded.frame_size;
+                for case in 0..6 {
+                    let mut permutation: Vec<usize> = (0..channels).collect();
+                    if case % 2 == 1 {
+                        for at in (1..channels).rev() {
+                            permutation.swap(at, noise.below(at as u64 + 1) as usize);
+                        }
+                    }
+                    let interval_shift = (case >= 3).then(|| {
+                        (0..channels)
+                            .map(|_| {
+                                noise.below(u64::from(crate::frame::MAX_OUTPUT_SHIFT) + 1) as u8
+                            })
+                            .collect::<Vec<u8>>()
+                    });
+                    let held = units(&mut noise, channels, frame, width);
+
+                    let mut taken = TakenIn::default();
+                    Intake {
+                        coded: &encoder.coded,
+                        channels,
+                        shift: encoder.shift,
+                        permutation: &permutation,
+                        interval_shift: interval_shift.as_deref(),
+                    }
+                    .take_in(&held, &mut taken);
+
+                    let stride = channels * frame;
+                    let mut scratch = vec![0i32; held.len() * stride];
+                    let measured: Vec<Measured> = scratch
+                        .chunks_mut(stride)
+                        .zip(&held)
+                        .map(|(chunk, unit)| {
+                            unit_in_as_it_was(
+                                &encoder.coded,
+                                channels,
+                                encoder.shift,
+                                &permutation,
+                                &interval_shift,
+                                unit,
+                                chunk,
+                            )
+                        })
+                        .collect();
+                    let widest = held
+                        .iter()
+                        .flat_map(|unit| unit.samples[..unit.frames * channels].iter())
+                        .fold(0u32, |m, sample| {
+                            m.max((sample << encoder.shift).unsigned_abs())
+                        });
+                    let what = format!("{channels} channels at {width} bits, case {case}");
+                    assert_eq!(taken.scratch, scratch, "{what}: the samples");
+                    assert_eq!(taken.measured, measured, "{what}: what was measured");
+                    assert_eq!(taken.widest, widest, "{what}: the widest");
+                    assert!(
+                        measured.iter().any(|m| m.check.iter().any(|c| *c != 0)),
+                        "{what}: a check worth comparing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A buffer that is taken in again is the same as a fresh one: what an
+    /// interval before it left in it does not survive.
+    #[test]
+    fn a_buffer_taken_in_again_keeps_nothing_of_the_interval_before() {
+        let mut noise = Noise(0x1234_5678_9abc_def1);
+        let channels = 12;
+        let encoder = encoder(channels, SampleBits::TwentyFour);
+        let frame = encoder.coded.frame_size;
+        let permutation: Vec<usize> = (0..channels).collect();
+        let intake = Intake {
+            coded: &encoder.coded,
+            channels,
+            shift: encoder.shift,
+            permutation: &permutation,
+            interval_shift: None,
+        };
+        let mut long: Vec<Held> = (0..3)
+            .flat_map(|_| units(&mut noise, channels, frame, 24))
+            .collect();
+        for unit in &mut long {
+            unit.frames = frame;
+            unit.padding = 0;
+            for sample in &mut unit.samples {
+                if *sample == 0 {
+                    *sample = -1;
+                }
+            }
+        }
+        let short = units(&mut noise, channels, frame, 24);
+        let mut reused = TakenIn::default();
+        intake.take_in(&long, &mut reused);
+        intake.take_in(&short, &mut reused);
+        let mut fresh = TakenIn::default();
+        intake.take_in(&short, &mut fresh);
+        assert_eq!(reused.scratch, fresh.scratch);
+        assert_eq!(reused.measured, fresh.measured);
+        assert_eq!(reused.widest, fresh.widest);
+    }
+
+    #[test]
+    fn the_domain_is_checked_where_the_matrices_are_applied_and_says_the_same() {
+        let mut noise = Noise(0xdead_beef_cafe_f00d);
+        for channels in [8usize, 12, 16] {
+            let mut encoder = encoder(channels, SampleBits::TwentyFour);
+            let frame = encoder.coded.frame_size;
+            let units = 9;
+            let stride = channels * frame;
+            for case in 0..8 {
+                // Loud enough that a weight near two leaves some channels past
+                // the codec's twenty-four bits, and not every one.
+                let mut scratch: Vec<i32> = (0..units * stride)
+                    .map(|_| {
+                        noise.sample(if case % 2 == 0 { 24 } else { 23 }, 0) >> (noise.below(3))
+                    })
+                    .collect();
+                encoder.matrices.clear();
+                for dest in 1..channels {
+                    if noise.below(3) == 0 {
+                        continue;
+                    }
+                    let source = noise.below(dest as u64) as usize;
+                    let weight =
+                        noise.below(1 << (matrix::FRACTION + 1)) as i32 - (1 << matrix::FRACTION);
+                    if let Some(mut matrix) =
+                        Primitive::fit(dest, &[source], &[weight], matrix::FRACTION)
+                    {
+                        if case % 3 == 0 {
+                            matrix.delta[source] = noise.below(64) as i32 - 32;
+                        }
+                        encoder.matrices.push(matrix);
+                    }
+                }
+                let mut expected = scratch.clone();
+                for (index, chunk) in expected.chunks_mut(stride).enumerate() {
+                    let mut planes: Vec<&mut [i32]> = chunk.chunks_mut(frame).collect();
+                    matrix::apply_inverse(&encoder.matrices, &mut planes, frame, index);
+                }
+                // The scan as `Encoder::over_the_domain` made it.
+                let domains: Vec<i32> = (0..channels).map(|c| encoder.domain_of(c)).collect();
+                let mut over_expected = vec![false; channels];
+                for chunk in expected.chunks(stride) {
+                    for (channel, plane) in chunk.chunks(frame).enumerate().take(channels) {
+                        let domain = domains[channel];
+                        if !over_expected[channel]
+                            && plane
+                                .iter()
+                                .any(|sample| !(-domain..domain).contains(sample))
+                        {
+                            over_expected[channel] = true;
+                        }
+                    }
+                }
+                let over = encoder.apply_the_matrices(&mut scratch, stride);
+                assert_eq!(scratch, expected, "{channels} channels, case {case}");
+                assert_eq!(over, over_expected, "{channels} channels, case {case}");
+            }
+        }
+    }
+
+    /// A signal with a roll-off a second filter can earn its keep on, a
+    /// different one per channel, so the trials do not all agree.
+    fn resonant(noise: &mut Noise, channel: usize, samples: usize) -> Vec<i32> {
+        let poles = [
+            (1.8, 0.85),
+            (1.5, 0.6),
+            (0.9, 0.1),
+            (1.72, 0.77),
+            (0.2, 0.0),
+            (1.9, 0.92),
+        ];
+        let (a, b) = poles[channel % poles.len()];
+        let loud = 1 << (6 + channel % 8);
+        let (mut one, mut two) = (0.0f64, 0.0f64);
+        (0..samples)
+            .map(|_| {
+                let excite = f64::from(noise.sample(12, 0)) * f64::from(loud) / 2048.0;
+                let next = a * one - b * two + excite;
+                two = one;
+                one = next;
+                (next.round() as i64).clamp(-(1 << 23), (1 << 23) - 1) as i32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_channels_trials_in_one_list_choose_what_each_channel_chose_alone() {
+        let mut noise = Noise(0x0123_4567_89ab_cdef);
+        let channels = 8;
+        let units = 64;
+        let mut seen = std::collections::BTreeSet::new();
+        for case in 0..6u64 {
+            let mut encoder = encoder(channels, SampleBits::TwentyFour);
+            let frame = encoder.coded.frame_size;
+            for channel in 0..channels {
+                // One channel with too little behind it to be judged at all.
+                let behind = if channel == 3 && case % 2 == 0 {
+                    200
+                } else {
+                    2400
+                };
+                let signal = resonant(&mut noise, channel + case as usize, behind + units * frame);
+                let mut past = History::new(filter::SECOND_CONTEXT, frame);
+                for unit in signal[..behind].chunks(frame) {
+                    past.push(unit);
+                }
+                encoder.past[channel] = past;
+                encoder.prepared[channel] = signal[behind..].to_vec();
+                encoder.second_mode[channel] = match noise.below(5) {
+                    0 => None,
+                    design => Some(design as usize - 1),
+                };
+            }
+            encoder.effort = if case < 3 { Effort::Full } else { Effort::Fast };
+            encoder.intervals_decided = case;
+
+            let block = crate::format::MAX_BLOCK.min(40);
+            let ahead = (units * frame).min(filter::TRIAL_BLOCKS * block);
+            let expected: Vec<Option<usize>> = (0..channels)
+                .map(|channel| {
+                    let behind = encoder.past[channel].window();
+                    let carried = behind.len().min(filter::FIT_CONTEXT);
+                    let mut trial = Vec::with_capacity(carried + ahead);
+                    trial.extend_from_slice(&behind[behind.len() - carried..]);
+                    trial.extend_from_slice(&encoder.prepared[channel][..ahead]);
+                    filter::pick_second(
+                        &trial,
+                        encoder.second_mode[channel],
+                        encoder.effort,
+                        encoder.intervals_decided,
+                    )
+                })
+                .collect();
+            encoder.decide_second_filters(units);
+            assert_eq!(encoder.second_mode, expected, "case {case}");
+            seen.extend(expected);
+        }
+        assert!(
+            seen.len() >= 3,
+            "the trials should not all agree, or this proves little: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_matrices_judged_as_they_are_suggested_are_the_ones_judged_after() {
+        let mut noise = Noise(0x5555_aaaa_3333_cccc);
+        let mut chosen = 0;
+        for channels in [6usize, 8, 12] {
+            let mut encoder = encoder(channels, SampleBits::TwentyFour);
+            let frame = encoder.coded.frame_size;
+            let units = 32;
+            let base: Vec<Vec<i32>> = (0..3)
+                .map(|channel| resonant(&mut noise, channel, units * frame))
+                .collect();
+            for channel in 0..channels {
+                // Each channel a mix of a few shared signals and its own, so
+                // some are worth coding against others and some are not.
+                let own = resonant(&mut noise, channel + 7, units * frame);
+                let share = [(channel % 3) as i32, (channel % 2) as i32 * 2, 1];
+                encoder.prepared[channel] = (0..units * frame)
+                    .map(|at| {
+                        let mixed = i64::from(base[0][at]) * i64::from(share[0])
+                            + i64::from(base[1][at]) * i64::from(share[1]) / 2
+                            + i64::from(own[at]) / (1 + i64::from(share[2]) * (channel as i64 % 4));
+                        (mixed / 2).clamp(-(1 << 22), (1 << 22) - 1) as i32
+                    })
+                    .collect();
+                let mut past = History::new(filter::SECOND_CONTEXT, frame);
+                for unit in resonant(&mut noise, channel, 1200).chunks(frame) {
+                    past.push(unit);
+                }
+                encoder.past[channel] = past;
+            }
+
+            let fused = encoder.suggest_matrices(units, true);
+            let candidates = encoder.candidates.clone();
+            let mut scratch = vec![0i32; frame];
+            for (dest, judged) in fused.iter().enumerate() {
+                let alone = if candidates[dest].is_empty() {
+                    Judged::default()
+                } else {
+                    encoder.judge_matrix(dest, &candidates[dest], &mut scratch)
+                };
+                assert_eq!(judged.best, alone.best, "{channels} channels, dest {dest}");
+                assert_eq!(
+                    judged.refused, alone.refused,
+                    "{channels} channels, dest {dest}"
+                );
+                chosen += usize::from(judged.best.is_some());
+            }
+
+            // Suggested again without judging, the candidates are the same and
+            // nothing is judged.
+            let unjudged = encoder.suggest_matrices(units, false);
+            assert!(
+                unjudged
+                    .iter()
+                    .all(|judged| judged.best.is_none() && judged.refused == 0)
+            );
+            for (again, before) in encoder.candidates.iter().zip(&candidates) {
+                assert_eq!(again.len(), before.len());
+                for (a, b) in again.iter().zip(before) {
+                    assert_eq!(
+                        (&a.sources, &a.weights, &a.steps),
+                        (&b.sources, &b.weights, &b.steps)
+                    );
+                }
+            }
+        }
+        assert!(chosen >= 2, "some matrix should pay, or this proves little");
     }
 }

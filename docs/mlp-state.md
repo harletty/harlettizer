@@ -172,19 +172,34 @@ its own interval takes.
 
 Encoder alone, release, best of three, on a Ryzen 9 9950X: **about 3 ms per
 channel-second** at full effort. `hz-cli` and `xtask` build `hz-mlp` with its
-`parallel` feature; the pool is the encoder's own and is sized to the machine.
-`HZ_TIME=1` in the environment makes the encoder time its phases and print
-them when the stream is finished.
+`parallel` feature. The encoder has a pool of its own, two threads a channel,
+never fewer than a channel's five second-filter trials and never more than the
+machine has, and the channel search another, a thread a channel. `HZ_TIME=1` in the environment makes the encoder time its phases
+and print them when the stream is finished; `suggest` there includes judging
+the matrices, and `build` the first pass over the units when it is made there.
 
 **The fork is once an interval, never once an access unit.** Four things run
-across the pool — the second-filter trials and the channel search, each a
-thread per channel walking all 128 units; the matrices, a thread per
-destination judging its candidates, then admitted in order under the
-substream budgets; and preparing the units, a thread per unit, in three passes
-with a serial one between the first two that hands each silent unit the shift
-in force before it. While the channel search forked per access unit, 360 000
-times over five minutes, a wider pool made the encode 21 % *slower*, and once
-the fork moved out it made it 13 % faster.
+across a pool — the second-filter trials, every channel's in one list handed
+out longest first; the channel search, a thread per channel walking all 128
+units; the matrices, a thread per destination suggesting its candidates and
+judging them as soon as they exist, then admitted in order under the
+substream budgets; and the matrices applied, in eight runs of units, each run
+checking what it left against the codec's domain while it is in the cache.
+While the channel search forked per access unit, 360 000 times over five
+minutes, a wider pool made the encode 21 % *slower*, and once the fork moved
+out it made it 13 % faster.
+
+**And never for less than it costs to wake the pool.** The rest of preparing
+an interval is a few hundred samples of work a unit, and handed to the pool a
+unit at a time it cost three times what it costs on one thread, because the
+pool had gone to sleep while the interval was read. So the first pass —
+de-interleaving, certifying, measuring the dead bits — runs on the thread that
+works out the interval's folds, beside the preparing of the interval before,
+whenever there are no folds to build; and the second pass, the dead bits and
+the cascade off, runs unit after unit on the preparing thread. With the
+pools sized as above, on a thirty-second programme at twelve elements, that
+took the encode from 0.84 s to 0.69 and from 0.61 s to 0.49 at `--fast`, byte
+for byte the same; the steps are in [`mlp.md`](mlp.md).
 
 What is left on one thread, on four minutes of a twelve-element programme
 carrying folds: writing the units 1.7 s and building the presentations 1.2 s,
