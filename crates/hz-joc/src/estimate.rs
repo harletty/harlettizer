@@ -133,6 +133,14 @@ pub const STEP: f32 = 820.0 / 8192.0;
 /// 192.
 const LEVELS: i32 = 192;
 const MAX_CHANNELS: usize = 7;
+/// Sums of the fit's equations taken side by side, each its own: the
+/// equations' entries come in runs this long, a row of the basis wide
+/// enough to hold whole runs.
+const LANES: usize = 8;
+/// Rows of the equations worked out at once, sharing what they read of the
+/// basis: within a run, so that the rows start in the same one.
+const TILE: usize = 2;
+const _: () = assert!(LANES.is_multiple_of(TILE) && BANDS.is_multiple_of(TILE));
 
 fn band_of(subband: usize) -> usize {
     BAND_START
@@ -182,7 +190,9 @@ pub struct Estimator {
     /// the basis under it, the normal equations and their factor — kept, so
     /// that a frame allocates nothing for them.
     window_root: Vec<f64>,
-    weighted: Vec<Vec<f64>>,
+    /// The basis under the window a sample to a row, [`wide`] long, the
+    /// columns past the basis nought.
+    weighted: Vec<f64>,
     gram: Vec<f64>,
     factor: Vec<f64>,
     /// For the steep decision: each slot's downmix matrices, per band, over
@@ -249,7 +259,7 @@ impl Estimator {
             window_root: (0..FRAME)
                 .map(|t| (std::f64::consts::PI * (t as f64 + 0.5) / FRAME as f64).sin())
                 .collect(),
-            weighted: vec![vec![0.0; FRAME]; channels * BANDS],
+            weighted: vec![0.0; FRAME * wide(channels * BANDS)],
             gram: vec![0.0; (channels * BANDS).pow(2)],
             factor: vec![0.0; (channels * BANDS).pow(2)],
             slot_gram: vec![[[0.0; MAX_CHANNELS]; MAX_CHANNELS]; SPAN * BANDS],
@@ -365,16 +375,13 @@ impl Estimator {
         // flat window of the same length fits each frame's gains to its
         // neighbours' mixes too, and a short flat one chases transients.
         let start = FRAME + DELAY / 2 - FRAME / 2;
-        let window_root = &self.window_root;
-        each_mut!(self.weighted)
-            .zip(each!(self.basis_out))
-            .for_each(|(weighted, basis)| {
-                for ((w, &root), &value) in weighted
-                    .iter_mut()
-                    .zip(window_root)
-                    .zip(&basis[start..start + FRAME])
-                {
-                    *w = root * f64::from(value);
+        let (window_root, basis_out) = (&self.window_root, &self.basis_out);
+        chunks_mut!(self.weighted, wide(n * BANDS))
+            .zip(each!(window_root))
+            .enumerate()
+            .for_each(|(t, (row, &root))| {
+                for (w, basis) in row.iter_mut().zip(basis_out) {
+                    *w = root * f64::from(basis[start + t]);
                 }
             });
         synthesis_system(
@@ -733,7 +740,7 @@ struct Frame<'a> {
     stepping: bool,
     /// Where the window starts in the two frames of output.
     start: usize,
-    weighted: &'a [Vec<f64>],
+    weighted: &'a [f64],
     gram: &'a [f64],
     factor: &'a [f64],
     window_root: &'a [f64],
@@ -744,7 +751,7 @@ struct Frame<'a> {
 /// The fit by synthesis's normal equations on the window from `from`
 /// samples into it, ridged, into `gram`, and their factor into `factor`.
 fn synthesis_system(
-    weighted: &[Vec<f64>],
+    weighted: &[f64],
     from: usize,
     n: usize,
     ridge: f32,
@@ -752,12 +759,21 @@ fn synthesis_system(
     factor: &mut [f64],
 ) {
     let m = n * BANDS;
-    // A row of the upper triangle at a time, then the lower from it.
-    chunks_mut!(gram[..m * m], m)
+    let rows = window(weighted, from, m);
+    // The upper triangle a few rows at a time, a run of their entries at
+    // once from the run the diagonal is in; then the lower from it.
+    chunks_mut!(gram[..m * m], TILE * m)
         .enumerate()
-        .for_each(|(i, row)| {
-            for j in i..m {
-                row[j] = dot(&weighted[i][from..], &weighted[j][from..]);
+        .for_each(|(tile, out)| {
+            let i = tile * TILE;
+            for run in (i / LANES * LANES..m).step_by(LANES) {
+                let sums = sums(rows, wide(m), run, |_, sample| {
+                    std::array::from_fn::<_, TILE, _>(|r| sample[i + r])
+                });
+                for (r, (row, sums)) in out.chunks_exact_mut(m).zip(&sums).enumerate() {
+                    let (first, end) = (run.max(i + r), (run + LANES).min(m));
+                    row[first..end].copy_from_slice(&sums[first - run..end - run]);
+                }
             }
         });
     for i in 0..m {
@@ -910,9 +926,13 @@ impl Fitter {
     /// normal equations `gram` and their factor `factor`.
     fn solve(&mut self, frame: &Frame, gram: &[f64], factor: &[f64], from: usize) {
         let m = frame.channels * BANDS;
-        for (b, weighted) in self.rhs.iter_mut().zip(frame.weighted) {
-            *b = dot(&weighted[from..], &self.weighted_target[from..]);
-        }
+        against(
+            frame.weighted,
+            from,
+            m,
+            &self.weighted_target,
+            &mut self.rhs,
+        );
         self.solution.copy_from_slice(&self.rhs);
         cholesky_solve(factor, m, &mut self.solution);
         self.hold_to_bounds(gram, m);
@@ -1396,6 +1416,54 @@ fn quantise(channels: usize, gain: impl Fn(usize, usize) -> f64) -> (Vec<Vec<u16
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// The width of a row of `m` signals a sample, in whole runs of [`LANES`].
+fn wide(m: usize) -> usize {
+    m.next_multiple_of(LANES)
+}
+
+/// The rows of a basis of `m` signals ([`wide`]) from sample `from` of the
+/// window on.
+fn window(weighted: &[f64], from: usize, m: usize) -> &[f64] {
+    &weighted[from * wide(m)..]
+}
+
+/// The right-hand side of the fit by synthesis on the window from `from`
+/// samples into it: each of the basis's `m` signals against `target`, into
+/// `rhs`.
+fn against(weighted: &[f64], from: usize, m: usize, target: &[f64], rhs: &mut [f64]) {
+    let (rows, target) = (window(weighted, from, m), &target[from..]);
+    for run in (0..m).step_by(LANES) {
+        let [sums] = sums(rows, wide(m), run, |t, _| [target[t]]);
+        let end = (run + LANES).min(m);
+        rhs[run..end].copy_from_slice(&sums[..end - run]);
+    }
+}
+
+/// The [`LANES`] columns of `rows` from `run`, each times each of the `R`
+/// values `by` takes of its row — from the row's sample and the row —
+/// summed down the rows: each sum its own, its products taken and added in
+/// the order [`dot`] takes them, and from where it starts, so that each is
+/// the dot of the two to the bit. Side by side, the sums do not wait on each
+/// other, and the `R` share each run they read.
+#[inline(always)]
+fn sums<const R: usize>(
+    rows: &[f64],
+    wide: usize,
+    run: usize,
+    by: impl Fn(usize, &[f64]) -> [f64; R],
+) -> [[f64; LANES]; R] {
+    let mut sums = [[std::iter::empty::<f64>().sum::<f64>(); LANES]; R];
+    for (t, row) in rows.chunks_exact(wide).enumerate() {
+        let column: &[f64; LANES] = row[run..run + LANES].try_into().expect("whole runs");
+        for (sums, a) in sums.iter_mut().zip(by(t, row)) {
+            for (sum, &b) in sums.iter_mut().zip(column) {
+                *sum += a * b;
+            }
+        }
+    }
+    sums
 }
 
 /// The lower-triangular factor of a symmetric positive-definite `m × m`
@@ -2323,5 +2391,89 @@ mod tests {
         let joc = estimator.push(&c2, &o2, &[true]).unwrap();
         assert!(joc.objects[0].is_none());
         assert_eq!(estimator.held(0), &held);
+    }
+
+    /// The system as it was summed before the runs: a dot for each entry,
+    /// each signal's samples a row of their own.
+    fn system_by_dots(
+        weighted: &[Vec<f64>],
+        from: usize,
+        n: usize,
+        ridge: f32,
+        gram: &mut [f64],
+        factor: &mut [f64],
+    ) {
+        let m = n * BANDS;
+        for i in 0..m {
+            for j in i..m {
+                gram[i * m + j] = dot(&weighted[i][from..], &weighted[j][from..]);
+            }
+        }
+        for i in 0..m {
+            for j in i + 1..m {
+                gram[j * m + i] = gram[i * m + j];
+            }
+        }
+        for band in 0..BANDS {
+            let mean = (0..n)
+                .map(|ch| gram[(ch * BANDS + band) * (m + 1)])
+                .sum::<f64>()
+                / n as f64;
+            let lambda = f64::from(ridge) * mean + 1e-12;
+            for ch in 0..n {
+                gram[(ch * BANDS + band) * (m + 1)] += lambda;
+            }
+        }
+        cholesky(gram, m, factor);
+    }
+
+    /// The fit's sums taken in runs side by side are the dots they replace,
+    /// to the bit: the system, its factor and a right-hand side, on every
+    /// number of channels and a window from any sample. Two of the signals
+    /// are noughts, one of each sign: their products are noughts of a sign
+    /// only a sum that starts where `dot`'s does keeps.
+    #[test]
+    fn the_sums_in_runs_are_the_dots_to_the_bit() {
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut seed = 21u32;
+        for n in 1..=MAX_CHANNELS {
+            let m = n * BANDS;
+            let mut signals: Vec<Vec<f64>> = (0..m)
+                .map(|_| {
+                    (0..FRAME)
+                        .map(|_| 3.0 * f64::from(noise(&mut seed)))
+                        .collect()
+                })
+                .collect();
+            signals[3] = vec![-0.0; FRAME];
+            signals[4] = vec![0.0; FRAME];
+            let target: Vec<f64> = (0..FRAME).map(|_| f64::from(noise(&mut seed))).collect();
+            let mut weighted = vec![0.0; FRAME * wide(m)];
+            for (t, row) in weighted.chunks_exact_mut(wide(m)).enumerate() {
+                for (w, signal) in row.iter_mut().zip(&signals) {
+                    *w = signal[t];
+                }
+            }
+            for from in [0, 1, 7, 700, FRAME - 1, FRAME] {
+                let (mut gram, mut factor) = (vec![0.0; m * m], vec![0.0; m * m]);
+                synthesis_system(&weighted, from, n, 1e-3, &mut gram, &mut factor);
+                let (mut dots, mut dots_factor) = (vec![0.0; m * m], vec![0.0; m * m]);
+                system_by_dots(&signals, from, n, 1e-3, &mut dots, &mut dots_factor);
+                assert_eq!(bits(&gram), bits(&dots), "{n} channels from {from}");
+                assert_eq!(
+                    bits(&factor),
+                    bits(&dots_factor),
+                    "{n} channels from {from}"
+                );
+
+                let mut rhs = vec![0.0; m];
+                against(&weighted, from, m, &target, &mut rhs);
+                let rhs_by_dots: Vec<f64> = signals
+                    .iter()
+                    .map(|signal| dot(&signal[from..], &target[from..]))
+                    .collect();
+                assert_eq!(bits(&rhs), bits(&rhs_by_dots), "{n} channels from {from}");
+            }
+        }
     }
 }

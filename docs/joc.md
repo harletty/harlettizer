@@ -500,6 +500,24 @@ coder its blocks, so both are what a single thread makes of them.
 | 40 objects, 4 s | 40 → 15 | 1.75 s | 0.48 s | 0.37 s | +42 % |
 | 40 objects and a 7.1.2 bed, 4 s | 49 → 15 | 1.83 s | 0.47 s | 0.37 s | +36 % |
 
+The fit's normal equations are sums of products over the window. Each of
+the downmix's basis signals is summed against every other, once a frame and
+again for each object whose gains step, and against each object's target.
+One such sum of fifteen hundred products waits on each addition before it
+can take the next. So the basis is laid out a sample to a row, and the
+sums are taken eight entries and two rows of the equations at a time
+(`sums`). Each entry is still its own sum, its products taken and added in
+the order a single sum takes them and from the same start, so every entry
+is the same to the bit. On sixteen cores:
+
+| programme | elements | before | after | CPU time |
+|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 0.66 s | 0.53 s | −22 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 1.34 s | 1.21 s | −8 % |
+| 60 s at 640 kb/s | 11 | 2.29 s | 2.04 s | −11 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.44 s | 0.41 s | −5 % |
+| 40 objects, 4 s | 40 → 15 | 0.23 s | 0.22 s | −6 % |
+
 A frame over its budget has some thirty λ tried on it, and every one weighs
 the same candidate levels. A channel's candidates and their weighted errors
 do not depend on λ, so they are laid out once a frame (`Trellis`), and what
