@@ -2428,7 +2428,7 @@ mod tests {
     }
 
     /// The fit's sums taken in runs side by side are the dots they replace,
-    /// to the bit: the system, its factor and a right-hand side, on any
+    /// to the bit: the system, its factor and a right-hand side, on every
     /// number of channels and a window from any sample. Two of the signals
     /// are noughts, one of each sign: their products are noughts of a sign
     /// only a sum that starts where `dot`'s does keeps.
@@ -2436,7 +2436,7 @@ mod tests {
     fn the_sums_in_runs_are_the_dots_to_the_bit() {
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         let mut seed = 21u32;
-        for n in [1, 2, 5, 7] {
+        for n in 1..=MAX_CHANNELS {
             let m = n * BANDS;
             let mut signals: Vec<Vec<f64>> = (0..m)
                 .map(|_| {
