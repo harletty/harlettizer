@@ -4,6 +4,8 @@ mod ac3;
 mod convert;
 mod dts;
 mod encode;
+#[cfg(test)]
+mod fixtures;
 mod iamf;
 mod iamf_objects;
 mod joc;

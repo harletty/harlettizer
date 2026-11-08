@@ -10,7 +10,14 @@
 //! Either way the loudness a decoder normalises by is measured on the two
 //! layouts the mix presentation states: 7.1.4, and the stereo pair a decoder
 //! folds it to.
+//!
+//! The measurement runs on a thread of its own, and each unit's substreams
+//! are coded on threads of theirs ([`hz_iamf::Writer::with_threads`]): the
+//! meters see every unit in order and each substream's coder the same calls,
+//! so the sequence is the same to the byte as on one thread, which is where
+//! all of it runs when no thread can be started.
 
+use crate::lane::{LANE_DEPTH, Lane, Stage};
 use hz_analysis::loudness::{ChannelWeight, Meter};
 use hz_analysis::truepeak::TruePeak;
 use hz_core::{Error, Result};
@@ -81,6 +88,19 @@ pub const OPUS_BITRATE: u32 = 96;
 
 /// The output, open, with its descriptors written.
 pub(crate) type Output = Writer<BufWriter<File>>;
+
+/// The most threads a unit's substreams are coded on.
+pub(crate) const THREADS: usize = 8;
+
+/// Threads for the substreams: as many as there are cores, up to
+/// [`THREADS`], or the caller's alone.
+pub(crate) fn coding_threads(threads: bool) -> usize {
+    if threads {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(THREADS))
+    } else {
+        1
+    }
+}
 
 /// Open `config.out` and start a sequence of these elements there.
 pub(crate) fn open(config: &Config, sample_rate: u32, elements: Vec<Element>) -> Result<Output> {
@@ -192,6 +212,79 @@ impl Measure {
     }
 }
 
+/// One unit as the measurement takes it: the whole mix as a decoder renders
+/// it on 7.1.4, and the dialogue alone when it has an element of its own.
+pub(crate) struct Measured {
+    pub(crate) whole: Vec<f32>,
+    pub(crate) dialogue: Vec<f32>,
+    /// The interleaved samples of each that are this unit's.
+    pub(crate) len: usize,
+}
+
+/// The measurement: the whole mix, and the dialogue alone when there is one.
+pub(crate) struct Measuring {
+    pub(crate) whole: Measure,
+    pub(crate) dialogue: Option<Measure>,
+}
+
+impl Stage for Measuring {
+    type In = Measured;
+    type Out = Measured;
+
+    fn run(&mut self, unit: Measured) -> Measured {
+        self.whole.push(&unit.whole[..unit.len]);
+        if let Some(dialogue) = &mut self.dialogue {
+            dialogue.push(&unit.dialogue[..unit.len]);
+        }
+        unit
+    }
+}
+
+/// The measurement on a thread of its own, and the buffers it hands back to
+/// be filled again. Each meter sees the units in the order they are pushed,
+/// so it measures what it would on the caller's thread.
+pub(crate) struct Measurer {
+    lane: Lane<Measuring>,
+    spare: Vec<Measured>,
+}
+
+impl Measurer {
+    /// `measuring` on a thread of its own when `threads`, its units up to
+    /// `width` interleaved samples.
+    pub(crate) fn new(measuring: Measuring, width: usize, threads: bool) -> Self {
+        let dialogue = if measuring.dialogue.is_some() {
+            width
+        } else {
+            0
+        };
+        let spare = (0..=LANE_DEPTH)
+            .map(|_| Measured {
+                whole: vec![0.0; width],
+                dialogue: vec![0.0; dialogue],
+                len: 0,
+            })
+            .collect();
+        Self {
+            lane: Lane::new(measuring, "iamf-measure", threads),
+            spare,
+        }
+    }
+
+    /// A unit to fill: one not yet handed over, or the oldest measured.
+    pub(crate) fn unit(&mut self) -> Measured {
+        self.spare.pop().unwrap_or_else(|| self.lane.recv())
+    }
+
+    pub(crate) fn push(&mut self, unit: Measured) {
+        self.lane.send(unit);
+    }
+
+    /// The measurement, every unit pushed measured.
+    pub(crate) fn finish(self) -> Measuring {
+        self.lane.into_stage()
+    }
+}
+
 /// How the summary names the coding.
 pub(crate) fn coding(config: &Config) -> String {
     match config.codec {
@@ -229,8 +322,14 @@ pub(crate) fn report_written(config: &Config, samples: u64, sample_rate: u32) ->
 }
 
 pub fn run(config: Config) -> Result<()> {
+    run_on(config, true)
+}
+
+/// [`run`], the measurement and the substreams on threads of their own when
+/// `threads`, or all on the caller's.
+pub(crate) fn run_on(config: Config, threads: bool) -> Result<()> {
     if config.objects.is_some() {
-        return crate::iamf_objects::run(config);
+        return crate::iamf_objects::run(config, threads);
     }
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
@@ -298,7 +397,8 @@ pub fn run(config: Config) -> Result<()> {
         return Err(Error::unsupported(path, "nothing in it to render"));
     }
 
-    let mut writer = open(&config, sample_rate, vec![Element::Channels(coded)])?;
+    let mut writer = open(&config, sample_rate, vec![Element::Channels(coded)])?
+        .with_threads(coding_threads(threads));
 
     let frame = config.frame;
     let total = config
@@ -310,8 +410,11 @@ pub fn run(config: Config) -> Result<()> {
     let mut input = vec![0f32; frame * stride];
     let mut mixed = vec![0f64; frame * width];
     let mut quantised = vec![0i32; frame * width];
-    let mut measured = vec![0f32; frame * width];
-    let mut measure = Measure::new(sample_rate);
+    let measuring = Measuring {
+        whole: Measure::new(sample_rate),
+        dialogue: None,
+    };
+    let mut measurer = Measurer::new(measuring, frame * width, threads);
 
     let quantiser = Quantiser::bits(config.bits);
     let full_scale = quantiser.full_scale();
@@ -347,13 +450,15 @@ pub fn run(config: Config) -> Result<()> {
         {
             *q = quantiser.code(m, &mut levels);
         }
-        for (f, &q) in measured[..got * width]
+        let mut measured = measurer.unit();
+        for (f, &q) in measured.whole[..got * width]
             .iter_mut()
             .zip(&quantised[..got * width])
         {
             *f = (f64::from(q) / full_scale) as f32;
         }
-        measure.push(&measured[..got * width]);
+        measured.len = got * width;
+        measurer.push(measured);
 
         writer
             .push(&quantised[..got * width], &[])
@@ -370,7 +475,7 @@ pub fn run(config: Config) -> Result<()> {
         return Err(Error::unsupported(path, "no audio to encode"));
     }
 
-    let loudness = measure.finish();
+    let loudness = measurer.finish().whole.finish();
     let units = writer.units();
     writer
         .finish(loudness)
@@ -433,5 +538,200 @@ pub(crate) fn lkfs(value: f64) -> String {
         format!("{value:.1} LKFS")
     } else {
         "silence".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures;
+    use std::path::Path;
+
+    /// A third of a second and some: sixteen units of 1024 and a short one
+    /// to end on, seventeen of Opus's 960.
+    const SAMPLES: usize = 16 * 1024 + 300;
+
+    /// How a test codes the master: a name, the codec, the frame, how the
+    /// objects travel — rendered to the bed, or as objects with this many
+    /// voices rendered into a dialogue element — and the output's extension.
+    type Case = (&'static str, Codec, usize, Option<usize>, &'static str);
+
+    fn cases() -> Vec<Case> {
+        let mut cases: Vec<Case> = vec![
+            ("bed-flac", Codec::Flac, 1024, None, "iamf"),
+            ("bed-lpcm", Codec::Lpcm, 1024, None, "iamf"),
+            ("objects-flac", Codec::Flac, 1024, Some(0), "mka"),
+            ("voices-flac", Codec::Flac, 4096, Some(1), "iamf"),
+        ];
+        if cfg!(feature = "opus") {
+            let opus = Codec::Opus { bitrate: 64_000 };
+            cases.push(("bed-opus", opus, OPUS_FRAME, None, "mka"));
+            cases.push(("objects-opus", opus, OPUS_FRAME, Some(0), "iamf"));
+        }
+        cases
+    }
+
+    /// `input` coded into `out` as `case` says, the measurement and the
+    /// substreams — and with objects the writer — on threads of their own
+    /// when `threads`: how the encode ended.
+    fn encoded(
+        input: &Path,
+        out: PathBuf,
+        case: &Case,
+        threads: bool,
+    ) -> std::result::Result<(), String> {
+        let (_, codec, frame, voices, _) = *case;
+        let config = Config {
+            input: input.to_path_buf(),
+            out,
+            frames: None,
+            mono_prefix: None,
+            codec,
+            bits: 24,
+            frame,
+            headphones: Headphones::Stereo,
+            progress: false,
+            objects: voices.map(|_| PositionKind::Cart16),
+            elements: None,
+            overlay: None,
+            voices_to_bed: voices.filter(|&n| n > 0),
+            overlaying: overlay::Options::default(),
+            mixing: Mixing::default(),
+        };
+        run_on(config, threads).map_err(|e| e.to_string())
+    }
+
+    /// [`encoded`] into `dir`: how the encode ended, and what it wrote.
+    fn coded(
+        input: &Path,
+        dir: &Path,
+        case: &Case,
+        threads: bool,
+    ) -> (std::result::Result<(), String>, Vec<u8>) {
+        let (name, .., extension) = *case;
+        let out = dir.join(format!("{name}-{threads}.{extension}"));
+        let ended = encoded(input, out.clone(), case, threads);
+        (ended, std::fs::read(&out).unwrap())
+    }
+
+    /// The temporal units in a standalone sequence: its temporal delimiters.
+    fn units(bytes: &[u8]) -> usize {
+        let mut at = 0;
+        let mut delimiters = 0;
+        while at < bytes.len() {
+            let header = bytes[at];
+            at += 1;
+            let (mut size, mut shift) = (0usize, 0);
+            loop {
+                let b = bytes[at];
+                at += 1;
+                size |= usize::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            if header >> 3 == 4 {
+                delimiters += 1;
+            }
+            at += size;
+        }
+        delimiters
+    }
+
+    /// The measurement on a thread of its own, the substreams on theirs and,
+    /// with objects, the writer on its own write what one thread writes: the
+    /// same bytes, a bed or objects, every codec, standalone or in Matroska,
+    /// the loudness patched in at the end the same.
+    #[test]
+    fn the_threads_write_what_one_thread_writes() {
+        let dir = fixtures::scratch("iamf", "threads");
+        let input = fixtures::master(&dir, SAMPLES);
+        for case in cases() {
+            let [(inline, alone), (threaded, beside)] =
+                [false, true].map(|threads| coded(&input, &dir, &case, threads));
+            let (name, ..) = case;
+            assert_eq!(inline, Ok(()), "{name}");
+            assert_eq!(threaded, Ok(()), "{name}");
+            assert!(!alone.is_empty(), "{name}");
+            assert!(alone == beside, "{name}: the same sequence on threads");
+        }
+    }
+
+    /// Audio that ends before its header says, in the sixth unit of 1024:
+    /// the encode stops there with the same error, on threads or not, and
+    /// leaves the same units — the five read whole.
+    #[test]
+    fn a_read_that_fails_stops_the_encode_where_one_thread_stops() {
+        const CUT: usize = 5 * 1024 + 300;
+        let dir = fixtures::scratch("iamf", "cut");
+        let input = fixtures::master(&dir, SAMPLES);
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Ten channels of 24 bits.
+        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        for case in cases() {
+            let (name, _, frame, _, extension) = case;
+            if frame != 1024 {
+                continue;
+            }
+            let (inline, alone) = coded(&input, &dir, &case, false);
+            assert!(inline.is_err(), "{name}: the read fails");
+            if extension == "iamf" {
+                assert_eq!(units(&alone), 5, "{name}: the units read whole");
+            }
+            for run in 0..8 {
+                let (threaded, beside) = coded(&input, &dir, &case, true);
+                assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
+                assert!(alone == beside, "{name}, run {run}: the same units left");
+            }
+        }
+    }
+
+    /// A write that fails — the output a full device — stops the encode
+    /// where one thread stops, on threads as on one: at the first push that
+    /// fails, before the read that would fail in the fourth unit. Units of
+    /// 1024 FLAC or LPCM samples outgrow the output's buffer at the first
+    /// push; Opus packets fill it a few units in, so there either may come
+    /// first, but the same one on threads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_that_fails_stops_the_encode_where_one_thread_stops() {
+        const CUT: usize = 3 * 1024 + 300;
+        let dir = fixtures::scratch("iamf", "full");
+        let input = fixtures::master(&dir, SAMPLES);
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        let full = PathBuf::from("/dev/full");
+        for case in cases() {
+            let (name, codec, frame, ..) = case;
+            let inline = encoded(&input, full.clone(), &case, false);
+            assert!(inline.is_err(), "{name}");
+            if frame == 1024 && !matches!(codec, Codec::Opus { .. }) {
+                assert!(
+                    inline
+                        .as_ref()
+                        .is_err_and(|e| e.contains("No space left on device")),
+                    "{name}: the write first, as one thread meets it: {inline:?}"
+                );
+            }
+            for run in 0..8 {
+                let threaded = encoded(&input, full.clone(), &case, true);
+                assert_eq!(threaded, inline, "{name}, run {run}");
+            }
+        }
     }
 }

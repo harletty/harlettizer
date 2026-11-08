@@ -52,8 +52,10 @@ impl std::error::Error for Unsupported {}
 ///
 /// One encoder serves every substream: a frame depends on nothing but its
 /// own samples and its number, and the scratch it needs is the same shape
-/// for all of them. Nothing is allocated per frame once the first one is
-/// written.
+/// for all of them — so a copy codes what the original does, and threads
+/// sharing out the substreams each take one. Nothing is allocated per frame
+/// once the first one is written.
+#[derive(Clone)]
 pub struct Encoder {
     sample_rate: u32,
     bits: u32,

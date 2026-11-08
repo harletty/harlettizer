@@ -52,7 +52,8 @@
 //! screen scaling. IAMF v2.0 positions a point and leaves the rest to the
 //! renderer.
 
-use crate::iamf::{self, Config, Measure, Output};
+use crate::iamf::{self, Config, Measure, Measurer, Measuring, Output};
+use crate::lane::{LANE_DEPTH, Lane, Stage};
 use hz_cluster::scene::Source as SceneSource;
 use hz_core::{Error, Result, speakers};
 use hz_iamf::{Animation, Element, PositionBlock, PositionKind, Subblock};
@@ -68,6 +69,8 @@ use hz_programme::source::Source;
 use hz_programme::{Part, parts_of};
 use hz_render::{Keyframe, Layout, Mixdown};
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Samples between two traced positions.
 const TRACE_INTERVAL: usize = 256;
@@ -536,7 +539,9 @@ struct Account {
     moves: u64,
 }
 
-pub fn run(config: Config) -> Result<()> {
+/// The objects carried as objects: the measurement, the writer and its
+/// substreams on threads of their own when `threads`.
+pub(crate) fn run(config: Config, threads: bool) -> Result<()> {
     let kind = config.objects.expect("the objects mode");
     let path = config.input.as_path();
     let source = Source::open(path, config.mono_prefix.as_deref())?;
@@ -560,8 +565,8 @@ pub fn run(config: Config) -> Result<()> {
             "`--overlay` and `--voices-to-bed` at once; one pans the voices onto the master's \
              elements and the other gives them an element of their own",
         )),
-        (Some(sources), None) => run_overlay(&config, kind, source, parts, sources),
-        (None, voices) => run_plain(&config, kind, source, parts, voices.unwrap_or(0)),
+        (Some(sources), None) => run_overlay(&config, kind, source, parts, sources, threads),
+        (None, voices) => run_plain(&config, kind, source, parts, voices.unwrap_or(0), threads),
     }
 }
 
@@ -573,6 +578,7 @@ fn run_plain(
     source: Source,
     parts: Vec<Part>,
     voices: usize,
+    threads: bool,
 ) -> Result<()> {
     let path = config.input.as_path();
     let objects: Vec<usize> = (0..parts.len())
@@ -794,6 +800,7 @@ fn run_plain(
         lines,
         overlay: None,
         dialogue: dialogue.map(|layout| (dialogue_first, layout)),
+        threads,
     })
 }
 
@@ -854,6 +861,7 @@ fn run_overlay(
     source: Source,
     parts: Vec<Part>,
     sources: usize,
+    threads: bool,
 ) -> Result<()> {
     let path = config.input.as_path();
     let options = &config.overlaying;
@@ -1082,6 +1090,7 @@ fn run_overlay(
             beds_first: options.beds_first,
             fold_depth: depth,
         }),
+        threads,
     })
 }
 
@@ -1709,6 +1718,9 @@ struct Drive<'a> {
     /// when the voices have one: labelled, given a gain a listener may move,
     /// and the loudness anchored on it.
     dialogue: Option<(usize, hz_iamf::Layout)>,
+    /// The writer, its substreams and the measurement on threads of their
+    /// own, or all on the caller's.
+    threads: bool,
 }
 
 /// Route a channel element's channels, from `first` in a pushed frame, onto
@@ -1771,11 +1783,49 @@ fn profile_name(elements: &[Element]) -> &'static str {
     }
 }
 
+/// The writer on a thread of its own, a unit or more behind the feed, as a
+/// folding `encode`'s encoder runs behind its fold: the two want different
+/// things and neither waits on the other for anything but the samples. Once
+/// a push has failed it writes nothing more, and raises `stopped` for the
+/// feed to see before it reads another unit: at once where it runs on the
+/// feed's own thread, as a single thread stops.
+struct Writing {
+    writer: Output,
+    /// Interleaved samples a frame.
+    width: usize,
+    failed: Option<std::io::Error>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Stage for Writing {
+    type In = Unit;
+    /// The unit, to be filled again.
+    type Out = Unit;
+
+    fn run(&mut self, unit: Unit) -> Unit {
+        if self.failed.is_none() {
+            let blocks = stated(&unit.blocks[..unit.stated]);
+            let samples = &unit.samples[..unit.frames * self.width];
+            let pushed = if unit.last {
+                let after = stated(&unit.after[..unit.after_stated]);
+                self.writer.push_last(samples, &blocks, &after)
+            } else {
+                self.writer.push(samples, &blocks)
+            };
+            if let Err(e) = pushed {
+                self.failed = Some(e);
+                self.stopped.store(true, Ordering::Release);
+            }
+        }
+        unit
+    }
+}
+
 /// Write the sequence: each unit's elements from the feed, the position
-/// blocks that start in it, the trace, the measurement. The codec runs on a
-/// thread of its own, a unit behind, as a folding `encode`'s encoder runs
-/// behind its fold: the two want different things and neither waits on the
-/// other for anything but the samples.
+/// blocks that start in it, the trace, the measurement. The writer, its
+/// substreams and the measurement run on threads of their own (see
+/// [`Writing`], [`Measurer`]), or all on the caller's where none can be
+/// started: the same sequence either way.
 fn drive(job: Drive<'_>) -> Result<()> {
     let Drive {
         config,
@@ -1790,6 +1840,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
         lines,
         overlay: overlay_summary,
         dialogue,
+        threads,
     } = job;
     let path = config.input.as_path();
     let format = *source.pcm_format();
@@ -1834,7 +1885,8 @@ fn drive(job: Drive<'_>) -> Result<()> {
             anchor: Some(hz_iamf::Anchor::Dialogue),
         },
     };
-    let writer = iamf::open_presenting(config, sample_rate, elements.clone(), presentation)?;
+    let writer = iamf::open_presenting(config, sample_rate, elements.clone(), presentation)?
+        .with_threads(iamf::coding_threads(threads));
     let delay = writer.delay() as i64;
 
     // The measurement renders what a decoder is handed, on 7.1.4: the bed
@@ -1846,12 +1898,12 @@ fn drive(job: Drive<'_>) -> Result<()> {
     }
     // The dialogue alone, rendered the same way, for the loudness anchored
     // on it; and within the whole mix, beside everything else.
-    let mut dialogue_measure = match &dialogue {
+    let mut dialogue_alone = match &dialogue {
         Some((first, channels)) => {
             route_channels(&mut mixdown, &layout, channels, *first);
             let mut alone = Mixdown::new(&layout)?;
             route_channels(&mut alone, &layout, channels, *first);
-            Some((alone, Measure::new(sample_rate)))
+            Some(alone)
         }
         None => None,
     };
@@ -1869,9 +1921,13 @@ fn drive(job: Drive<'_>) -> Result<()> {
             index
         })
         .collect();
-    let mut measure = Measure::new(sample_rate);
 
     let frame = config.frame;
+    let measuring = Measuring {
+        whole: Measure::new(sample_rate),
+        dialogue: dialogue_alone.as_ref().map(|_| Measure::new(sample_rate)),
+    };
+    let mut measurer = Measurer::new(measuring, frame * layout.channels(), threads);
     let total = config
         .frames
         .map_or(source.frames(), |limit| limit.min(source.frames()));
@@ -1880,15 +1936,23 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let mut raw = Vec::with_capacity(frame * source.channels());
     let mut input = vec![0f32; frame * width];
     let mut rendered = vec![0f64; frame * layout.channels()];
-    let mut measured = vec![0f32; frame * layout.channels()];
     let mut account = Account::default();
     let mut trace = Trace::open(width)?;
     let mut one = Vec::new();
 
-    let (to_writer, from_main) = std::sync::mpsc::sync_channel::<Unit>(2);
-    let (free, spare) = std::sync::mpsc::channel::<Unit>();
-    for _ in 0..3 {
-        let _ = free.send(Unit {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut writing = Lane::new(
+        Writing {
+            writer,
+            width,
+            failed: None,
+            stopped: Arc::clone(&stopped),
+        },
+        "iamf-writer",
+        threads,
+    );
+    let mut spare: Vec<Unit> = (0..=LANE_DEPTH)
+        .map(|_| Unit {
             samples: vec![0; frame * width],
             frames: 0,
             blocks: (0..carried.len()).map(|_| (0, Vec::new())).collect(),
@@ -1896,36 +1960,21 @@ fn drive(job: Drive<'_>) -> Result<()> {
             last: false,
             after: (0..carried.len()).map(|_| (0, Vec::new())).collect(),
             after_stated: 0,
-        });
-    }
+        })
+        .collect();
 
-    let (written, looped) = std::thread::scope(|scope| {
-        let handle = scope.spawn(move || -> std::io::Result<Output> {
-            let mut writer = writer;
-            while let Ok(unit) = from_main.recv() {
-                let blocks = stated(&unit.blocks[..unit.stated]);
-                let samples = &unit.samples[..unit.frames * width];
-                if unit.last {
-                    let after = stated(&unit.after[..unit.after_stated]);
-                    writer.push_last(samples, &blocks, &after)?;
-                } else {
-                    writer.push(samples, &blocks)?;
-                }
-                drop(blocks);
-                if free.send(unit).is_err() {
-                    break;
-                }
-            }
-            Ok(writer)
-        });
-
+    let (writing, looped) = {
         let mut looped = || -> Result<u64> {
             let mut at = 0u64;
             let mut unit_index = 0u64;
             while at < total {
-                let Ok(mut unit) = spare.recv() else {
+                // A writer that has failed ends the encode there.
+                if stopped.load(Ordering::Acquire) {
                     break;
-                };
+                }
+                // A unit to fill: one not yet handed over, or the oldest
+                // written.
+                let mut unit = spare.pop().unwrap_or_else(|| writing.recv());
                 let want = (total - at).min(frame as u64) as usize;
                 let got = feed.fill(
                     &mut source,
@@ -2000,9 +2049,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     trace.samples(&input[..got * width], width)?;
                 }
                 unit.frames = got;
-                if to_writer.send(unit).is_err() {
-                    break;
-                }
+                writing.send(unit);
 
                 // And measured as a decoder renders it: split where any
                 // object's path breaks, its renderer told where the object is
@@ -2056,14 +2103,15 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     );
                     done = end;
                 }
+                let mut measured = measurer.unit();
                 for (m, &r) in measured
+                    .whole
                     .iter_mut()
                     .zip(&rendered[..got * layout.channels()])
                 {
                     *m = r as f32;
                 }
-                measure.push(&measured[..got * layout.channels()]);
-                if let Some((alone, dialogue)) = dialogue_measure.as_mut() {
+                if let Some(alone) = dialogue_alone.as_mut() {
                     rendered[..got * layout.channels()].fill(0.0);
                     alone.render(
                         &input[..got * width],
@@ -2072,13 +2120,15 @@ fn drive(job: Drive<'_>) -> Result<()> {
                         &mut rendered[..got * layout.channels()],
                     );
                     for (m, &r) in measured
+                        .dialogue
                         .iter_mut()
                         .zip(&rendered[..got * layout.channels()])
                     {
                         *m = r as f32;
                     }
-                    dialogue.push(&measured[..got * layout.channels()]);
                 }
+                measured.len = got * layout.channels();
+                measurer.push(measured);
 
                 // A fold's history is only looked at a unit or two back.
                 let next_a = (unit_index as i64 + 1) * frame as i64 - delay;
@@ -2100,18 +2150,24 @@ fn drive(job: Drive<'_>) -> Result<()> {
             Ok(at)
         };
         let looped = looped();
-        drop(to_writer);
-        let written = handle.join().expect("the writer thread does not panic");
-        (written, looped)
-    });
+        // Every unit handed over written, or the failure that stopped it.
+        (writing.into_stage(), looped)
+    };
+    // A push that failed came before anything the feed met after handing
+    // that unit over, so it is what a single thread stops at: the feed's own
+    // failure, a read or the trace's, only when every push was written.
+    let writer = match writing.failed {
+        Some(e) => return Err(Error::io(&config.out, e)),
+        None => writing.writer,
+    };
     let at = looped?;
-    let writer = written.map_err(|e| Error::io(&config.out, e))?;
     if at == 0 {
         return Err(Error::unsupported(path, "no audio to encode"));
     }
 
-    let loudness = measure.finish();
-    let anchored = dialogue_measure.map(|(_, dialogue)| {
+    let Measuring { whole, dialogue } = measurer.finish();
+    let loudness = whole.finish();
+    let anchored = dialogue.map(|dialogue| {
         let [stereo, native] = dialogue.finish();
         [stereo.integrated, native.integrated]
     });

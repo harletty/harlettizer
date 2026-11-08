@@ -589,6 +589,44 @@ Without the stream groups it writes seven unrelated tracks, which no IAMF
 player will recognise. For Opus the MP4 carries the `roll` sample groups the
 encapsulation requires (§6.2.2), from the codec config's roll distance.
 
+## Speed
+
+A unit's substreams are coded apart from each other. A FLAC frame depends on
+nothing but its own samples and its number, and each Opus substream has an
+encoder of its own. So `harlettizer iamf` codes each unit's substreams on up
+to eight threads of their own, a share of them each, and lays the frames out
+in the order it always does once every share is back. Each substream is coded
+by the same calls, in the same order, as on one thread, so the sequence is
+the same to the byte. There are never more threads than substreams, nor
+than cores: a 7.1.4 bed's seven substreams take seven on seven cores or
+more. A coupled pair counts for two mono substreams when they are shared
+out. LPCM stays on one thread: copying samples is no work to share.
+
+The loudness and true peak a mix presentation states are measured on a
+thread of their own, a unit or more behind, on the samples a decoder hands
+back: 7.1.4, and the stereo pair it folds to. The meters see every unit in
+order, so they read what they read on one thread. With `--objects` the
+writer has its own thread too, behind the feed, as it already had. Where no
+thread can be started, all of it runs on the encode's own thread, the bytes
+unchanged.
+
+On sixteen cores, wall time, the same sequence either way:
+
+| programme | everything on the encode's thread, the writer aside | on threads | CPU time |
+|---|---|---|---|
+| twelve waveforms, 30 s, rendered to the bed, FLAC | 0.60 s | 0.22 s | +5 % |
+| the same, Opus | 1.00 s | 0.31 s | +11 % |
+| the same, LPCM | 0.35 s | 0.22 s | 0 % |
+| the same as 11 objects and an LFE, FLAC | 0.36 s | 0.22 s | +3 % |
+| the same, Opus | 0.77 s | 0.23 s | +12 % |
+| 40 objects folded into 27, 4 s, FLAC | 0.27 s | 0.25 s | +8 % |
+| fourteen waveforms, 90 s, rendered to the bed, FLAC | 1.80 s | 0.69 s | +10 % |
+| the same as 13 objects and an LFE, Opus | 2.04 s | 0.72 s | +14 % |
+
+What is left bounds each programme differently. The measurement's thread
+is now the longest, its true peak on 7.1.4 most of it. Past 27 objects, the
+fold runs on the encode's own thread, and it is most of that thread's work.
+
 ## Options
 
 | Option | Default | What it does |

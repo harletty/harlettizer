@@ -46,6 +46,7 @@
 //! arithmetic gives them a trim at the end of a short last unit and nothing
 //! else.
 
+use crate::crew::Crew;
 use crate::flac;
 use crate::layout::{Layout, STEREO_SOUND_SYSTEM};
 use crate::matroska;
@@ -141,9 +142,10 @@ pub struct PositionBlock<'a> {
 
 /// One substream, as the writer codes it.
 #[derive(Debug, Clone)]
-struct Substream {
-    /// Channels it carries, as indices into a pushed frame.
-    channels: Vec<usize>,
+pub(crate) struct Substream {
+    /// Channels it carries, as indices into a pushed frame: one, or a
+    /// coupled pair.
+    pub(crate) channels: Vec<usize>,
     /// Coded narrowband by a lossy codec.
     #[cfg_attr(not(feature = "opus"), allow(dead_code))]
     lfe: bool,
@@ -274,7 +276,7 @@ impl From<opus::OpusError> for Error {
 }
 
 /// The coder behind each codec, with whatever state it keeps.
-enum Coder {
+pub(crate) enum Coder {
     Lpcm,
     Flac(flac::Encoder),
     #[cfg(feature = "opus")]
@@ -312,6 +314,14 @@ const LOUDNESS_FIELDS: usize = 6;
 const TRUE_PEAK: u8 = 1;
 const ANCHORED: u8 = 2;
 
+/// Where the substreams are coded.
+enum Coding {
+    /// On the caller's thread, one after another.
+    Here(Coder),
+    /// On threads of their own, a share each: see [`Writer::with_threads`].
+    Crew(Crew),
+}
+
 /// How the sequence is laid out in the output.
 enum Framing {
     /// A standalone IA sequence: the descriptors, then every unit opened by
@@ -328,7 +338,7 @@ pub struct Writer<W: Write + Seek> {
     config: Config,
     substreams: Vec<Substream>,
     width: usize,
-    coder: Coder,
+    coding: Coding,
     /// Samples a channel the codec's output lags its input by.
     delay: usize,
     /// Where, in `out`, each layout's loudness fields start: stereo, then
@@ -442,7 +452,7 @@ impl<W: Write + Seek> Writer<W> {
             config,
             substreams,
             width,
-            coder,
+            coding: Coding::Here(coder),
             delay,
             loudness_at: offsets.map(|at| start + at as u64),
             unit: Vec::new(),
@@ -453,6 +463,48 @@ impl<W: Write + Seek> Writer<W> {
             end_trim: 0,
             ended: false,
         })
+    }
+
+    /// Code each unit's substreams on up to `threads` threads of their own,
+    /// a share of them each, every unit written once all its shares are
+    /// back: the same bytes as on the caller's thread, since each substream
+    /// is coded by the same calls in the same order and its frames are laid
+    /// out where they always are. A push still returns once its unit is
+    /// written, and fails where it would have.
+    ///
+    /// The coding stays on the caller's thread with `threads` under two, for
+    /// a sequence of one substream, for LPCM — copying samples is no work to
+    /// share — and where a thread cannot be started. There are never more
+    /// threads than substreams.
+    ///
+    /// A push that fails leaves the writer spent, threads or not: push
+    /// nothing more, and do not finish it. On one thread the substreams after
+    /// the one that failed have not coded that unit; on threads, those of the
+    /// other shares have, so a stateful codec's state differs from there on.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        let hands = threads.min(self.substreams.len());
+        let coding = std::mem::replace(&mut self.coding, Coding::Here(Coder::Lpcm));
+        self.coding = match coding {
+            Coding::Here(coder) if hands > 1 && !matches!(coder, Coder::Lpcm) => {
+                match Crew::start(
+                    coder,
+                    &self.substreams,
+                    hands,
+                    self.config.frame,
+                    self.config.bits,
+                ) {
+                    Ok(crew) => Coding::Crew(crew),
+                    Err(coder) => Coding::Here(*coder),
+                }
+            }
+            coding => coding,
+        };
+        self
+    }
+
+    /// Whether the substreams are coded on threads of their own.
+    pub fn threaded(&self) -> bool {
+        matches!(self.coding, Coding::Crew(_))
     }
 
     /// Samples a channel each push takes.
@@ -652,50 +704,29 @@ impl<W: Write + Seek> Writer<W> {
             );
             put_obu(&mut self.unit, ObuType::ParameterBlock, None, &self.payload);
         }
+        if let Coding::Crew(crew) = &mut self.coding {
+            crew.code(&self.channels, self.units);
+        }
         for (substream, coded) in self.substreams.iter().enumerate() {
-            let carried = coded.channels.as_slice();
             self.payload.clear();
             // Past the eighteen ids a frame's type can carry, the id leads
             // the payload.
             if substream > 17 {
                 put_leb128(&mut self.payload, substream as u64);
             }
-            match &mut self.coder {
-                Coder::Lpcm => {
-                    let width = self.config.bits as usize / 8;
-                    for i in 0..frame {
-                        for &c in carried {
-                            let bytes = self.channels[c][i].to_le_bytes();
-                            self.payload.extend_from_slice(&bytes[..width]);
-                        }
-                    }
+            match &mut self.coding {
+                Coding::Here(coder) => {
+                    let (slices, count) = carried(&self.channels, &coded.channels);
+                    code(
+                        coder,
+                        substream,
+                        &slices[..count],
+                        self.units,
+                        self.config.bits,
+                        &mut self.payload,
+                    )?;
                 }
-                Coder::Flac(encoder) => {
-                    let slices: [&[i32]; 2];
-                    let channels: &[&[i32]] = if carried.len() == 2 {
-                        slices = [&self.channels[carried[0]], &self.channels[carried[1]]];
-                        &slices
-                    } else {
-                        slices = [&self.channels[carried[0]], &[]];
-                        &slices[..1]
-                    };
-                    self.payload
-                        .extend_from_slice(encoder.encode(self.units, channels));
-                }
-                #[cfg(feature = "opus")]
-                Coder::Opus { encoders, scratch } => {
-                    let scale = 1.0 / f64::from(1u32 << (self.config.bits - 1));
-                    scratch.clear();
-                    for i in 0..frame {
-                        for &c in carried {
-                            scratch.push((f64::from(self.channels[c][i]) * scale) as f32);
-                        }
-                    }
-                    let packet = encoders[substream]
-                        .encode(scratch)
-                        .map_err(io::Error::other)?;
-                    self.payload.extend_from_slice(packet);
-                }
+                Coding::Crew(crew) => self.payload.extend_from_slice(crew.coded(substream)?),
             }
             let kind = if substream > 17 {
                 ObuType::AudioFrame
@@ -767,6 +798,57 @@ impl<W: Write + Seek> Writer<W> {
         self.out.flush()?;
         Ok(self.out)
     }
+}
+
+/// A substream's channels out of a unit's, as slices: one, or a coupled
+/// pair, and how many.
+pub(crate) fn carried<'a>(channels: &'a [Vec<i32>], indices: &[usize]) -> ([&'a [i32]; 2], usize) {
+    assert!(
+        matches!(indices.len(), 1 | 2),
+        "a substream carries one channel or a pair"
+    );
+    let second = indices.get(1).map_or(&[][..], |&c| channels[c].as_slice());
+    ([channels[indices[0]].as_slice(), second], indices.len())
+}
+
+/// Code one substream's frame, `number`, appending it to `out`. `carried`
+/// is its channels, a frame each; `index` is its encoder among `coder`'s
+/// for a codec that keeps one a substream.
+#[cfg_attr(not(feature = "opus"), allow(unused_variables))]
+pub(crate) fn code(
+    coder: &mut Coder,
+    index: usize,
+    carried: &[&[i32]],
+    number: u64,
+    bits: u32,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let frame = carried[0].len();
+    match coder {
+        Coder::Lpcm => {
+            let width = bits as usize / 8;
+            for i in 0..frame {
+                for channel in carried {
+                    let bytes = channel[i].to_le_bytes();
+                    out.extend_from_slice(&bytes[..width]);
+                }
+            }
+        }
+        Coder::Flac(encoder) => out.extend_from_slice(encoder.encode(number, carried)),
+        #[cfg(feature = "opus")]
+        Coder::Opus { encoders, scratch } => {
+            let scale = 1.0 / f64::from(1u32 << (bits - 1));
+            scratch.clear();
+            for i in 0..frame {
+                for channel in carried {
+                    scratch.push((f64::from(channel[i]) * scale) as f32);
+                }
+            }
+            let packet = encoders[index].encode(scratch).map_err(io::Error::other)?;
+            out.extend_from_slice(packet);
+        }
+    }
+    Ok(())
 }
 
 /// Units a decoder has to decode before a seek point to be right at it:
@@ -1532,6 +1614,112 @@ mod tests {
         assert_eq!(profile(&bed, false).unwrap(), 5);
         bed.push(object(PositionKind::Cart8));
         assert!(profile(&bed, false).is_err());
+    }
+
+    /// A tone under noise that differs from channel to channel and from
+    /// unit to unit, so that every substream codes something of its own and
+    /// a frame given another's samples, number or encoder shows.
+    fn programme(width: usize, frames: usize) -> Vec<i32> {
+        let mut state = 0x2545_f491_u32;
+        (0..width * frames)
+            .map(|i| {
+                let (channel, n) = (i % width, i / width);
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let hz = 55.0 * (channel + 1) as f64;
+                let tone = (std::f64::consts::TAU * hz * n as f64 / 48_000.0).sin();
+                let noise = f64::from(state >> 8) / f64::from(1u32 << 24) - 0.5;
+                ((tone * 0.4 + noise * 0.05 * (channel % 3) as f64) * f64::from(1 << 22)) as i32
+            })
+            .collect()
+    }
+
+    /// Each unit's substreams coded on threads write what one thread writes:
+    /// a 7.1.4 bed's seven substreams, and twenty — ids past eighteen, one
+    /// object moving — beside an LFE; standalone and in Matroska; on two
+    /// threads, three, seven, and more than there are substreams. The
+    /// programme ends in a short unit with room for Opus's delay, in one
+    /// without — the delay flushed in a unit of its own, placed by the blocks
+    /// `push_last` is given — and on a whole unit, flushed by `finish`.
+    #[test]
+    fn substreams_on_threads_write_what_one_thread_writes() {
+        use crate::layout::LFE;
+        #[allow(unused_mut)]
+        let mut codecs = vec![Codec::Flac, Codec::Lpcm];
+        #[cfg(feature = "opus")]
+        codecs.push(Codec::Opus { bitrate: 64_000 });
+        let mut objects = vec![Element::Channels(LFE)];
+        objects.extend(vec![object(PositionKind::Cart16); 19]);
+        let loudness = Loudness {
+            integrated: -20.0,
+            digital_peak: -1.0,
+            true_peak: -1.0,
+        };
+        for codec in codecs {
+            let opus = matches!(codec, Codec::Opus { .. });
+            let frame = if opus { 960 } else { 256 };
+            // Ending with room for a delay of 312, without, and whole.
+            let endings = [(frame / 3, false), (frame - 100, true), (frame, true)];
+            for elements in [vec![Element::Channels(SEVEN_ONE_FOUR)], objects.clone()] {
+                let width: usize = elements.iter().map(Element::channels).sum();
+                for (last, flushed) in endings {
+                    let samples = programme(width, 5 * frame + last);
+                    for matroska in [false, true] {
+                        let write = |threads: usize| {
+                            let config = Config {
+                                elements: elements.clone(),
+                                frame,
+                                ..config(codec)
+                            };
+                            let out = Cursor::new(Vec::new());
+                            let writer = if matroska {
+                                Writer::matroska(out, config, "test")
+                            } else {
+                                Writer::new(out, config)
+                            };
+                            let mut writer = writer.unwrap().with_threads(threads);
+                            assert_eq!(
+                                writer.threaded(),
+                                threads > 1 && codec != Codec::Lpcm,
+                                "{codec:?} on {threads}"
+                            );
+                            let units = samples.chunks(frame * width).count();
+                            for (n, unit) in samples.chunks(frame * width).enumerate() {
+                                let at = |n: usize| [n as f64 / 10.0 - 0.2, 1.0, 0.0];
+                                let here = [step(at(n), frame as u32)];
+                                let next = [step(at(n + 1), frame as u32)];
+                                let block = |subblocks| PositionBlock {
+                                    element: 3,
+                                    subblocks,
+                                };
+                                let moving = width > 12;
+                                let blocks = if moving { vec![block(&here)] } else { vec![] };
+                                if n + 1 == units && last < frame {
+                                    let after = if moving { vec![block(&next)] } else { vec![] };
+                                    writer.push_last(unit, &blocks, &after).unwrap();
+                                } else {
+                                    writer.push(unit, &blocks).unwrap();
+                                }
+                            }
+                            writer.finish([loudness; 2]).unwrap().into_inner()
+                        };
+                        let alone = write(1);
+                        if !matroska {
+                            let units = obus(&alone).iter().filter(|o| o.0 == 4).count();
+                            assert_eq!(units, 6 + usize::from(opus && flushed), "{codec:?}");
+                        }
+                        for threads in [2, 3, 7, 64] {
+                            assert!(
+                                write(threads) == alone,
+                                "{codec:?}, {width} channels, ending {last}, Matroska \
+                                 {matroska}: {threads} threads"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// An LFE and nineteen objects: twenty substreams, so the last two

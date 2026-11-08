@@ -28,6 +28,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod crew;
 pub mod flac;
 pub mod layout;
 pub mod matroska;
