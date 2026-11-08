@@ -450,9 +450,15 @@ pub struct Overlaid {
     /// them into seconds.
     pub run: Vec<u64>,
     pub worst_run: u64,
+    /// Whose the longest run is and where it ends, so that a refusal can say
+    /// where to listen: a stream left on disk "so it can be heard" is no use
+    /// without the minute to hear. The first of two equal runs is the one
+    /// named.
+    pub worst_run_at: Option<RunAt>,
     /// The same for a source with nowhere at all to go, and the run it is in.
     pub stranded_run: Vec<u64>,
     pub worst_stranded_run: u64,
+    pub worst_stranded_run_at: Option<RunAt>,
     /// How far a source's rendered level strayed on any presentation, at its
     /// worst, in decibels; and the worst a source's fold cost, with what each
     /// presentation cost in the block that was worst.
@@ -583,8 +589,10 @@ impl Overlaid {
             over_cost: 0,
             run: vec![0; sources],
             worst_run: 0,
+            worst_run_at: None,
             stranded_run: Vec::new(),
             worst_stranded_run: 0,
+            worst_stranded_run_at: None,
             worst_level: 0.0,
             worst_cost: 0.0,
             worst_cost_where: String::new(),
@@ -848,7 +856,13 @@ impl Overlaid {
                     if self.bounds.drift > 0.0 && at > self.bounds.drift {
                         self.over_drift += 1;
                         self.run[index] += 1;
-                        self.worst_run = self.worst_run.max(self.run[index]);
+                        if self.run[index] > self.worst_run {
+                            self.worst_run = self.run[index];
+                            self.worst_run_at = Some(RunAt {
+                                source: index,
+                                last: self.reported_blocks,
+                            });
+                        }
                     } else {
                         self.run[index] = 0;
                     }
@@ -870,7 +884,13 @@ impl Overlaid {
                     self.drifted += 1;
                     self.run[index] = 0;
                     self.stranded_run[index] += 1;
-                    self.worst_stranded_run = self.worst_stranded_run.max(self.stranded_run[index]);
+                    if self.stranded_run[index] > self.worst_stranded_run {
+                        self.worst_stranded_run = self.stranded_run[index];
+                        self.worst_stranded_run_at = Some(RunAt {
+                            source: index,
+                            last: self.reported_blocks,
+                        });
+                    }
                     let held = self
                         .resting
                         .get(index)
@@ -1209,6 +1229,45 @@ impl Overlaid {
     }
 }
 
+/// Where a run of blocks ended: the source it was, by its index among the
+/// sources, and the last block of it, counted from the programme's first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunAt {
+    pub source: usize,
+    pub last: u64,
+}
+
+impl RunAt {
+    /// `source 7 of 7`: counted from one, among the last `sources` objects of
+    /// the master, which is what the sources are.
+    pub fn who(&self, sources: usize) -> String {
+        format!("source {} of {sources}", self.source + 1)
+    }
+
+    /// `from 1:02:03.4 to 1:02:05.8`, for a run `blocks` long, in the
+    /// programme's own time.
+    pub fn when(&self, blocks: u64, seconds_a_block: f64) -> String {
+        let end = self.last + 1;
+        format!(
+            "from {} to {}",
+            clock(end.saturating_sub(blocks) as f64 * seconds_a_block),
+            clock(end as f64 * seconds_a_block)
+        )
+    }
+}
+
+/// `seconds` as `h:mm:ss.t`, the way a player shows where it is.
+fn clock(seconds: f64) -> String {
+    let tenths = (seconds.max(0.0) * 10.0).round() as u64;
+    format!(
+        "{}:{:02}:{:02}.{}",
+        tenths / 36_000,
+        tenths / 600 % 60,
+        tenths / 10 % 60,
+        tenths % 10
+    )
+}
+
 /// One thing the guards found, and how seriously.
 pub struct Remark {
     pub refused: bool,
@@ -1246,13 +1305,22 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
                 ),
             );
         } else if run > OVERLAY_RUN {
+            // Which source and when: the stream is left so that it can be
+            // heard, and a feature is too long to find two seconds in.
+            let (who, when) = match overlaid.worst_run_at {
+                Some(at) => (
+                    at.who(overlaid.sources),
+                    format!(", {}", at.when(overlaid.worst_run, seconds_a_block)),
+                ),
+                None => ("a source".to_string(), String::new()),
+            };
             say(
                 true,
                 format!(
-                    "a source stayed more than {:.0}° from where it asked to be for {run:.1} s \
-                     without a break, which is past the {OVERLAY_RUN:.0} s this refuses at — a \
-                     share says how much of a programme is wrong and not whether it is wrong all \
-                     at once",
+                    "{who} stayed more than {:.0}° from where it asked to be for {run:.1} s \
+                     without a break{when}, which is past the {OVERLAY_RUN:.0} s this refuses at \
+                     — a share says how much of a programme is wrong and not whether it is wrong \
+                     all at once",
                     bounds.drift
                 ),
             );
@@ -1333,9 +1401,19 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
         // that it keeps happening, or that it happens for a whole phrase.
         let share = overlaid.stranded as f64 / placed.max(1.0);
         let run = overlaid.worst_stranded_run as f64 * seconds_a_block;
+        let at = overlaid
+            .worst_stranded_run_at
+            .map(|at| {
+                format!(
+                    ", {} {}",
+                    at.who(overlaid.sources),
+                    at.when(overlaid.worst_stranded_run, seconds_a_block)
+                )
+            })
+            .unwrap_or_default();
         let said = format!(
             "{} source-blocks ({:.1} %) were audible with no element to carry them at all — \
-             every candidate muted, and no bed to fall back to — the longest stretch {run:.1} s",
+             every candidate muted, and no bed to fall back to — the longest stretch {run:.1} s{at}",
             overlaid.stranded,
             100.0 * share
         );
@@ -1656,5 +1734,24 @@ mod tests {
         assert_eq!(block_samples(96_000), 2560);
         assert_eq!(block_samples(44_100), 1280);
         assert_eq!(block_samples(88_200), 2560);
+    }
+
+    /// A run is named the way a player shows where it is, so that the
+    /// stretch a refusal names can be found in the stream it left.
+    #[test]
+    fn a_run_says_whose_and_when() {
+        assert_eq!(clock(0.0), "0:00:00.0");
+        assert_eq!(clock(59.96), "0:01:00.0");
+        assert_eq!(clock(3_723.44), "1:02:03.4");
+
+        // Ninety blocks of 1280 at 48 kHz, 2.4 s, the last of them block
+        // 139 649: it began on block 139 560, at 3 721.6 s.
+        let block = 1280.0 / 48_000.0;
+        let at = RunAt {
+            source: 6,
+            last: 139_649,
+        };
+        assert_eq!(at.who(7), "source 7 of 7");
+        assert_eq!(at.when(90, block), "from 1:02:01.6 to 1:02:04.0");
     }
 }

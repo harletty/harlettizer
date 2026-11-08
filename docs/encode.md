@@ -338,7 +338,11 @@ exceeded in more than a twentieth of the blocks the source was **audible** in;
 drift and the no-carrier case also when they run for more than two seconds
 unbroken, because a twentieth scattered over a feature is a fault nobody
 localises and a twentieth in one place is a scene. A pause ends a run: two
-phrases either side of one are two runs.
+phrases either side of one are two runs. A run that refuses is named — which
+source, counted from one among the last objects of the master, and the stretch
+in the programme's own time, `from 1:02:01.6 to 1:02:04.0` — because the
+stream is left so that it can be heard, and two seconds cannot be found by ear
+in a feature; of two equally long runs, the first is the one named.
 
 Short of a refusal there are `note` lines, and what earns one differs by
 bound because the bounds are not all the same shape. Drift and level remark at

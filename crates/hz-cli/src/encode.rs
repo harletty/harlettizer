@@ -3439,6 +3439,12 @@ mod tests {
             "the silence did not end the run: it reached {}",
             overlaid.worst_run
         );
+        // Two runs of three: the first is the one named, ending on its third
+        // block, so that a refusal points at where it started going wrong.
+        assert_eq!(
+            overlaid.worst_run_at,
+            Some(overlay::RunAt { source: 0, last: 2 })
+        );
     }
 
     /// **A dub's master declares no bed.** A programme decoded back out of a
