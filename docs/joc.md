@@ -561,9 +561,10 @@ The search itself was then most of what such a frame cost. For each λ, each
 candidate of each band takes the least, over the band before's candidates,
 of that candidate's cost plus the price of the step, compared by
 `total_cmp`: some two thousand sums and comparisons a channel. Short of a
-weight or a λ that is NaN or negative, or a weight or a gain out of all
-proportion, every error and every price is nought or more, and so is every
-cost, a sum of them. Between such values `<` is `total_cmp`'s order, and
+weight or a λ that is negative, −0 or NaN, a gain that is NaN, or an
+infinite weight on a band whose gain sits on a level, every error and every
+price is +0 or more and not NaN, and so is every cost, a sum of them.
+Between such values `<` is `total_cmp`'s order, and
 values that tie are the same value, so a candidate's cost is the same
 whichever tied candidate before gave it. So the costs are found alone
 (`Trellis::trade_plain`): each from the same sums in the same order, the
@@ -572,7 +573,7 @@ whose prices from any one level before are consecutive too and read
 together. Which candidate before gave a candidate its cost is found again
 only on the path the codes take, by the same sums and comparisons in the
 same order. Every code is the same, and an error or a price that is not
-nought or more leaves the search as it was. Several channels searched in
++0 or more leaves the search as it was. Several channels searched in
 step, as the steep decision's splits are solved, were no faster than one,
 nor were tasks of more than one channel. On sixteen cores:
 

@@ -1366,11 +1366,12 @@ const SPREAD: i32 = LEVELS - 1;
 /// slower, and so was sixteen.
 const RUN: usize = 8;
 
-/// Whether a cost, or a part of one, is nought or more and not NaN. Of two
-/// values that are, `<` puts one first exactly where [`f64::total_cmp`]
-/// does — their bits run in the same order as they do, and there is no −0
-/// to tie with +0 — the two are equal only as the same bits, and their sum
-/// is one again.
+/// Whether a cost, or a part of one, has its sign bit clear and is not NaN:
+/// +0 to +∞. Of two values that are, `<` puts one first exactly where
+/// [`f64::total_cmp`] does — their bits run in the same order as they do,
+/// and there is no −0 to tie with +0 — the two are equal only as the same
+/// bits, and their sum is one again. (Subnormals count as themselves, as
+/// they always do here: nothing sets a mode that flushes them to nought.)
 fn is_plain(x: f64) -> bool {
     x.is_sign_positive() && !x.is_nan()
 }
@@ -1380,8 +1381,10 @@ fn is_plain(x: f64) -> bool {
 /// band's from nought — worked out once for each λ the budget's search
 /// tries, not once for each code it weighs.
 struct Prices {
-    /// By step, from `−SPREAD`; past the last, room for a run that starts
-    /// there to read on.
+    /// By step, from `−SPREAD`, to the power of two [`Prices::of`] masks
+    /// by, and [`RUN`] more: a run read from any index the mask gives stays
+    /// in bounds without a check. A run in range reads past the last step
+    /// only in lanes past its end, which nothing reads back.
     steps: [f64; PRICES + RUN],
     /// Every price a step in range has is [`is_plain`].
     plain: bool,
@@ -1492,9 +1495,10 @@ impl Trellis {
     ///
     /// Where every error laid out and every price is [`is_plain`], the
     /// search takes fewer steps to the same codes ([`Self::trade_plain`]).
-    /// One that is not — from a weight or a λ that is NaN or negative, or a
-    /// weight or a gain out of all proportion — leaves it to
-    /// [`Self::trade_in_order`].
+    /// One that is not leaves it to [`Self::trade_in_order`]: from a weight
+    /// or a λ that is negative, −0 or NaN, a gain that is NaN, or an
+    /// infinite weight on a band whose gain sits on a level. An error that
+    /// overflows to +∞ is plain, and searched the faster way.
     fn trade(&self, prices: &Prices) -> [u16; BANDS] {
         if self.plain && prices.plain {
             self.trade_plain(prices)
@@ -2760,9 +2764,13 @@ mod tests {
                 _ => {}
             }
             trellis.lay(&wanted, &weight);
+            // Each run as long as it is: counted from where it starts.
             for band in 0..BANDS {
+                let levels = &trellis.levels[band];
                 for s in 0..trellis.counts[band] {
-                    runs[usize::from(trellis.runs[band][s])] = true;
+                    if s == 0 || levels[s - 1] + 1 != levels[s] {
+                        runs[usize::from(trellis.runs[band][s])] = true;
+                    }
                 }
             }
             for lambda in [
@@ -2783,16 +2791,19 @@ mod tests {
             ] {
                 let lambda = lambda * (1.0 + f64::from(noise(&mut seed)) * 0.01);
                 let prices = Prices::new(lambda);
+                let codes = traded(&trellis, &prices);
+                assert_eq!(trellis.trade(&prices), codes, "case {case}, λ {lambda}");
                 if trellis.plain && prices.plain {
+                    // The faster search itself, whichever `trade` takes.
+                    assert_eq!(
+                        trellis.trade_plain(&prices),
+                        codes,
+                        "case {case}, λ {lambda}: the plain search"
+                    );
                     plain += 1;
                 } else {
                     not_plain += 1;
                 }
-                assert_eq!(
-                    trellis.trade(&prices),
-                    traded(&trellis, &prices),
-                    "case {case}, λ {lambda}"
-                );
             }
             // Prices no λ makes: one step's, near nought, NaN of either
             // sign, −0 or below nought, the rest as they were.
