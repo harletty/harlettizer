@@ -473,15 +473,24 @@ the byte.
 `harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most eight
 threads. Past eight, a frame's pieces are too few to share out, and the
 encoder's own steps between them are one thread's: more threads wait more
-than they work. On sixteen cores, against one thread:
+than they work.
 
-| programme | elements | one thread | eight threads | CPU time |
-|---|---|---|---|---|
-| twelve waveforms, 30 s | 11 | 3.02 s | 1.10 s | +18 % |
-| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 3.61 s | 1.06 s | +30 % |
+The E-AC-3 core, coded twice a frame, runs beside the estimator. The probe
+codes a frame's core on a thread of its own while the gains of the frame
+before are fitted. The stream's encoder, with the meter of the true peak its
+loudness states, writes the frame before that on another. Each sees its
+frames in order and keeps its own state from one to the next, so the stream
+is the one a single thread writes, to the byte. Where no thread can be
+started, both run on the encode's own. On sixteen cores:
 
-What is left on the encode's own thread — the E-AC-3 core, coded twice a
-frame, and the true peak — is now most of the wall time.
+| programme | elements | one thread | estimator on eight threads | and the core beside it | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s | 11 | 3.04 s | 1.13 s | 0.69 s | +32 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 3.64 s | 1.08 s | 0.93 s | +32 % |
+| 60 s at 640 kb/s, 1124 of 1876 payloads quantised coarser | 11 | 17.69 s | 4.84 s | 3.97 s | +38 % |
+
+What is left on the encode's own thread is the render, the fold past
+fifteen elements, and the budget's search for λ, a step at a time.
 
 ## Not done
 
