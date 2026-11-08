@@ -557,6 +557,33 @@ so eleven objects keep eight threads busy. On sixteen cores:
 | 60 s at 640 kb/s | 11 | 1124 of 1876 | 3.87 s | 2.30 s | −38 % |
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.80 s | 0.49 s | −37 % |
 
+The search itself was then most of what such a frame cost. For each λ, each
+candidate of each band takes the least, over the band before's candidates,
+of that candidate's cost plus the price of the step, compared by
+`total_cmp`: some two thousand sums and comparisons a channel. Short of a
+weight or a λ that is NaN or negative, or a weight or a gain out of all
+proportion, every error and every price is nought or more, and so is every
+cost, a sum of them. Between such values `<` is `total_cmp`'s order, and
+values that tie are the same value, so a candidate's cost is the same
+whichever tied candidate before gave it. So the costs are found alone
+(`Trellis::trade_plain`): each from the same sums in the same order, the
+least kept, eight candidates at a time from a run of consecutive levels,
+whose prices from any one level before are consecutive too and read
+together. Which candidate before gave a candidate its cost is found again
+only on the path the codes take, by the same sums and comparisons in the
+same order. Every code is the same, and an error or a price that is not
+nought or more leaves the search as it was. Several channels searched in
+step, as the steep decision's splits are solved, were no faster than one,
+nor were tasks of more than one channel. On sixteen cores:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.43 s | 0.43 s | 0 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 1.10 s | 0.74 s | −33 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.83 s | 1.29 s | −30 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.36 s | 0.25 s | −34 % |
+| 40 objects, 4 s | 40 → 15 | 126 of 126 | 0.19 s | 0.13 s | −34 % |
+
 The programme itself was rendered on the encode's own thread too, a frame at
 a time between the estimator's: the master read, rendered to 7.1 and folded
 to 5.1, its loudness measured. `harlettizer ac3` renders it on a thread of

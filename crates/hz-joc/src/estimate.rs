@@ -1360,12 +1360,32 @@ const NEAR: i32 = 6;
 const MOST: usize = 2 * NEAR as usize + 1 + 5 + 1;
 /// The most steps two levels can be apart, either way.
 const SPREAD: i32 = LEVELS - 1;
+/// How many of a band's candidates [`Trellis::trade_plain`] costs at once:
+/// of a run of consecutive levels, whose prices from any one level of the
+/// band before are consecutive as well, and read together. Two or four were
+/// slower, and so was sixteen.
+const RUN: usize = 8;
+
+/// Whether a cost, or a part of one, is nought or more and not NaN. Of two
+/// values that are, `<` puts one first exactly where [`f64::total_cmp`]
+/// does — their bits run in the same order as they do, and there is no −0
+/// to tie with +0 — the two are equal only as the same bits, and their sum
+/// is one again.
+fn is_plain(x: f64) -> bool {
+    x.is_sign_positive() && !x.is_nan()
+}
 
 /// What each code costs at a λ: λ times its bits in the fine codebook, for
 /// every step a band's level can be from the band before's, and the first
 /// band's from nought — worked out once for each λ the budget's search
 /// tries, not once for each code it weighs.
-struct Prices([f64; PRICES]);
+struct Prices {
+    /// By step, from `−SPREAD`; past the last, room for a run that starts
+    /// there to read on.
+    steps: [f64; PRICES + RUN],
+    /// Every price a step in range has is [`is_plain`].
+    plain: bool,
+}
 /// The prices' room: the `2 · SPREAD + 1` steps, to a power of two, so that
 /// a step's index needs no bounds check — masking one in range changes
 /// nothing.
@@ -1376,15 +1396,34 @@ impl Prices {
     fn new(lambda: f64) -> Self {
         let book = Codebook::get(Kind::Matrix { fine: true });
         let bits = |code: i32| book.length(code.rem_euclid(LEVELS) as u16) as f64;
-        Self(std::array::from_fn(|i| match i32::try_from(i) {
+        Self::from_steps(std::array::from_fn(|i| match i32::try_from(i) {
             Ok(i) if i <= 2 * SPREAD => lambda * bits(i - SPREAD),
             _ => f64::NAN,
         }))
     }
 
+    /// Prices as given, and whether every one in range is plain.
+    fn from_steps(steps: [f64; PRICES + RUN]) -> Self {
+        let plain = steps[..=2 * SPREAD as usize]
+            .iter()
+            .all(|&price| is_plain(price));
+        Self { steps, plain }
+    }
+
     fn of(&self, steps: i32) -> f64 {
         debug_assert!((-SPREAD..=SPREAD).contains(&steps));
-        self.0[(steps + SPREAD) as usize & (PRICES - 1)]
+        self.steps[(steps + SPREAD) as usize & (PRICES - 1)]
+    }
+
+    /// The prices of `steps` and of the [`RUN`] − 1 steps after it: from
+    /// one level to a run of consecutive levels, the first `steps` from it.
+    /// Past [`SPREAD`] what is read is no price, for lanes past a run.
+    fn run(&self, steps: i32) -> &[f64; RUN] {
+        debug_assert!((-SPREAD..=SPREAD).contains(&steps));
+        let at = (steps + SPREAD) as usize & (PRICES - 1);
+        self.steps[at..at + RUN]
+            .try_into()
+            .expect("room past every step")
     }
 }
 
@@ -1397,6 +1436,12 @@ struct Trellis {
     levels: [[i32; MOST]; BANDS],
     counts: [usize; BANDS],
     errors: [[f64; MOST]; BANDS],
+    /// By band and candidate, how many of the band's candidates from it on
+    /// are each one level above the one before: the runs a trade costs at
+    /// once.
+    runs: [[u8; MOST]; BANDS],
+    /// Every error laid out is [`is_plain`].
+    plain: bool,
 }
 
 impl Trellis {
@@ -1424,7 +1469,18 @@ impl Trellis {
                     *count += 1;
                 }
             }
+            let mut run = 0;
+            for s in (0..*count).rev() {
+                run = if s + 1 < *count && levels[s + 1] == levels[s] + 1 {
+                    run + 1
+                } else {
+                    1
+                };
+                self.runs[band][s] = run;
+            }
         }
+        self.plain = (self.errors.iter().zip(&self.counts))
+            .all(|(errors, &count)| errors[..count].iter().all(|&error| is_plain(error)));
     }
 
     /// The channel's fine codes for the least `Σ w·(gain − wanted)² + λ·bits`
@@ -1432,8 +1488,24 @@ impl Trellis {
     /// candidate levels — a few either side of its own, the channel's
     /// weighted mean and nought, the last two so that a flat run, or all
     /// nought, is always there to take. Of costs that tie, the level laid
-    /// out first is taken.
+    /// out first is taken, costs ordered as [`f64::total_cmp`] orders them.
+    ///
+    /// Where every error laid out and every price is [`is_plain`], the
+    /// search takes fewer steps to the same codes ([`Self::trade_plain`]).
+    /// One that is not — from a weight or a λ that is NaN or negative, or a
+    /// weight or a gain out of all proportion — leaves it to
+    /// [`Self::trade_in_order`].
     fn trade(&self, prices: &Prices) -> [u16; BANDS] {
+        if self.plain && prices.plain {
+            self.trade_plain(prices)
+        } else {
+            self.trade_in_order(prices)
+        }
+    }
+
+    /// [`Self::trade`] by its definition, every cost compared by
+    /// [`f64::total_cmp`].
+    fn trade_in_order(&self, prices: &Prices) -> [u16; BANDS] {
         let mut cost = [[0f64; MOST]; BANDS];
         let mut from = [[0u8; MOST]; BANDS];
         let first = self.counts[0];
@@ -1475,15 +1547,97 @@ impl Trellis {
             levels[band] = self.levels[band][s];
             s = usize::from(from[band][s]);
         }
-        std::array::from_fn(|band| {
-            let code = if band == 0 {
-                levels[0]
-            } else {
-                levels[band] - levels[band - 1]
-            };
-            code.rem_euclid(LEVELS) as u16
-        })
+        fine_codes(&levels)
     }
+
+    /// [`Self::trade`] where every error and price is [`is_plain`], and so
+    /// every cost, each a sum of them. Between such costs `<` is
+    /// `total_cmp`'s order, and costs that tie are the same value: so a
+    /// candidate's cost — the least over the band before of a candidate's
+    /// cost plus the step's price, then its own error — is the one
+    /// [`Self::trade_in_order`] finds, from the same sums in the same
+    /// order, whichever of the tied candidates before gave it. These are
+    /// found alone, the candidates of a run of consecutive levels [`RUN`]
+    /// at a time, a lane each. Which candidate before gave a candidate its
+    /// cost is needed only on the path the codes take, and is found there
+    /// again, by the same sums and comparisons in the same order: the first
+    /// that costs the least.
+    fn trade_plain(&self, prices: &Prices) -> [u16; BANDS] {
+        let mut cost = [[0f64; MOST]; BANDS];
+        let first = self.counts[0];
+        for ((cost, &error), &level) in cost[0][..first]
+            .iter_mut()
+            .zip(&self.errors[0][..first])
+            .zip(&self.levels[0][..first])
+        {
+            *cost = error + prices.of(level);
+        }
+        for band in 1..BANDS {
+            let (done, rest) = cost.split_at_mut(band);
+            let count = self.counts[band - 1];
+            let (before, costs) = (&self.levels[band - 1][..count], &done[band - 1][..count]);
+            let mut s = 0;
+            while s < self.counts[band] {
+                let run = usize::from(self.runs[band][s]).min(RUN);
+                let q = self.levels[band][s];
+                // Each lane a candidate of the run, its own sums in its own
+                // order; lanes past the run cost what nothing reads.
+                let mut least = prices.run(q - before[0]).map(|price| costs[0] + price);
+                for (&cost, &level) in costs[1..].iter().zip(&before[1..]) {
+                    for (least, &price) in least.iter_mut().zip(prices.run(q - level)) {
+                        let tried = cost + price;
+                        *least = if tried < *least { tried } else { *least };
+                    }
+                }
+                for ((cost, least), &error) in rest[0][s..s + run]
+                    .iter_mut()
+                    .zip(least)
+                    .zip(&self.errors[band][s..s + run])
+                {
+                    *cost = least + error;
+                }
+                s += run;
+            }
+        }
+        let last = BANDS - 1;
+        let mut s = 0;
+        for t in 1..self.counts[last] {
+            if cost[last][t] < cost[last][s] {
+                s = t;
+            }
+        }
+        let mut levels = [0i32; BANDS];
+        for band in (1..BANDS).rev() {
+            let q = self.levels[band][s];
+            levels[band] = q;
+            let count = self.counts[band - 1];
+            let (before, costs) = (&self.levels[band - 1][..count], &cost[band - 1][..count]);
+            let mut best = costs[0] + prices.of(q - before[0]);
+            s = 0;
+            for p in 1..count {
+                let tried = costs[p] + prices.of(q - before[p]);
+                if tried < best {
+                    best = tried;
+                    s = p;
+                }
+            }
+        }
+        levels[0] = self.levels[0][s];
+        fine_codes(&levels)
+    }
+}
+
+/// A channel's levels by band to its fine codes: the first band's level,
+/// and each other band's step from the band before, modulo 192.
+fn fine_codes(levels: &[i32; BANDS]) -> [u16; BANDS] {
+    std::array::from_fn(|band| {
+        let code = if band == 0 {
+            levels[0]
+        } else {
+            levels[band] - levels[band - 1]
+        };
+        code.rem_euclid(LEVELS) as u16
+    })
 }
 
 /// Gains to the decoder's codes: quantise each to the fine step, and chain
@@ -2452,6 +2606,216 @@ mod tests {
                 code.rem_euclid(LEVELS) as u16
             })
             .collect()
+    }
+
+    /// The trade as it was before costs were compared by `<` where that is
+    /// their order: every comparison by [`f64::total_cmp`]. Kept to hold
+    /// the trade to it.
+    fn traded(trellis: &Trellis, prices: &Prices) -> [u16; BANDS] {
+        let mut cost = [[0f64; MOST]; BANDS];
+        let mut from = [[0u8; MOST]; BANDS];
+        let first = trellis.counts[0];
+        for ((cost, &error), &level) in cost[0][..first]
+            .iter_mut()
+            .zip(&trellis.errors[0][..first])
+            .zip(&trellis.levels[0][..first])
+        {
+            *cost = error + prices.of(level);
+        }
+        for band in 1..BANDS {
+            let (done, rest) = cost.split_at_mut(band);
+            let count = trellis.counts[band - 1];
+            let (before, costs) = (&trellis.levels[band - 1][..count], &done[band - 1][..count]);
+            for s in 0..trellis.counts[band] {
+                let q = trellis.levels[band][s];
+                let mut best = costs[0] + prices.of(q - before[0]);
+                let mut at = 0;
+                for p in 1..count {
+                    let tried = costs[p] + prices.of(q - before[p]);
+                    if tried.total_cmp(&best).is_lt() {
+                        best = tried;
+                        at = p;
+                    }
+                }
+                rest[0][s] = best + trellis.errors[band][s];
+                from[band][s] = at as u8;
+            }
+        }
+        let last = BANDS - 1;
+        let mut s = 0;
+        for t in 1..trellis.counts[last] {
+            if cost[last][t].total_cmp(&cost[last][s]).is_lt() {
+                s = t;
+            }
+        }
+        let mut levels = [0i32; BANDS];
+        for band in (0..BANDS).rev() {
+            levels[band] = trellis.levels[band][s];
+            s = usize::from(from[band][s]);
+        }
+        std::array::from_fn(|band| {
+            let code = if band == 0 {
+                levels[0]
+            } else {
+                levels[band] - levels[band - 1]
+            };
+            code.rem_euclid(LEVELS) as u16
+        })
+    }
+
+    /// Of two plain values, `<` puts one first exactly where `total_cmp`
+    /// does, the two are equal only as the same bits, and their sum is
+    /// plain; −0, negative values and NaN are not plain.
+    #[test]
+    fn plain_values_are_ordered_by_less_as_by_total_cmp() {
+        let plain = [
+            0.0,
+            f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            1e-300,
+            0.5,
+            1.0,
+            1.0 + f64::EPSILON,
+            3e5,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for a in plain {
+            assert!(is_plain(a), "{a:e}");
+            for b in plain {
+                assert_eq!(a < b, a.total_cmp(&b).is_lt(), "{a:e} < {b:e}");
+                assert_eq!(a == b, a.to_bits() == b.to_bits(), "{a:e} == {b:e}");
+                assert!(is_plain(a + b), "{a:e} + {b:e}");
+            }
+        }
+        for x in [-0.0, -1e-300, -1.0, f64::NEG_INFINITY, f64::NAN, -f64::NAN] {
+            assert!(!is_plain(x), "{x:e}");
+        }
+    }
+
+    /// The trade takes the codes it took when every comparison was by
+    /// `total_cmp` ([`traded`]), to the code: on gains that lay each band's
+    /// candidates out in runs of every length from one to nineteen — cut by
+    /// the quantiser's range, the mean's and nought's beside the band's own
+    /// or apart from them — taken eight at a time with what is left over;
+    /// on costs that tie, from bands that weigh nothing, gains on a half
+    /// step and a λ of nought, and at a λ that makes every code nought; and,
+    /// where it is left to `total_cmp` itself, on errors and prices that
+    /// are not plain, from weights and λ of −0, negative, infinite or NaN,
+    /// gains infinite or NaN, and prices of which only one is not.
+    #[test]
+    fn the_trade_takes_the_codes_comparing_by_total_cmp_took() {
+        let mut seed = 59u32;
+        let step = f64::from(STEP);
+        let mut trellis = Trellis::default();
+        let (mut plain, mut not_plain) = (0, 0);
+        let mut runs = [false; MOST + 1];
+        for case in 0..1200 {
+            let kind = case % 8;
+            // A level the channel's gains sit about, and each band's own
+            // level from it, on a step or between two.
+            let centre = (f64::from(noise(&mut seed)) * 24.0).round();
+            let mut wanted: [f64; BANDS] = std::array::from_fn(|band| {
+                let own = match kind {
+                    // Around the centre, near enough for the runs to meet.
+                    0..=2 => centre + (f64::from(noise(&mut seed)) * 50.0).round(),
+                    // Against either end of the quantiser's range, or past it.
+                    3 => {
+                        (90.0 + f64::from(noise(&mut seed)) * 24.0).round() * [1.0, -1.0][band % 2]
+                    }
+                    // Every band at the centre but the first, which the
+                    // weights all but ignore: its own run against the
+                    // mean's and nought's at every distance.
+                    _ if band > 0 => centre,
+                    _ => centre + (case / 8 % 41) as f64 - 20.0,
+                };
+                let off = match (case + band) % 3 {
+                    0 => 0.0,
+                    1 => 0.5,
+                    _ => f64::from(noise(&mut seed)) * 0.9,
+                };
+                (own + off) * step
+            });
+            let mut weight: [f64; BANDS] = std::array::from_fn(|band| match kind {
+                4..=7 if band == 0 => 1e-9,
+                _ => match (case / 3 + band) % 7 {
+                    0 => 0.0,
+                    1 => f64::from(noise(&mut seed)).abs() * 1e-9,
+                    _ => f64::from(noise(&mut seed)) + 0.6,
+                },
+            });
+            // One case in six with an error that is not plain.
+            let band = case / 36 % BANDS;
+            match case % 36 {
+                5 => weight[band] = -0.0,
+                11 => weight[band] = -f64::from(noise(&mut seed)).abs() - 0.1,
+                17 => {
+                    // Infinite, on a level: one candidate's error is NaN.
+                    weight[band] = f64::INFINITY;
+                    wanted[band] = (wanted[band] / step).round() * step;
+                }
+                23 => weight[band] = f64::NAN,
+                29 => wanted[band] = f64::NAN,
+                35 => wanted[band] = [f64::INFINITY, f64::NEG_INFINITY][case / 36 % 2],
+                _ => {}
+            }
+            trellis.lay(&wanted, &weight);
+            for band in 0..BANDS {
+                for s in 0..trellis.counts[band] {
+                    runs[usize::from(trellis.runs[band][s])] = true;
+                }
+            }
+            for lambda in [
+                0.0,
+                1e-9,
+                1e-4,
+                3e-3,
+                0.02,
+                0.1,
+                0.7,
+                4.0,
+                50.0,
+                1e6,
+                f64::INFINITY,
+                -0.0,
+                -0.5,
+                f64::NAN,
+            ] {
+                let lambda = lambda * (1.0 + f64::from(noise(&mut seed)) * 0.01);
+                let prices = Prices::new(lambda);
+                if trellis.plain && prices.plain {
+                    plain += 1;
+                } else {
+                    not_plain += 1;
+                }
+                assert_eq!(
+                    trellis.trade(&prices),
+                    traded(&trellis, &prices),
+                    "case {case}, λ {lambda}"
+                );
+            }
+            // Prices no λ makes: one step's, near nought, NaN of either
+            // sign, −0 or below nought, the rest as they were.
+            let mut steps = Prices::new(0.05).steps;
+            steps[(SPREAD + [0, 1, -1, 2][case % 4]) as usize] =
+                [-f64::NAN, f64::NAN, -0.0, -0.3][case / 4 % 4];
+            let prices = Prices::from_steps(steps);
+            assert!(!prices.plain);
+            not_plain += 1;
+            assert_eq!(
+                trellis.trade(&prices),
+                traded(&trellis, &prices),
+                "case {case}, poisoned prices"
+            );
+        }
+        assert!(
+            runs[1..].iter().all(|&seen| seen),
+            "runs of every length: {runs:?}"
+        );
+        assert!(
+            plain > 10_000 && not_plain > 4_000,
+            "{plain} plain, {not_plain} not"
+        );
     }
 
     /// The trellis trades as the search before it did, code for code: λ
