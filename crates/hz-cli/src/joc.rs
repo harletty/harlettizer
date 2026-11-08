@@ -650,11 +650,13 @@ impl Writer {
     }
 
     /// The error an encode stops at, met before its next frame reached the
-    /// writer: `e`, once the syncframes handed to the stream's encoder are
-    /// appended to `out`, as a single thread would have appended them before
-    /// it met `e` — or the refusal of one of them, which it would have met
-    /// first. The stream's encoder writes them on a thread of its own, and
-    /// [`Self::frame`] takes only those already written.
+    /// writer: `e`, once every syncframe the stream's encoder has been given
+    /// a payload for is appended to `out`, as a single thread would have
+    /// appended them before it met `e` — or the refusal of one of them,
+    /// which it would have met first. The stream's encoder writes them on a
+    /// thread of its own, and [`Self::frame`] takes only those already
+    /// written; the frame it holds for the next payload stays unwritten, as
+    /// on one thread.
     pub fn stop(&mut self, e: Error, out: &mut Vec<u8>) -> Error {
         match self.coder.settle(out) {
             Ok(()) => e,
