@@ -1096,6 +1096,7 @@ impl Fitter {
                         n,
                     );
             }
+            let mut rest = [([0f64; MAX_CHANNELS], 0f64); SLOTS + 1];
             for split in (1..=SLOTS).rev() {
                 if split < SLOTS {
                     take(
@@ -1106,8 +1107,22 @@ impl Fitter {
                         n,
                     );
                 }
-                let c = steep.stepped[split].solve(rhs, n);
-                stepped[split] += before[split] + error(&steep.steps[split], &rhs, energy, &c, n);
+                rest[split] = (rhs, energy);
+            }
+            // Each split's gains and error apart from every other's, a few
+            // splits side by side: one's solve does not wait on the last's.
+            for first in (1..=SLOTS).step_by(SIDE) {
+                let gains = Eliminated::solve_side_by_side::<SIDE>(
+                    std::array::from_fn(|s| &steep.stepped[first + s]),
+                    std::array::from_fn(|s| rest[first + s].0),
+                    n,
+                );
+                for (s, c) in gains.iter().enumerate() {
+                    let split = first + s;
+                    let (rhs, energy) = &rest[split];
+                    stepped[split] +=
+                        before[split] + error(&steep.steps[split], rhs, *energy, c, n);
+                }
             }
         }
         let (split, _) = (1..=SLOTS)
@@ -1718,30 +1733,50 @@ impl Eliminated {
 
     /// The system's `x` for the leading `n` unknowns of `rhs`: the
     /// elimination's swaps and steps, then back substitution.
+    fn solve(&self, rhs: [f64; MAX_CHANNELS], n: usize) -> [f64; MAX_CHANNELS] {
+        let [x] = Self::solve_side_by_side([self], [rhs], n);
+        x
+    }
+
+    /// [`Self::solve`] for each of `K` systems and right-hand sides, taken
+    /// a step of each at a time: each system's steps are its own, in its own
+    /// order, but one's division need not wait on another's.
     #[allow(clippy::needless_range_loop)] // a textbook elimination, indexed as one
-    fn solve(&self, mut rhs: [f64; MAX_CHANNELS], n: usize) -> [f64; MAX_CHANNELS] {
-        let lu = &self.lu;
+    fn solve_side_by_side<const K: usize>(
+        systems: [&Self; K],
+        mut rhs: [[f64; MAX_CHANNELS]; K],
+        n: usize,
+    ) -> [[f64; MAX_CHANNELS]; K] {
         for col in 0..n {
-            rhs.swap(col, usize::from(self.pivots[col]));
-            if lu[col][col].abs() < 1e-30 {
-                continue;
-            }
-            for row in col + 1..n {
-                rhs[row] -= lu[row][col] * rhs[col];
+            for (system, rhs) in systems.iter().zip(&mut rhs) {
+                rhs.swap(col, usize::from(system.pivots[col]));
+                if system.lu[col][col].abs() < 1e-30 {
+                    continue;
+                }
+                for row in col + 1..n {
+                    rhs[row] -= system.lu[row][col] * rhs[col];
+                }
             }
         }
-        let mut x = [0f64; MAX_CHANNELS];
+        let mut x = [[0f64; MAX_CHANNELS]; K];
         for row in (0..n).rev() {
-            let d = lu[row][row];
-            if d.abs() < 1e-30 {
-                continue;
+            for ((system, x), rhs) in systems.iter().zip(&mut x).zip(&rhs) {
+                let d = system.lu[row][row];
+                if d.abs() < 1e-30 {
+                    continue;
+                }
+                let s: f64 = (row + 1..n).map(|k| system.lu[row][k] * x[k]).sum();
+                x[row] = (rhs[row] - s) / d;
             }
-            let s: f64 = (row + 1..n).map(|k| lu[row][k] * x[k]).sum();
-            x[row] = (rhs[row] - s) / d;
         }
         x
     }
 }
+
+/// How many splits the steep decision solves side by side: six or eight
+/// were no faster than four.
+const SIDE: usize = 4;
+const _: () = assert!(SLOTS.is_multiple_of(SIDE));
 
 /// The gains a dense, single-point object's codes stand for, as the decoder
 /// dequantises them: per channel and band.
@@ -2656,19 +2691,21 @@ mod tests {
         solve_beside(system, rhs, n)
     }
 
-    /// An elimination kept and taken again for each right-hand side solves
-    /// to the bit what eliminating each beside the system did: on every
-    /// number of channels, with and without the ridge, on systems of every
-    /// kind the decision meets — full, symmetric, singular, a silent
-    /// channel's nought row, pivots that tie, a column below the threshold —
-    /// and right-hand sides with noughts of either sign.
+    /// An elimination kept and taken again for each right-hand side, alone
+    /// or beside other systems', solves to the bit what eliminating each
+    /// beside the system did: on every number of channels, with and without
+    /// the ridge, on systems of every kind the decision meets — full,
+    /// symmetric, singular, a silent channel's nought row, pivots that tie, a
+    /// column below the threshold — and right-hand sides with noughts of
+    /// either sign.
     #[test]
     #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
     fn a_kept_elimination_solves_as_one_beside_the_right_hand_side_to_the_bit() {
+        const KINDS: usize = 6;
         let mut seed = 53u32;
         let mut value = || 4.0 * f64::from(noise(&mut seed));
         for n in 1..=MAX_CHANNELS {
-            for kind in 0..6 {
+            let systems: [_; KINDS] = std::array::from_fn(|kind| {
                 let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
                 // The Gram matrix of a few vectors: fewer than `n` leaves it
                 // singular, as a band the downmix fills from fewer channels.
@@ -2711,32 +2748,61 @@ mod tests {
                         }
                     }
                 }
-                let kept = Eliminated::new(system, n);
-                let kept_ridged = Eliminated::ridged(system, n, 1e-5);
+                system
+            });
+            for ridged in [false, true] {
+                let kept = systems.map(|system| match ridged {
+                    false => Eliminated::new(system, n),
+                    true => Eliminated::ridged(system, n, 1e-5),
+                });
                 for r in 0..5 {
-                    let mut rhs: [f64; MAX_CHANNELS] = std::array::from_fn(|_| value());
-                    if r == 3 {
-                        rhs[0] = -0.0;
-                        rhs[n - 1] = 0.0;
+                    let rhs: [[f64; MAX_CHANNELS]; KINDS] = std::array::from_fn(|_| match r {
+                        3 => {
+                            let mut rhs: [f64; MAX_CHANNELS] = std::array::from_fn(|_| value());
+                            rhs[0] = -0.0;
+                            rhs[n - 1] = 0.0;
+                            rhs
+                        }
+                        // Under a column left as it is, a nought below a
+                        // negative stays the nought it is.
+                        4 => std::array::from_fn(|i| if i % 2 == 0 { -1.0 } else { -0.0 }),
+                        _ => std::array::from_fn(|_| value()),
+                    });
+                    let beside: [_; KINDS] = std::array::from_fn(|kind| match ridged {
+                        false => solve_beside(systems[kind], rhs[kind], n),
+                        true => ridged_beside(systems[kind], rhs[kind], n, 1e-5),
+                    });
+                    let bits = |x: &[f64; MAX_CHANNELS]| x.map(f64::to_bits);
+                    for kind in 0..KINDS {
+                        assert_eq!(
+                            bits(&kept[kind].solve(rhs[kind], n)),
+                            bits(&beside[kind]),
+                            "{n} channels, kind {kind}, right-hand side {r}, ridged {ridged}"
+                        );
                     }
-                    // Under a column left as it is, a nought below a
-                    // negative stays the nought it is.
-                    if r == 4 {
-                        rhs = std::array::from_fn(|i| if i % 2 == 0 { -1.0 } else { -0.0 });
-                    }
+                    let side_by_side = Eliminated::solve_side_by_side(kept.each_ref(), rhs, n);
                     assert_eq!(
-                        kept.solve(rhs, n).map(f64::to_bits),
-                        solve_beside(system, rhs, n).map(f64::to_bits),
-                        "{n} channels, kind {kind}, right-hand side {r}"
-                    );
-                    assert_eq!(
-                        kept_ridged.solve(rhs, n).map(f64::to_bits),
-                        ridged_beside(system, rhs, n, 1e-5).map(f64::to_bits),
-                        "{n} channels, kind {kind}, right-hand side {r}, ridged"
+                        side_by_side.each_ref().map(bits),
+                        beside.each_ref().map(bits),
+                        "{n} channels side by side, right-hand side {r}, ridged {ridged}"
                     );
                 }
             }
         }
+        // A column left as it is takes nothing from the rows below it, not
+        // even a nought: one taken would turn the next row's nought, and
+        // that row's gain, to the other sign.
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        (system[0][0], system[1][1], system[2][2]) = (1e-31, 1.0, 1.0);
+        let rhs = [-1.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0];
+        let beside = solve_beside(system, rhs, 3).map(f64::to_bits);
+        assert_eq!(beside[1], (-0.0f64).to_bits());
+        let kept = Eliminated::new(system, 3);
+        assert_eq!(kept.solve(rhs, 3).map(f64::to_bits), beside);
+        assert_eq!(
+            Eliminated::solve_side_by_side([&kept; 2], [rhs; 2], 3).map(|x| x.map(f64::to_bits)),
+            [beside; 2]
+        );
     }
 
     /// A band's systems as each object summed them for itself, before they
