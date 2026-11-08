@@ -500,6 +500,21 @@ coder its blocks, so both are what a single thread makes of them.
 | 40 objects, 4 s | 40 → 15 | 1.75 s | 0.48 s | 0.37 s | +42 % |
 | 40 objects and a 7.1.2 bed, 4 s | 49 → 15 | 1.83 s | 0.47 s | 0.37 s | +36 % |
 
+A frame over its budget has some thirty λ tried on it, and every one weighs
+the same candidate levels. A channel's candidates and their weighted errors
+do not depend on λ, so they are laid out once a frame (`Trellis`), and what
+each code costs at a λ is worked out once for that λ (`Prices`). Only the
+Viterbi search across the bands runs for each λ, with the same sums in the
+same order and ties broken the same way, so the codes are the same ones. Each
+object's channels are traded as tasks of their own, not an object to a task,
+so eleven objects keep eight threads busy. On sixteen cores:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 2.73 s | 1.47 s | −43 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 3.87 s | 2.30 s | −38 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.80 s | 0.49 s | −37 % |
+
 What is left on the encode's own thread is the render and the budget's
 search for λ, a step at a time.
 

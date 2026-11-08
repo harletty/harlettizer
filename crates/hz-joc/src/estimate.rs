@@ -196,6 +196,12 @@ pub struct Estimator {
     /// equations' diagonal.
     wanted: Vec<Gains>,
     weights: Vec<Gains>,
+    /// Each object's channels laid out for the budget's search, a frame at
+    /// a time, `channels` an object; which of them are present objects'; and
+    /// the codes each trades for at the λ tried last.
+    trellises: Vec<Trellis>,
+    live: Vec<bool>,
+    codes: Vec<[u16; BANDS]>,
     sequence: u16,
     pub fit: Fit,
     /// The ridge on the normal equations, relative to their mean diagonal:
@@ -250,6 +256,9 @@ impl Estimator {
             fitters: vec![Fitter::new(channels * BANDS)],
             wanted: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             weights: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
+            trellises: vec![Trellis::default(); objects * channels],
+            live: vec![false; objects * channels],
+            codes: vec![[0; BANDS]; objects * channels],
             sequence: 0,
             fit: Fit::default(),
             ridge: 1e-5,
@@ -504,8 +513,23 @@ impl Estimator {
             .max(1e-30)
             * step
             * step;
-        let fits = |estimator: &Self, joc: &mut Joc, lambda: f64| {
-            estimator.requantise(joc, lambda);
+        // What each present object's trade does not owe λ, laid out once for
+        // every λ tried: each object's channels apart from every other's.
+        let n = self.channels;
+        let (objects, wanted, weights) = (&joc.objects, &self.wanted, &self.weights);
+        each_mut!(self.trellises)
+            .zip(each_mut!(self.live))
+            .enumerate()
+            .for_each(|(i, (trellis, live))| {
+                let (o, ch) = (i / n, i % n);
+                *live = objects[o].is_some();
+                if *live {
+                    trellis.lay(&wanted[o][ch], &weights[o][ch]);
+                }
+            });
+        let mut codes = std::mem::take(&mut self.codes);
+        let fits = |estimator: &Self, joc: &mut Joc, codes: &mut [[u16; BANDS]], lambda: f64| {
+            estimator.requantise(joc, codes, lambda);
             joc.to_bytes().len() <= estimator.budget
         };
         // A λ that fits and a quarter of it that does not, each way from the
@@ -514,9 +538,9 @@ impl Estimator {
         // least that fits between them, halving the ratio.
         let (mut low, mut high) = (scale / 4.0, scale);
         for _ in 0..40 {
-            if !fits(self, joc, high) {
+            if !fits(self, joc, &mut codes, high) {
                 (low, high) = (high, high * 4.0);
-            } else if fits(self, joc, low) {
+            } else if fits(self, joc, &mut codes, low) {
                 (low, high) = (low / 4.0, low);
             } else {
                 break;
@@ -524,15 +548,15 @@ impl Estimator {
         }
         for _ in 0..24 {
             let middle = (low * high).sqrt();
-            if fits(self, joc, middle) {
+            if fits(self, joc, &mut codes, middle) {
                 high = middle;
             } else {
                 low = middle;
             }
         }
-        self.requantise(joc, high);
+        self.requantise(joc, &mut codes, high);
+        self.codes = codes;
         self.squeezed += 1;
-        let n = self.channels;
         for (held, object) in self.held.iter_mut().zip(&joc.objects) {
             if let Some(gains) = object.as_ref().and_then(|o| dequantise(o, n)) {
                 *held = gains;
@@ -541,21 +565,37 @@ impl Estimator {
     }
 
     /// Every present object's codes for the trade of error against bits at
-    /// `lambda`.
-    fn requantise(&self, joc: &mut Joc, lambda: f64) {
-        let book = Codebook::get(Kind::Matrix { fine: true });
-        // Each object's channels apart from every other's.
-        each_mut!(joc.objects)
-            .zip(each!(self.wanted).zip(each!(self.weights)))
-            .for_each(|(object, (wanted, weights))| {
-                let Some(object) = object else {
-                    return;
-                };
-                let codes = (0..self.channels)
-                    .map(|ch| trade(&wanted[ch], &weights[ch], lambda, book))
-                    .collect();
-                object.data = Data::Dense(vec![codes]);
+    /// `lambda`, each of its channels traded in `codes` apart from every
+    /// other's.
+    fn requantise(&self, joc: &mut Joc, codes: &mut [[u16; BANDS]], lambda: f64) {
+        let prices = Prices::new(lambda);
+        each_mut!(codes)
+            .zip(each!(self.trellises).zip(each!(self.live)))
+            .for_each(|(codes, (trellis, &live))| {
+                if live {
+                    *codes = trellis.trade(&prices);
+                }
             });
+        let n = self.channels;
+        for (object, codes) in joc.objects.iter_mut().zip(codes.chunks(n)) {
+            let Some(object) = object else {
+                continue;
+            };
+            match &mut object.data {
+                // Written over where the last λ's are, which are the codes'
+                // own shape.
+                Data::Dense(points)
+                    if points.len() == 1
+                        && points[0].len() == n
+                        && points[0].iter().all(|kept| kept.len() == BANDS) =>
+                {
+                    for (kept, codes) in points[0].iter_mut().zip(codes) {
+                        kept.copy_from_slice(codes);
+                    }
+                }
+                data => *data = Data::Dense(vec![codes.iter().map(|c| c.to_vec()).collect()]),
+            }
+        }
     }
 
     /// How many payloads [`Self::budget`] has made smaller so far.
@@ -1199,71 +1239,128 @@ fn band_range(band: usize) -> std::ops::Range<usize> {
     BAND_START[band]..BAND_START.get(band + 1).copied().unwrap_or(SUBBANDS)
 }
 
-/// A channel's fine codes for the least `Σ w·(gain − wanted)² + λ·bits`
-/// over its bands: a Viterbi search over each band's candidate levels — a
-/// few either side of its own, the channel's weighted mean and nought, the
-/// last two so that a flat run, or all nought, is always there to take.
-fn trade(wanted: &[f64; BANDS], weight: &[f64; BANDS], lambda: f64, book: &Codebook) -> Vec<u16> {
-    const NEAR: i32 = 6;
-    const MOST: usize = 2 * NEAR as usize + 1 + 5 + 1;
-    let step = f64::from(STEP);
-    let level = |gain: f64| (gain / step).round().clamp(-96.0, 95.0) as i32;
-    let total: f64 = weight.iter().sum();
-    let mean = if total > 0.0 {
-        level(wanted.iter().zip(weight).map(|(g, w)| g * w).sum::<f64>() / total)
-    } else {
-        0
-    };
-    let mut candidates = [[0i32; MOST]; BANDS];
-    let mut counts = [0usize; BANDS];
-    for band in 0..BANDS {
-        let own = level(wanted[band]);
-        let near = (own - NEAR..=own + NEAR)
-            .chain(mean - 2..=mean + 2)
-            .chain(0..=0);
-        for q in near.filter(|q| (-96..=95).contains(q)) {
-            let list = &mut candidates[band][..counts[band]];
-            if !list.contains(&q) {
-                candidates[band][counts[band]] = q;
-                counts[band] += 1;
+/// Levels a band's code may take in the trade: its own, six steps either
+/// side, two either side of the gains' weighted mean, and nought.
+const NEAR: i32 = 6;
+const MOST: usize = 2 * NEAR as usize + 1 + 5 + 1;
+/// The most steps two levels can be apart, either way.
+const SPREAD: i32 = LEVELS - 1;
+
+/// What each code costs at a λ: λ times its bits in the fine codebook, for
+/// every step a band's level can be from the band before's, and the first
+/// band's from nought — worked out once for each λ the budget's search
+/// tries, not once for each code it weighs.
+struct Prices([f64; PRICES]);
+/// The prices' room: the `2 · SPREAD + 1` steps, to a power of two, so that
+/// a step's index needs no bounds check — masking one in range changes
+/// nothing.
+const PRICES: usize = 512;
+const _: () = assert!(PRICES > 2 * SPREAD as usize);
+
+impl Prices {
+    fn new(lambda: f64) -> Self {
+        let book = Codebook::get(Kind::Matrix { fine: true });
+        let bits = |code: i32| book.length(code.rem_euclid(LEVELS) as u16) as f64;
+        Self(std::array::from_fn(|i| match i32::try_from(i) {
+            Ok(i) if i <= 2 * SPREAD => lambda * bits(i - SPREAD),
+            _ => f64::NAN,
+        }))
+    }
+
+    fn of(&self, steps: i32) -> f64 {
+        debug_assert!((-SPREAD..=SPREAD).contains(&steps));
+        self.0[(steps + SPREAD) as usize & (PRICES - 1)]
+    }
+}
+
+/// One object's gains on one downmix channel, laid out for the trade of
+/// error against bits: each band's candidate levels and the weighted error
+/// of each. None of it changes with λ, so it is laid out once a frame, and
+/// the budget's search tries λ after λ on it.
+#[derive(Clone, Default)]
+struct Trellis {
+    levels: [[i32; MOST]; BANDS],
+    counts: [usize; BANDS],
+    errors: [[f64; MOST]; BANDS],
+}
+
+impl Trellis {
+    fn lay(&mut self, wanted: &[f64; BANDS], weight: &[f64; BANDS]) {
+        let step = f64::from(STEP);
+        let level = |gain: f64| (gain / step).round().clamp(-96.0, 95.0) as i32;
+        let total: f64 = weight.iter().sum();
+        let mean = if total > 0.0 {
+            level(wanted.iter().zip(weight).map(|(g, w)| g * w).sum::<f64>() / total)
+        } else {
+            0
+        };
+        for band in 0..BANDS {
+            let own = level(wanted[band]);
+            let near = (own - NEAR..=own + NEAR)
+                .chain(mean - 2..=mean + 2)
+                .chain(0..=0);
+            let (levels, count) = (&mut self.levels[band], &mut self.counts[band]);
+            *count = 0;
+            for q in near.filter(|q| (-96..=95).contains(q)) {
+                if !levels[..*count].contains(&q) {
+                    levels[*count] = q;
+                    self.errors[band][*count] =
+                        weight[band] * (f64::from(q) * step - wanted[band]).powi(2);
+                    *count += 1;
+                }
             }
         }
     }
-    let bits = |code: i32| book.length(code.rem_euclid(LEVELS) as u16) as f64;
-    let error = |band: usize, q: i32| weight[band] * (f64::from(q) * step - wanted[band]).powi(2);
-    let mut cost = [[0f64; MOST]; BANDS];
-    let mut from = [[0usize; MOST]; BANDS];
-    for s in 0..counts[0] {
-        let q = candidates[0][s];
-        cost[0][s] = error(0, q) + lambda * bits(q);
-    }
-    for band in 1..BANDS {
-        for s in 0..counts[band] {
-            let q = candidates[band][s];
-            let (best, at) = (0..counts[band - 1])
-                .map(|p| {
-                    (
-                        cost[band - 1][p] + lambda * bits(q - candidates[band - 1][p]),
-                        p,
-                    )
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-                .expect("candidates");
-            cost[band][s] = best + error(band, q);
-            from[band][s] = at;
+
+    /// The channel's fine codes for the least `Σ w·(gain − wanted)² + λ·bits`
+    /// over its bands, at `prices`' λ: a Viterbi search over each band's
+    /// candidate levels — a few either side of its own, the channel's
+    /// weighted mean and nought, the last two so that a flat run, or all
+    /// nought, is always there to take. Of costs that tie, the level laid
+    /// out first is taken.
+    fn trade(&self, prices: &Prices) -> [u16; BANDS] {
+        let mut cost = [[0f64; MOST]; BANDS];
+        let mut from = [[0u8; MOST]; BANDS];
+        let first = self.counts[0];
+        for ((cost, &error), &level) in cost[0][..first]
+            .iter_mut()
+            .zip(&self.errors[0][..first])
+            .zip(&self.levels[0][..first])
+        {
+            *cost = error + prices.of(level);
         }
-    }
-    let last = BANDS - 1;
-    let mut s = (0..counts[last])
-        .min_by(|a, b| cost[last][*a].total_cmp(&cost[last][*b]))
-        .expect("candidates");
-    let mut levels = [0i32; BANDS];
-    for band in (0..BANDS).rev() {
-        levels[band] = candidates[band][s];
-        s = from[band][s];
-    }
-    (0..BANDS)
-        .map(|band| {
+        for band in 1..BANDS {
+            let (done, rest) = cost.split_at_mut(band);
+            let count = self.counts[band - 1];
+            let (before, costs) = (&self.levels[band - 1][..count], &done[band - 1][..count]);
+            for s in 0..self.counts[band] {
+                let q = self.levels[band][s];
+                let mut best = costs[0] + prices.of(q - before[0]);
+                let mut at = 0;
+                for p in 1..count {
+                    let tried = costs[p] + prices.of(q - before[p]);
+                    if tried.total_cmp(&best).is_lt() {
+                        best = tried;
+                        at = p;
+                    }
+                }
+                rest[0][s] = best + self.errors[band][s];
+                from[band][s] = at as u8;
+            }
+        }
+        let last = BANDS - 1;
+        let mut s = 0;
+        for t in 1..self.counts[last] {
+            if cost[last][t].total_cmp(&cost[last][s]).is_lt() {
+                s = t;
+            }
+        }
+        let mut levels = [0i32; BANDS];
+        for band in (0..BANDS).rev() {
+            levels[band] = self.levels[band][s];
+            s = usize::from(from[band][s]);
+        }
+        std::array::from_fn(|band| {
             let code = if band == 0 {
                 levels[0]
             } else {
@@ -1271,7 +1368,7 @@ fn trade(wanted: &[f64; BANDS], weight: &[f64; BANDS], lambda: f64, book: &Codeb
             };
             code.rem_euclid(LEVELS) as u16
         })
-        .collect()
+    }
 }
 
 /// Gains to the decoder's codes: quantise each to the fine step, and chain
@@ -2024,16 +2121,135 @@ mod tests {
         }
     }
 
+    /// The trade as it was searched before [`Trellis`]: everything laid out
+    /// afresh for each λ. Kept to hold the trellis to it.
+    ///
+    /// A channel's fine codes for the least `Σ w·(gain − wanted)² + λ·bits`
+    /// over its bands: a Viterbi search over each band's candidate levels — a
+    /// few either side of its own, the channel's weighted mean and nought, the
+    /// last two so that a flat run, or all nought, is always there to take.
+    fn searched(
+        wanted: &[f64; BANDS],
+        weight: &[f64; BANDS],
+        lambda: f64,
+        book: &Codebook,
+    ) -> Vec<u16> {
+        const NEAR: i32 = 6;
+        const MOST: usize = 2 * NEAR as usize + 1 + 5 + 1;
+        let step = f64::from(STEP);
+        let level = |gain: f64| (gain / step).round().clamp(-96.0, 95.0) as i32;
+        let total: f64 = weight.iter().sum();
+        let mean = if total > 0.0 {
+            level(wanted.iter().zip(weight).map(|(g, w)| g * w).sum::<f64>() / total)
+        } else {
+            0
+        };
+        let mut candidates = [[0i32; MOST]; BANDS];
+        let mut counts = [0usize; BANDS];
+        for band in 0..BANDS {
+            let own = level(wanted[band]);
+            let near = (own - NEAR..=own + NEAR)
+                .chain(mean - 2..=mean + 2)
+                .chain(0..=0);
+            for q in near.filter(|q| (-96..=95).contains(q)) {
+                let list = &mut candidates[band][..counts[band]];
+                if !list.contains(&q) {
+                    candidates[band][counts[band]] = q;
+                    counts[band] += 1;
+                }
+            }
+        }
+        let bits = |code: i32| book.length(code.rem_euclid(LEVELS) as u16) as f64;
+        let error =
+            |band: usize, q: i32| weight[band] * (f64::from(q) * step - wanted[band]).powi(2);
+        let mut cost = [[0f64; MOST]; BANDS];
+        let mut from = [[0usize; MOST]; BANDS];
+        for s in 0..counts[0] {
+            let q = candidates[0][s];
+            cost[0][s] = error(0, q) + lambda * bits(q);
+        }
+        for band in 1..BANDS {
+            for s in 0..counts[band] {
+                let q = candidates[band][s];
+                let (best, at) = (0..counts[band - 1])
+                    .map(|p| {
+                        (
+                            cost[band - 1][p] + lambda * bits(q - candidates[band - 1][p]),
+                            p,
+                        )
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .expect("candidates");
+                cost[band][s] = best + error(band, q);
+                from[band][s] = at;
+            }
+        }
+        let last = BANDS - 1;
+        let mut s = (0..counts[last])
+            .min_by(|a, b| cost[last][*a].total_cmp(&cost[last][*b]))
+            .expect("candidates");
+        let mut levels = [0i32; BANDS];
+        for band in (0..BANDS).rev() {
+            levels[band] = candidates[band][s];
+            s = from[band][s];
+        }
+        (0..BANDS)
+            .map(|band| {
+                let code = if band == 0 {
+                    levels[0]
+                } else {
+                    levels[band] - levels[band - 1]
+                };
+                code.rem_euclid(LEVELS) as u16
+            })
+            .collect()
+    }
+
+    /// The trellis trades as the search before it did, code for code: λ
+    /// from nought to past where every code is nought, gains past the
+    /// quantiser's range either way, bands that weigh nothing — where every
+    /// level costs the same, and the first laid out has to be taken — and
+    /// gains on a half step.
+    #[test]
+    fn the_trellis_trades_as_the_search_did() {
+        let mut seed = 77u32;
+        let book = Codebook::get(Kind::Matrix { fine: true });
+        let step = f64::from(STEP);
+        let mut trellis = Trellis::default();
+        for case in 0..400 {
+            let wanted: [f64; BANDS] = std::array::from_fn(|band| match (case + band) % 5 {
+                0 => (f64::from(noise(&mut seed)) * 40.0).round() * step + step / 2.0,
+                1 => f64::from(noise(&mut seed)) * 30.0,
+                _ => f64::from(noise(&mut seed)) * 4.0,
+            });
+            let weight: [f64; BANDS] = std::array::from_fn(|band| match (case / 3 + band) % 7 {
+                0 => 0.0,
+                1 => f64::from(noise(&mut seed)).abs() * 1e-9,
+                _ => f64::from(noise(&mut seed)) + 0.6,
+            });
+            trellis.lay(&wanted, &weight);
+            for lambda in [0.0, 1e-9, 1e-4, 3e-3, 0.02, 0.1, 0.7, 4.0, 50.0, 1e6] {
+                let lambda = lambda * (1.0 + f64::from(noise(&mut seed)) * 0.01);
+                assert_eq!(
+                    trellis.trade(&Prices::new(lambda))[..],
+                    searched(&wanted, &weight, lambda, book)[..],
+                    "case {case}, λ {lambda}"
+                );
+            }
+        }
+    }
+
     /// With nothing asked for bits, the trade is the plain quantisation.
     #[test]
     fn a_trade_at_nought_is_the_plain_quantisation() {
         let mut seed = 41u32;
-        let book = Codebook::get(Kind::Matrix { fine: true });
         for _ in 0..20 {
             let wanted: [f64; BANDS] = std::array::from_fn(|_| f64::from(noise(&mut seed)) * 12.0);
             let weight: [f64; BANDS] = std::array::from_fn(|_| f64::from(noise(&mut seed)) + 0.6);
             let (codes, _) = quantise(1, |_, band| wanted[band]);
-            assert_eq!(trade(&wanted, &weight, 0.0, book), codes[0]);
+            let mut trellis = Trellis::default();
+            trellis.lay(&wanted, &weight);
+            assert_eq!(trellis.trade(&Prices::new(0.0))[..], codes[0][..]);
         }
     }
 
