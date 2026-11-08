@@ -45,7 +45,52 @@ pub struct Config {
     pub progress: bool,
 }
 
+/// The threads a joint object coding encode runs on, at most. A frame's
+/// work comes in pieces of an object or a band each, a dozen or so at a
+/// time, and the encoder's own steps between them are one thread's: past
+/// eight, more threads wait more than they work — the encode no sooner, the
+/// processor busier.
+const JOC_THREADS: usize = 8;
+
 pub fn run(config: Config) -> Result<()> {
+    if !config.joc {
+        return encode(config);
+    }
+    // Joint object coding fits a frame's objects, and the downmix's side of
+    // their equations, at once (`hz-joc`'s `parallel` feature): on a pool of
+    // its own that the whole encode runs in, so that the thread driving it
+    // works in the pool between its own steps. The same stream, to the byte.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(JOC_THREADS));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|n| format!("joc-{n}"))
+        // The stack the encode has on the main thread.
+        .stack_size(8 << 20)
+        .build()
+        // A process that may start no more threads (a task limit) still
+        // encodes, on the thread it has: a pool of that thread alone starts
+        // none, and is what Rayon itself falls back to where there are no
+        // threads. Not `encode` outside any pool: the estimator's work would
+        // start Rayon's global pool, which fails the same way, and panics.
+        // Rayon keeps that thread its own for the rest of the process, and
+        // the stream is the same to the byte.
+        .or_else(|_| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build()
+        })
+        // Refused before anything is opened, the output left as it was.
+        .map_err(|e| {
+            Error::io(
+                &config.out,
+                std::io::Error::other(format!("no thread to encode on: {e}")),
+            )
+        })?;
+    pool.install(|| encode(config))
+}
+
+fn encode(config: Config) -> Result<()> {
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still

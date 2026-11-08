@@ -253,6 +253,7 @@ dependencies = [
  "hz-mlp",
  "hz-programme",
  "hz-render",
+ "rayon",
 ]
 
 [[package]]
@@ -303,6 +304,7 @@ name = "hz-joc"
 version = "0.1.0"
 dependencies = [
  "hz-core",
+ "rayon",
 ]
 
 [[package]]

@@ -47,6 +47,70 @@
 use crate::huffman::{Codebook, Kind};
 use crate::payload::{Data, Joc, Object};
 use crate::qmf::{Analysis, DELAY, SUBBANDS, Slot, Synthesis};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+// Rayon's iterators with the `parallel` feature, the standard ones without:
+// the same loops either way, each step of them the same arithmetic, so the
+// same results to the bit.
+#[cfg(feature = "parallel")]
+macro_rules! each {
+    ($v:expr) => {
+        $v.par_iter()
+    };
+}
+#[cfg(not(feature = "parallel"))]
+macro_rules! each {
+    ($v:expr) => {
+        $v.iter()
+    };
+}
+#[cfg(feature = "parallel")]
+macro_rules! each_mut {
+    ($v:expr) => {
+        $v.par_iter_mut()
+    };
+}
+#[cfg(not(feature = "parallel"))]
+macro_rules! each_mut {
+    ($v:expr) => {
+        $v.iter_mut()
+    };
+}
+#[cfg(feature = "parallel")]
+macro_rules! chunks {
+    ($v:expr, $n:expr) => {
+        $v.par_chunks($n)
+    };
+}
+#[cfg(not(feature = "parallel"))]
+macro_rules! chunks {
+    ($v:expr, $n:expr) => {
+        $v.chunks($n)
+    };
+}
+#[cfg(feature = "parallel")]
+macro_rules! chunks_mut {
+    ($v:expr, $n:expr) => {
+        $v.par_chunks_mut($n)
+    };
+}
+#[cfg(not(feature = "parallel"))]
+macro_rules! chunks_mut {
+    ($v:expr, $n:expr) => {
+        $v.chunks_mut($n)
+    };
+}
+
+/// The threads a frame's objects are fitted on.
+#[cfg(feature = "parallel")]
+fn workers() -> usize {
+    rayon::current_num_threads()
+}
+#[cfg(not(feature = "parallel"))]
+fn workers() -> usize {
+    1
+}
 
 /// Samples, and slots, in a frame of six blocks.
 const FRAME: usize = 1536;
@@ -114,31 +178,19 @@ pub struct Estimator {
     target: Vec<Vec<f32>>,
     raw: Vec<Vec<f32>>,
     /// The square root of the frame-long Hann window [`Fit::Synthesis`]
-    /// weighs the output by, and the fit's scratch: the basis and the target
-    /// under it, the normal equations, their factor, a right-hand side and its
-    /// solution, and the smaller system left when gains are held at the
-    /// quantiser's bounds — kept, so that a frame allocates nothing for them.
+    /// weighs the output by, and what the frame's objects share of the fit:
+    /// the basis under it, the normal equations and their factor — kept, so
+    /// that a frame allocates nothing for them.
     window_root: Vec<f64>,
     weighted: Vec<Vec<f64>>,
-    weighted_target: Vec<f64>,
     gram: Vec<f64>,
     factor: Vec<f64>,
-    solution: Vec<f64>,
-    rhs: Vec<f64>,
-    bounded: Vec<bool>,
-    free: Vec<usize>,
-    reduced: Vec<f64>,
-    reduced_factor: Vec<f64>,
     /// For the steep decision: each slot's downmix matrices, per band, over
-    /// the frame and half the next, and an object's side of them; and the
-    /// fit by synthesis on part of the window, apart from the frame's.
+    /// the frame and half the next.
     slot_gram: Vec<[[f64; MAX_CHANNELS]; MAX_CHANNELS]>,
-    slot_rhs: Vec<[f64; MAX_CHANNELS]>,
-    slot_energy: Vec<f64>,
-    steep_gram: Vec<f64>,
-    steep_factor: Vec<f64>,
-    /// The gains the steep decision found for the step it chose.
-    step_gains: Matrix,
+    /// The scratch each object's fit works in, one per thread the objects
+    /// are fitted on at once.
+    fitters: Vec<Fitter>,
     /// For the budget: the gains each object's codes were quantised from,
     /// and how much an error in each weighs — the fit's own normal
     /// equations' diagonal.
@@ -192,21 +244,10 @@ impl Estimator {
                 .map(|t| (std::f64::consts::PI * (t as f64 + 0.5) / FRAME as f64).sin())
                 .collect(),
             weighted: vec![vec![0.0; FRAME]; channels * BANDS],
-            weighted_target: vec![0.0; FRAME],
             gram: vec![0.0; (channels * BANDS).pow(2)],
             factor: vec![0.0; (channels * BANDS).pow(2)],
-            solution: vec![0.0; channels * BANDS],
-            rhs: vec![0.0; channels * BANDS],
-            bounded: vec![false; channels * BANDS],
-            free: Vec::with_capacity(channels * BANDS),
-            reduced: vec![0.0; (channels * BANDS).pow(2)],
-            reduced_factor: vec![0.0; (channels * BANDS).pow(2)],
             slot_gram: vec![[[0.0; MAX_CHANNELS]; MAX_CHANNELS]; SPAN * BANDS],
-            slot_rhs: vec![[0.0; MAX_CHANNELS]; SPAN * BANDS],
-            slot_energy: vec![0.0; SPAN * BANDS],
-            steep_gram: vec![0.0; (channels * BANDS).pow(2)],
-            steep_factor: vec![0.0; (channels * BANDS).pow(2)],
-            step_gains: [[0.0; BANDS]; MAX_CHANNELS],
+            fitters: vec![Fitter::new(channels * BANDS)],
             wanted: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             weights: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             sequence: 0,
@@ -246,24 +287,19 @@ impl Estimator {
         assert_eq!(core.len(), self.channels);
         assert_eq!(objects.len(), self.objects.len());
         assert_eq!(present.len(), self.objects.len());
-        for (slots, (bank, signal)) in self
-            .core_slots
-            .iter_mut()
-            .zip(self.core.iter_mut().zip(core))
-            .chain(
-                self.object_slots
-                    .iter_mut()
-                    .zip(self.objects.iter_mut().zip(objects)),
-            )
-        {
-            slots.copy_within(SLOTS.., 0);
-            for t in 0..SLOTS {
-                bank.slot(
-                    &signal[t * SUBBANDS..(t + 1) * SUBBANDS],
-                    &mut slots[SLOTS + t],
-                );
-            }
-        }
+        // Every channel and object through its own bank.
+        each_mut!(self.core_slots)
+            .zip(each_mut!(self.core).zip(each!(core)))
+            .chain(each_mut!(self.object_slots).zip(each_mut!(self.objects).zip(each!(objects))))
+            .for_each(|(slots, (bank, signal))| {
+                slots.copy_within(SLOTS.., 0);
+                for t in 0..SLOTS {
+                    bank.slot(
+                        &signal[t * SUBBANDS..(t + 1) * SUBBANDS],
+                        &mut slots[SLOTS + t],
+                    );
+                }
+            });
         if self.fit == Fit::Synthesis {
             self.synthesise(objects);
         }
@@ -274,24 +310,26 @@ impl Estimator {
     /// Run the new frame through the synthesis basis, and put the objects on
     /// the decoder's clock beside it.
     fn synthesise(&mut self, objects: &[&[f32]]) {
-        for out in &mut self.basis_out {
-            out.copy_within(FRAME.., 0);
-        }
-        for ch in 0..self.channels {
-            for t in 0..SLOTS {
-                let slot = self.core_slots[ch][SLOTS + t];
-                for band in 0..BANDS {
+        // Each channel's share of each band through its own bank, `i` being
+        // `channel · BANDS + band`.
+        let core_slots = &self.core_slots;
+        each_mut!(self.basis)
+            .zip(each_mut!(self.basis_out))
+            .enumerate()
+            .for_each(|(i, (bank, out))| {
+                let (ch, band) = (i / BANDS, i % BANDS);
+                out.copy_within(FRAME.., 0);
+                for t in 0..SLOTS {
+                    let slot = core_slots[ch][SLOTS + t];
                     let mut share = Slot::default();
                     for k in band_range(band) {
                         share.real[k] = slot.real[k];
                         share.imaginary[k] = slot.imaginary[k];
                     }
-                    let i = ch * BANDS + band;
                     let at = FRAME + t * SUBBANDS;
-                    self.basis[i].slot(&share, &mut self.basis_out[i][at..at + SUBBANDS]);
+                    bank.slot(&share, &mut out[at..at + SUBBANDS]);
                 }
-            }
-        }
+            });
         for ((target, raw), object) in self.target.iter_mut().zip(&mut self.raw).zip(objects) {
             target.copy_within(FRAME.., 0);
             for n in 0..FRAME {
@@ -318,134 +356,79 @@ impl Estimator {
         // flat window of the same length fits each frame's gains to its
         // neighbours' mixes too, and a short flat one chases transients.
         let start = FRAME + DELAY / 2 - FRAME / 2;
-        for (weighted, basis) in self.weighted.iter_mut().zip(&self.basis_out) {
-            for ((w, &root), &value) in weighted
-                .iter_mut()
-                .zip(&self.window_root)
-                .zip(&basis[start..start + FRAME])
-            {
-                *w = root * f64::from(value);
-            }
-        }
-        self.synthesis_system(0);
+        let window_root = &self.window_root;
+        each_mut!(self.weighted)
+            .zip(each!(self.basis_out))
+            .for_each(|(weighted, basis)| {
+                for ((w, &root), &value) in weighted
+                    .iter_mut()
+                    .zip(window_root)
+                    .zip(&basis[start..start + FRAME])
+                {
+                    *w = root * f64::from(value);
+                }
+            });
+        synthesis_system(
+            &self.weighted,
+            0,
+            n,
+            self.ridge,
+            &mut self.gram,
+            &mut self.factor,
+        );
         let stepping = self.steep_margin > 0.0;
         if stepping {
             self.slot_matrices();
         }
 
-        let mut out_objects = Vec::with_capacity(self.objects.len());
-        for (o, &here) in present.iter().enumerate() {
-            if !here {
-                out_objects.push(None);
-                continue;
-            }
-            for ((w, &root), &value) in self
-                .weighted_target
-                .iter_mut()
-                .zip(&self.window_root)
-                .zip(&self.target[o][start..start + FRAME])
-            {
-                *w = root * f64::from(value);
-            }
-            self.synthesis_solve(0);
-            let step = if stepping { self.steep_split(o) } else { None };
-            let split = step.map(|step| step.split);
-            if let Some(split) = split {
-                // Stepped at `split`: refitted on the output only the slots
-                // from there on make — a slot's synthesis reaches nine slots
-                // past it — or on all of the window if that starts later.
-                let from = (split * SUBBANDS + DELAY - 1).saturating_sub(start);
-                if from > 0 {
-                    std::mem::swap(&mut self.gram, &mut self.steep_gram);
-                    std::mem::swap(&mut self.factor, &mut self.steep_factor);
-                    self.synthesis_system(from);
-                    self.synthesis_solve(from);
-                    std::mem::swap(&mut self.gram, &mut self.steep_gram);
-                    std::mem::swap(&mut self.factor, &mut self.steep_factor);
-                }
-            }
-            let x = &self.solution;
-            let (mut codes, mut gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
-            for (ch, wanted) in self.wanted[o].iter_mut().enumerate().take(n) {
-                *wanted = std::array::from_fn(|band| x[ch * BANDS + band]);
-            }
-            if let Some(step) = step {
-                // The gains sent are held to the test the step passed: the
-                // refit on the output after it can find nothing there to fit
-                // — a transient over before its window begins — and come
-                // back nought. Then the decision's own gains are sent, fitted
-                // on every slot from the step on.
-                let error = (0..BANDS)
-                    .map(|band| self.stepped_error(band, step.split, &self.held[o], &gains))
-                    .sum();
-                if !step.passes(error, self.steep_margin) {
-                    let found = self.step_gains;
-                    (codes, gains) = quantise(n, |ch, band| f64::from(found[ch][band]));
-                    for (wanted, found) in self.wanted[o].iter_mut().zip(&found) {
-                        *wanted = found.map(f64::from);
+        // Each object is fitted from what the decoder holds for it, against
+        // the downmix's side of the equations the frame's objects share: so
+        // apart, a run of them to each thread, each run in its own scratch.
+        let objects = present.len();
+        let runs = workers().clamp(1, objects.max(1));
+        if self.fitters.len() < runs {
+            self.fitters.resize_with(runs, || Fitter::new(n * BANDS));
+        }
+        let run = objects.div_ceil(runs).max(1);
+        let frame = Frame {
+            channels: n,
+            ridge: self.ridge,
+            steep_margin: self.steep_margin,
+            stepping,
+            start,
+            weighted: &self.weighted,
+            gram: &self.gram,
+            factor: &self.factor,
+            window_root: &self.window_root,
+            slot_gram: &self.slot_gram,
+            core_slots: &self.core_slots,
+        };
+        let mut out_objects: Vec<Option<Object>> = (0..objects).map(|_| None).collect();
+        chunks_mut!(out_objects, run)
+            .zip(chunks!(present, run))
+            .zip(chunks_mut!(self.held, run))
+            .zip(chunks_mut!(self.wanted, run))
+            .zip(chunks_mut!(self.weights, run))
+            .zip(chunks!(self.target, run))
+            .zip(chunks!(self.object_slots, run))
+            .zip(each_mut!(self.fitters))
+            .for_each(
+                |(((((((out, present), held), wanted), weights), target), slots), fitter)| {
+                    for (o, &here) in present.iter().enumerate() {
+                        if here {
+                            out[o] = Some(fitter.fit(
+                                &frame,
+                                &target[o],
+                                &slots[o],
+                                &mut held[o],
+                                &mut wanted[o],
+                                &mut weights[o],
+                            ));
+                        }
                     }
-                }
-            }
-            let m = n * BANDS;
-            for ch in 0..n {
-                for band in 0..BANDS {
-                    self.weights[o][ch][band] = self.gram[(ch * BANDS + band) * (m + 1)];
-                }
-            }
-            self.held[o] = gains;
-            out_objects.push(Some(Object {
-                bands_index: BANDS_INDEX,
-                fine: true,
-                steep: split.is_some(),
-                // The decoder switches at the slot one past the code.
-                offsets: split.map(|s| vec![(s - 1) as u8]).unwrap_or_default(),
-                data: Data::Dense(vec![codes]),
-            }));
-        }
+                },
+            );
         self.joc(out_objects)
-    }
-
-    /// The fit by synthesis's normal equations on the window from `from`
-    /// samples into it, ridged, into `gram`, and their factor into `factor`.
-    fn synthesis_system(&mut self, from: usize) {
-        let (n, m) = (self.channels, self.channels * BANDS);
-        let gram = &mut self.gram;
-        for i in 0..m {
-            for j in i..m {
-                let v = dot(&self.weighted[i][from..], &self.weighted[j][from..]);
-                gram[i * m + j] = v;
-                gram[j * m + i] = v;
-            }
-        }
-        // The ridge is one per band, shared by its channels: the bands span
-        // tens of decibels, and one ridge across all sixty flattens the
-        // quiet ones to nought; but within a band it must weigh every
-        // channel's gain alike, so that of two channels carrying one signal
-        // the fit leans on the louder — one per signal, against that signal's
-        // own energy, asks a channel at −40 dB for a gain of fifty.
-        for band in 0..BANDS {
-            let mean = (0..n)
-                .map(|ch| gram[(ch * BANDS + band) * (m + 1)])
-                .sum::<f64>()
-                / n as f64;
-            let lambda = f64::from(self.ridge) * mean + 1e-12;
-            for ch in 0..n {
-                gram[(ch * BANDS + band) * (m + 1)] += lambda;
-            }
-        }
-        cholesky(gram, m, &mut self.factor);
-    }
-
-    /// The gains for the weighted target on the window from `from` samples
-    /// into it, under the quantiser's bounds, into `solution`.
-    fn synthesis_solve(&mut self, from: usize) {
-        let m = self.channels * BANDS;
-        for (b, weighted) in self.rhs.iter_mut().zip(&self.weighted) {
-            *b = dot(&weighted[from..], &self.weighted_target[from..]);
-        }
-        self.solution.copy_from_slice(&self.rhs);
-        cholesky_solve(&self.factor, m, &mut self.solution);
-        self.hold_to_bounds(m);
     }
 
     /// Each slot's downmix matrices per band, over the frame and half the
@@ -453,326 +436,31 @@ impl Estimator {
     #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
     fn slot_matrices(&mut self) {
         let n = self.channels;
-        self.slot_gram.fill([[0.0; MAX_CHANNELS]; MAX_CHANNELS]);
-        for t in 0..SPAN {
-            for k in 0..SUBBANDS {
-                let cell = &mut self.slot_gram[t * BANDS + band_of(k)];
-                for i in 0..n {
-                    let xi = &self.core_slots[i][t];
-                    let (ri, ii) = (f64::from(xi.real[k]), f64::from(xi.imaginary[k]));
-                    for j in i..n {
-                        let xj = &self.core_slots[j][t];
-                        cell[i][j] += ri * f64::from(xj.real[k]) + ii * f64::from(xj.imaginary[k]);
+        let core_slots = &self.core_slots;
+        chunks_mut!(self.slot_gram, BANDS)
+            .enumerate()
+            .for_each(|(t, cells)| {
+                cells.fill([[0.0; MAX_CHANNELS]; MAX_CHANNELS]);
+                for k in 0..SUBBANDS {
+                    let cell = &mut cells[band_of(k)];
+                    for i in 0..n {
+                        let xi = &core_slots[i][t];
+                        let (ri, ii) = (f64::from(xi.real[k]), f64::from(xi.imaginary[k]));
+                        for j in i..n {
+                            let xj = &core_slots[j][t];
+                            cell[i][j] +=
+                                ri * f64::from(xj.real[k]) + ii * f64::from(xj.imaginary[k]);
+                        }
                     }
                 }
-            }
-        }
-        for cell in &mut self.slot_gram {
-            for i in 0..n {
-                for j in 0..i {
-                    cell[i][j] = cell[j][i];
-                }
-            }
-        }
-    }
-
-    /// Whether object `o`'s gains are better stepped than ramped this frame,
-    /// and at which slot: the decoder holds the last frame's gains before it
-    /// and this frame's from it on. Weighed in the QMF domain — the decoder's
-    /// own model of the frame, before synthesis — over the frame and half
-    /// the next, against the ramp: each the least-squares gains for its
-    /// shape, the ramp from the gains held, the step after the held ones.
-    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
-    fn steep_split(&mut self, o: usize) -> Option<Step> {
-        let n = self.channels;
-        for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
-            *rhs = [0.0; MAX_CHANNELS];
-            *energy = 0.0;
-        }
-        for t in 0..SPAN {
-            let target = &self.object_slots[o][t];
-            for k in 0..SUBBANDS {
-                let cell = t * BANDS + band_of(k);
-                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
-                self.slot_energy[cell] += or * or + oi * oi;
-                for (i, slots) in self.core_slots.iter().enumerate() {
-                    let x = &slots[t];
-                    self.slot_rhs[cell][i] +=
-                        f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
-                }
-            }
-        }
-        let held = self.held[o];
-        let ridge = f64::from(self.ridge);
-        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
-        for band in 0..BANDS {
-            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
-            let cell = |t: usize| t * BANDS + band;
-            // The ramp: (1 − w)·h + w·c at slot t, w = (t + 1)/24, then c.
-            let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
-            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
-            let mut rhs = [0f64; MAX_CHANNELS];
-            for t in 0..SPAN {
-                let (w, a, g) = (weight(t), &self.slot_gram[cell(t)], &self.slot_rhs[cell(t)]);
-                for i in 0..n {
-                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
-                    for j in 0..n {
-                        system[i][j] += w * w * a[i][j];
+                for cell in cells {
+                    for i in 0..n {
+                        for j in 0..i {
+                            cell[i][j] = cell[j][i];
+                        }
                     }
                 }
-            }
-            let c = snap(ridged_solve(system, rhs, n, ridge));
-            for t in 0..SPAN {
-                let w = weight(t);
-                let mix: [f64; MAX_CHANNELS] =
-                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
-                ramped += error(
-                    &self.slot_gram[cell(t)],
-                    &self.slot_rhs[cell(t)],
-                    self.slot_energy[cell(t)],
-                    &mix,
-                    n,
-                );
-            }
-            // The steps: the held gains on the slots before the split, the
-            // least-squares gains on the rest, the split from late to early so
-            // that the rest's sums build up.
-            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
-            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
-            for t in SLOTS..SPAN {
-                accumulate(
-                    &mut system,
-                    &mut rhs,
-                    &mut energy,
-                    &self.slot_gram[cell(t)],
-                    &self.slot_rhs[cell(t)],
-                    self.slot_energy[cell(t)],
-                    n,
-                );
-            }
-            let mut before = [0f64; SLOTS + 1];
-            for t in 0..SLOTS {
-                before[t + 1] = before[t]
-                    + error(
-                        &self.slot_gram[cell(t)],
-                        &self.slot_rhs[cell(t)],
-                        self.slot_energy[cell(t)],
-                        &h,
-                        n,
-                    );
-            }
-            for split in (1..=SLOTS).rev() {
-                let t = split;
-                if t < SLOTS {
-                    accumulate(
-                        &mut system,
-                        &mut rhs,
-                        &mut energy,
-                        &self.slot_gram[cell(t)],
-                        &self.slot_rhs[cell(t)],
-                        self.slot_energy[cell(t)],
-                        n,
-                    );
-                }
-                let c = ridged_solve(system, rhs, n, ridge);
-                stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
-            }
-        }
-        let (split, _) = (1..=SLOTS)
-            .map(|split| (split, stepped[split]))
-            .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        // The best step weighed again with its gains rounded to the
-        // quantiser's steps, as the decoder will have them: a gain between
-        // two steps looks better reached at once than ramped to, until both
-        // round to the step already held.
-        let mut best = 0.0;
-        for band in 0..BANDS {
-            let (error, gains) = self.step_error(band, split, &held, ridge);
-            best += error;
-            for (ch, gain) in gains.iter().enumerate().take(n) {
-                self.step_gains[ch][band] = *gain as f32;
-            }
-        }
-        // And it must buy back a share of the object's own energy: where
-        // both errors are down at the quantiser's, their ratio is noise.
-        let step = Step {
-            split,
-            ramped,
-            signal: self.slot_energy.iter().sum(),
-        };
-        step.passes(best, self.steep_margin).then_some(step)
-    }
-
-    /// The error in `band` of the object [`Self::steep_split`] last weighed,
-    /// stepped at `split`: the held gains before it, the least-squares gains
-    /// from it on, rounded to the quantiser's steps — and those gains.
-    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
-    fn step_error(
-        &self,
-        band: usize,
-        split: usize,
-        held: &Matrix,
-        ridge: f64,
-    ) -> (f64, [f64; MAX_CHANNELS]) {
-        let n = self.channels;
-        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
-        let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
-        for t in split..SPAN {
-            let cell = t * BANDS + band;
-            accumulate(
-                &mut system,
-                &mut rhs,
-                &mut energy,
-                &self.slot_gram[cell],
-                &self.slot_rhs[cell],
-                self.slot_energy[cell],
-                n,
-            );
-        }
-        let c = snap(ridged_solve(system, rhs, n, ridge));
-        (
-            self.held_error(band, split, held) + error(&system, &rhs, energy, &c, n),
-            c,
-        )
-    }
-
-    /// The error in `band` of the object [`Self::steep_split`] last weighed,
-    /// stepped at `split` to `gains`.
-    fn stepped_error(&self, band: usize, split: usize, held: &Matrix, gains: &Matrix) -> f64 {
-        let n = self.channels;
-        let g: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(gains[ch][band]));
-        let after: f64 = (split..SPAN)
-            .map(|t| {
-                let cell = t * BANDS + band;
-                error(
-                    &self.slot_gram[cell],
-                    &self.slot_rhs[cell],
-                    self.slot_energy[cell],
-                    &g,
-                    n,
-                )
-            })
-            .sum();
-        self.held_error(band, split, held) + after
-    }
-
-    /// The error in `band`, on the slots before `split`, of the held gains.
-    fn held_error(&self, band: usize, split: usize, held: &Matrix) -> f64 {
-        let n = self.channels;
-        let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
-        (0..split)
-            .map(|t| {
-                let cell = t * BANDS + band;
-                error(
-                    &self.slot_gram[cell],
-                    &self.slot_rhs[cell],
-                    self.slot_energy[cell],
-                    &h,
-                    n,
-                )
-            })
-            .sum()
-    }
-
-    /// Keep the solution within what the quantiser holds: the least-squares
-    /// gains under the bounds, by the primal active-set method for a box. A
-    /// gain clamped by itself would leave the others fitted to a partner it
-    /// no longer has, and one held for good can be wrong once others move —
-    /// so gains are held one at a time, where a step towards the refit
-    /// crosses a bound first, and released when the fit would gain by moving
-    /// one back inside. It ends where no free gain is past a bound and no held
-    /// one wants to leave its own, the optimum over the box. Nothing to do,
-    /// and nothing done, when the unbounded solution is inside.
-    fn hold_to_bounds(&mut self, m: usize) {
-        // The codes −96..=95; a little past them a gain still rounds inside,
-        // so only a solution past that margin starts the search.
-        let step = f64::from(STEP);
-        let (low, high) = (-96.0 * step, 95.0 * step);
-        if self.solution[..m]
-            .iter()
-            .all(|x| (low - step / 2.0..=high + step / 2.0).contains(x))
-        {
-            return;
-        }
-        // A feasible start: the solution clamped, the clamped ones held.
-        for (x, held) in self.solution.iter_mut().zip(&mut self.bounded).take(m) {
-            *held = !(low..=high).contains(x);
-            *x = x.clamp(low, high);
-        }
-        let mut trial = [0f64; MAX_CHANNELS * BANDS];
-        // Each round holds or releases one gain; the bound keeps a degenerate
-        // case from cycling.
-        for _ in 0..4 * m {
-            // The free gains' fit with the held ones where they are.
-            self.free.clear();
-            self.free.extend((0..m).filter(|&i| !self.bounded[i]));
-            let k = self.free.len();
-            for (a, &i) in self.free.iter().enumerate() {
-                for (b, &j) in self.free.iter().enumerate() {
-                    self.reduced[a * k + b] = self.gram[i * m + j];
-                }
-                trial[a] = self.rhs[i]
-                    - (0..m)
-                        .filter(|&j| self.bounded[j])
-                        .map(|j| self.gram[i * m + j] * self.solution[j])
-                        .sum::<f64>();
-            }
-            if k > 0 {
-                cholesky(&self.reduced[..k * k], k, &mut self.reduced_factor[..k * k]);
-                cholesky_solve(&self.reduced_factor[..k * k], k, &mut trial[..k]);
-            }
-            // Step towards it as far as the bounds let; the first gain to
-            // reach one is held there.
-            let mut reach = 1.0;
-            let mut blocking = None;
-            for (a, &i) in self.free.iter().enumerate() {
-                let (from, to) = (self.solution[i], trial[a]);
-                let bound = if to > high {
-                    high
-                } else if to < low {
-                    low
-                } else {
-                    continue;
-                };
-                let t = ((bound - from) / (to - from)).clamp(0.0, 1.0);
-                if t < reach {
-                    reach = t;
-                    blocking = Some((i, bound));
-                }
-            }
-            for (a, &i) in self.free.iter().enumerate() {
-                self.solution[i] += reach * (trial[a] - self.solution[i]);
-            }
-            if let Some((i, bound)) = blocking {
-                self.solution[i] = bound;
-                self.bounded[i] = true;
-                continue;
-            }
-            // At the free gains' optimum: release the held gain whose bound
-            // costs most, if any — one the error falls by moving inside.
-            let mut release = None;
-            let mut worst = 0.0;
-            for i in (0..m).filter(|&i| self.bounded[i]) {
-                let gradient =
-                    dot(&self.gram[i * m..(i + 1) * m], &self.solution[..m]) - self.rhs[i];
-                // At the upper bound the error falls inward if it rises with
-                // the gain; at the lower, if it falls with it.
-                let pull = if self.solution[i] >= high {
-                    gradient
-                } else {
-                    -gradient
-                };
-                let tolerance = 1e-9 * self.gram[i * m + i] * step;
-                if pull > tolerance && pull > worst {
-                    worst = pull;
-                    release = Some(i);
-                }
-            }
-            match release {
-                Some(i) => self.bounded[i] = false,
-                None => return,
-            }
-        }
+            });
     }
 
     /// The frame's payload around its objects; the sequence count steps on.
@@ -856,15 +544,18 @@ impl Estimator {
     /// `lambda`.
     fn requantise(&self, joc: &mut Joc, lambda: f64) {
         let book = Codebook::get(Kind::Matrix { fine: true });
-        for (o, object) in joc.objects.iter_mut().enumerate() {
-            let Some(object) = object else {
-                continue;
-            };
-            let codes = (0..self.channels)
-                .map(|ch| trade(&self.wanted[o][ch], &self.weights[o][ch], lambda, book))
-                .collect();
-            object.data = Data::Dense(vec![codes]);
-        }
+        // Each object's channels apart from every other's.
+        each_mut!(joc.objects)
+            .zip(each!(self.wanted).zip(each!(self.weights)))
+            .for_each(|(object, (wanted, weights))| {
+                let Some(object) = object else {
+                    return;
+                };
+                let codes = (0..self.channels)
+                    .map(|ch| trade(&wanted[ch], &weights[ch], lambda, book))
+                    .collect();
+                object.data = Data::Dense(vec![codes]);
+            });
     }
 
     /// How many payloads [`Self::budget`] has made smaller so far.
@@ -989,6 +680,517 @@ impl Estimator {
         }
 
         self.joc(out_objects)
+    }
+}
+
+/// What a frame's fits by synthesis share: the downmix's side of the normal
+/// equations and their factor, the basis they are formed from, and the slots
+/// the steep decision weighs.
+struct Frame<'a> {
+    channels: usize,
+    ridge: f32,
+    steep_margin: f32,
+    stepping: bool,
+    /// Where the window starts in the two frames of output.
+    start: usize,
+    weighted: &'a [Vec<f64>],
+    gram: &'a [f64],
+    factor: &'a [f64],
+    window_root: &'a [f64],
+    slot_gram: &'a [[[f64; MAX_CHANNELS]; MAX_CHANNELS]],
+    core_slots: &'a [[Slot; 2 * SLOTS]],
+}
+
+/// The fit by synthesis's normal equations on the window from `from`
+/// samples into it, ridged, into `gram`, and their factor into `factor`.
+fn synthesis_system(
+    weighted: &[Vec<f64>],
+    from: usize,
+    n: usize,
+    ridge: f32,
+    gram: &mut [f64],
+    factor: &mut [f64],
+) {
+    let m = n * BANDS;
+    // A row of the upper triangle at a time, then the lower from it.
+    chunks_mut!(gram[..m * m], m)
+        .enumerate()
+        .for_each(|(i, row)| {
+            for j in i..m {
+                row[j] = dot(&weighted[i][from..], &weighted[j][from..]);
+            }
+        });
+    for i in 0..m {
+        for j in i + 1..m {
+            gram[j * m + i] = gram[i * m + j];
+        }
+    }
+    // The ridge is one per band, shared by its channels: the bands span
+    // tens of decibels, and one ridge across all sixty flattens the
+    // quiet ones to nought; but within a band it must weigh every
+    // channel's gain alike, so that of two channels carrying one signal
+    // the fit leans on the louder — one per signal, against that signal's
+    // own energy, asks a channel at −40 dB for a gain of fifty.
+    for band in 0..BANDS {
+        let mean = (0..n)
+            .map(|ch| gram[(ch * BANDS + band) * (m + 1)])
+            .sum::<f64>()
+            / n as f64;
+        let lambda = f64::from(ridge) * mean + 1e-12;
+        for ch in 0..n {
+            gram[(ch * BANDS + band) * (m + 1)] += lambda;
+        }
+    }
+    cholesky(gram, m, factor);
+}
+
+/// The scratch one object's fit by synthesis works in — the target under
+/// the window, a right-hand side and its solution, the smaller system left
+/// when gains are held at the quantiser's bounds, the equations of a refit
+/// after a step, and the steep decision's side of the object — kept, so
+/// that a frame allocates nothing for them.
+struct Fitter {
+    weighted_target: Vec<f64>,
+    rhs: Vec<f64>,
+    solution: Vec<f64>,
+    bounded: Vec<bool>,
+    free: Vec<usize>,
+    reduced: Vec<f64>,
+    reduced_factor: Vec<f64>,
+    steep_gram: Vec<f64>,
+    steep_factor: Vec<f64>,
+    slot_rhs: Vec<[f64; MAX_CHANNELS]>,
+    slot_energy: Vec<f64>,
+    /// The gains the steep decision found for the step it chose.
+    step_gains: Matrix,
+}
+
+impl Fitter {
+    /// For `m` gains: a downmix channel's in each band.
+    fn new(m: usize) -> Self {
+        Self {
+            weighted_target: vec![0.0; FRAME],
+            rhs: vec![0.0; m],
+            solution: vec![0.0; m],
+            bounded: vec![false; m],
+            free: Vec::with_capacity(m),
+            reduced: vec![0.0; m * m],
+            reduced_factor: vec![0.0; m * m],
+            steep_gram: vec![0.0; m * m],
+            steep_factor: vec![0.0; m * m],
+            slot_rhs: vec![[0.0; MAX_CHANNELS]; SPAN * BANDS],
+            slot_energy: vec![0.0; SPAN * BANDS],
+            step_gains: [[0.0; BANDS]; MAX_CHANNELS],
+        }
+    }
+
+    /// An object's payload for the frame: its gains fitted to `target`, the
+    /// object on the decoder's clock over the two frames, from `held`, what
+    /// the decoder holds for it, which they replace; `wanted` and `weights`
+    /// take what the budget needs to quantise them again.
+    fn fit(
+        &mut self,
+        frame: &Frame,
+        target: &[f32],
+        slots: &[Slot; 2 * SLOTS],
+        held: &mut Matrix,
+        wanted: &mut Gains,
+        weights: &mut Gains,
+    ) -> Object {
+        let (n, start) = (frame.channels, frame.start);
+        for ((w, &root), &value) in self
+            .weighted_target
+            .iter_mut()
+            .zip(frame.window_root)
+            .zip(&target[start..start + FRAME])
+        {
+            *w = root * f64::from(value);
+        }
+        self.solve(frame, frame.gram, frame.factor, 0);
+        let step = if frame.stepping {
+            self.steep_split(frame, slots, held)
+        } else {
+            None
+        };
+        let split = step.map(|step| step.split);
+        if let Some(split) = split {
+            // Stepped at `split`: refitted on the output only the slots
+            // from there on make — a slot's synthesis reaches nine slots
+            // past it — or on all of the window if that starts later.
+            let from = (split * SUBBANDS + DELAY - 1).saturating_sub(start);
+            if from > 0 {
+                let (mut gram, mut factor) = (
+                    std::mem::take(&mut self.steep_gram),
+                    std::mem::take(&mut self.steep_factor),
+                );
+                synthesis_system(frame.weighted, from, n, frame.ridge, &mut gram, &mut factor);
+                self.solve(frame, &gram, &factor, from);
+                (self.steep_gram, self.steep_factor) = (gram, factor);
+            }
+        }
+        let x = &self.solution;
+        let (mut codes, mut gains) = quantise(n, |ch, band| x[ch * BANDS + band]);
+        for (ch, wanted) in wanted.iter_mut().enumerate().take(n) {
+            *wanted = std::array::from_fn(|band| x[ch * BANDS + band]);
+        }
+        if let Some(step) = step {
+            // The gains sent are held to the test the step passed: the
+            // refit on the output after it can find nothing there to fit
+            // — a transient over before its window begins — and come
+            // back nought. Then the decision's own gains are sent, fitted
+            // on every slot from the step on.
+            let error = (0..BANDS)
+                .map(|band| self.stepped_error(frame, band, step.split, held, &gains))
+                .sum();
+            if !step.passes(error, frame.steep_margin) {
+                let found = self.step_gains;
+                (codes, gains) = quantise(n, |ch, band| f64::from(found[ch][band]));
+                for (wanted, found) in wanted.iter_mut().zip(&found) {
+                    *wanted = found.map(f64::from);
+                }
+            }
+        }
+        let m = n * BANDS;
+        for (ch, weights) in weights.iter_mut().enumerate().take(n) {
+            *weights = std::array::from_fn(|band| frame.gram[(ch * BANDS + band) * (m + 1)]);
+        }
+        *held = gains;
+        Object {
+            bands_index: BANDS_INDEX,
+            fine: true,
+            steep: split.is_some(),
+            // The decoder switches at the slot one past the code.
+            offsets: split.map(|s| vec![(s - 1) as u8]).unwrap_or_default(),
+            data: Data::Dense(vec![codes]),
+        }
+    }
+
+    /// The gains for the weighted target on the window from `from` samples
+    /// into it, under the quantiser's bounds, into `solution`, by the
+    /// normal equations `gram` and their factor `factor`.
+    fn solve(&mut self, frame: &Frame, gram: &[f64], factor: &[f64], from: usize) {
+        let m = frame.channels * BANDS;
+        for (b, weighted) in self.rhs.iter_mut().zip(frame.weighted) {
+            *b = dot(&weighted[from..], &self.weighted_target[from..]);
+        }
+        self.solution.copy_from_slice(&self.rhs);
+        cholesky_solve(factor, m, &mut self.solution);
+        self.hold_to_bounds(gram, m);
+    }
+
+    /// Whether object `o`'s gains are better stepped than ramped this frame,
+    /// and at which slot: the decoder holds the last frame's gains before it
+    /// and this frame's from it on. Weighed in the QMF domain — the decoder's
+    /// own model of the frame, before synthesis — over the frame and half
+    /// the next, against the ramp: each the least-squares gains for its
+    /// shape, the ramp from the gains held, the step after the held ones.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn steep_split(
+        &mut self,
+        frame: &Frame,
+        slots: &[Slot; 2 * SLOTS],
+        held: &Matrix,
+    ) -> Option<Step> {
+        let n = frame.channels;
+        for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
+            *rhs = [0.0; MAX_CHANNELS];
+            *energy = 0.0;
+        }
+        for t in 0..SPAN {
+            let target = &slots[t];
+            for k in 0..SUBBANDS {
+                let cell = t * BANDS + band_of(k);
+                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
+                self.slot_energy[cell] += or * or + oi * oi;
+                for (i, core) in frame.core_slots.iter().enumerate() {
+                    let x = &core[t];
+                    self.slot_rhs[cell][i] +=
+                        f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
+                }
+            }
+        }
+        let held = *held;
+        let ridge = f64::from(frame.ridge);
+        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
+        for band in 0..BANDS {
+            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+            let cell = |t: usize| t * BANDS + band;
+            // The ramp: (1 − w)·h + w·c at slot t, w = (t + 1)/24, then c.
+            let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let mut rhs = [0f64; MAX_CHANNELS];
+            for t in 0..SPAN {
+                let (w, a, g) = (
+                    weight(t),
+                    &frame.slot_gram[cell(t)],
+                    &self.slot_rhs[cell(t)],
+                );
+                for i in 0..n {
+                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
+                    for j in 0..n {
+                        system[i][j] += w * w * a[i][j];
+                    }
+                }
+            }
+            let c = snap(ridged_solve(system, rhs, n, ridge));
+            for t in 0..SPAN {
+                let w = weight(t);
+                let mix: [f64; MAX_CHANNELS] =
+                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
+                ramped += error(
+                    &frame.slot_gram[cell(t)],
+                    &self.slot_rhs[cell(t)],
+                    self.slot_energy[cell(t)],
+                    &mix,
+                    n,
+                );
+            }
+            // The steps: the held gains on the slots before the split, the
+            // least-squares gains on the rest, the split from late to early so
+            // that the rest's sums build up.
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
+            for t in SLOTS..SPAN {
+                accumulate(
+                    &mut system,
+                    &mut rhs,
+                    &mut energy,
+                    &frame.slot_gram[cell(t)],
+                    &self.slot_rhs[cell(t)],
+                    self.slot_energy[cell(t)],
+                    n,
+                );
+            }
+            let mut before = [0f64; SLOTS + 1];
+            for t in 0..SLOTS {
+                before[t + 1] = before[t]
+                    + error(
+                        &frame.slot_gram[cell(t)],
+                        &self.slot_rhs[cell(t)],
+                        self.slot_energy[cell(t)],
+                        &h,
+                        n,
+                    );
+            }
+            for split in (1..=SLOTS).rev() {
+                let t = split;
+                if t < SLOTS {
+                    accumulate(
+                        &mut system,
+                        &mut rhs,
+                        &mut energy,
+                        &frame.slot_gram[cell(t)],
+                        &self.slot_rhs[cell(t)],
+                        self.slot_energy[cell(t)],
+                        n,
+                    );
+                }
+                let c = ridged_solve(system, rhs, n, ridge);
+                stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
+            }
+        }
+        let (split, _) = (1..=SLOTS)
+            .map(|split| (split, stepped[split]))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        // The best step weighed again with its gains rounded to the
+        // quantiser's steps, as the decoder will have them: a gain between
+        // two steps looks better reached at once than ramped to, until both
+        // round to the step already held.
+        let mut best = 0.0;
+        for band in 0..BANDS {
+            let (error, gains) = self.step_error(frame, band, split, &held, ridge);
+            best += error;
+            for (ch, gain) in gains.iter().enumerate().take(n) {
+                self.step_gains[ch][band] = *gain as f32;
+            }
+        }
+        // And it must buy back a share of the object's own energy: where
+        // both errors are down at the quantiser's, their ratio is noise.
+        let step = Step {
+            split,
+            ramped,
+            signal: self.slot_energy.iter().sum(),
+        };
+        step.passes(best, frame.steep_margin).then_some(step)
+    }
+
+    /// The error in `band` of the object [`Self::steep_split`] last weighed,
+    /// stepped at `split`: the held gains before it, the least-squares gains
+    /// from it on, rounded to the quantiser's steps — and those gains.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn step_error(
+        &self,
+        frame: &Frame,
+        band: usize,
+        split: usize,
+        held: &Matrix,
+        ridge: f64,
+    ) -> (f64, [f64; MAX_CHANNELS]) {
+        let n = frame.channels;
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
+        for t in split..SPAN {
+            let cell = t * BANDS + band;
+            accumulate(
+                &mut system,
+                &mut rhs,
+                &mut energy,
+                &frame.slot_gram[cell],
+                &self.slot_rhs[cell],
+                self.slot_energy[cell],
+                n,
+            );
+        }
+        let c = snap(ridged_solve(system, rhs, n, ridge));
+        (
+            self.held_error(frame, band, split, held) + error(&system, &rhs, energy, &c, n),
+            c,
+        )
+    }
+
+    /// The error in `band` of the object [`Self::steep_split`] last weighed,
+    /// stepped at `split` to `gains`.
+    fn stepped_error(
+        &self,
+        frame: &Frame,
+        band: usize,
+        split: usize,
+        held: &Matrix,
+        gains: &Matrix,
+    ) -> f64 {
+        let n = frame.channels;
+        let g: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(gains[ch][band]));
+        let after: f64 = (split..SPAN)
+            .map(|t| {
+                let cell = t * BANDS + band;
+                error(
+                    &frame.slot_gram[cell],
+                    &self.slot_rhs[cell],
+                    self.slot_energy[cell],
+                    &g,
+                    n,
+                )
+            })
+            .sum();
+        self.held_error(frame, band, split, held) + after
+    }
+
+    /// The error in `band`, on the slots before `split`, of the held gains.
+    fn held_error(&self, frame: &Frame, band: usize, split: usize, held: &Matrix) -> f64 {
+        let n = frame.channels;
+        let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+        (0..split)
+            .map(|t| {
+                let cell = t * BANDS + band;
+                error(
+                    &frame.slot_gram[cell],
+                    &self.slot_rhs[cell],
+                    self.slot_energy[cell],
+                    &h,
+                    n,
+                )
+            })
+            .sum()
+    }
+
+    /// Keep the solution within what the quantiser holds: the least-squares
+    /// gains under the bounds, by the primal active-set method for a box. A
+    /// gain clamped by itself would leave the others fitted to a partner it
+    /// no longer has, and one held for good can be wrong once others move —
+    /// so gains are held one at a time, where a step towards the refit
+    /// crosses a bound first, and released when the fit would gain by moving
+    /// one back inside. It ends where no free gain is past a bound and no held
+    /// one wants to leave its own, the optimum over the box. Nothing to do,
+    /// and nothing done, when the unbounded solution is inside.
+    fn hold_to_bounds(&mut self, gram: &[f64], m: usize) {
+        // The codes −96..=95; a little past them a gain still rounds inside,
+        // so only a solution past that margin starts the search.
+        let step = f64::from(STEP);
+        let (low, high) = (-96.0 * step, 95.0 * step);
+        if self.solution[..m]
+            .iter()
+            .all(|x| (low - step / 2.0..=high + step / 2.0).contains(x))
+        {
+            return;
+        }
+        // A feasible start: the solution clamped, the clamped ones held.
+        for (x, held) in self.solution.iter_mut().zip(&mut self.bounded).take(m) {
+            *held = !(low..=high).contains(x);
+            *x = x.clamp(low, high);
+        }
+        let mut trial = [0f64; MAX_CHANNELS * BANDS];
+        // Each round holds or releases one gain; the bound keeps a degenerate
+        // case from cycling.
+        for _ in 0..4 * m {
+            // The free gains' fit with the held ones where they are.
+            self.free.clear();
+            self.free.extend((0..m).filter(|&i| !self.bounded[i]));
+            let k = self.free.len();
+            for (a, &i) in self.free.iter().enumerate() {
+                for (b, &j) in self.free.iter().enumerate() {
+                    self.reduced[a * k + b] = gram[i * m + j];
+                }
+                trial[a] = self.rhs[i]
+                    - (0..m)
+                        .filter(|&j| self.bounded[j])
+                        .map(|j| gram[i * m + j] * self.solution[j])
+                        .sum::<f64>();
+            }
+            if k > 0 {
+                cholesky(&self.reduced[..k * k], k, &mut self.reduced_factor[..k * k]);
+                cholesky_solve(&self.reduced_factor[..k * k], k, &mut trial[..k]);
+            }
+            // Step towards it as far as the bounds let; the first gain to
+            // reach one is held there.
+            let mut reach = 1.0;
+            let mut blocking = None;
+            for (a, &i) in self.free.iter().enumerate() {
+                let (from, to) = (self.solution[i], trial[a]);
+                let bound = if to > high {
+                    high
+                } else if to < low {
+                    low
+                } else {
+                    continue;
+                };
+                let t = ((bound - from) / (to - from)).clamp(0.0, 1.0);
+                if t < reach {
+                    reach = t;
+                    blocking = Some((i, bound));
+                }
+            }
+            for (a, &i) in self.free.iter().enumerate() {
+                self.solution[i] += reach * (trial[a] - self.solution[i]);
+            }
+            if let Some((i, bound)) = blocking {
+                self.solution[i] = bound;
+                self.bounded[i] = true;
+                continue;
+            }
+            // At the free gains' optimum: release the held gain whose bound
+            // costs most, if any — one the error falls by moving inside.
+            let mut release = None;
+            let mut worst = 0.0;
+            for i in (0..m).filter(|&i| self.bounded[i]) {
+                let gradient = dot(&gram[i * m..(i + 1) * m], &self.solution[..m]) - self.rhs[i];
+                // At the upper bound the error falls inward if it rises with
+                // the gain; at the lower, if it falls with it.
+                let pull = if self.solution[i] >= high {
+                    gradient
+                } else {
+                    -gradient
+                };
+                let tolerance = 1e-9 * gram[i * m + i] * step;
+                if pull > tolerance && pull > worst {
+                    worst = pull;
+                    release = Some(i);
+                }
+            }
+            match release {
+                Some(i) => self.bounded[i] = false,
+                None => return,
+            }
+        }
     }
 }
 
@@ -1622,6 +1824,98 @@ mod tests {
                 (core, objects)
             })
             .collect()
+    }
+
+    /// Fitted on a pool of any size, every payload is the one a pool of one
+    /// thread fits, to the byte, and the decoder is left holding the same
+    /// gains — objects stepped, held at the quantiser's bounds, absent, and
+    /// payloads over the budget among them.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn any_number_of_threads_fits_what_one_fits() {
+        const OBJECTS: usize = 9;
+        let mut seed = 5u32;
+        let input: Vec<Frame> = (0..24)
+            .map(|f| {
+                let core: Vec<Vec<f32>> = (0..5)
+                    .map(|_| (0..1536).map(|_| noise(&mut seed)).collect())
+                    .collect();
+                let objects = (0..OBJECTS)
+                    .map(|o| {
+                        (0..1536)
+                            .map(|n| match o % 3 {
+                                // Noise beside a channel: over any budget.
+                                0 => core[o % 5][n] + 2.0 * noise(&mut seed),
+                                // A mix that switches inside every third
+                                // frame: a step.
+                                1 if f % 3 == 1 && n >= 700 => core[(o + 1) % 5][n],
+                                1 => core[o % 5][n],
+                                // Past the quantiser's bounds.
+                                _ => 20.0 * core[o % 5][n],
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (core, objects)
+            })
+            .collect();
+        let fit = |threads: usize, budget: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut estimator = Estimator::new(OBJECTS, 0);
+                estimator.budget = budget;
+                let mut payloads = Vec::new();
+                for (f, (core, objects)) in input.iter().enumerate() {
+                    let core: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                    let objects: Vec<&[f32]> = objects.iter().map(Vec::as_slice).collect();
+                    // One object away every other frame.
+                    let present: Vec<bool> = (0..OBJECTS).map(|o| o != 4 || f % 2 == 0).collect();
+                    payloads.extend(
+                        estimator
+                            .push(&core, &objects, &present)
+                            .map(|j| j.to_bytes()),
+                    );
+                }
+                payloads.extend(estimator.finish().map(|j| j.to_bytes()));
+                let held: Vec<Matrix> = (0..OBJECTS).map(|o| *estimator.held(o)).collect();
+                (payloads, held, estimator.squeezed())
+            })
+        };
+        // A budget a quarter under the largest payload: most frames over it,
+        // none down to nought.
+        let largest = fit(1, usize::MAX).0.iter().map(Vec::len).max().unwrap();
+        for budget in [usize::MAX, largest * 3 / 4] {
+            let one = fit(1, budget);
+            assert_eq!(
+                one.2 > 0,
+                budget < usize::MAX,
+                "squeezed only under a budget"
+            );
+            let objects: Vec<Object> = one
+                .0
+                .iter()
+                .flat_map(|bytes| crate::payload::read(bytes).unwrap().objects)
+                .flatten()
+                .collect();
+            assert!(objects.iter().any(|o| o.steep), "no object stepped");
+            let bound = 95.0 * STEP;
+            assert!(
+                objects
+                    .iter()
+                    .filter_map(|o| dequantise(o, 5))
+                    .any(|gains| gains.iter().flatten().any(|g| g.abs() >= bound)),
+                "no gain held at a bound"
+            );
+            for threads in [2, 3, 8] {
+                assert!(
+                    fit(threads, budget) == one,
+                    "{threads} threads, a budget of {budget}"
+                );
+            }
+        }
     }
 
     /// A payload over its budget comes back under it, still a payload the

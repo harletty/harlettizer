@@ -10,3 +10,12 @@ description = "Joint object coding (TS 103 420): the payload E-AC-3 carries obje
 
 [dependencies]
 hz-core.workspace = true
+rayon = { workspace = true, optional = true }
+
+[features]
+# Fit a frame's objects, and the downmix's side of their equations, at once.
+# Off by default: the crate is dependency-free without it. The payloads are
+# byte-identical either way: every object is fitted from what the decoder
+# holds for it against the downmix the frame shares, and every sum is taken
+# in the order one thread takes it.
+parallel = ["dep:rayon"]
