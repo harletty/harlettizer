@@ -26,8 +26,8 @@ const PHASES: usize = 4;
 /// measurement is limited by the window rather than by the length.
 const TAPS_PER_PHASE: usize = 12;
 /// Samples the meter's reconstruction runs behind what is pushed. The
-/// prototype's centre is 5,875 samples back, so a push measures four points
-/// between 5,875 and 5,125 samples before the newest: once this many more
+/// prototype's centre is 5.875 samples back, so a push measures four points
+/// between 5.875 and 5.125 samples before the newest: once this many more
 /// have come, every point up to the next sample is measured, the eighth of a
 /// sample on either side of a sample's own instant among them. A stretch
 /// measured on its own ([`TruePeak::take`]) has to run this far into the
@@ -41,6 +41,10 @@ const KEEP: usize = TAPS_PER_PHASE - 1;
 /// Samples of a channel reconstructed at once, a lane each.
 const LANES: usize = 8;
 
+/// Frames of a push laid out at a time: a channel's line of them stays a few
+/// kilobytes, however long the push.
+const CHUNK: usize = 1024;
+
 /// Tracks the true peak of an interleaved signal, per channel.
 #[derive(Debug, Clone)]
 pub struct TruePeak {
@@ -52,8 +56,8 @@ pub struct TruePeak {
     tails: Vec<f64>,
     channels: usize,
     peaks: Vec<f64>,
-    /// One channel of a push, after its tail: kept, so that a push allocates
-    /// nothing once one as long has been made.
+    /// One channel of up to [`CHUNK`] frames of a push, after its tail:
+    /// kept, so that no push allocates after the first.
     line: Vec<f64>,
 }
 
@@ -89,26 +93,27 @@ impl TruePeak {
     /// the bit; and the largest magnitude of them is the largest whichever
     /// order they are compared in. NaN is never one, as before.
     pub fn push(&mut self, interleaved: &[f32]) {
-        if self.channels == 0 {
+        let channels = self.channels;
+        if channels == 0 {
             return;
         }
-        let frames = interleaved.len() / self.channels;
-        if frames == 0 {
-            return;
-        }
-        self.line.resize(KEEP + frames, 0.0);
-        let line = &mut self.line[..KEEP + frames];
-        let tails = self.tails.chunks_exact_mut(KEEP);
-        for (channel, (tail, peak)) in tails.zip(&mut self.peaks).enumerate() {
-            line[..KEEP].copy_from_slice(tail);
-            for (x, frame) in line[KEEP..]
-                .iter_mut()
-                .zip(interleaved.chunks_exact(self.channels))
-            {
-                *x = f64::from(frame[channel]);
+        let whole = &interleaved[..interleaved.len() / channels * channels];
+        for chunk in whole.chunks(CHUNK * channels) {
+            let frames = chunk.len() / channels;
+            if self.line.len() < KEEP + frames {
+                self.line.resize(KEEP + frames, 0.0);
             }
-            *peak = loudest(&self.taps, line, *peak);
-            tail.copy_from_slice(&line[frames..]);
+            let line = &mut self.line[..KEEP + frames];
+            let tails = self.tails.chunks_exact_mut(KEEP);
+            for (channel, (tail, peak)) in tails.zip(&mut self.peaks).enumerate() {
+                line[..KEEP].copy_from_slice(tail);
+                let samples = chunk[channel..].iter().step_by(channels);
+                for (x, &sample) in line[KEEP..].iter_mut().zip(samples) {
+                    *x = f64::from(sample);
+                }
+                *peak = loudest(&self.taps, line, *peak);
+                tail.copy_from_slice(&line[frames..]);
+            }
         }
     }
 
@@ -405,14 +410,14 @@ mod tests {
 mod window_tests {
     use super::*;
 
-    /// The doubled history and the reversed taps have to compute what the
+    /// The tails, the lanes and the reversed taps have to compute what the
     /// obvious loop computes.
     ///
-    /// The obvious loop is written out here rather than referred to: it is a
-    /// modulo per tap per phase per channel per sample, which is what the
-    /// buffer exists to avoid, and the only way to know the avoidance is
-    /// faithful is to run both. The sums are in opposite orders, so they agree
-    /// to within rounding rather than exactly.
+    /// The obvious loop is written out here rather than referred to: a ring
+    /// with a modulo per tap per phase per channel per sample, and the only
+    /// way to know the meter is faithful to it is to run both. The sums are
+    /// in opposite orders, so they agree to within rounding rather than
+    /// exactly.
     #[test]
     fn the_contiguous_window_agrees_with_the_obvious_loop() {
         const CHANNELS: usize = 3;
@@ -542,7 +547,7 @@ mod before_tests {
         match pick {
             0 => -0.0,
             1 => 0.0,
-            2 => f32::from_bits(1 + (*state as u32 & 0x7f_ffff)),
+            2 => f32::from_bits((*state as u32 & 0x7f_ffff).max(1)),
             3 => -f32::MIN_POSITIVE / 3.0,
             4 => f32::MAX,
             5 => -f32::MAX,

@@ -633,13 +633,13 @@ about half the time it did:
 
 | programme | before | after | CPU time |
 |---|---|---|---|
-| twelve waveforms, 30 s, rendered to the bed, FLAC | 0.21 s | 0.18 s | −14 % |
-| the same, Opus | 0.32 s | 0.31 s | −10 % |
+| twelve waveforms, 30 s, rendered to the bed, FLAC | 0.22 s | 0.19 s | −13 % |
+| the same, Opus | 0.32 s | 0.30 s | −10 % |
 | the same, LPCM | 0.21 s | 0.14 s | −21 % |
-| the same as 11 objects and an LFE, FLAC | 0.22 s | 0.14 s | −14 % |
-| the same, Opus | 0.23 s | 0.18 s | −6 % |
-| fourteen waveforms, 90 s, rendered to the bed, FLAC | 0.67 s | 0.54 s | −13 % |
-| the same as 13 objects and an LFE, Opus | 0.71 s | 0.52 s | −5 % |
+| the same as 11 objects and an LFE, FLAC | 0.21 s | 0.14 s | −7 % |
+| the same, Opus | 0.22 s | 0.18 s | −3 % |
+| fourteen waveforms, 90 s, rendered to the bed, FLAC | 0.68 s | 0.55 s | −12 % |
+| the same as 13 objects and an LFE, Opus | 0.71 s | 0.51 s | −7 % |
 
 What is left bounds each programme differently. A bed in FLAC still waits
 on the measurement; a bed in Opus as much on the threads coding its coupled
