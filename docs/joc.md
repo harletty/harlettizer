@@ -470,10 +470,10 @@ feature these pieces run at once on rayon's threads. Each still takes its
 sums in the order one thread takes them, and the payloads are the same to
 the byte.
 
-`harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most eight
-threads. Past eight, a frame's pieces are too few to share out, and the
-encoder's own steps between them are one thread's: more threads wait more
-than they work.
+`harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most six
+threads (eight until the banks were made quicker, below). Past six, a
+frame's pieces are too few to share out, and the encoder's own steps between
+them are one thread's: more threads wait more than they work.
 
 The E-AC-3 core, coded twice a frame, runs beside the estimator. The probe
 codes a frame's core on a thread of its own while the gains of the frame
@@ -626,6 +626,24 @@ cores:
 | twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.77 s | 0.73 s | −4 % |
 | 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.33 s | 1.26 s | −5 % |
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.26 s | 0.24 s | −4 % |
+
+With the banks that much quicker, eight threads were more than a frame's
+pieces keep busy. Eleven objects are fitted in six runs of two on eight
+threads as on six, and a thread with nothing to do looks for work again and
+again before it sleeps: on eight threads, that looking was a fifth of the
+processor's time at 384 kb/s and on the 60 s master. On six, the encode is
+as soon or sooner, and the processor a fifth to a quarter less busy. The
+stream is the same on one thread as on sixteen. On sixteen cores:
+
+| programme | elements | payloads quantised coarser | eight threads | six | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.40 s | 0.38 s | −17 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.73 s | 0.69 s | −22 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.26 s | 1.14 s | −26 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.24 s | 0.24 s | −20 % |
+
+Five threads were no sooner than six, and four slower; seven, twelve and
+sixteen slower than six too, sixteen by a fifth to a third.
 
 What is left on the encode's own thread is the budget's search for λ, a
 step at a time, and, where there is no fold, each element's samples read

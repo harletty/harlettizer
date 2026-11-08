@@ -49,9 +49,10 @@ pub struct Config {
 /// The threads a joint object coding encode runs on, at most. A frame's
 /// work comes in pieces of an object or a band each, a dozen or so at a
 /// time, and the encoder's own steps between them are one thread's: past
-/// eight, more threads wait more than they work — the encode no sooner, the
-/// processor busier.
-const JOC_THREADS: usize = 8;
+/// six, more threads wait more than they work, and a thread with nothing to
+/// do looks for work before it sleeps — the encode no sooner, the processor
+/// busier (`docs/joc.md`).
+const JOC_THREADS: usize = 6;
 
 pub fn run(config: Config) -> Result<()> {
     if !config.joc {
