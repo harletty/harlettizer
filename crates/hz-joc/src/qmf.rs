@@ -232,14 +232,18 @@ impl Analysis {
 /// stages in the same order: a stage's butterflies each read and write their
 /// own two places, so taking some side by side, or one quarter of the last
 /// two stages before another, changes no value. Read as sixteen rows of
-/// four, input `n` is in row `n / 4` and lane `n % 4`, and place `rev(n)` puts
-/// the lane in the place's top two bits: the first four stages pair places
-/// whose top bits agree, so each of their butterflies pairs two rows, lane
-/// by lane, by one twiddle. The last two pair places differing in those
-/// bits. So four rows, those whose places agree in bits two and three, are
-/// turned so that each row holds four places consecutive, and each of the
-/// last two stages' butterflies pairs two of these, lane by lane, by four
-/// twiddles consecutive. What comes out is in order.
+/// four, input `n` is in row `n / 4` and lane `n % 4`, and goes to place
+/// `rev(n)`: a place with bits `b0` to `b5` is in row
+/// `8·b0 + 4·b1 + 2·b2 + b3` and lane `2·b4 + b5`, its top two bits the
+/// lane's reversed. The first four stages pair places that differ in one of
+/// bits nought to three, the same lane of two rows, by a twiddle of bits
+/// nought to two alone: so each of their butterflies pairs two rows, lane by
+/// lane, by one twiddle. The last two pair places that differ in bit four or
+/// five, two lanes of a row. So four rows, those whose places agree in bits
+/// two and three, are turned so that each row holds four places
+/// consecutive, and each of the last two stages' butterflies pairs two of
+/// these, lane by lane, by four twiddles consecutive. What comes out is in
+/// order.
 fn dft(re: &mut [f32; SUBBANDS], im: &mut [f32; SUBBANDS]) {
     let t = tables();
     for &(a, b, w) in &ROW_BUTTERFLIES {

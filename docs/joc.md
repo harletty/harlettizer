@@ -607,8 +607,10 @@ the radix-2 way: the input put in bit-reversed order, then six stages of 32
 butterflies, each pairing two places by a twiddle. Taken one at a time, each
 butterfly waited on its loads and their bounds checks, and the banks' DFTs
 were the largest single item of a frame's work. Read as sixteen rows of
-four, an input's lane in its row is the top two bits of its bit-reversed
-place, so each butterfly of the first four stages pairs two rows, four
+four, an input's lane in its row holds the top two bits of its bit-reversed
+place, reversed: a place with bits b0 to b5 is in row 8·b0 + 4·b1 + 2·b2 + b3
+and lane 2·b4 + b5. The first four stages pair places that differ in one of
+bits nought to three, so each of their butterflies pairs two rows, four
 places at once by one twiddle. Then four rows at a time are turned, so that
 each butterfly of the last two stages pairs two of them by four consecutive
 twiddles, and the output comes out in order (`qmf::dft`). Every butterfly is
@@ -628,12 +630,16 @@ cores:
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.26 s | 0.24 s | −4 % |
 
 With the banks that much quicker, eight threads were more than a frame's
-pieces keep busy. Eleven objects are fitted in six runs of two on eight
-threads as on six, and a thread with nothing to do looks for work again and
+pieces keep busy. Eleven objects, or twelve, are fitted in six runs of two
+on eight threads as on six. Thirteen to fifteen are fitted in runs of three
+on six where eight took runs of two, and the 39 → 15 row shows that this
+costs nothing there. A thread with nothing to do looks for work again and
 again before it sleeps: on eight threads, that looking was a fifth of the
 processor's time at 384 kb/s and on the 60 s master. On six, the encode is
 as soon or sooner, and the processor a fifth to a quarter less busy. The
-stream is the same on one thread as on sixteen. On sixteen cores:
+stream is the same on one thread as on sixteen. Measured on one machine
+only, of sixteen cores and 32 threads, with programmes of eleven and fifteen
+elements:
 
 | programme | elements | payloads quantised coarser | eight threads | six | CPU time |
 |---|---|---|---|---|---|
@@ -642,8 +648,9 @@ stream is the same on one thread as on sixteen. On sixteen cores:
 | 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.26 s | 1.14 s | −26 % |
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.24 s | 0.24 s | −20 % |
 
-Five threads were no sooner than six, and four slower; seven, twelve and
-sixteen slower than six too, sixteen by a fifth to a third.
+On the same machine, five threads were no sooner than six, and four
+slower; seven, twelve and sixteen slower than six too, sixteen by a fifth to
+a third. A machine of other cores may well want another number.
 
 What is left on the encode's own thread is the budget's search for λ, a
 step at a time, and, where there is no fold, each element's samples read
