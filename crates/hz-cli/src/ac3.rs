@@ -655,48 +655,115 @@ mod tests {
         path
     }
 
+    /// Fixtures go under `target/`, never the system temp directory.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-fixtures/hz-cli/ac3")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What a test codes a master to: a name, the layout, whether E-AC-3,
+    /// whether the objects are carried by joint object coding, and kb/s.
+    type Case = (&'static str, Layout, bool, bool, u32);
+
+    /// AC-3, E-AC-3 in stereo, and E-AC-3 carrying the objects.
+    fn cases() -> [Case; 3] {
+        [
+            ("ac3", Layout::surround_5_1(), false, false, 448),
+            ("eac3-stereo", Layout::stereo(), true, false, 192),
+            ("joc", Layout::surround_5_1(), true, true, 448),
+        ]
+    }
+
+    /// The bytes of one syncframe at `kbps`.
+    fn syncframe(kbps: u32) -> usize {
+        kbps as usize * 1000 / 8 * FRAME_SAMPLES / 48_000
+    }
+
+    /// `input` coded into `dir` as `case` says, the programme rendered on a
+    /// thread of its own when `threads`: how the encode ended, and what it
+    /// wrote.
+    fn coded(
+        input: &std::path::Path,
+        dir: &std::path::Path,
+        case: &Case,
+        threads: bool,
+    ) -> (std::result::Result<(), String>, Vec<u8>) {
+        let (name, layout, eac3, joc, kbps) = case;
+        let out = dir.join(format!("{name}-{threads}"));
+        let config = Config {
+            input: input.to_path_buf(),
+            out: out.clone(),
+            frames: None,
+            mono_prefix: None,
+            layout: layout.clone(),
+            bit_rate: Some(*kbps),
+            dialnorm: -31,
+            coupling: true,
+            eac3: *eac3,
+            joc: *joc,
+            progress: false,
+        };
+        let ended = encode_on(config, threads).map_err(|e| e.to_string());
+        (ended, std::fs::read(&out).unwrap())
+    }
+
     /// The programme rendered on a thread of its own codes to what it codes
     /// to on the encode's: the same bytes, AC-3 and E-AC-3, with objects and
     /// without, and as many syncframes as carry the programme out.
     #[test]
     fn the_render_on_its_thread_codes_what_one_thread_codes() {
-        let dir = std::env::temp_dir().join(format!("hz-cli-ac3-render-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("render");
         let input = master(&dir);
-        for (name, layout, eac3, joc, kbps) in [
-            ("ac3", Layout::surround_5_1(), false, false, 448),
-            ("eac3-stereo", Layout::stereo(), true, false, 192),
-            ("joc", Layout::surround_5_1(), true, true, 448),
-        ] {
-            let coded = [false, true].map(|threads| {
-                let out = dir.join(format!("{name}-{threads}"));
-                let config = Config {
-                    input: input.clone(),
-                    out: out.clone(),
-                    frames: None,
-                    mono_prefix: None,
-                    layout: layout.clone(),
-                    bit_rate: Some(kbps),
-                    dialnorm: -31,
-                    coupling: true,
-                    eac3,
-                    joc,
-                    progress: false,
-                };
-                encode_on(config, threads).unwrap();
-                std::fs::read(&out).unwrap()
-            });
-            assert!(coded[0] == coded[1], "{name}: the same stream on a thread");
-            let syncframe = kbps as usize * 1000 / 8 * FRAME_SAMPLES / 48_000;
+        for case in cases() {
+            let [(inline, alone), (threaded, beside)] =
+                [false, true].map(|threads| coded(&input, &dir, &case, threads));
+            let (name, _, _, joc, kbps) = case;
+            assert_eq!(inline, Ok(()), "{name}");
+            assert_eq!(threaded, Ok(()), "{name}");
+            assert!(alone == beside, "{name}: the same stream on a thread");
             let lag = if joc { crate::joc::LATENCY } else { DELAY };
-            assert_eq!(coded[0].len() % syncframe, 0, "{name}");
+            assert_eq!(alone.len() % syncframe(kbps), 0, "{name}");
             assert_eq!(
-                (coded[0].len() / syncframe) as u64,
+                (alone.len() / syncframe(kbps)) as u64,
                 syncframes_to_cover(SAMPLES as u64, lag),
                 "{name}: the programme carried out, and no further"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audio that ends before its header says, in the sixth frame: the
+    /// encode stops there with the same error, the render on a thread or not,
+    /// and leaves the same stream behind — every frame before the failed
+    /// read coded, and nothing after it.
+    #[test]
+    fn a_read_that_fails_stops_the_encode_where_one_thread_stops() {
+        const CUT: usize = 5 * FRAME_SAMPLES + 300;
+        let dir = scratch("cut");
+        let input = master(&dir);
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Ten channels of 24 bits.
+        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        for case in cases() {
+            let [(inline, alone), (threaded, beside)] =
+                [false, true].map(|threads| coded(&input, &dir, &case, threads));
+            let (name, _, _, joc, kbps) = case;
+            assert!(inline.is_err(), "{name}: the read fails");
+            assert_eq!(threaded, inline, "{name}: and says so the same way");
+            assert!(alone == beside, "{name}: the same stream left behind");
+            if !joc {
+                assert_eq!(alone.len(), 5 * syncframe(kbps), "{name}: the frames read");
+            }
+        }
     }
 }
