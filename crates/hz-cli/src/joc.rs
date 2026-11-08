@@ -508,20 +508,10 @@ impl Writer {
     /// own when `lfe`. More than [`MAX_ELEMENTS`] are folded into that many,
     /// at `config`'s sample rate and dialnorm — see [`Folded`].
     /// `downmix`: the `dmixtyp` the programme information declares for the
-    /// fold that made the core ([`downmix_type`]).
+    /// fold that made the core ([`downmix_type`]). Its encoders, and the fold,
+    /// run on threads of their own when `threads` and they can be started, on
+    /// the caller's otherwise.
     pub fn new(
-        config: hz_ac3::Config,
-        elements: Vec<Element>,
-        lfe: bool,
-        downmix: Option<u8>,
-        out: &Path,
-    ) -> Result<Self> {
-        Self::build(config, elements, lfe, downmix, out, true)
-    }
-
-    /// [`Writer::new`], its encoders on threads of their own when `threads`
-    /// and they can be started, on the caller's otherwise.
-    fn build(
         config: hz_ac3::Config,
         elements: Vec<Element>,
         lfe: bool,
@@ -657,6 +647,19 @@ impl Writer {
             folding.lane.close();
         }
         self.coder.finish(out)
+    }
+
+    /// The error an encode stops at, met before its next frame reached the
+    /// writer: `e`, once the syncframes handed to the stream's encoder are
+    /// appended to `out`, as a single thread would have appended them before
+    /// it met `e` — or the refusal of one of them, which it would have met
+    /// first. The stream's encoder writes them on a thread of its own, and
+    /// [`Self::frame`] takes only those already written.
+    pub fn stop(&mut self, e: Error, out: &mut Vec<u8>) -> Error {
+        match self.coder.settle(out) {
+            Ok(()) => e,
+            Err(first) => first,
+        }
     }
 }
 
@@ -994,7 +997,9 @@ impl Coder {
     fn push(&mut self, job: Job, out: &mut Vec<u8>) -> Result<()> {
         if let Some(trace) = &mut self.trace {
             let signals: Vec<&[f32]> = job.signals.iter().map(Vec::as_slice).collect();
-            trace.frame(&signals, &job.renders)?;
+            if let Err(e) = trace.frame(&signals, &job.renders) {
+                return self.refuse(e, out);
+            }
         }
         self.probe.send(job);
         self.probed += 1;
@@ -1007,7 +1012,9 @@ impl Coder {
     /// The last frames' syncframes, appended to `out`.
     fn finish(&mut self, out: &mut Vec<u8>) -> Result<()> {
         if let Some(trace) = &mut self.trace {
-            trace.finish()?;
+            if let Err(e) = trace.finish() {
+                return self.refuse(e, out);
+            }
         }
         if self.probed > self.fitted {
             self.fit(out)?;
@@ -1377,7 +1384,7 @@ mod tests {
     ) -> std::collections::BTreeMap<u16, f64> {
         const FRAMES: usize = 33;
         let out = PathBuf::from("test.ec3");
-        let mut writer = Writer::new(config(), beds(2), true, Some(2), &out).unwrap();
+        let mut writer = Writer::new(config(), beds(2), true, Some(2), &out, true).unwrap();
         let mut stream = Vec::new();
         let input = vec![0f32; 2 * FRAME_SAMPLES];
         for k in 0..FRAMES {
@@ -1519,7 +1526,7 @@ mod tests {
         let mut kept = Vec::new();
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
-        let mut writer = Writer::build(config(), elements, true, Some(2), &out, threads).unwrap();
+        let mut writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
         let fold = match &writer.feed {
             Feed::Direct(_) => None,
             Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),

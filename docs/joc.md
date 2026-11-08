@@ -480,8 +480,10 @@ codes a frame's core on a thread of its own while the gains of the frame
 before are fitted. The stream's encoder, with the meter of the true peak its
 loudness states, writes the frame before that on another. Each sees its
 frames in order and keeps its own state from one to the next, so the stream
-is the one a single thread writes, to the byte. Where no thread can be
-started, both run on the encode's own. On sixteen cores:
+is the one a single thread writes, to the byte. An encode that stops short,
+at a read that fails or a frame refused, waits for the stream's encoder
+first, and leaves the syncframes a single thread would have left. Where no
+thread can be started, both run on the encode's own. On sixteen cores:
 
 | programme | elements | one thread | estimator on eight threads | and the core beside it | CPU time |
 |---|---|---|---|---|---|

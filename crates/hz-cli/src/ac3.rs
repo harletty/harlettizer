@@ -96,7 +96,8 @@ fn encode(config: Config) -> Result<()> {
 }
 
 /// [`encode`], the programme read and rendered on a thread of its own when
-/// `threads`, on the caller's otherwise.
+/// `threads` — and with objects, the joint object coding's encoders and fold
+/// on theirs — on the caller's otherwise.
 fn encode_on(config: Config, threads: bool) -> Result<()> {
     let path = config.input.as_path();
     let source = Source::open(path, config.mono_prefix.as_deref())?;
@@ -214,6 +215,7 @@ fn encode_on(config: Config, threads: bool) -> Result<()> {
             master_lfe,
             crate::joc::downmix_type(FoldMode::default()),
             &config.out,
+            threads,
         )?))
     } else {
         Sink::Plain(Box::new(
@@ -270,7 +272,24 @@ fn encode_on(config: Config, threads: bool) -> Result<()> {
     let mut at = 0u64;
     let mut syncframes = 0u64;
     loop {
-        let rendered = render.recv()?;
+        let rendered = match render.recv() {
+            Ok(rendered) => rendered,
+            // The frames before stay where a single thread would have left
+            // them: with objects, the syncframes still being written for
+            // them are waited for and written first.
+            Err(e) => {
+                return Err(match &mut sink {
+                    Sink::Plain(_) => e,
+                    Sink::Joc(writer) => {
+                        frame.clear();
+                        let e = writer.stop(e, &mut frame);
+                        out.write_all(&frame)
+                            .map_err(|e| Error::io(&config.out, e))?;
+                        e
+                    }
+                });
+            }
+        };
         let got = rendered.got;
 
         frame.clear();
@@ -683,9 +702,10 @@ mod tests {
         kbps as usize * 1000 / 8 * FRAME_SAMPLES / 48_000
     }
 
-    /// `input` coded into `dir` as `case` says, the programme rendered on a
-    /// thread of its own when `threads`: how the encode ended, and what it
-    /// wrote.
+    /// `input` coded into `dir` as `case` says, on threads of their own
+    /// when `threads` — the render, and with objects the encoders and the
+    /// fold — or all on the test's, the estimator's own pool aside: how the
+    /// encode ended, and what it wrote.
     fn coded(
         input: &std::path::Path,
         dir: &std::path::Path,
@@ -711,9 +731,10 @@ mod tests {
         (ended, std::fs::read(&out).unwrap())
     }
 
-    /// The programme rendered on a thread of its own codes to what it codes
-    /// to on the encode's: the same bytes, AC-3 and E-AC-3, with objects and
-    /// without, and as many syncframes as carry the programme out.
+    /// The programme rendered on a thread of its own, and with objects
+    /// coded on theirs, codes to what one thread codes: the same bytes, AC-3
+    /// and E-AC-3, with objects and without, and as many syncframes as carry
+    /// the programme out.
     #[test]
     fn the_render_on_its_thread_codes_what_one_thread_codes() {
         let dir = scratch("render");
@@ -736,9 +757,12 @@ mod tests {
     }
 
     /// Audio that ends before its header says, in the sixth frame: the
-    /// encode stops there with the same error, the render on a thread or not,
-    /// and leaves the same stream behind — every frame before the failed
-    /// read coded, and nothing after it.
+    /// encode stops there with the same error, on threads or not, and leaves
+    /// the same stream behind — every frame before the failed read coded, and
+    /// nothing after it; with objects, two fewer than were read: the
+    /// estimator holds one for the next one's payload, and the probe codes
+    /// the next. Threads that leave a syncframe behind or not by
+    /// how far they got are given a few runs to show it.
     #[test]
     fn a_read_that_fails_stops_the_encode_where_one_thread_stops() {
         const CUT: usize = 5 * FRAME_SAMPLES + 300;
@@ -755,14 +779,19 @@ mod tests {
             .set_len(length - missing)
             .unwrap();
         for case in cases() {
-            let [(inline, alone), (threaded, beside)] =
-                [false, true].map(|threads| coded(&input, &dir, &case, threads));
+            let (inline, alone) = coded(&input, &dir, &case, false);
             let (name, _, _, joc, kbps) = case;
             assert!(inline.is_err(), "{name}: the read fails");
-            assert_eq!(threaded, inline, "{name}: and says so the same way");
-            assert!(alone == beside, "{name}: the same stream left behind");
-            if !joc {
-                assert_eq!(alone.len(), 5 * syncframe(kbps), "{name}: the frames read");
+            let coded_frames = if joc { 3 } else { 5 };
+            assert_eq!(
+                alone.len(),
+                coded_frames * syncframe(kbps),
+                "{name}: the frames read"
+            );
+            for run in 0..8 {
+                let (threaded, beside) = coded(&input, &dir, &case, true);
+                assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
+                assert!(alone == beside, "{name}, run {run}: the same stream left");
             }
         }
     }
