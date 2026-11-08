@@ -623,9 +623,28 @@ On sixteen cores, wall time, the same sequence either way:
 | fourteen waveforms, 90 s, rendered to the bed, FLAC | 1.80 s | 0.69 s | +10 % |
 | the same as 13 objects and an LFE, Opus | 2.04 s | 0.72 s | +14 % |
 
-What is left bounds each programme differently. The measurement's thread
-is now the longest, its true peak on 7.1.4 most of it. Past 27 objects, the
-fold runs on the encode's own thread, and it is most of that thread's work.
+The measurement's thread was then the longest, its true peak on 7.1.4 most
+of it. The true peak reconstructs four points after each sample, each a sum
+of twelve products, and it now reconstructs a channel's samples eight at a
+time (`hz_analysis::truepeak`). Each point is still the same twelve products
+added in the same order, so it reads the same to the bit, and the loudest of
+them is the loudest whichever order they are compared in. The meter takes
+about half the time it did:
+
+| programme | before | after | CPU time |
+|---|---|---|---|
+| twelve waveforms, 30 s, rendered to the bed, FLAC | 0.22 s | 0.19 s | −13 % |
+| the same, Opus | 0.32 s | 0.30 s | −10 % |
+| the same, LPCM | 0.21 s | 0.14 s | −21 % |
+| the same as 11 objects and an LFE, FLAC | 0.21 s | 0.14 s | −7 % |
+| the same, Opus | 0.22 s | 0.18 s | −3 % |
+| fourteen waveforms, 90 s, rendered to the bed, FLAC | 0.68 s | 0.55 s | −12 % |
+| the same as 13 objects and an LFE, Opus | 0.71 s | 0.51 s | −7 % |
+
+What is left bounds each programme differently. A bed in FLAC still waits
+on the measurement; a bed in Opus as much on the threads coding its coupled
+pairs. Past 27 objects, the fold runs on the encode's own thread, and it is
+most of that thread's work.
 
 ## Options
 
