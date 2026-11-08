@@ -10,7 +10,8 @@ pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
 }
 
 /// [`master`] with `objects` objects circling the room, every other one
-/// climbing, on the channels after the bed's: with two, [`master`] itself.
+/// climbing to the ceiling, on the channels after the bed's: with two,
+/// [`master`] itself, to the byte.
 pub(crate) fn master_with(dir: &Path, samples: usize, objects: usize) -> PathBuf {
     const BED: [(&str, u32); 8] = [
         ("L", 0),
@@ -50,12 +51,16 @@ pub(crate) fn master_with(dir: &Path, samples: usize, objects: usize) -> PathBuf
     }
     // Each object somewhere new every 1000 samples, ramping there, each
     // going round the other way from the one before, set apart from the
-    // others, and every other one climbing.
+    // others, and every other one climbing to the ceiling.
     for (k, id) in ids().enumerate() {
         for step in 0..=samples / 1000 {
             let turn = (step as f64 / 6.0 + k as f64 / objects as f64) * std::f64::consts::TAU;
             let way = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let (x, y, z) = (way * turn.sin(), turn.cos(), (k % 2 * step) as f64 / 20.0);
+            let (x, y, z) = (
+                way * turn.sin(),
+                turn.cos(),
+                (((k % 2) * step) as f64 / 20.0).min(1.0),
+            );
             events.push_str(&format!(
                 "  - ID: {id}\n    samplePos: {}\n    active: true\n    pos: [{x:.4}, \
                  {y:.4}, {z:.4}]\n    snap: false\n    elevation: true\n    zones: all\n    \

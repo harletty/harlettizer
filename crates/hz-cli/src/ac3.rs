@@ -729,10 +729,12 @@ mod tests {
     /// before its header says, in the thirteenth frame: its elements folded
     /// into fifteen, the encode stops there with the same error on threads
     /// or not, and leaves the same stream behind — six syncframes fewer than
-    /// the twelve frames read. A block is folded once the two after it are
-    /// read, and made ready for the coder once the one after it is folded;
-    /// what the fold makes of a frame is taken when the next goes in; and
-    /// the coder writes two fewer than it is given, as without a fold.
+    /// the twelve frames read. A block is folded once the blocks the fold
+    /// looks ahead to are read — [`hz_cluster::smooth::SMOOTHING`]'s
+    /// `ahead`, two, which every fold steers by — and made ready for the
+    /// coder once the one after it is folded; what the fold makes of a frame
+    /// is taken when the next goes in; and the coder writes two fewer than
+    /// it is given, as without a fold.
     #[test]
     fn a_read_that_fails_on_a_folded_master_stops_where_one_thread_stops() {
         const SAMPLES: usize = 16 * FRAME_SAMPLES + 1000;
@@ -757,7 +759,14 @@ mod tests {
             panic!("the read fails");
         };
         assert!(error.contains("m.atmos.audio"), "the read's error: {error}");
-        assert_eq!(alone.len(), 6 * syncframe(case.4), "six of twelve read");
+        let lag = hz_cluster::smooth::SMOOTHING.ahead + 2;
+        let written = CUT / FRAME_SAMPLES - lag - 2;
+        assert_eq!(written, 6);
+        assert_eq!(
+            alone.len(),
+            written * syncframe(case.4),
+            "six of twelve read"
+        );
         for run in 0..8 {
             let (threaded, beside) = coded(&input, &dir, &case, true);
             assert_eq!(threaded, inline, "run {run}: said the same way");

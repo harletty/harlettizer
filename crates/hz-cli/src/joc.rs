@@ -1529,19 +1529,7 @@ mod tests {
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
         let mut writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
-        let fold = match &writer.feed {
-            Feed::Direct(_) => None,
-            Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),
-        };
-        for lane in [
-            matches!(writer.coder.probe, Lane::Thread { .. }),
-            matches!(writer.coder.stream, Lane::Thread { .. }),
-        ]
-        .into_iter()
-        .chain(fold)
-        {
-            assert_eq!(lane, threads, "the stages where they were asked to be");
-        }
+        assert_lanes(&writer, threads);
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for k in 0..frames {
@@ -1563,6 +1551,26 @@ mod tests {
         }
         writer.finish(&mut stream).unwrap();
         (writer, stream, kept)
+    }
+
+    /// The writer's stages on threads of their own when `threads`, and on
+    /// the caller's otherwise: a lane falls back to the caller's thread when
+    /// it cannot start one, and a comparison of the two would be of one
+    /// thread with itself.
+    fn assert_lanes(writer: &Writer, threads: bool) {
+        let fold = match &writer.feed {
+            Feed::Direct(_) => None,
+            Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),
+        };
+        for lane in [
+            matches!(writer.coder.probe, Lane::Thread { .. }),
+            matches!(writer.coder.stream, Lane::Thread { .. }),
+        ]
+        .into_iter()
+        .chain(fold)
+        {
+            assert_eq!(lane, threads, "the stages where they were asked to be");
+        }
     }
 
     /// A frame of noise on each of `width` master channels, interleaved,
@@ -1990,6 +1998,7 @@ mod tests {
         let out = PathBuf::from("test.ec3");
         let writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
         let mut writer = prepare(writer);
+        assert_lanes(&writer, threads);
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for frame in 0..frames {
@@ -2039,24 +2048,39 @@ mod tests {
         }
     }
 
-    /// A refusal of the stream's encoder still on its way back when a read
-    /// fails is what the encode stops at, as on one thread, which meets it
-    /// before it reads on. The coder makes room for eight bytes more than
-    /// the stream's Evolution frames have: the first six frames' elements
-    /// are silent, and the payloads fitted to them take less than the room
-    /// there is; the first fitted to loud ones takes more than the stream's,
-    /// which refuses it. One thread meets the refusal coding the frame that
-    /// hands that payload to the stream's encoder — two frames on, the
-    /// probe's and the estimator's, and with a fold four more — and leaves
-    /// the syncframes before it, those the encode that fits writes; a read
-    /// that fails at that frame instead is what it stops at, with the same
-    /// syncframes; one that fails at the frame after finds the refusal, on
-    /// threads, still on its way back, and stops at it all the same. Carried
-    /// as they are, and folded.
+    /// Frames from one going in to its block reaching the coder, for what a
+    /// test codes: none for elements carried as they are. Folded, a block
+    /// is folded once the blocks the fold looks ahead to are read
+    /// ([`hz_cluster::smooth::SMOOTHING`]'s `ahead`, which [`Folder`] steers
+    /// by), made ready for the coder once the block after it is folded, and
+    /// taken from the fold's lane as the next frame goes in.
+    fn fold_lag(what: &str) -> usize {
+        match what {
+            "2 beds" => 0,
+            _ => hz_cluster::smooth::SMOOTHING.ahead + 2,
+        }
+    }
+
+    /// A refusal of the stream's encoder still on its way back is what the
+    /// encode stops at, as on one thread, which meets it before it reads on.
+    /// The coder makes room for eight bytes more than the stream's Evolution
+    /// frames have: the first four frames' elements are silent, and the
+    /// payloads fitted to them take less than the room there is; the first
+    /// fitted to loud ones takes more than the stream's, which refuses it.
+    /// One thread meets the refusal coding the frame that hands that payload
+    /// to the stream's encoder — two frames on, the probe's and the
+    /// estimator's, and with a fold [`fold_lag`] more — and leaves the
+    /// syncframes before it, those the encode that fits writes. On threads
+    /// the refusal is still on its way back then, and is met further on: by
+    /// a later frame, as the frames keep going in; or, when the read of the
+    /// next frame fails, by [`Writer::stop`], which stops at the refusal all
+    /// the same. A read that fails at the frame one thread meets it at is
+    /// what the encode stops at, with the same syncframes. Carried as they
+    /// are, and folded.
     #[test]
-    fn a_refusal_on_its_way_back_when_a_read_fails_is_what_the_encode_stops_at() {
-        const FRAMES: usize = 16;
-        const QUIET: usize = 6;
+    fn a_refusal_on_its_way_back_is_what_the_encode_stops_at() {
+        const FRAMES: usize = 12;
+        const QUIET: usize = 4;
         let overstated = |mut writer: Writer| {
             writer.coder.size += 8;
             writer
@@ -2065,9 +2089,6 @@ mod tests {
             let run = |fails, threads, prepare: fn(Writer) -> Writer| {
                 driven(elements_of(what), FRAMES, QUIET, fails, threads, prepare)
             };
-            let whole = run(None, false, |w| w);
-            assert_eq!(whole.error, None, "{what}: the encode that fits");
-            assert_eq!(whole.stream.len(), FRAMES * SYNCFRAME, "{what}");
             let alone = run(None, false, overstated);
             let refusal = alone.error.clone().expect("refused");
             let refused: usize = refusal
@@ -2093,29 +2114,53 @@ mod tests {
                 (QUIET - 1..=QUIET).contains(&refused),
                 "{what}: the first payload fitted to loud elements, not {refused}"
             );
-            let lag = if what == "2 beds" { 2 } else { 6 };
             assert_eq!(
                 alone.frame,
-                refused + lag,
+                refused + 2 + fold_lag(what),
                 "{what}: where one thread meets it"
             );
+            assert!(alone.frame + 1 < FRAMES, "{what}: frames past it");
+            // The encode that fits, as far as the frame one thread meets the
+            // refusal at.
+            let whole = driven(elements_of(what), alone.frame, QUIET, None, false, |w| w);
+            assert_eq!(whole.error, None, "{what}: the encode that fits");
             assert!(
                 alone.stream == whole.stream[..refused * SYNCFRAME],
                 "{what}: the syncframes before the refusal, as the encode that fits writes them"
             );
             let read = "m.atmos.audio: unexpected end of file";
-            for (fails, error) in [(alone.frame, read), (alone.frame + 1, refusal.as_str())] {
-                let one = run(Some(fails), false, overstated);
-                let failing = format!("{what}, the read failing at frame {fails}");
+            for (fails, error) in [
+                (None, refusal.as_str()),
+                (Some(alone.frame), read),
+                (Some(alone.frame + 1), refusal.as_str()),
+            ] {
+                let one = run(fails, false, overstated);
+                let failing = match fails {
+                    None => format!("{what}, every read made"),
+                    Some(frame) => format!("{what}, the read failing at frame {frame}"),
+                };
                 assert_eq!(one.error.as_deref(), Some(error), "{failing}");
                 assert!(one.stream == alone.stream, "{failing}: the stream left");
+                // Threaded runs that met the refusal further on than one
+                // thread: the refusal on its way back when one thread meets
+                // it. It is handed to the stream's encoder just before the
+                // coder looks for what it has written, while the syncframe
+                // before it is still being written: of 576 runs counted,
+                // loaded and not, 572 met it further on, and no eight met it
+                // at once. All eight of a test meeting it at once is how that
+                // path would go untested.
+                let mut further = 0;
                 for attempt in 0..8 {
-                    let apart = run(Some(fails), true, overstated);
+                    let apart = run(fails, true, overstated);
                     assert_eq!(apart.error, one.error, "{failing}, run {attempt}");
                     assert!(
                         apart.same(&one),
                         "{failing}, run {attempt}: the stream left"
                     );
+                    further += usize::from(apart.frame > one.frame);
+                }
+                if error == refusal {
+                    assert!(further > 0, "{failing}: never met further on");
                 }
             }
         }
@@ -2151,16 +2196,16 @@ mod tests {
     /// A trace that fails to write a frame stops the encode there, once the
     /// syncframes before it are written, as on one thread: the trace's error,
     /// and two syncframes fewer than the frames traced — those the encode
-    /// untraced writes. Its element files fail on the ninth frame's samples,
-    /// and on the fourteenth's — with a fold, one of the last blocks, coded
-    /// as the encode finishes. Carried as they are, and folded.
+    /// untraced writes. Its element files fail on the seventh frame's
+    /// samples, carried as they are and folded; and folded, on the tenth's
+    /// too, one of the last blocks, coded as the encode finishes.
     #[test]
     fn a_trace_that_fails_a_frame_stops_the_encode_where_one_thread_stops() {
-        const FRAMES: usize = 16;
-        for what in ["2 beds", "20 beds"] {
+        const FRAMES: usize = 12;
+        for (what, traced) in [("2 beds", &[6][..]), ("20 beds", &[6, 9])] {
             let whole = driven(elements_of(what), FRAMES, 0, None, false, |w| w);
             assert_eq!(whole.error, None, "{what}");
-            for traced in [8, 13] {
+            for &traced in traced {
                 let case = format!("{what}, {traced} frames traced");
                 let name = format!("trace-{}-{traced}", what.replace(' ', "-"));
                 let dir = crate::fixtures::scratch("joc", &name);
@@ -2175,9 +2220,8 @@ mod tests {
                 let alone = run(false);
                 let error = alone.error.as_deref().expect("the trace fails");
                 assert!(error.starts_with("HZ_JOC_TRACE: "), "{case}: {error}");
-                // The fold hands a frame to the coder four frames on.
-                let lag = if what == "2 beds" { 0 } else { 4 };
-                assert_eq!(alone.frame, (traced + lag).min(FRAMES), "{case}");
+                let at = (traced + fold_lag(what)).min(FRAMES);
+                assert_eq!(alone.frame, at, "{case}: the frame that hands it in");
                 assert!(
                     alone.stream == whole.stream[..(traced - 2) * SYNCFRAME],
                     "{case}: the syncframes before it"
@@ -2198,7 +2242,7 @@ mod tests {
     /// Carried as they are and folded.
     #[test]
     fn a_trace_that_fails_at_the_end_stops_the_encode_where_one_thread_stops() {
-        const FRAMES: usize = 16;
+        const FRAMES: usize = 10;
         // Every frame's samples fit, and go out at the end.
         let capacity = 4 * FRAMES * FRAME_SAMPLES;
         for what in ["2 beds", "20 beds"] {
