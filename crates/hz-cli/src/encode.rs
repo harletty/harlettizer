@@ -4782,7 +4782,9 @@ mod thread_tests {
             .unwrap();
     }
 
-    /// The last block an overlay's report records, by its number.
+    /// The last block an overlay's report records, by its number. Only the
+    /// tests that write to a full device read it, and they run on Linux.
+    #[cfg(target_os = "linux")]
     fn last_block(report: &[u8]) -> usize {
         String::from_utf8_lossy(report)
             .lines()
