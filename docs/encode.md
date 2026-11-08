@@ -290,6 +290,7 @@ listen to what it stopped.
 | `--overlay-wobble` | per cent of windows carrying movement nobody asked for | 5 |
 | `--overlay-level` | decibels a source's rendered level may stray on any presentation | 2 |
 | `--overlay-cost` | the worst a source's fold may cost, as a fraction of its own gains | 0.5 |
+| `--overlay-masking` | decibels under the block's loudest object past which a source is not judged on drift, spread or stranding | 20 |
 
 ### Why `--overlay-cost` defaults to a half, and what it assumes
 
@@ -334,7 +335,8 @@ for a bug.
 
 Nought turns one off — a bound chosen without a programme to choose it on is a
 bound a caller who has listened knows better than. Each is refused when it is
-exceeded in more than a twentieth of the blocks the source was **audible** in;
+exceeded in more than a twentieth of the blocks the source was **judged** in
+(audible, and for drift, spread and stranding not masked, see below);
 drift and the no-carrier case also when they run for more than two seconds
 unbroken, because a twentieth scattered over a feature is a fault nobody
 localises and a twentieth in one place is a scene. A pause ends a run: two
@@ -352,12 +354,48 @@ was diffuse, because its bound is a floor under the strongest weight rather
 than a ceiling over an error, and half of a floor is not a milder version of
 it. The no-carrier case remarks whenever it happened at all.
 
-Every share is over the blocks a source was audible in, stranded blocks
+Every share is over the blocks a source was judged in, stranded blocks
 included: a source audible with nothing to carry it is counted as placed
 nowhere, so it enters the denominator of the drift share and of the fallback
-share, and it dilutes the mean drift — which is stated over the same count —
-without adding any angle to it. A programme stranded throughout reports a
-full share, not a count over one.
+share, and it dilutes the mean drift — which is stated over every audible
+block — without adding any angle to it. A programme stranded throughout
+reports a full share, not a count over one.
+
+### A masked voice is not judged on where it is
+
+Drift, spread and stranding are about **where** a voice is heard. A voice
+twenty decibels under the loudest thing playing is at the edge of being
+noticed and is no longer localised: nobody can hear where it is, so nobody can
+hear that it is in the wrong place either. A surround voice thirty decibels
+under the centre's dialogue is one nobody can place, however far off its
+carriers put it.
+
+So `--overlay-masking` (20 dB by default) leaves a source out of those three
+guards in a block where it is that far under the block's loudest object — any
+object, a kept element or another source, since a voice is masked by whatever
+plays. Such a block counts neither for the source nor against it: it is out of
+the denominators as well as the numerators, and it neither extends a run nor
+breaks one. A masked block that shows the source back in place does end its
+run, since where the carriers put a source is geometry and not hearing. A
+refusal whose run had masked blocks inside it says so:
+`from 1:02:01.6 to 1:02:04.0, not counting the 0.8 s it was masked in`. The
+summary says how many source-blocks were left out:
+
+```text
+  masked       12.4 % of the audible source-blocks were more than 20 dB under the block's loudest object, …
+```
+
+**Masked is not silent.** Whether a voice is there at all is
+[`hz_cluster::floor`](clustering.md#the-floor-is-where-the-room-puts-it)'s question, and that floor deliberately
+does not answer it by the neighbours: a voice under an explosion is still a
+voice. A masked source is mixed, carried and fallen back exactly as it would be
+with the margin declined, bit for bit; only the count against it changes. The
+level, cost and wobble guards are not affected: they judge every audible
+source.
+
+Twenty is an estimate from what masking is known to do, not a measure. The
+relative floor's forty would be too lenient for this. Nought judges every
+audible block, as before the margin existed.
 
 `--overlay-fallback` (on by default) routes a source the fit could not place —
 no carrier at all, past the drift bound, or too diffuse — onto the nearest bed

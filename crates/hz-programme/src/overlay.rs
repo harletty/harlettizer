@@ -97,6 +97,35 @@ pub struct Bounds {
     /// Whether a source the fit could not place acceptably is routed to the
     /// nearest bed element outright. See [`Overlaid::fell_back`].
     pub fallback: bool,
+    /// How far under the block's loudest object a source may be, in
+    /// decibels, and still be judged by the guards on where it is: drift,
+    /// spread, and no carrier at all. Nought judges every audible block.
+    ///
+    /// # Masked is not silent
+    ///
+    /// Those three guards are about *where* a voice is heard. A voice twenty
+    /// decibels under the loudest thing playing is at the edge of being
+    /// noticed and is no longer localised, so nobody can hear that it is in
+    /// the wrong place either; a programme refused for it is refused for
+    /// something no listener will notice. That is a different question from
+    /// whether the voice is there, which [`hz_cluster::floor`] answers, and
+    /// deliberately not by its neighbours: a voice under an explosion is
+    /// still a voice. So a masked source is mixed, carried and fallen back
+    /// exactly as before. Only the count against it changes.
+    ///
+    /// Twenty is an estimate from what masking is known to do, not a
+    /// measure. The relative floor's forty would be too lenient for this: a
+    /// surround voice thirty under the centre's dialogue is already one
+    /// nobody can place.
+    ///
+    /// The loudest object is any object of the block, a kept element or a
+    /// source, since a voice is masked by whatever plays. A masked block counts
+    /// neither for a source nor against it: it is out of the shares'
+    /// denominators as well as their numerators, and it neither extends a run
+    /// nor breaks one, except that a block that shows the source back in
+    /// place ends its run whatever its level, since that is geometry and
+    /// not hearing.
+    pub masking: f64,
 }
 
 /// The bounds as they ship — see [`Bounds`], which says where each comes
@@ -106,6 +135,7 @@ pub const OVERLAY_SPREAD: f64 = 0.5;
 pub const OVERLAY_WOBBLE: f64 = 5.0;
 pub const OVERLAY_LEVEL: f64 = 2.0;
 pub const OVERLAY_COST: f64 = 0.5;
+pub const OVERLAY_MASKING: f64 = 20.0;
 
 impl Default for Bounds {
     fn default() -> Self {
@@ -116,6 +146,20 @@ impl Default for Bounds {
             level: OVERLAY_LEVEL,
             cost: OVERLAY_COST,
             fallback: true,
+            masking: OVERLAY_MASKING,
+        }
+    }
+}
+
+impl Bounds {
+    /// [`Bounds::masking`] as the fraction of the loudest object's power a
+    /// source has to carry to be judged; nought when the margin is declined,
+    /// which every source carries.
+    pub fn masked_under(&self) -> f64 {
+        if self.masking > 0.0 {
+            10f64.powf(-self.masking / 10.0)
+        } else {
+            0.0
         }
     }
 }
@@ -428,6 +472,8 @@ pub struct Overlaid {
     pub remixed: u64,
     /// Blocks where an audible source had no carrier at all.
     pub stranded: u64,
+    /// And the ones of those the guards judged — see [`Overlaid::exposed`].
+    pub over_stranded: u64,
     /// How far the carriers put the audible sources from where they asked to
     /// be, summed and at its worst — see `hz_cluster::overlay::drift`.
     pub drift: f64,
@@ -435,9 +481,18 @@ pub struct Overlaid {
     pub worst_drift: f64,
     /// What the encode refuses to write, and what it only remarks on.
     pub bounds: Bounds,
-    /// Source-blocks in which each bound was exceeded, over the voiced ones.
-    /// The denominator is [`Overlaid::drifted`]: a source is counted once a
-    /// block, in the blocks it was audible in.
+    /// Source-blocks the guards on where a source is judged: audible, and
+    /// within [`Bounds::masking`] of the block's loudest object. A share of
+    /// [`Overlaid::drifted`], which counts every audible one; the rest were
+    /// masked.
+    pub exposed: u64,
+    /// The worst drift over those, which is what the remark on drift quotes.
+    pub worst_exposed_drift: f64,
+    /// Blocks in which each bound was exceeded. Drift and spread count
+    /// source-blocks, over [`Overlaid::exposed`]: a source is counted once a
+    /// block, in the blocks it was judged in. Level and cost count blocks,
+    /// over [`Overlaid::voiced`], since the metric judges every panned
+    /// source at once.
     pub over_drift: u64,
     /// And over half of it, which is what the remark is about — a remark that
     /// quotes the refusal's share beside the half bound contradicts itself.
@@ -446,9 +501,11 @@ pub struct Overlaid {
     pub over_level: u64,
     pub over_cost: u64,
     /// The longest unbroken run of blocks a source was past the drift bound
-    /// for, and the run each source is in now. In blocks; the summary turns
-    /// them into seconds.
+    /// for, and the run each source is in now, with the block it began on.
+    /// In judged blocks: a masked one inside a run is in its stretch and not
+    /// in its length. The summary turns them into seconds.
     pub run: Vec<u64>,
+    pub run_from: Vec<u64>,
     pub worst_run: u64,
     /// Whose the longest run is and where it ends, so that a refusal can say
     /// where to listen: a stream left on disk "so it can be heard" is no use
@@ -457,6 +514,7 @@ pub struct Overlaid {
     pub worst_run_at: Option<RunAt>,
     /// The same for a source with nowhere at all to go, and the run it is in.
     pub stranded_run: Vec<u64>,
+    pub stranded_from: Vec<u64>,
     pub worst_stranded_run: u64,
     pub worst_stranded_run_at: Option<RunAt>,
     /// How far a source's rendered level strayed on any presentation, at its
@@ -578,19 +636,24 @@ impl Overlaid {
             copied: 0,
             remixed: 0,
             stranded: 0,
+            over_stranded: 0,
             drift: 0.0,
             drifted: 0,
             worst_drift: 0.0,
             bounds,
+            exposed: 0,
+            worst_exposed_drift: 0.0,
             over_drift: 0,
             over_half_drift: 0,
             over_spread: 0,
             over_level: 0,
             over_cost: 0,
             run: vec![0; sources],
+            run_from: vec![0; sources],
             worst_run: 0,
             worst_run_at: None,
             stranded_run: Vec::new(),
+            stranded_from: Vec::new(),
             worst_stranded_run: 0,
             worst_stranded_run_at: None,
             worst_level: 0.0,
@@ -756,8 +819,19 @@ impl Overlaid {
         self.resultants.clear();
         self.energies.clear();
         self.run.resize(self.sources, 0);
+        self.run_from.resize(self.sources, 0);
         self.resting.resize(self.sources, None);
         self.stranded_run.resize(self.sources, 0);
+        self.stranded_from.resize(self.sources, 0);
+        // What a source has to carry for where it is to be heard: within the
+        // masking margin of the loudest thing playing, an element or a source.
+        // See [`Bounds::masking`]. Nought, the margin declined, is carried by
+        // every source.
+        let exposure = scene_objects
+            .iter()
+            .map(|object| object.energy)
+            .fold(0.0f64, f64::max)
+            * self.bounds.masked_under();
         std::mem::swap(&mut self.was_audible, &mut self.audible);
         self.audible.clear();
         self.audible.resize(self.sources, false);
@@ -767,7 +841,7 @@ impl Overlaid {
             let slotted = self.slotted[index];
             // A source with an element of its own is exactly where it asked to
             // be, and a source nobody can hear is not a fact about the
-            // programme. Neither is judged, and neither breaks a run.
+            // programme. Neither is judged, and silence ends a run: see below.
             let voiced = !slotted && floor.heard(source.energy.max(0.0));
             self.audible[index] = voiced;
             self.energies
@@ -845,25 +919,43 @@ impl Overlaid {
                 }
             }
 
+            // Whether where the source is can be heard, which is what the
+            // guards below judge. Everything else this block does to it — the
+            // fit, the fallback above, the mix — is the same either way.
+            let exposed = source.energy.max(0.0) >= exposure;
+            if exposed {
+                self.exposed += 1;
+            }
+
             match drift {
                 Some(at) => {
                     self.drift += at;
                     self.drifted += 1;
                     self.worst_drift = self.worst_drift.max(at);
-                    if self.bounds.drift > 0.0 && at > self.bounds.drift / 2.0 {
-                        self.over_half_drift += 1;
+                    let past = self.bounds.drift > 0.0 && at > self.bounds.drift;
+                    if exposed {
+                        self.worst_exposed_drift = self.worst_exposed_drift.max(at);
+                        if self.bounds.drift > 0.0 && at > self.bounds.drift / 2.0 {
+                            self.over_half_drift += 1;
+                        }
                     }
-                    if self.bounds.drift > 0.0 && at > self.bounds.drift {
+                    if past && exposed {
                         self.over_drift += 1;
+                        if self.run[index] == 0 {
+                            self.run_from[index] = self.reported_blocks;
+                        }
                         self.run[index] += 1;
                         if self.run[index] > self.worst_run {
                             self.worst_run = self.run[index];
                             self.worst_run_at = Some(RunAt {
                                 source: index,
+                                first: self.run_from[index],
                                 last: self.reported_blocks,
                             });
                         }
-                    } else {
+                    } else if !past {
+                        // Back in place ends a run, heard or masked: where the
+                        // carriers put a source is geometry, whatever its level.
                         self.run[index] = 0;
                     }
                     self.stranded_run[index] = 0;
@@ -883,13 +975,20 @@ impl Overlaid {
                     self.stranded += 1;
                     self.drifted += 1;
                     self.run[index] = 0;
-                    self.stranded_run[index] += 1;
-                    if self.stranded_run[index] > self.worst_stranded_run {
-                        self.worst_stranded_run = self.stranded_run[index];
-                        self.worst_stranded_run_at = Some(RunAt {
-                            source: index,
-                            last: self.reported_blocks,
-                        });
+                    if exposed {
+                        self.over_stranded += 1;
+                        if self.stranded_run[index] == 0 {
+                            self.stranded_from[index] = self.reported_blocks;
+                        }
+                        self.stranded_run[index] += 1;
+                        if self.stranded_run[index] > self.worst_stranded_run {
+                            self.worst_stranded_run = self.stranded_run[index];
+                            self.worst_stranded_run_at = Some(RunAt {
+                                source: index,
+                                first: self.stranded_from[index],
+                                last: self.reported_blocks,
+                            });
+                        }
                     }
                     let held = self
                         .resting
@@ -900,7 +999,7 @@ impl Overlaid {
                     self.resultants.push(held);
                 }
             }
-            if self.bounds.spread > 0.0 && spread.strongest < self.bounds.spread {
+            if exposed && self.bounds.spread > 0.0 && spread.strongest < self.bounds.spread {
                 self.over_spread += 1;
             }
         }
@@ -1229,11 +1328,13 @@ impl Overlaid {
     }
 }
 
-/// Where a run of blocks ended: the source it was, by its index among the
-/// sources, and the last block of it, counted from the programme's first.
+/// Where a run of blocks was: the source it was, by its index among the
+/// sources, and its first block and its last, counted from the programme's
+/// first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunAt {
     pub source: usize,
+    pub first: u64,
     pub last: u64,
 }
 
@@ -1244,15 +1345,24 @@ impl RunAt {
         format!("source {} of {sources}", self.source + 1)
     }
 
-    /// `from 1:02:03.4 to 1:02:05.8`, for a run `blocks` long, in the
-    /// programme's own time.
+    /// `from 1:02:03.4 to 1:02:05.8`, in the programme's own time, for a run
+    /// `blocks` long; and how much of the stretch it was masked in, when a
+    /// masked block inside it made the stretch longer than the run.
     pub fn when(&self, blocks: u64, seconds_a_block: f64) -> String {
         let end = self.last + 1;
-        format!(
+        let masked = end.saturating_sub(self.first).saturating_sub(blocks);
+        let mut said = format!(
             "from {} to {}",
-            clock(end.saturating_sub(blocks) as f64 * seconds_a_block),
+            clock(self.first as f64 * seconds_a_block),
             clock(end as f64 * seconds_a_block)
-        )
+        );
+        if masked > 0 {
+            said.push_str(&format!(
+                ", not counting the {:.1} s it was masked in",
+                masked as f64 * seconds_a_block
+            ));
+        }
+        said
     }
 }
 
@@ -1276,9 +1386,11 @@ pub struct Remark {
 
 /// What the guards say about the stream that was just written.
 ///
-/// Every share is over the blocks a source was **audible** in, and the
-/// sources that took a spare element of their own are not judged at all: they
-/// are exactly where they asked to be, by construction.
+/// Every share of drift, spread and stranding is over the blocks a source was
+/// **judged** in: audible, and not masked by the block's loudest object (see
+/// [`Bounds::masking`]). The sources that took a spare element of their own
+/// are not judged at all: they are exactly where they asked to be, by
+/// construction.
 ///
 /// The stream is **left on disk** when this refuses. A refusal is a statement
 /// about what is in the file, and the fastest way to check a bound nobody has
@@ -1287,17 +1399,17 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
     let mut out = Vec::new();
     let bounds = overlaid.bounds;
     let voiced = overlaid.voiced.max(1) as f64;
-    let placed = overlaid.drifted.max(1) as f64;
+    let judged = overlaid.exposed.max(1) as f64;
     let mut say = |refused: bool, said: String| out.push(Remark { refused, said });
 
-    if bounds.drift > 0.0 && overlaid.drifted > 0 {
-        let share = overlaid.over_drift as f64 / placed;
+    if bounds.drift > 0.0 && overlaid.exposed > 0 {
+        let share = overlaid.over_drift as f64 / judged;
         let run = overlaid.worst_run as f64 * seconds_a_block;
         if share > OVERLAY_SHARE {
             say(
                 true,
                 format!(
-                    "{:.1} % of the blocks a source was audible in put it more than {:.0}° from \
+                    "{:.1} % of the blocks a source was judged in put it more than {:.0}° from \
                      where it asked to be, which is past the {:.0} % this refuses at",
                     100.0 * share,
                     bounds.drift,
@@ -1324,32 +1436,32 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
                     bounds.drift
                 ),
             );
-        } else if overlaid.worst_drift > bounds.drift / 2.0 {
+        } else if overlaid.worst_exposed_drift > bounds.drift / 2.0 {
             say(
                 false,
                 format!(
                     "a source reached {:.1}° from where it asked to be, past the {:.0}° a rear \
-                     blur stops forgiving; {:.1} % of the audible blocks are over that",
-                    overlaid.worst_drift,
+                     blur stops forgiving; {:.1} % of the judged blocks are over that",
+                    overlaid.worst_exposed_drift,
                     bounds.drift / 2.0,
                     // The share over the *half* bound, which is what this
                     // sentence is about. Printing the share over the refusal
                     // bound here said "0.0 % over 15°" on a run whose mean
                     // drift was 15.4°, which is a number that contradicts the
                     // sentence around it.
-                    100.0 * overlaid.over_half_drift as f64 / placed
+                    100.0 * overlaid.over_half_drift as f64 / judged
                 ),
             );
         }
     }
 
-    if bounds.spread > 0.0 && overlaid.drifted > 0 {
-        let share = overlaid.over_spread as f64 / placed;
+    if bounds.spread > 0.0 && overlaid.exposed > 0 {
+        let share = overlaid.over_spread as f64 / judged;
         if share > OVERLAY_SHARE {
             say(
                 true,
                 format!(
-                    "{:.1} % of the blocks a source was audible in left no element holding {:.2} \
+                    "{:.1} % of the blocks a source was judged in left no element holding {:.2} \
                      of it, so it is rendered from everywhere the fit reached rather than from \
                      somewhere",
                     100.0 * share,
@@ -1360,7 +1472,7 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
             say(
                 false,
                 format!(
-                    "{:.1} % of the audible blocks spread a source with no element holding {:.2} \
+                    "{:.1} % of the judged blocks spread a source with no element holding {:.2} \
                      of it",
                     100.0 * share,
                     bounds.spread
@@ -1399,7 +1511,7 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
         // nowhere to go is a hole in the dub, but one of them is 27 ms and a
         // programme is not unshippable for it; what makes it unshippable is
         // that it keeps happening, or that it happens for a whole phrase.
-        let share = overlaid.stranded as f64 / placed.max(1.0);
+        let share = overlaid.over_stranded as f64 / judged;
         let run = overlaid.worst_stranded_run as f64 * seconds_a_block;
         let at = overlaid
             .worst_stranded_run_at
@@ -1411,11 +1523,21 @@ pub fn remarks(overlaid: &Overlaid, totals: &Totals, seconds_a_block: f64) -> Ve
                 )
             })
             .unwrap_or_default();
+        // Counted as the drift is: a masked block with nowhere to go is a
+        // voice nobody could have placed missing from where nobody could
+        // have placed it.
+        let masked = overlaid.stranded - overlaid.over_stranded;
         let said = format!(
-            "{} source-blocks ({:.1} %) were audible with no element to carry them at all — \
-             every candidate muted, and no bed to fall back to — the longest stretch {run:.1} s{at}",
-            overlaid.stranded,
-            100.0 * share
+            "{} source-blocks ({:.1} %) were judged with no element to carry them at all — \
+             every candidate muted, and no bed to fall back to — the longest stretch \
+             {run:.1} s{at}{}",
+            overlaid.over_stranded,
+            100.0 * share,
+            if masked > 0 {
+                format!("; {masked} more were masked, and not judged")
+            } else {
+                String::new()
+            }
         );
         say(share > OVERLAY_SHARE || run > OVERLAY_RUN, said);
     }
@@ -1570,6 +1692,18 @@ pub fn summary(overlaid: &Overlaid, blocks: u64, beds_reach: Option<f64>) {
             None => "whatever fits best, the moving elements included".to_string(),
         }
     );
+    let masked = overlaid.drifted - overlaid.exposed;
+    if masked > 0 {
+        println!(
+            "  masked       {:.1} % of the audible source-blocks were more than {:.0} dB under the \
+             block's loudest object, too far under it for anyone to hear where they are, and \
+             were not judged on drift, spread or stranding ({} of {})",
+            100.0 * masked as f64 / overlaid.drifted as f64,
+            overlaid.bounds.masking,
+            masked,
+            overlaid.drifted
+        );
+    }
     if overlaid.fell_back > 0 && overlaid.drifted > 0 {
         println!(
             "  fell back    {:.1} % of the audible source-blocks were put on the nearest bed \
@@ -1736,6 +1870,20 @@ mod tests {
         assert_eq!(block_samples(88_200), 2560);
     }
 
+    /// The margin is in decibels of power under the loudest object, and
+    /// nought declines it.
+    #[test]
+    fn the_masking_margin_is_a_fraction_of_the_loudest_power() {
+        let bounds = |masking| Bounds {
+            masking,
+            ..Bounds::default()
+        };
+        assert!((bounds(20.0).masked_under() - 0.01).abs() < 1e-12);
+        assert!((bounds(10.0).masked_under() - 0.1).abs() < 1e-12);
+        assert_eq!(bounds(0.0).masked_under(), 0.0);
+        assert_eq!(Bounds::default().masking, OVERLAY_MASKING);
+    }
+
     /// A run is named the way a player shows where it is, so that the
     /// stretch a refusal names can be found in the stream it left.
     #[test]
@@ -1749,9 +1897,16 @@ mod tests {
         let block = 1280.0 / 48_000.0;
         let at = RunAt {
             source: 6,
+            first: 139_560,
             last: 139_649,
         };
         assert_eq!(at.who(7), "source 7 of 7");
         assert_eq!(at.when(90, block), "from 1:02:01.6 to 1:02:04.0");
+        // Thirty of those blocks masked: the stretch is the same and the run
+        // is 0.8 s shorter than it.
+        assert_eq!(
+            at.when(60, block),
+            "from 1:02:01.6 to 1:02:04.0, not counting the 0.8 s it was masked in"
+        );
     }
 }

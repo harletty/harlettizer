@@ -525,7 +525,9 @@ struct OverlayArgs {
 
     /// Refuse the encode if a source ends up more than this many degrees
     /// from where it asked to be, on more than a twentieth of the blocks
-    /// it is audible in or for an unbroken run of more than two seconds.
+    /// it is judged in or for an unbroken run of more than two seconds.
+    /// A source is judged where it is audible and not masked: see
+    /// `--overlay-masking`.
     ///
     /// Thirty degrees is not a localisation bound — it is far past one.
     /// It is the point at which a voice is in a different part of the room
@@ -535,9 +537,23 @@ struct OverlayArgs {
     #[arg(long, value_name = "DEGREES", default_value_t = overlay::OVERLAY_DRIFT)]
     overlay_drift: f64,
 
+    /// Leave a source out of the drift, spread and no-carrier guards in a
+    /// block where it is more than this many decibels under the block's
+    /// loudest object, an element or another source.
+    ///
+    /// Those guards are about where a voice is heard, and a voice this far
+    /// under what plays with it is masked: nobody can hear where it is, so
+    /// nobody can hear that it is in the wrong place. It is still mixed
+    /// and carried exactly as it would be otherwise; only what is counted
+    /// against it changes. Twenty is an estimate from what masking is known
+    /// to do, not a measure. The summary says how many blocks were left
+    /// out. Nought judges every audible block.
+    #[arg(long, value_name = "DB", default_value_t = overlay::OVERLAY_MASKING)]
+    overlay_masking: f64,
+
     /// Refuse the encode if the strongest element carrying a source holds
     /// less than this fraction of it, on more than a twentieth of the
-    /// blocks it is audible in.
+    /// blocks it is judged in (see `--overlay-masking`).
     ///
     /// Under it the source is diffuse: no one element is rendering it, so
     /// it arrives from everywhere the fit reached and moves whenever any
@@ -746,6 +762,7 @@ impl OverlayArgs {
                 level: self.overlay_level,
                 cost: self.overlay_cost,
                 fallback: self.overlay_fallback,
+                masking: self.overlay_masking,
             },
             spare: self.overlay_spare,
             report: self.overlay_report,
