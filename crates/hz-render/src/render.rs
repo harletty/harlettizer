@@ -40,4 +40,11 @@ pub trait Renderer: Send {
 
     /// What to call this presentation in a report.
     fn name(&self) -> &str;
+
+    /// The fold this is, when it is one: what lets a set of presentations
+    /// render a position on 7.1 once for every fold among them — see
+    /// [`crate::fold::Renders`].
+    fn as_fold(&self) -> Option<&crate::ObjectFold> {
+        None
+    }
 }

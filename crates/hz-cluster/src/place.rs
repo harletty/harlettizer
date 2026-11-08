@@ -378,6 +378,9 @@ pub fn refine(
                 .unwrap_or(clustering.positions[*element]);
 
             let mut best = clustering.positions[*element];
+            // Where what `best` radiates is: once a candidate wins, the
+            // vector it was scored on is kept rather than panned again.
+            let mut held = Held::Current;
             // Where it is now is already panned, so it is scored without
             // panning it again.
             let mut best_score = scored(
@@ -402,19 +405,42 @@ pub fn refine(
             {
                 let candidate = objects[dominant].position;
                 if candidate != clustering.positions[*element] {
-                    let cost = score(
-                        candidate,
-                        &scratch.touched,
-                        &scratch.rest,
-                        targets,
-                        objects,
-                        reference,
-                        rows,
-                        &mut scratch.candidate,
-                    ) + search.movement * carried * apart(candidate, was);
+                    // A member of no size radiates as a point where it is,
+                    // which is its target: the same panning of the same
+                    // position, so the target is scored rather than panning
+                    // it again.
+                    let point = objects[dominant].size.to_bits() == 0.0f64.to_bits();
+                    let score = if point {
+                        scored(
+                            &targets[dominant],
+                            &scratch.touched,
+                            &scratch.rest,
+                            targets,
+                            objects,
+                            rows,
+                        )
+                    } else {
+                        score(
+                            candidate,
+                            &scratch.touched,
+                            &scratch.rest,
+                            targets,
+                            objects,
+                            reference,
+                            rows,
+                            &mut scratch.candidate,
+                        )
+                    };
+                    let cost = score + search.movement * carried * apart(candidate, was);
                     if cost < best_score {
                         best_score = cost;
                         best = candidate;
+                        held = if point {
+                            Held::Target(dominant)
+                        } else {
+                            std::mem::swap(&mut scratch.candidate, &mut scratch.best);
+                            Held::Best
+                        };
                     }
                 }
             }
@@ -446,6 +472,8 @@ pub fn refine(
                     if cost < best_score {
                         best_score = cost;
                         best = candidate;
+                        std::mem::swap(&mut scratch.candidate, &mut scratch.best);
+                        held = Held::Best;
                     }
                 }
             }
@@ -474,12 +502,21 @@ pub fn refine(
                     && staying - best_score > HOLDING_AT_LEAST * carried;
                 if !pays {
                     best = was;
+                    // Staying was scored on what `was` radiates.
+                    std::mem::swap(&mut scratch.candidate, &mut scratch.best);
+                    held = Held::Best;
                 }
             }
 
             if best != clustering.positions[*element] {
                 clustering.positions[*element] = best;
-                reference.radiated(best, 0.0, &mut radiated[slot]);
+                // What the winner radiates, as it was scored: the same panning
+                // of the same position as panning it again.
+                match held {
+                    Held::Best => std::mem::swap(&mut radiated[slot], &mut scratch.best),
+                    Held::Target(object) => radiated[slot].clone_from(&targets[object]),
+                    Held::Current => reference.radiated(best, 0.0, &mut radiated[slot]),
+                }
             }
         }
         reach *= 0.5;
@@ -552,12 +589,328 @@ pub struct Scratch {
     touched: Vec<(usize, f64)>,
     rest: Vec<f64>,
     candidate: Vec<f64>,
+    /// What the best candidate so far radiates, when it is in here.
+    best: Vec<f64>,
+}
+
+/// Where what an element's best candidate radiates is held.
+#[derive(Debug, Clone, Copy)]
+enum Held {
+    /// It is where the element stands, which `radiated` already holds.
+    Current,
+    /// In [`Scratch::best`].
+    Best,
+    /// It is object `n`'s target: a member of no size, where it is.
+    Target(usize),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Clusterer, Weighting};
+
+    /// The search as it was before the winner's vector was kept: every
+    /// winner panned again, and the dominant member's place panned rather
+    /// than its target taken. The oracle [`refine`] is held to, to the bit.
+    #[allow(clippy::too_many_arguments)]
+    fn refine_as_it_was(
+        clustering: &mut Clustering,
+        objects: &[Object],
+        live: &[usize],
+        reference: &Reference,
+        targets: &[Vec<f64>],
+        radiated: &mut [Vec<f64>],
+        previous: Option<&Clustering>,
+        search: Search,
+        scratch: &mut Scratch,
+    ) {
+        if search.passes == 0 || live.is_empty() {
+            return;
+        }
+        let rows = reference.rows();
+        let pinned: Vec<bool> = (0..clustering.elements())
+            .map(|element| {
+                objects.iter().enumerate().any(|(object, source)| {
+                    source.pinned.is_some() && clustering.owners[object] == element
+                })
+            })
+            .collect();
+
+        let mut reach = search.reach;
+        for pass in 0..search.passes {
+            let last = pass + 1 == search.passes;
+            for (slot, element) in live.iter().enumerate() {
+                if pinned[*element] {
+                    continue;
+                }
+                // Which objects this element carries, and how much of each. An
+                // element nothing reaches has nothing to be placed for.
+                scratch.touched.clear();
+                for (object, row) in clustering.weights.iter().enumerate() {
+                    if row[*element] != 0.0 {
+                        scratch.touched.push((object, row[*element]));
+                    }
+                }
+                if scratch.touched.is_empty() {
+                    continue;
+                }
+
+                // What every *other* element already puts on the reference for
+                // each of those objects, and how far off the target that leaves
+                // them. Computed once; each candidate then adds one term.
+                scratch.rest.clear();
+                scratch.rest.resize(scratch.touched.len() * rows, 0.0);
+                for (index, (object, _)) in scratch.touched.iter().enumerate() {
+                    let row = &clustering.weights[*object];
+                    let rest = &mut scratch.rest[index * rows..(index + 1) * rows];
+                    for (other, radiated) in live.iter().zip(radiated.iter()) {
+                        let weight = row[*other];
+                        if weight == 0.0 || other == element {
+                            continue;
+                        }
+                        for (slot, value) in rest.iter_mut().zip(radiated) {
+                            *slot += weight * value;
+                        }
+                    }
+                }
+
+                let carried: f64 = scratch
+                    .touched
+                    .iter()
+                    .map(|(object, weight)| objects[*object].energy.max(0.0) * weight * weight)
+                    .sum();
+                let was = previous
+                    .and_then(|previous| previous.positions.get(*element).copied())
+                    .unwrap_or(clustering.positions[*element]);
+
+                let mut best = clustering.positions[*element];
+                // Where it is now is already panned, so it is scored without
+                // panning it again.
+                let mut best_score = scored(
+                    &radiated[slot],
+                    &scratch.touched,
+                    &scratch.rest,
+                    targets,
+                    objects,
+                    rows,
+                ) + search.movement * carried * apart(best, was);
+
+                // One more candidate: where the member carrying the most of this
+                // element sits. Judged like the others, not taken on trust.
+                let dominant = if search.dominant {
+                    scratch
+                        .touched
+                        .iter()
+                        .map(|(object, weight)| {
+                            (*object, objects[*object].energy.max(0.0) * weight * weight)
+                        })
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                } else {
+                    None
+                };
+                if let Some((dominant, _)) = dominant {
+                    let candidate = objects[dominant].position;
+                    if candidate != clustering.positions[*element] {
+                        let cost = score(
+                            candidate,
+                            &scratch.touched,
+                            &scratch.rest,
+                            targets,
+                            objects,
+                            reference,
+                            rows,
+                            &mut scratch.candidate,
+                        ) + search.movement * carried * apart(candidate, was);
+                        if cost < best_score {
+                            best_score = cost;
+                            best = candidate;
+                        }
+                    }
+                }
+
+                // Six candidates: a step along each axis of the cube, both ways.
+                // The cube is the frame a fold reads, so it is the frame to search
+                // in — a step along the sphere would be a step off the grid every
+                // presentation is a row of.
+                for axis in 0..3 {
+                    for direction in [-1.0f64, 1.0] {
+                        let mut candidate = clustering.positions[*element];
+                        candidate[axis] += direction * reach;
+                        // The cube has no below and no outside.
+                        candidate[axis] =
+                            candidate[axis].clamp(if axis == 2 { 0.0 } else { -1.0 }, 1.0);
+                        if candidate == clustering.positions[*element] {
+                            continue;
+                        }
+                        let cost = score(
+                            candidate,
+                            &scratch.touched,
+                            &scratch.rest,
+                            targets,
+                            objects,
+                            reference,
+                            rows,
+                            &mut scratch.candidate,
+                        ) + search.movement * carried * apart(candidate, was);
+                        if cost < best_score {
+                            best_score = cost;
+                            best = candidate;
+                        }
+                    }
+                }
+
+                // The dead band, once the search has finished looking. Staying
+                // is not a candidate among the others — it is the answer unless
+                // moving pays, which is not the same thing and is why it is
+                // weighed here rather than scored above.
+                if last
+                    && search.holding > 0.0
+                    && previous.is_some()
+                    && best != was
+                    && !scratch.touched.is_empty()
+                {
+                    let staying = score(
+                        was,
+                        &scratch.touched,
+                        &scratch.rest,
+                        targets,
+                        objects,
+                        reference,
+                        rows,
+                        &mut scratch.candidate,
+                    );
+                    let pays = best_score < staying * (1.0 - search.holding)
+                        && staying - best_score > HOLDING_AT_LEAST * carried;
+                    if !pays {
+                        best = was;
+                    }
+                }
+
+                if best != clustering.positions[*element] {
+                    clustering.positions[*element] = best;
+                    reference.radiated(best, 0.0, &mut radiated[slot]);
+                }
+            }
+            reach *= 0.5;
+        }
+    }
+
+    fn vector_bits(vectors: &[Vec<f64>]) -> Vec<Vec<u64>> {
+        vectors
+            .iter()
+            .map(|v| v.iter().map(|x| x.to_bits()).collect())
+            .collect()
+    }
+
+    fn position_bits(positions: &[[f64; 3]]) -> Vec<[u64; 3]> {
+        positions.iter().map(|p| p.map(f64::to_bits)).collect()
+    }
+
+    /// Scenes that turn and jitter, wide members among points, searched with
+    /// and without the dominant member and the dead band: the search ends
+    /// where it did, holding the vectors it did.
+    #[test]
+    fn keeping_the_winners_vector_searches_as_panning_it_again_did() {
+        let reference = Reference::new().unwrap();
+        let rows = reference.rows();
+        for search in [
+            Search::default(),
+            Search {
+                dominant: true,
+                holding: 0.0,
+                ..Search::default()
+            },
+            Search {
+                dominant: false,
+                ..Search::default()
+            },
+        ] {
+            let mut clusterer = Clusterer::new(8, Weighting::Fitted)
+                .unwrap()
+                .searching(Search::OFF);
+            let mut previous: Option<crate::Clustering> = None;
+            let mut moved = 0;
+            for block in 0..40 {
+                let objects: Vec<Object> = jittered(block, 3.0)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, object)| {
+                        let turn = (block as f64 * 2.0).to_radians();
+                        let (x, y) = (object.position[0], object.position[1]);
+                        Object {
+                            position: [
+                                x * turn.cos() + y * turn.sin(),
+                                y * turn.cos() - x * turn.sin(),
+                                (index % 4) as f64 * 0.3,
+                            ],
+                            size: match index % 6 {
+                                1 => 0.25,
+                                3 => -0.0,
+                                _ => 0.0,
+                            },
+                            energy: 1.0 + ((index * 7 + block) % 5) as f64,
+                            ..object
+                        }
+                    })
+                    .collect();
+                let targets: Vec<Vec<f64>> = objects
+                    .iter()
+                    .map(|object| {
+                        let mut out = Vec::new();
+                        reference.radiated(object.position, object.size, &mut out);
+                        out
+                    })
+                    .collect();
+                let start = clusterer.cluster(&objects, previous.as_ref()).unwrap();
+                let live: Vec<usize> = (0..start.elements())
+                    .filter(|element| start.owners.contains(element))
+                    .collect();
+                let radiated: Vec<Vec<f64>> = live
+                    .iter()
+                    .map(|element| {
+                        let mut out = Vec::new();
+                        reference.radiated(start.positions[*element], 0.0, &mut out);
+                        out
+                    })
+                    .collect();
+                let (mut new, mut new_radiated) = (start.clone(), radiated.clone());
+                let (mut old, mut old_radiated) = (start.clone(), radiated);
+                refine(
+                    &mut new,
+                    &objects,
+                    &live,
+                    &reference,
+                    &targets,
+                    &mut new_radiated,
+                    previous.as_ref(),
+                    search,
+                    &mut Scratch::default(),
+                );
+                refine_as_it_was(
+                    &mut old,
+                    &objects,
+                    &live,
+                    &reference,
+                    &targets,
+                    &mut old_radiated,
+                    previous.as_ref(),
+                    search,
+                    &mut Scratch::default(),
+                );
+                assert_eq!(position_bits(&new.positions), position_bits(&old.positions));
+                assert_eq!(vector_bits(&new_radiated), vector_bits(&old_radiated));
+                assert!(new_radiated.iter().all(|v| v.len() == rows));
+                moved += new
+                    .positions
+                    .iter()
+                    .zip(&start.positions)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                previous = Some(new);
+            }
+            assert!(moved > 0, "the search moved something");
+        }
+    }
 
     /// A ring of objects at fixed places, each displaced by a small angle a
     /// block. Nothing moves, so anything the elements do is the fold

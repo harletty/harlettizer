@@ -658,6 +658,85 @@ mod tests {
         }
     }
 
+    /// More objects than elements: the fold, read and placed on a lane of
+    /// its own a unit ahead and mixed on the loop's, writes what one thread
+    /// writes — whole, cut short by `--frames` mid-unit, and with audio that
+    /// ends before its header says, where it stops with the same error and
+    /// the same units left.
+    #[test]
+    fn a_fold_on_a_lane_of_its_own_writes_what_one_thread_writes() {
+        let dir = fixtures::scratch("iamf", "fold");
+        let input = fixtures::master_of(&dir, SAMPLES, 7);
+        let fold = |out: PathBuf, codec: Codec, frame: usize, frames: Option<u64>, threads| {
+            let config = Config {
+                input: input.clone(),
+                out,
+                frames,
+                mono_prefix: None,
+                codec,
+                bits: 24,
+                frame,
+                headphones: Headphones::Stereo,
+                progress: false,
+                objects: Some(PositionKind::Cart16),
+                elements: Some(4),
+                overlay: None,
+                voices_to_bed: None,
+                overlaying: overlay::Options::default(),
+                mixing: Mixing::default(),
+            };
+            run_on(config, threads).map_err(|e| e.to_string())
+        };
+        let mut codecs = vec![(Codec::Flac, 1024), (Codec::Lpcm, 2048)];
+        if cfg!(feature = "opus") {
+            codecs.push((Codec::Opus { bitrate: 64_000 }, OPUS_FRAME));
+        }
+        let mut runs = Vec::new();
+        for (n, &(codec, frame)) in codecs.iter().enumerate() {
+            for frames in [None, Some(5 * 1024 + 77)] {
+                let made = [false, true].map(|threads| {
+                    let out = dir.join(format!("fold-{n}-{frames:?}-{threads}.iamf"));
+                    let ended = fold(out.clone(), codec, frame, frames, threads);
+                    (ended, std::fs::read(&out).unwrap())
+                });
+                assert_eq!(made[0].0, Ok(()), "{codec:?} {frames:?}");
+                assert_eq!(made[1].0, Ok(()), "{codec:?} {frames:?}");
+                assert!(
+                    made[0].1 == made[1].1,
+                    "{codec:?} {frames:?}: the same sequence"
+                );
+                runs.push(made[0].1.len());
+            }
+        }
+        assert!(runs.iter().all(|&len| len > 0));
+
+        // Cut in the sixth unit of 1024.
+        const CUT: usize = 5 * 1024 + 300;
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        let missing = ((SAMPLES - CUT) * 15 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        let alone = dir.join("cut-false.iamf");
+        let inline = fold(alone.clone(), Codec::Flac, 1024, None, false);
+        assert!(inline.is_err(), "the read fails");
+        let alone = std::fs::read(&alone).unwrap();
+        assert!(units(&alone) > 0, "the units before it written");
+        for run in 0..8 {
+            let beside = dir.join("cut-true.iamf");
+            let threaded = fold(beside.clone(), Codec::Flac, 1024, None, true);
+            assert_eq!(threaded, inline, "run {run}: said the same way");
+            assert!(
+                alone == std::fs::read(&beside).unwrap(),
+                "run {run}: the same units left"
+            );
+        }
+    }
+
     /// Audio that ends before its header says, in the sixth unit of 1024:
     /// the encode stops there with the same error, on threads or not, and
     /// leaves the same units — the five read whole.

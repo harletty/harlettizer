@@ -54,11 +54,12 @@
 
 use crate::iamf::{self, Config, Measure, Measurer, Measuring, Output};
 use crate::lane::{LANE_DEPTH, Lane, Stage};
+use hz_cluster::Clustering;
 use hz_cluster::scene::Source as SceneSource;
 use hz_core::{Error, Result, speakers};
 use hz_iamf::{Animation, Element, PositionBlock, PositionKind, Subblock};
 use hz_io::container::SampleFormat;
-use hz_programme::fold::{Folder, Member};
+use hz_programme::fold::{Folder, Member, Mix, Reader};
 use hz_programme::follow::Following;
 use hz_programme::mix::{Mixer, Mixing};
 use hz_programme::overlay::{self, Overlaid};
@@ -1290,15 +1291,42 @@ impl Pending {
 /// ([`Folder`]), and hands the folded frames out a unit at a time. The mix's
 /// options are the command's: the dialnorm's floor, the weighing, the
 /// headroom rule, and the depth the mixed elements are rounded to.
+///
+/// Three parts: the reading of the master ([`Reading`]), each block's
+/// members gained and weighed on a lane of its own a few blocks ahead; the
+/// placing ([`Fold`]), each block's elements placed on a lane of its own a
+/// unit ahead ([`Ahead`]); and the mix and the coding of each block placed
+/// ([`Coding`]), on the loop's thread. None looks at another's state: each
+/// takes what the one before hands it, in order, so each makes what it made
+/// when one thread did all three a block at a time.
 struct Folding {
-    bed: BedFill,
+    fold: Fold,
+    coding: Coding,
+}
+
+/// The placing: each block read taken in, and its elements placed once the
+/// blocks its window reaches ahead are in.
+struct Fold {
     /// The fold, each block carrying the master's samples it was read from,
-    /// which the bed element is filled from once it is folded.
+    /// which the bed element is filled from once it is mixed. Its reading is
+    /// apart from it, in [`Reading`], and its mix in [`Coding`].
     folder: Folder<Vec<i32>>,
-    /// Samples a block, and samples read from the master.
+    /// Samples a block.
     block: usize,
-    at: u64,
     exhausted: bool,
+    /// Frames placed and not yet handed out.
+    waiting: usize,
+}
+
+/// A block of the master as it was read, with its samples for the bed.
+type ReadBlock = hz_programme::fold::Block<Vec<i32>>;
+
+/// The mix and the coding: each block placed mixed into the fold's elements,
+/// and every element coded into frames — the bed's from the master's
+/// samples, the fold's from its mix — and handed out a unit at a time.
+struct Coding {
+    mix: Mix,
+    bed: BedFill,
     pending: Pending,
     /// What a mixed sample is rounded to, in the codec's integers.
     mixed: Quantiser,
@@ -1317,54 +1345,58 @@ impl Folding {
         mixing: &Mixing,
         mixed: Quantiser,
     ) -> Result<Self> {
-        let folder = Folder::new(sources, count, f64::from(sample_rate), mixing)
+        let mut folder = Folder::new(sources, count, f64::from(sample_rate), mixing)
+            .map_err(|why| Error::unsupported(path, why.to_string()))?;
+        let mix = folder
+            .mix_apart()
             .map_err(|why| Error::unsupported(path, why.to_string()))?;
         Ok(Self {
-            bed,
-            folder,
-            block,
-            at: 0,
-            exhausted: false,
-            pending: Pending::new(width),
-            mixed,
+            fold: Fold {
+                folder,
+                block,
+                exhausted: false,
+                waiting: 0,
+            },
+            coding: Coding {
+                mix,
+                bed,
+                pending: Pending::new(width),
+                mixed,
+            },
         })
     }
+}
 
-    /// Up to `want` frames of every element into `q`: as many blocks read and
-    /// folded as it takes, the rest held for the next unit. Fewer only at the
-    /// end.
-    #[allow(clippy::too_many_arguments)]
+impl Fold {
+    /// As many blocks read and placed as it takes for `want` frames to be
+    /// waiting, each placed block onto `out` with its placement: how many of
+    /// those waiting are the unit's, `want`, fewer only at the end; the rest
+    /// are held for the next unit.
     fn fill(
         &mut self,
-        source: &mut Source,
+        reads: &mut Reads,
         want: usize,
-        scale: &Scale,
-        q: &mut [i32],
-        carried: &mut [Carried],
-        account: &mut Account,
+        out: &mut Vec<(ReadBlock, Clustering)>,
     ) -> Result<usize> {
-        let stride = source.channels();
-        while self.pending.count < want {
+        while self.waiting < want {
             if !self.exhausted {
-                self.read_block(source, stride, scale)?;
+                self.read_block(reads)?;
             }
-            // A block is folded once the blocks its window reaches ahead are
+            // A block is placed once the blocks its window reaches ahead are
             // in, or there are no more to come.
-            if (self.folder.ready() || self.exhausted)
-                && !self.fold(stride, scale, carried, account)?
-            {
+            if (self.folder.ready() || self.exhausted) && !self.place(out)? {
                 break;
             }
         }
-        Ok(self.pending.take(want, q))
+        let got = want.min(self.waiting);
+        self.waiting -= got;
+        Ok(got)
     }
 
-    /// Read the next block, whole whatever `--frames` says, and record what
-    /// it weighs.
-    fn read_block(&mut self, source: &mut Source, stride: usize, scale: &Scale) -> Result<()> {
-        let mut block = self.folder.block();
-        block.carry.resize(self.block * stride, 0);
-        let frames = source.fill(&mut block.carry, self.block)?;
+    /// Take the next block read, whole whatever `--frames` says, and record
+    /// what it weighs.
+    fn read_block(&mut self, reads: &mut Reads) -> Result<()> {
+        let (block, frames) = reads.next(&mut self.folder, self.block)?;
         if frames < self.block {
             self.exhausted = true;
         }
@@ -1372,34 +1404,47 @@ impl Folding {
             self.folder.recycle(block);
             return Ok(());
         }
-        let input = scale.input;
-        self.folder.read(
-            block,
-            self.at as i64,
-            frames,
-            |raw: &Vec<i32>, n, channel| f64::from(raw[n * stride + channel]) * input,
-        );
-        self.at += frames as u64;
+        self.folder.take(block);
         Ok(())
     }
 
-    /// Fold the oldest block read into the frames waiting to be handed out,
-    /// and append each element's place at its end to its history: whether
-    /// there was one.
-    fn fold(
-        &mut self,
-        stride: usize,
-        scale: &Scale,
-        carried: &mut [Carried],
-        account: &mut Account,
-    ) -> Result<bool> {
-        let Some(read) = self
+    /// Place the oldest block read, and hand it out onto `out` with its
+    /// placement: whether there was one.
+    fn place(&mut self, out: &mut Vec<(ReadBlock, Clustering)>) -> Result<bool> {
+        let Some(placed) = self
             .folder
-            .fold(scale.output.ceiling())
+            .place()
             .map_err(|why| Error::unsupported(std::path::Path::new("the fold"), why.to_string()))?
         else {
             return Ok(false);
         };
+        self.waiting += placed.0.frames;
+        out.push(placed);
+        Ok(true)
+    }
+
+    /// Blocks handed out and done with, back for the next ones to be read
+    /// into.
+    fn recycle(&mut self, done: &mut Vec<ReadBlock>) {
+        for block in done.drain(..) {
+            self.folder.recycle(block);
+        }
+    }
+}
+
+impl Coding {
+    /// A placed block mixed, and its frames onto those waiting to be handed
+    /// out: the bed element filled from the master's samples it was read
+    /// with, and the fold's elements from the mix.
+    fn code(
+        &mut self,
+        read: &mut ReadBlock,
+        clustering: Clustering,
+        stride: usize,
+        scale: &Scale,
+        account: &mut Account,
+    ) {
+        self.mix.mix(read, clustering, scale.output.ceiling());
         let frames = read.frames;
         let width = self.pending.width;
         let first = self.bed.width;
@@ -1414,21 +1459,12 @@ impl Folding {
             width,
             account,
         );
-        for (element, signal) in self.folder.mixer.mixed.iter().enumerate() {
+        for (element, signal) in self.mix.mixer.mixed.iter().enumerate() {
             for n in 0..frames {
                 out[n * width + first + element] =
                     self.mixed.code(f64::from(signal[n]), &mut account.levels);
             }
         }
-        // Where each element is going, for the blocks and the measurement,
-        // which ramp there across the block.
-        for (element, at_end) in self.folder.positions().iter().enumerate() {
-            if let Placement::Folded(folded) = &mut carried[element].placement {
-                folded.history.push(*at_end);
-            }
-        }
-        self.folder.recycle(read);
-        Ok(true)
     }
 }
 
@@ -1632,7 +1668,8 @@ impl Overlay {
 enum Feed {
     /// The bed element and every object as it is.
     Direct(BedFill),
-    /// The bed element, and the objects folded into the object elements.
+    /// The bed element, and the objects folded into the object elements: on
+    /// a lane of its own ([`Ahead`]).
     Folded(Box<Folding>),
     /// The master's elements kept, its last few objects panned onto them.
     Overlaid(Box<Overlay>),
@@ -1640,7 +1677,8 @@ enum Feed {
 
 impl Feed {
     /// Up to `want` frames of every element into `q`, `width` a frame, from
-    /// sample `at`: how many, fewer only at the end.
+    /// sample `at`: how many, fewer only at the end. A fold fills through
+    /// [`Ahead`].
     #[allow(clippy::too_many_arguments)]
     fn fill(
         &mut self,
@@ -1659,7 +1697,7 @@ impl Feed {
             Self::Overlaid(overlay) => {
                 return overlay.fill(source, stride, want, scale, q, account);
             }
-            Self::Folded(folding) => return folding.fill(source, want, scale, q, carried, account),
+            Self::Folded(_) => unreachable!("a fold fills on its own lane"),
             Self::Direct(_) => {}
         }
         raw.resize(want * stride, 0);
@@ -1695,6 +1733,293 @@ impl Feed {
                 Ok(got)
             }
             Self::Folded(_) | Self::Overlaid(_) => unreachable!("handed out above"),
+        }
+    }
+}
+
+/// The master read a block at a time, each block's members gained and
+/// weighed as the fold reads them ([`Reader::read`]), as a [`Stage`]: the
+/// block to read into, and the block read and its frames back, or the
+/// failure the read met.
+struct Reading {
+    reader: Reader,
+    source: Source,
+    /// Samples a block, channels a frame of the master, and what scales them.
+    block: usize,
+    stride: usize,
+    input: f64,
+    /// Samples read from the master.
+    at: u64,
+}
+
+impl Stage for Reading {
+    type In = ReadBlock;
+    type Out = Result<(ReadBlock, usize)>;
+
+    fn run(&mut self, mut block: ReadBlock) -> Result<(ReadBlock, usize)> {
+        let stride = self.stride;
+        block.carry.resize(self.block * stride, 0);
+        let frames = self.source.fill(&mut block.carry, self.block)?;
+        if frames > 0 {
+            let input = self.input;
+            self.reader.read(
+                &mut block,
+                self.at as i64,
+                frames,
+                |raw: &Vec<i32>, n, channel| f64::from(raw[n * stride + channel]) * input,
+            );
+            self.at += frames as u64;
+        }
+        Ok((block, frames))
+    }
+}
+
+/// The reading on a thread of its own where one can be started ([`Lane`]),
+/// the blocks after the one the fold takes read while it places: asked for
+/// ahead only after a block read whole — when the fold reads on — so each
+/// block it takes is the one it would have read next, a failure met where
+/// it takes the block that met it. A block asked for that the fold never
+/// takes is a read that changes nothing. Where no thread can be started, each
+/// block is read when the fold takes it, as it was.
+struct Reads {
+    lane: Lane<Reading>,
+    /// Blocks asked for and not yet taken.
+    asked: usize,
+}
+
+impl Reads {
+    /// The next block read, from `folder`'s blocks to read into, and its
+    /// frames, `block` a block whole.
+    fn next(&mut self, folder: &mut Folder<Vec<i32>>, block: usize) -> Result<(ReadBlock, usize)> {
+        if self.asked == 0 {
+            self.lane.send(folder.block());
+            self.asked += 1;
+        }
+        let read = self.lane.recv();
+        self.asked -= 1;
+        if matches!(read, Ok((_, frames)) if frames == block)
+            && matches!(self.lane, Lane::Thread { .. })
+        {
+            while self.asked < LANE_DEPTH {
+                self.lane.send(folder.block());
+                self.asked += 1;
+            }
+        }
+        read
+    }
+}
+
+/// The fold's placing, and the reading it takes its blocks from, as a
+/// [`Stage`]: a unit's blocks placed as [`Fold::fill`] places them.
+struct Placing {
+    fold: Fold,
+    reads: Reads,
+}
+
+/// A unit for the fold: how many frames it wants; the blocks handed out
+/// before that the loop is done with; and room for the ones it places.
+struct Ask {
+    want: usize,
+    done: Vec<ReadBlock>,
+    room: Vec<(ReadBlock, Clustering)>,
+}
+
+/// A unit the fold placed: how many frames of it are the unit's, or the
+/// failure the fold met; the blocks it placed, in order, the ones before a
+/// failure among them; and the room the loop's blocks were handed back in.
+struct Filled {
+    got: Result<usize>,
+    placed: Vec<(ReadBlock, Clustering)>,
+    done: Vec<ReadBlock>,
+}
+
+impl Stage for Placing {
+    type In = Ask;
+    type Out = Filled;
+
+    fn run(&mut self, ask: Ask) -> Filled {
+        let Ask {
+            want,
+            mut done,
+            mut room,
+        } = ask;
+        self.fold.recycle(&mut done);
+        let got = self.fold.fill(&mut self.reads, want, &mut room);
+        Filled {
+            got,
+            placed: room,
+            done,
+        }
+    }
+}
+
+/// The fold on a thread of its own where one can be started ([`Lane`]), a
+/// unit ahead of the rest of the feed: the next unit is read and folded
+/// while this one is coded, written and measured, as the E-AC-3 encode folds
+/// a frame ahead of its coder. The fold makes its units in order, each the
+/// frames it is asked for, and the loop codes each unit's blocks in order
+/// ([`Coding`]) and puts where each put the elements onto their histories
+/// before the unit is looked at: what a single thread has made by then. A
+/// unit is only asked for ahead when the one before was whole and not the
+/// last, so it is the one the loop wants next; and a failure is met when the
+/// loop takes the unit that met it, after the blocks folded before it are
+/// coded, where a single thread meets it. Where no thread can be started,
+/// each unit is asked for when the loop wants it, and folded there and then.
+struct Ahead {
+    lane: Lane<Placing>,
+    coding: Coding,
+    /// Channels a frame of the master.
+    stride: usize,
+    /// The unit asked for ahead of its turn, by the frames it wants.
+    asked: Option<usize>,
+    /// The blocks the last unit was made of, to hand back with the next ask,
+    /// and room for the next unit's.
+    done: Vec<ReadBlock>,
+    room: Vec<(ReadBlock, Clustering)>,
+    frame: usize,
+}
+
+impl Ahead {
+    fn ask(&mut self, want: usize) {
+        let done = std::mem::take(&mut self.done);
+        let room = std::mem::take(&mut self.room);
+        self.lane.send(Ask { want, done, room });
+    }
+
+    /// Up to `want` frames of every element from sample `at`, of the `total`
+    /// the run writes, into `q`, and where the fold put the elements onto
+    /// their histories in `carried`: how many, fewer only at the end. Then
+    /// the next unit asked for, when the fold has a thread of its own and
+    /// there is one.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        want: usize,
+        at: u64,
+        total: u64,
+        scale: &Scale,
+        q: &mut [i32],
+        carried: &mut [Carried],
+        account: &mut Account,
+    ) -> Result<usize> {
+        match self.asked.take() {
+            Some(asked) => assert_eq!(asked, want, "the unit asked for ahead is the one wanted"),
+            None => self.ask(want),
+        }
+        let Filled {
+            got,
+            mut placed,
+            mut done,
+        } = self.lane.recv();
+        for (mut block, clustering) in placed.drain(..) {
+            // Where each element is going, for the blocks and the
+            // measurement, which ramp there across the block.
+            for (element, at_end) in clustering.positions.iter().enumerate() {
+                if let Placement::Folded(folded) = &mut carried[element].placement {
+                    folded.history.push(*at_end);
+                }
+            }
+            self.coding
+                .code(&mut block, clustering, self.stride, scale, account);
+            done.push(block);
+        }
+        (self.done, self.room) = (done, placed);
+        let got = got?;
+        assert_eq!(
+            self.coding.pending.take(want, q),
+            got,
+            "the frames coded are the ones folded"
+        );
+        let next = at + got as u64;
+        if got == want && next < total && matches!(self.lane, Lane::Thread { .. }) {
+            let want = (total - next).min(self.frame as u64) as usize;
+            self.ask(want);
+            self.asked = Some(want);
+        }
+        Ok(got)
+    }
+
+    /// The fold back, its thread ended. Its reading is let go of, a block
+    /// it was asked for ahead and never taken still being read, perhaps.
+    fn finish(self) -> Folding {
+        Folding {
+            fold: self.lane.into_stage().fold,
+            coding: self.coding,
+        }
+    }
+}
+
+/// The feed as the loop takes its units from: on the loop's own thread, or
+/// a fold on a lane of its own ([`Ahead`]), the master with it.
+enum Filling {
+    Here(Box<(Feed, Source)>),
+    Ahead(Box<Ahead>),
+}
+
+impl Filling {
+    fn new(feed: Feed, source: Source, scale: Scale, frame: usize, threads: bool) -> Self {
+        match feed {
+            Feed::Folded(folding) => {
+                let Folding { mut fold, coding } = *folding;
+                let stride = source.channels();
+                let reading = Reading {
+                    reader: fold.folder.read_apart(),
+                    source,
+                    block: fold.block,
+                    stride,
+                    input: scale.input,
+                    at: 0,
+                };
+                let placing = Placing {
+                    fold,
+                    reads: Reads {
+                        lane: Lane::new(reading, "iamf-read", threads),
+                        asked: 0,
+                    },
+                };
+                Self::Ahead(Box::new(Ahead {
+                    lane: Lane::new(placing, "iamf-fold", threads),
+                    coding,
+                    stride,
+                    asked: None,
+                    done: Vec::new(),
+                    room: Vec::new(),
+                    frame,
+                }))
+            }
+            feed => Self::Here(Box::new((feed, source))),
+        }
+    }
+
+    /// [`Feed::fill`] for the unit from sample `at`, of the `total` the run
+    /// writes.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        raw: &mut Vec<i32>,
+        want: usize,
+        at: u64,
+        total: u64,
+        scale: &Scale,
+        q: &mut [i32],
+        width: usize,
+        carried: &mut [Carried],
+        account: &mut Account,
+    ) -> Result<usize> {
+        match self {
+            Self::Here(here) => {
+                let (feed, source) = &mut **here;
+                feed.fill(source, raw, want, at, scale, q, width, carried, account)
+            }
+            Self::Ahead(ahead) => ahead.fill(want, at, total, scale, q, carried, account),
+        }
+    }
+
+    /// The feed, for the summary, once every unit is filled.
+    fn finish(self) -> Feed {
+        match self {
+            Self::Here(here) => here.0,
+            Self::Ahead(ahead) => Feed::Folded(Box::new(ahead.finish())),
         }
     }
 }
@@ -1830,12 +2155,12 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let Drive {
         config,
         kind,
-        mut source,
+        source,
         elements,
         bed_width,
         bed,
         mut carried,
-        mut feed,
+        feed,
         programme,
         lines,
         overlay: overlay_summary,
@@ -1934,6 +2259,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
     let mut progress = Progress::new(config.progress, total);
 
     let mut raw = Vec::with_capacity(frame * source.channels());
+    let mut filling = Filling::new(feed, source, scale, frame, threads);
     let mut input = vec![0f32; frame * width];
     let mut rendered = vec![0f64; frame * layout.channels()];
     let mut account = Account::default();
@@ -1976,11 +2302,11 @@ fn drive(job: Drive<'_>) -> Result<()> {
                 // written.
                 let mut unit = spare.pop().unwrap_or_else(|| writing.recv());
                 let want = (total - at).min(frame as u64) as usize;
-                let got = feed.fill(
-                    &mut source,
+                let got = filling.fill(
                     &mut raw,
                     want,
                     at,
+                    total,
                     &scale,
                     &mut unit.samples,
                     width,
@@ -2164,6 +2490,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
     if at == 0 {
         return Err(Error::unsupported(path, "no audio to encode"));
     }
+    let feed = filling.finish();
 
     let Measuring { whole, dialogue } = measurer.finish();
     let loudness = whole.finish();
@@ -2203,30 +2530,30 @@ fn drive(job: Drive<'_>) -> Result<()> {
     match &feed {
         Feed::Direct(_) => {}
         Feed::Folded(folding) => {
-            let smoothing = folding.folder.placer.smoothing();
+            let smoothing = folding.fold.folder.placer.smoothing();
             println!(
                 "  fold         {:.4} mean over the presentations, {:.3} at its worst, as a \
                  fraction of the object's own gains; blocks of {}, steadied by a hold over {} \
                  behind and {} ahead",
-                folding.folder.mixer.cost.mean(),
-                folding.folder.mixer.cost.worst,
-                folding.block,
+                folding.coding.mix.mixer.cost.mean(),
+                folding.coding.mix.mixer.cost.worst,
+                folding.fold.block,
                 smoothing.behind,
                 smoothing.ahead
             );
             println!(
                 "  floor        {:.1} dBFS at the playback level a dialnorm of {:.0} implies, \
                  {:.2} objects a block under it",
-                folding.folder.mixer.floor.threshold_dbfs(),
+                folding.coding.mix.mixer.floor.threshold_dbfs(),
                 config.mixing.dialnorm,
-                folding.folder.mixer.cost.inaudible as f64
-                    / folding.folder.mixer.cost.blocks.max(1) as f64
+                folding.coding.mix.mixer.cost.inaudible as f64
+                    / folding.coding.mix.mixer.cost.blocks.max(1) as f64
             );
             println!(
                 "  headroom     {} blocks where an element's coherent peak was bounded in the \
                  fit, {}; the elements rounded to {} bits",
-                folding.folder.placer.bounded(),
-                match &folding.folder.mixer.limiter {
+                folding.fold.folder.placer.bounded(),
+                match &folding.coding.mix.mixer.limiter {
                     Some(limiter) => format!(
                         "{} where the limiter brought every element down, the mix peaking at \
                          {:.2} of full scale before it",
@@ -2234,7 +2561,7 @@ fn drive(job: Drive<'_>) -> Result<()> {
                     ),
                     None => "no limiter".to_string(),
                 },
-                config.bits - folding.mixed.step().log2() as u32
+                config.bits - folding.coding.mixed.step().log2() as u32
             );
         }
         Feed::Overlaid(overlay) => {

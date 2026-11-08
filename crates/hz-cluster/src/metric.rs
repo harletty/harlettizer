@@ -30,6 +30,7 @@
 use crate::floor::Floor;
 use crate::{Clustering, Object};
 use hz_core::Result;
+use hz_render::fold::Renders;
 use hz_render::{Layout, ObjectFold, Panner, Renderer};
 
 /// The presentations a delivery stream is actually played through.
@@ -138,8 +139,16 @@ pub fn error_with(
     floor: &Floor,
 ) -> Result<Report> {
     let mut layouts = Vec::with_capacity(renderers.len());
+    // Each object's and each element's 7.1 render, made once for every fold.
+    let mut renders = Gains::new(objects, clustering);
     for renderer in renderers {
-        layouts.push(one(objects, clustering, renderer.as_ref(), floor)?);
+        layouts.push(one(
+            objects,
+            clustering,
+            renderer.as_ref(),
+            floor,
+            &mut renders,
+        )?);
     }
     let inaudible = objects
         .iter()
@@ -176,16 +185,75 @@ pub fn error_with(
     })
 }
 
+/// Every object's and every element's gains on one presentation, made once
+/// for all that is measured on it, and their 7.1 renders kept from one fold
+/// of the set to the next ([`Renders`]).
+struct Gains<'a> {
+    objects: Vec<Renders<'a>>,
+    elements: Vec<Renders<'a>>,
+    /// Per object, its gain vector, `channels` long.
+    wanted: Vec<f64>,
+    /// Per element, its gain vector; zero for an element with no position.
+    element_gains: Vec<Vec<f64>>,
+    channels: usize,
+}
+
+impl<'a> Gains<'a> {
+    fn new(objects: &[Object], clustering: &Clustering) -> Self {
+        Self {
+            objects: vec![Renders::default(); objects.len()],
+            elements: vec![Renders::default(); clustering.elements()],
+            wanted: Vec::new(),
+            element_gains: Vec::new(),
+            channels: 0,
+        }
+    }
+
+    /// The gains on `renderer`: each object's at its position, with its size,
+    /// and each element's at its own, as a point.
+    fn on(&mut self, objects: &[Object], clustering: &Clustering, renderer: &'a dyn Renderer) {
+        let channels = renderer.channels();
+        self.channels = channels;
+        self.element_gains.clear();
+        self.element_gains
+            .resize_with(clustering.elements(), || vec![0.0f64; channels]);
+        for ((position, gains), renders) in clustering
+            .positions
+            .iter()
+            .zip(&mut self.element_gains)
+            .zip(&mut self.elements)
+        {
+            renders.gains(renderer, *position, 0.0, gains);
+        }
+        self.wanted.clear();
+        self.wanted.resize(objects.len() * channels, 0.0);
+        for ((object, wanted), renders) in objects
+            .iter()
+            .zip(self.wanted.chunks_exact_mut(channels.max(1)))
+            .zip(&mut self.objects)
+        {
+            renders.gains(renderer, object.position, object.size, wanted);
+        }
+    }
+
+    /// Object `index`'s gain vector.
+    fn wanted(&self, index: usize) -> &[f64] {
+        &self.wanted[index * self.channels..(index + 1) * self.channels]
+    }
+}
+
 /// One presentation's figures.
-fn one(
+fn one<'a>(
     objects: &[Object],
     clustering: &Clustering,
-    renderer: &dyn Renderer,
+    renderer: &'a dyn Renderer,
     floor: &Floor,
+    gains: &mut Gains<'a>,
 ) -> Result<Layer> {
-    let each = errors(objects, clustering, renderer)?;
-    let levels = levels(objects, clustering, renderer)?;
-    let own = own_norms(objects, renderer);
+    gains.on(objects, clustering, renderer);
+    let each = errors_of(objects, clustering, gains);
+    let levels = levels_of(objects, clustering, gains);
+    let own = own_norms_of(objects, gains);
 
     let mut weighted = 0.0;
     let mut weighted_level = 0.0;
@@ -244,6 +312,20 @@ pub fn own_norms(objects: &[Object], renderer: &dyn Renderer) -> Vec<f64> {
         .collect()
 }
 
+/// [`own_norms`], from the gains made once.
+fn own_norms_of(objects: &[Object], gains: &Gains<'_>) -> Vec<f64> {
+    (0..objects.len())
+        .map(|index| {
+            gains
+                .wanted(index)
+                .iter()
+                .map(|g| g * g)
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect()
+}
+
 /// How far below the loudest object something has to be before where it lands
 /// stops counting towards the worst case.
 ///
@@ -272,22 +354,14 @@ pub fn own_norms(objects: &[Object], renderer: &dyn Renderer) -> Vec<f64> {
 pub const AUDIBLE_FLOOR: f64 = 1e-4;
 
 /// How loud each object comes out against how loud it was, as rendered.
-fn levels(
-    objects: &[Object],
-    clustering: &Clustering,
-    renderer: &dyn Renderer,
-) -> Result<Vec<f64>> {
-    let channels = renderer.channels();
-    let mut element_gains = vec![vec![0.0f64; channels]; clustering.elements()];
-    for (position, gains) in clustering.positions.iter().zip(&mut element_gains) {
-        renderer.gains(*position, 0.0, gains);
-    }
+fn levels_of(objects: &[Object], clustering: &Clustering, gains: &Gains<'_>) -> Vec<f64> {
+    let channels = gains.channels;
+    let element_gains = &gains.element_gains;
 
-    let mut wanted = vec![0.0f64; channels];
     let mut got = vec![0.0f64; channels];
     let mut out = Vec::with_capacity(objects.len());
-    for (index, object) in objects.iter().enumerate() {
-        renderer.gains(object.position, object.size, &mut wanted);
+    for index in 0..objects.len() {
+        let wanted = gains.wanted(index);
         got.fill(0.0);
         for (element, weight) in clustering.weights[index].iter().enumerate() {
             if *weight == 0.0 {
@@ -301,7 +375,7 @@ fn levels(
         let asked: f64 = wanted.iter().map(|v| v * v).sum::<f64>().sqrt();
         out.push(if asked > 1e-12 { reached / asked } else { 1.0 });
     }
-    Ok(out)
+    out
 }
 
 /// The same measurement, per object, before it is summarised.
@@ -315,26 +389,28 @@ pub fn errors(
     clustering: &Clustering,
     renderer: &dyn Renderer,
 ) -> Result<Vec<f64>> {
-    let channels = renderer.channels();
+    let mut gains = Gains::new(objects, clustering);
+    gains.on(objects, clustering, renderer);
+    Ok(errors_of(objects, clustering, &gains))
+}
 
+/// [`errors`], from the gains made once.
+fn errors_of(objects: &[Object], clustering: &Clustering, gains: &Gains<'_>) -> Vec<f64> {
+    let channels = gains.channels;
     // Every element's gain vector, once: they are the same for every object.
-    let mut element_gains = vec![vec![0.0f64; channels]; clustering.elements()];
-    for (position, gains) in clustering.positions.iter().zip(&mut element_gains) {
-        renderer.gains(*position, 0.0, gains);
-    }
+    let element_gains = &gains.element_gains;
 
-    let mut wanted = vec![0.0f64; channels];
     let mut got = vec![0.0f64; channels];
     let mut each = Vec::with_capacity(objects.len());
 
-    for (index, object) in objects.iter().enumerate() {
+    for index in 0..objects.len() {
         // The object as the mix made it, **with its size**; the elements as
         // point sources, because the output will not carry one. Panning both
         // as points would make a fold that flattens a wide object look free,
         // which is the one thing this has to be able to see. A fold ignores
         // the size on both sides, so a width is seen only on the presentation
         // that is rendered.
-        renderer.gains(object.position, object.size, &mut wanted);
+        let wanted = gains.wanted(index);
 
         got.fill(0.0);
         let weights = &clustering.weights[index];
@@ -362,5 +438,252 @@ pub fn errors(
         });
     }
 
-    Ok(each)
+    each
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Clusterer, Weighting};
+
+    /// One presentation's figures as they were made before the gains were
+    /// made once: every object panned three times and every element twice.
+    /// The oracle [`error_with`] is held to, to the bit.
+    mod as_it_was {
+        use super::super::*;
+
+        pub fn error_with(
+            objects: &[Object],
+            clustering: &Clustering,
+            renderers: &[Box<dyn Renderer>],
+            floor: &Floor,
+        ) -> Report {
+            let mut layouts = Vec::new();
+            for renderer in renderers {
+                layouts.push(one(objects, clustering, renderer.as_ref(), floor));
+            }
+            let inaudible = objects
+                .iter()
+                .filter(|object| !floor.heard(object.energy.max(0.0)))
+                .count();
+            let mut paths = 0usize;
+            let mut worst_paths = 0usize;
+            for row in &clustering.weights {
+                let reached = row.iter().filter(|weight| **weight != 0.0).count();
+                paths += reached;
+                worst_paths = worst_paths.max(reached);
+            }
+            let paths = if clustering.weights.is_empty() {
+                0.0
+            } else {
+                paths as f64 / clustering.weights.len() as f64
+            };
+            let count = layouts.len().max(1) as f64;
+            let mean = layouts.iter().map(|layer| layer.mean).sum::<f64>() / count;
+            let energy = layouts.iter().map(|layer| layer.energy).sum::<f64>() / count;
+            let worst = layouts.iter().fold(0.0f64, |m, layer| m.max(layer.worst));
+            Report {
+                mean,
+                worst,
+                energy,
+                objects: objects.len(),
+                inaudible,
+                paths,
+                worst_paths,
+                layouts,
+            }
+        }
+
+        fn one(
+            objects: &[Object],
+            clustering: &Clustering,
+            renderer: &dyn Renderer,
+            floor: &Floor,
+        ) -> Layer {
+            let each = errors(objects, clustering, renderer);
+            let levels = levels(objects, clustering, renderer);
+            let own = own_norms(objects, renderer);
+            let mut weighted = 0.0;
+            let mut weighted_level = 0.0;
+            let mut weighted_own = 0.0;
+            let mut total_energy = 0.0;
+            let mut worst: f64 = 0.0;
+            let loudest = objects
+                .iter()
+                .fold(0.0f64, |m, object| m.max(object.energy.max(0.0)));
+            for (((object, relative), level), own) in
+                objects.iter().zip(&each).zip(&levels).zip(&own)
+            {
+                let energy = object.energy.max(0.0);
+                weighted += energy * relative;
+                weighted_level += energy * level;
+                weighted_own += energy * own;
+                total_energy += energy;
+                if floor.audible(energy, loudest) {
+                    worst = worst.max(*relative);
+                }
+            }
+            Layer {
+                name: renderer.name().to_string(),
+                mean: if total_energy > 0.0 {
+                    weighted / total_energy
+                } else {
+                    0.0
+                },
+                worst,
+                energy: if total_energy > 0.0 {
+                    weighted_level / total_energy
+                } else {
+                    1.0
+                },
+                own: if total_energy > 0.0 {
+                    weighted_own / total_energy
+                } else {
+                    0.0
+                },
+            }
+        }
+
+        fn levels(
+            objects: &[Object],
+            clustering: &Clustering,
+            renderer: &dyn Renderer,
+        ) -> Vec<f64> {
+            let channels = renderer.channels();
+            let mut element_gains = vec![vec![0.0f64; channels]; clustering.elements()];
+            for (position, gains) in clustering.positions.iter().zip(&mut element_gains) {
+                renderer.gains(*position, 0.0, gains);
+            }
+            let mut wanted = vec![0.0f64; channels];
+            let mut got = vec![0.0f64; channels];
+            let mut out = Vec::with_capacity(objects.len());
+            for (index, object) in objects.iter().enumerate() {
+                renderer.gains(object.position, object.size, &mut wanted);
+                got.fill(0.0);
+                for (element, weight) in clustering.weights[index].iter().enumerate() {
+                    if *weight == 0.0 {
+                        continue;
+                    }
+                    for (channel, gain) in element_gains[element].iter().enumerate() {
+                        got[channel] += weight * gain;
+                    }
+                }
+                let reached: f64 = got.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let asked: f64 = wanted.iter().map(|v| v * v).sum::<f64>().sqrt();
+                out.push(if asked > 1e-12 { reached / asked } else { 1.0 });
+            }
+            out
+        }
+
+        pub fn errors(
+            objects: &[Object],
+            clustering: &Clustering,
+            renderer: &dyn Renderer,
+        ) -> Vec<f64> {
+            let channels = renderer.channels();
+            let mut element_gains = vec![vec![0.0f64; channels]; clustering.elements()];
+            for (position, gains) in clustering.positions.iter().zip(&mut element_gains) {
+                renderer.gains(*position, 0.0, gains);
+            }
+            let mut wanted = vec![0.0f64; channels];
+            let mut got = vec![0.0f64; channels];
+            let mut each = Vec::with_capacity(objects.len());
+            for (index, object) in objects.iter().enumerate() {
+                renderer.gains(object.position, object.size, &mut wanted);
+                got.fill(0.0);
+                let weights = &clustering.weights[index];
+                for (element, weight) in weights.iter().enumerate() {
+                    if *weight == 0.0 {
+                        continue;
+                    }
+                    for (channel, gain) in element_gains[element].iter().enumerate() {
+                        got[channel] += weight * gain;
+                    }
+                }
+                let mut difference = 0.0;
+                let mut reference = 0.0;
+                for (want, reached) in wanted.iter().zip(&got) {
+                    difference += (reached - want) * (reached - want);
+                    reference += want * want;
+                }
+                each.push(if reference > 1e-12 {
+                    (difference / reference).sqrt()
+                } else {
+                    0.0
+                });
+            }
+            each
+        }
+    }
+
+    fn report_bits(report: &Report) -> Vec<u64> {
+        let mut out = vec![
+            report.mean.to_bits(),
+            report.worst.to_bits(),
+            report.energy.to_bits(),
+            report.objects as u64,
+            report.inaudible as u64,
+            report.paths.to_bits(),
+            report.worst_paths as u64,
+        ];
+        for layer in &report.layouts {
+            out.extend([
+                layer.mean.to_bits(),
+                layer.worst.to_bits(),
+                layer.energy.to_bits(),
+                layer.own.to_bits(),
+            ]);
+        }
+        out
+    }
+
+    /// Scenes that move, with wide objects and silent ones among them, an
+    /// element at the same place as an object and a position on a fold's
+    /// grid: the figures are the ones the gains made three times over gave.
+    #[test]
+    fn the_gains_made_once_give_the_figures_they_gave_made_each_time() {
+        let renderers = delivery().unwrap();
+        let mut clusterer = Clusterer::new(9, Weighting::Fitted).unwrap();
+        let mut previous: Option<Clustering> = None;
+        for block in 0..30 {
+            let objects: Vec<Object> = (0..20)
+                .map(|index| {
+                    let angle = index as f64 * 0.7 + block as f64 * 0.05;
+                    let position = match index {
+                        0 => [0.0, 1.0, 0.0],
+                        1 => [-1.0, -0.0, 1.0],
+                        _ => [angle.sin(), angle.cos(), (index % 3) as f64 * 0.4],
+                    };
+                    Object {
+                        position,
+                        energy: if index == 4 {
+                            0.0
+                        } else {
+                            1.0 + index as f64 * 0.1
+                        },
+                        size: if index % 5 == 2 { 0.3 } else { 0.0 },
+                        pinned: None,
+                        peak: 0.0,
+                        mode: crate::Mode::default(),
+                    }
+                })
+                .collect();
+            let clustering = clusterer.cluster(&objects, previous.as_ref()).unwrap();
+            for floor in [Floor::default(), Floor::for_dialnorm(-31.0)] {
+                let new = error_with(&objects, &clustering, &renderers, &floor).unwrap();
+                let old = as_it_was::error_with(&objects, &clustering, &renderers, &floor);
+                assert_eq!(report_bits(&new), report_bits(&old), "block {block}");
+                assert_eq!(new, old);
+            }
+            for renderer in &renderers {
+                let new = errors(&objects, &clustering, renderer.as_ref()).unwrap();
+                let old = as_it_was::errors(&objects, &clustering, renderer.as_ref());
+                assert_eq!(
+                    new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    old.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            previous = Some(clustering);
+        }
+    }
 }

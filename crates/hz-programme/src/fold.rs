@@ -155,6 +155,9 @@ pub struct Block<T> {
     /// Where each member is, where it is pinned when it is, and how it
     /// renders.
     places: Vec<([f64; 3], Option<[f64; 3]>, Mode)>,
+    /// The scene the look-ahead weighed it as, which is the scene it is
+    /// folded on — see [`Folder::fold`].
+    weighed: Vec<Object>,
 }
 
 impl<T> Block<T> {
@@ -183,74 +186,22 @@ impl<T> Block<T> {
     }
 }
 
-/// A master's members folded into fewer elements block by block: each block
-/// placed by the energies of the window around it ([`Placer`]), which needs
-/// the blocks ahead read before it is folded — so blocks go in
-/// ([`Folder::read`]) a window ahead of the ones that come out
-/// ([`Folder::fold`]).
-pub struct Folder<T> {
+/// What reads a fold's blocks: each member's samples with its gain on
+/// them, where each is, and the scene the look-ahead weighs the block as —
+/// its own scene, because a weighted scene's filter has state and this one
+/// reads ahead of the fold's. A [`Folder`]'s own, or taken apart from it
+/// ([`Folder::read_apart`]) to read on a thread of its own.
+pub struct Reader {
     members: Vec<(usize, Member)>,
-    pub placer: Placer,
-    /// The fold's scene, mix and cost; after [`Folder::fold`], its `mixed`
-    /// holds the block's elements.
-    pub mixer: Mixer,
-    /// What each block read weighs, for the look-ahead: its own scene,
-    /// because a weighted scene's filter has state and this one reads ahead
-    /// of the fold's.
     ahead: Scene,
-    read: VecDeque<Block<T>>,
-    spare: Vec<Block<T>>,
-    energies: Vec<f64>,
 }
 
-impl<T: Default> Folder<T> {
-    /// `members`, each with the master channel it is read from, folded into
-    /// `elements` at `sample_rate` as `mixing` says: the dialnorm's floor,
-    /// the weighing, and the headroom rule. What the mixed elements are
-    /// rounded to is the writer's.
-    pub fn new(
-        members: Vec<(usize, Member)>,
-        elements: usize,
-        sample_rate: f64,
-        mixing: &Mixing,
-    ) -> Result<Self> {
-        let mut mixer = Mixer::new(
-            sample_rate,
-            mixing.weighing,
-            mixing.dialnorm,
-            mixing.headroom.limits(),
-            elements,
-        )?;
-        mixer.gains = vec![1.0; members.len()];
-        Ok(Self {
-            members,
-            placer: Placer::new(
-                Clusterer::new(elements, Weighting::Fitted)?
-                    .flooring(hz_cluster::floor::Floor::for_dialnorm(mixing.dialnorm))
-                    .bounding(mixing.headroom.bounds()),
-                hz_cluster::smooth::SMOOTHING,
-            ),
-            mixer,
-            ahead: Scene::weighed(sample_rate, mixing.weighing)?,
-            read: VecDeque::new(),
-            spare: Vec::new(),
-            energies: Vec::new(),
-        })
-    }
-
-    /// An empty block to read into, its carry as the last one folded left
-    /// it: the writer fills the carry, then hands it to [`Folder::read`].
-    pub fn block(&mut self) -> Block<T> {
-        self.spare.pop().unwrap_or_default()
-    }
-
-    /// Read `block`, `frames` samples from the master's sample `at`:
-    /// `sample(carry, n, channel)` is the master's sample `n` of the block on
-    /// `channel`, as a fraction of full scale. Each member's samples take its
-    /// gain, and the block's energies are recorded for the window.
-    pub fn read(
+impl Reader {
+    /// Read `block`, `frames` samples from the master's sample `at`, as
+    /// [`Folder::read`] reads it, for [`Folder::take`].
+    pub fn read<T>(
         &mut self,
-        mut block: Block<T>,
+        block: &mut Block<T>,
         at: i64,
         frames: usize,
         sample: impl Fn(&T, usize, usize) -> f64,
@@ -262,7 +213,7 @@ impl<T: Default> Folder<T> {
             signals,
             places,
             ..
-        } = &mut block;
+        } = block;
         signals.resize_with(self.members.len(), Vec::new);
         places.clear();
         // Before the programme an object is where it starts; its samples
@@ -301,11 +252,108 @@ impl<T: Default> Folder<T> {
             });
         }
         block.weigh(&mut self.ahead);
+        block.weighed.clear();
+        block.weighed.extend_from_slice(self.ahead.objects());
+    }
+}
+
+/// A master's members folded into fewer elements block by block: each block
+/// placed by the energies of the window around it ([`Placer`]), which needs
+/// the blocks ahead read before it is folded — so blocks go in
+/// ([`Folder::read`]) a window ahead of the ones that come out
+/// ([`Folder::fold`]).
+pub struct Folder<T> {
+    /// What reads the blocks, unless it was taken apart
+    /// ([`Folder::read_apart`]).
+    reader: Option<Reader>,
+    /// What the mixer was made from, for another made alike.
+    members: usize,
+    sample_rate: f64,
+    mixing: Mixing,
+    elements: usize,
+    pub placer: Placer,
+    /// The fold's scene, mix and cost; after [`Folder::fold`], its `mixed`
+    /// holds the block's elements.
+    pub mixer: Mixer,
+    read: VecDeque<Block<T>>,
+    spare: Vec<Block<T>>,
+    energies: Vec<f64>,
+}
+
+impl<T: Default> Folder<T> {
+    /// `members`, each with the master channel it is read from, folded into
+    /// `elements` at `sample_rate` as `mixing` says: the dialnorm's floor,
+    /// the weighing, and the headroom rule. What the mixed elements are
+    /// rounded to is the writer's.
+    pub fn new(
+        members: Vec<(usize, Member)>,
+        elements: usize,
+        sample_rate: f64,
+        mixing: &Mixing,
+    ) -> Result<Self> {
+        let mixer = mixer_for(members.len(), elements, sample_rate, mixing)?;
+        Ok(Self {
+            members: members.len(),
+            reader: Some(Reader {
+                members,
+                ahead: Scene::weighed(sample_rate, mixing.weighing)?,
+            }),
+            sample_rate,
+            mixing: *mixing,
+            elements,
+            placer: Placer::new(
+                Clusterer::new(elements, Weighting::Fitted)?
+                    .flooring(hz_cluster::floor::Floor::for_dialnorm(mixing.dialnorm))
+                    .bounding(mixing.headroom.bounds()),
+                hz_cluster::smooth::SMOOTHING,
+            ),
+            mixer,
+            read: VecDeque::new(),
+            spare: Vec::new(),
+            energies: Vec::new(),
+        })
+    }
+
+    /// An empty block to read into, its carry as the last one folded left
+    /// it: the writer fills the carry, then hands it to [`Folder::read`].
+    pub fn block(&mut self) -> Block<T> {
+        self.spare.pop().unwrap_or_default()
+    }
+
+    /// Read `block`, `frames` samples from the master's sample `at`:
+    /// `sample(carry, n, channel)` is the master's sample `n` of the block on
+    /// `channel`, as a fraction of full scale. Each member's samples take its
+    /// gain, and the block's energies are recorded for the window.
+    pub fn read(
+        &mut self,
+        mut block: Block<T>,
+        at: i64,
+        frames: usize,
+        sample: impl Fn(&T, usize, usize) -> f64,
+    ) {
+        self.reader
+            .as_mut()
+            .expect("the fold's reader, not taken apart")
+            .read(&mut block, at, frames, sample);
+        self.take(block);
+    }
+
+    /// A block read apart from the fold ([`Reader::read`]) into it: what it
+    /// weighs recorded for the window, and the block held until it is folded
+    /// — the rest of [`Folder::read`].
+    pub fn take(&mut self, block: Block<T>) {
         self.energies.clear();
-        self.energies
-            .extend(self.ahead.objects().iter().map(|o| o.energy));
+        self.energies.extend(block.weighed.iter().map(|o| o.energy));
         self.placer.record(&self.energies);
         self.read.push_back(block);
+    }
+
+    /// The reading, taken apart from the fold: [`Reader::read`] reads each
+    /// block as [`Folder::read`] does, and [`Folder::take`] takes it in.
+    pub fn read_apart(&mut self) -> Reader {
+        self.reader
+            .take()
+            .expect("the fold's reader, taken apart once")
     }
 
     /// Whether the oldest block read can be folded: the blocks its window
@@ -326,19 +374,53 @@ impl<T: Default> Folder<T> {
     /// a fraction of full scale; where each is at the block's end is
     /// `placer.previous()`'s. Nothing when no block is waiting. Hand the
     /// block back with [`Folder::recycle`] once done with it.
+    ///
+    /// The block is placed and judged on the scene the look-ahead weighed it
+    /// as when it was read. That is the scene the mixer's own would weigh it
+    /// as now: both are made alike, and each weighs every block, in the order
+    /// read — which is the order folded — from the same samples, so each
+    /// weighs block `n` from the same state, the one `n` blocks of the same
+    /// samples leave, whatever a rule carries from one block to the next.
     pub fn fold(&mut self, ceiling: f64) -> Result<Option<Block<T>>> {
         let Some(mut block) = self.read.pop_front() else {
             return Ok(None);
         };
-        block.weigh(&mut self.mixer.scene);
-        let clustering = self.placer.place(self.mixer.scene.objects())?;
-        std::mem::swap(&mut self.mixer.signals, &mut block.signals);
-        self.mixer
-            .fold(&clustering, self.placer.previous(), block.frames, ceiling);
-        self.mixer.judge(&clustering);
-        std::mem::swap(&mut self.mixer.signals, &mut block.signals);
+        let clustering = self.placer.place(&block.weighed)?;
+        mix(
+            &mut self.mixer,
+            self.placer.previous(),
+            &mut block,
+            &clustering,
+            ceiling,
+        );
         self.placer.keep(clustering);
         Ok(Some(block))
+    }
+
+    /// The first half of [`Folder::fold`], for a caller that mixes apart
+    /// from the placing ([`Folder::mix_apart`]): the oldest block read placed
+    /// — the placement kept, for the next block to start from — and handed
+    /// back with it, for [`Mix::mix`]. Nothing when no block is waiting.
+    pub fn place(&mut self) -> Result<Option<(Block<T>, Clustering)>> {
+        let Some(block) = self.read.pop_front() else {
+            return Ok(None);
+        };
+        let clustering = self.placer.place(&block.weighed)?;
+        self.placer.keep(clustering.clone());
+        Ok(Some((block, clustering)))
+    }
+
+    /// The mix, taken apart from the placing: the fold's own mixer, and the
+    /// last block placed, for [`Mix::mix`] to mix each block
+    /// [`Folder::place`] places as [`Folder::fold`] would have; one made
+    /// alike is left in its place, which nothing mixes with while the two
+    /// are apart.
+    pub fn mix_apart(&mut self) -> Result<Mix> {
+        let alike = mixer_for(self.members, self.elements, self.sample_rate, &self.mixing)?;
+        Ok(Mix {
+            mixer: std::mem::replace(&mut self.mixer, alike),
+            previous: self.placer.previous().cloned(),
+        })
     }
 
     /// A folded block back, for its buffers to be read into again.
@@ -358,6 +440,60 @@ impl<T: Default> Folder<T> {
     }
 }
 
+/// The mix of a fold apart from its placing: each block [`Folder::place`]
+/// placed, mixed and judged, in the order placed, as [`Folder::fold`] mixes
+/// and judges it — see [`Folder::mix_apart`].
+pub struct Mix {
+    pub mixer: Mixer,
+    /// The last block's placement, which the next one's weights ramp from.
+    previous: Option<Clustering>,
+}
+
+impl Mix {
+    /// Mix `block`, placed by `clustering`: its elements are in
+    /// `mixer.mixed`, its cost in `mixer.cost`. The next block ramps from
+    /// this one.
+    pub fn mix<T>(&mut self, block: &mut Block<T>, clustering: Clustering, ceiling: f64) {
+        mix(
+            &mut self.mixer,
+            self.previous.as_ref(),
+            block,
+            &clustering,
+            ceiling,
+        );
+        self.previous = Some(clustering);
+    }
+}
+
+/// The mixer a fold of `members` into `elements` mixes with.
+fn mixer_for(members: usize, elements: usize, sample_rate: f64, mixing: &Mixing) -> Result<Mixer> {
+    let mut mixer = Mixer::new(
+        sample_rate,
+        mixing.weighing,
+        mixing.dialnorm,
+        mixing.headroom.limits(),
+        elements,
+    )?;
+    mixer.gains = vec![1.0; members];
+    Ok(mixer)
+}
+
+/// The second half of a fold: `block`, placed by `clustering`, mixed with the
+/// weights ramping from `previous`'s, limited under `ceiling`, and judged on
+/// the scene it was placed on.
+fn mix<T>(
+    mixer: &mut Mixer,
+    previous: Option<&Clustering>,
+    block: &mut Block<T>,
+    clustering: &Clustering,
+    ceiling: f64,
+) {
+    std::mem::swap(&mut mixer.signals, &mut block.signals);
+    mixer.fold(clustering, previous, block.frames, ceiling);
+    mixer.judge_on(&block.weighed, clustering);
+    std::mem::swap(&mut mixer.signals, &mut block.signals);
+}
+
 /// An object's `frames` samples from the master's sample `at`, `sample(n)`
 /// each, with its gain on them, into `signal`; where it is at `end`.
 fn gained(
@@ -371,16 +507,267 @@ fn gained(
 ) -> [f64; 3] {
     // Before the programme an object is where it starts; its samples there
     // are the writer's to make silent.
-    signal.extend((0..frames).map(|n| {
-        let gain = path.gain((at + n as i64).max(0) as u64, hint);
-        (sample(n) * gain) as f32
-    }));
+    let mut n = 0;
+    while n < frames {
+        let t = (at + n as i64).max(0) as u64;
+        let segment = *path.segment(t, hint);
+        if segment.end == u64::MAX || segment.from == segment.to {
+            // Standing, its gain is the segment's `from` at every sample of
+            // it — what `Segment::at` hands back for each — so it is taken
+            // once for every sample up to the segment's end.
+            let gain = segment.from.gain;
+            let until = if segment.end == u64::MAX {
+                frames
+            } else {
+                (i128::from(segment.end) - i128::from(at)).min(frames as i128) as usize
+            };
+            signal.extend((n..until).map(|n| (sample(n) * gain) as f32));
+            n = until;
+        } else {
+            signal.push((sample(n) * segment.at(t).gain) as f32);
+            n += 1;
+        }
+    }
     path.segment(end, hint).at(end).position
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An object's samples with its gain on them as they were made before a
+    /// standstill's gain was taken once for all its samples: the path asked
+    /// at every sample. The oracle [`gained`] is held to, to the bit.
+    fn gained_as_it_was(
+        signal: &mut Vec<f32>,
+        path: &Path,
+        hint: &mut usize,
+        at: i64,
+        frames: usize,
+        end: u64,
+        sample: impl Fn(usize) -> f64,
+    ) -> [f64; 3] {
+        signal.extend((0..frames).map(|n| {
+            let gain = path.gain((at + n as i64).max(0) as u64, hint);
+            (sample(n) * gain) as f32
+        }));
+        path.segment(end, hint).at(end).position
+    }
+
+    fn keyframe(sample_pos: u64, x: f64, gain: f64, ramp_samples: u32) -> Keyframe {
+        Keyframe {
+            sample_pos,
+            position: [x, 1.0, 0.0],
+            gain,
+            ramp_samples,
+            ..Keyframe::default()
+        }
+    }
+
+    /// Holds and ramps, a ramp cut short, a gain that ramps while the place
+    /// holds and the other way round, a negative zero, blocks from before the
+    /// programme and past its last update, and a walk started over: the same
+    /// samples, the same place, and the walk left where it was.
+    #[test]
+    fn a_standstills_gain_taken_once_is_the_one_taken_at_every_sample() {
+        let paths = [
+            vec![keyframe(0, 0.0, 1.0, 0)],
+            vec![
+                keyframe(100, -0.5, 0.5, 0),
+                keyframe(700, -0.5, 0.25, 300),
+                keyframe(850, 0.5, 0.25, 400),
+                keyframe(2000, 0.5, -0.0, 0),
+                keyframe(2600, 0.25, 0.75, 1000),
+                keyframe(3000, 0.75, 0.75, 0),
+            ],
+            vec![keyframe(5, 1.0, 0.0, 10), keyframe(4096, -1.0, 1.0, 2048)],
+        ];
+        let sample = |n: usize| ((n * 7919) % 2001) as f64 / 1000.0 - 1.0;
+        for keyframes in &paths {
+            let path = Path::new(keyframes);
+            for frames in [1, 64, 256, 1024] {
+                let (mut new_hint, mut old_hint) = (0usize, 0usize);
+                for start in (-1500i64..9000).step_by(frames + 37) {
+                    // Now and then a walk that has to start over.
+                    if start % 5 == 0 {
+                        (new_hint, old_hint) = (0, 0);
+                    }
+                    let end = (start + frames as i64 - 1).max(0) as u64;
+                    let (mut new, mut old) = (Vec::new(), Vec::new());
+                    let new_at = gained(&mut new, &path, &mut new_hint, start, frames, end, sample);
+                    let old_at = gained_as_it_was(
+                        &mut old,
+                        &path,
+                        &mut old_hint,
+                        start,
+                        frames,
+                        end,
+                        sample,
+                    );
+                    assert_eq!(
+                        new.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "from {start}, {frames} frames"
+                    );
+                    assert_eq!(new_at.map(f64::to_bits), old_at.map(f64::to_bits));
+                    assert_eq!(new_hint, old_hint);
+                }
+            }
+        }
+    }
+
+    /// [`Folder::fold`] as it was before it folded on the look-ahead's scene:
+    /// the block weighed again by the mixer's own. The oracle the fold, and
+    /// the placing with the mix apart, are held to.
+    fn fold_as_it_was<T: Default>(folder: &mut Folder<T>, ceiling: f64) -> Option<Block<T>> {
+        let mut block = folder.read.pop_front()?;
+        block.weigh(&mut folder.mixer.scene);
+        let clustering = folder.placer.place(folder.mixer.scene.objects()).unwrap();
+        std::mem::swap(&mut folder.mixer.signals, &mut block.signals);
+        folder
+            .mixer
+            .fold(&clustering, folder.placer.previous(), block.frames, ceiling);
+        folder.mixer.judge(&clustering);
+        std::mem::swap(&mut folder.mixer.signals, &mut block.signals);
+        folder.placer.keep(clustering);
+        Some(block)
+    }
+
+    fn members() -> Vec<(usize, Member)> {
+        (0..9)
+            .map(|channel| {
+                let x = channel as f64 / 4.0 - 1.0;
+                let member = match channel % 3 {
+                    0 => Member::Bed {
+                        position: [x, 1.0, 0.0],
+                        pinned: channel == 0,
+                    },
+                    1 => Member::Moving(
+                        Path::new(&[
+                            keyframe(0, x, 1.0, 0),
+                            keyframe(900, -x, 0.5, 2000),
+                            keyframe(4000, x * 0.5, 0.8, 300),
+                        ]),
+                        0,
+                    ),
+                    _ => {
+                        Member::classed(vec![keyframe(0, -x, 0.9, 0), keyframe(1500, x, 0.9, 700)])
+                    }
+                };
+                (channel, member)
+            })
+            .collect()
+    }
+
+    fn signal_bits(signals: &[Vec<f32>]) -> Vec<Vec<u32>> {
+        signals
+            .iter()
+            .map(|s| s.iter().map(|x| x.to_bits()).collect())
+            .collect()
+    }
+
+    /// Under every rule a block's power is weighed by, the filter's among
+    /// them: the fold on the look-ahead's scene, and the placing with the mix
+    /// apart, mix what weighing each block again did, place it where it did
+    /// and cost what it did, block for block and to the bit.
+    #[test]
+    fn a_fold_on_the_look_aheads_scene_folds_as_weighing_it_again_did() {
+        use hz_cluster::scene::{Loudness, PERCEPTION};
+        const FRAMES: usize = 512;
+        const CHANNELS: usize = 9;
+        for weighing in [
+            Loudness::Flat,
+            Loudness::KWeighted,
+            Loudness::Perceptual(PERCEPTION),
+        ] {
+            let mixing = Mixing {
+                weighing,
+                ..Mixing::default()
+            };
+            let mut old: Folder<usize> = Folder::new(members(), 4, 48_000.0, &mixing).unwrap();
+            let mut new: Folder<usize> = Folder::new(members(), 4, 48_000.0, &mixing).unwrap();
+            let mut apart: Folder<usize> = Folder::new(members(), 4, 48_000.0, &mixing).unwrap();
+            let mut mix = apart.mix_apart().unwrap();
+            let mut seed = 9u32;
+            let mut noise = move || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                f64::from(seed >> 8) / f64::from(1u32 << 24) - 0.5
+            };
+            let blocks = 14;
+            let mut folded = 0;
+            for k in 0..=blocks {
+                if k < blocks {
+                    // Louder and quieter blocks, and a short last one.
+                    let frames = if k + 1 == blocks { 300 } else { FRAMES };
+                    let level = [1.0, 0.05, 2.0, 0.5][k % 4];
+                    let samples: Vec<f64> =
+                        (0..frames * CHANNELS).map(|_| noise() * level).collect();
+                    for folder in [&mut old, &mut new, &mut apart] {
+                        let mut block = folder.block();
+                        block.carry = k;
+                        folder.read(block, k as i64 * FRAMES as i64 - 100, frames, |_, n, c| {
+                            samples[n * CHANNELS + c]
+                        });
+                    }
+                }
+                while old.ready() || (k == blocks && old.waiting() > 0) {
+                    let a = fold_as_it_was(&mut old, 0.9).unwrap();
+                    let b = new.fold(0.9).unwrap().unwrap();
+                    let (mut c, placed) = apart.place().unwrap().unwrap();
+                    mix.mix(&mut c, placed, 0.9);
+                    assert_eq!((a.carry, b.carry, c.carry), (folded, folded, folded));
+                    let mixed = signal_bits(&old.mixer.mixed);
+                    assert_eq!(
+                        signal_bits(&new.mixer.mixed),
+                        mixed,
+                        "{weighing:?} {folded}"
+                    );
+                    assert_eq!(
+                        signal_bits(&mix.mixer.mixed),
+                        mixed,
+                        "{weighing:?} {folded}"
+                    );
+                    let at = |f: &Folder<usize>| -> Vec<[u64; 3]> {
+                        f.positions().iter().map(|p| p.map(f64::to_bits)).collect()
+                    };
+                    assert_eq!(at(&new), at(&old));
+                    assert_eq!(at(&apart), at(&old));
+                    for cost in [new.mixer.cost, mix.mixer.cost] {
+                        assert_eq!(cost.sum.to_bits(), old.mixer.cost.sum.to_bits());
+                        assert_eq!(cost.worst.to_bits(), old.mixer.cost.worst.to_bits());
+                        assert_eq!(cost.blocks, old.mixer.cost.blocks);
+                        assert_eq!(cost.inaudible, old.mixer.cost.inaudible);
+                    }
+                    assert_eq!(
+                        new.mixer
+                            .limiter
+                            .as_ref()
+                            .map(|l| (l.limited, l.peak.to_bits())),
+                        old.mixer
+                            .limiter
+                            .as_ref()
+                            .map(|l| (l.limited, l.peak.to_bits()))
+                    );
+                    assert_eq!(
+                        mix.mixer
+                            .limiter
+                            .as_ref()
+                            .map(|l| (l.limited, l.peak.to_bits())),
+                        old.mixer
+                            .limiter
+                            .as_ref()
+                            .map(|l| (l.limited, l.peak.to_bits()))
+                    );
+                    old.recycle(a);
+                    new.recycle(b);
+                    apart.recycle(c);
+                    folded += 1;
+                }
+            }
+            assert_eq!(folded, blocks);
+            assert!(old.mixer.cost.blocks > 0);
+        }
+    }
 
     /// A block comes out once the blocks its window reaches ahead are in,
     /// and in the order they went in, each with what was carried beside it;
