@@ -57,7 +57,8 @@ pub struct TruePeak {
     channels: usize,
     peaks: Vec<f64>,
     /// One channel of up to [`CHUNK`] frames of a push, after its tail:
-    /// kept, so that no push allocates after the first.
+    /// made with the meter, as long as it ever needs to be, so that no push
+    /// allocates.
     line: Vec<f64>,
 }
 
@@ -78,7 +79,7 @@ impl TruePeak {
             tails: vec![0.0; channels * KEEP],
             channels,
             peaks: vec![0.0; channels],
-            line: Vec::new(),
+            line: vec![0.0; KEEP + CHUNK],
         }
     }
 
@@ -100,9 +101,6 @@ impl TruePeak {
         let whole = &interleaved[..interleaved.len() / channels * channels];
         for chunk in whole.chunks(CHUNK * channels) {
             let frames = chunk.len() / channels;
-            if self.line.len() < KEEP + frames {
-                self.line.resize(KEEP + frames, 0.0);
-            }
             let line = &mut self.line[..KEEP + frames];
             let tails = self.tails.chunks_exact_mut(KEEP);
             for (channel, (tail, peak)) in tails.zip(&mut self.peaks).enumerate() {
@@ -612,5 +610,54 @@ mod before_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Allocations this thread has made.
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The system's allocator, counting each thread's allocations.
+    struct Counting;
+
+    // SAFETY: every call is handed on to the system's allocator unchanged;
+    // the count is a thread-local cell, which allocates nothing.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATIONS.with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// No push allocates, the first included: the scratch is made with the
+    /// meter. Pushes of six frames then the rest of a frame, as the E-AC-3
+    /// stream's meter is pushed, and longer than a chunk, and of nothing.
+    #[test]
+    fn no_push_allocates() {
+        let samples: Vec<f32> = (0..6 * 5000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let mut meter = TruePeak::new(6);
+        let before = ALLOCATIONS.with(Cell::get);
+        for frames in [6, 1530, 6, 1530, 0, 1, 5000, 3] {
+            meter.push(&samples[..frames * 6]);
+        }
+        let peak = meter.take();
+        assert_eq!(ALLOCATIONS.with(Cell::get), before, "allocations in a push");
+        assert!(peak > 0.9);
     }
 }
