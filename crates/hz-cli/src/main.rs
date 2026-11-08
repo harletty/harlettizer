@@ -7,6 +7,7 @@ mod encode;
 mod iamf;
 mod iamf_objects;
 mod joc;
+mod lane;
 
 use clap::{Parser, Subcommand};
 use hz_programme::mix::{self, Headroom, Mixing};

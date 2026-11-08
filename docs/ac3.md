@@ -30,6 +30,13 @@ The loudness measured on the render, before the codec, is reported beside the
 dialnorm the stream states (`--dialnorm`, −31 unless asked). Nothing sets the
 one from the other yet.
 
+The command reads and renders the master on a thread of its own, up to four
+frames ahead of the encoder, which codes the frames it would have rendered
+itself, to the byte. A 30-second master of twelve waveforms codes to 5.1 in
+0.17 s rather than 0.24 s, and to stereo in 0.06 s rather than 0.11 s. A
+60-second one codes to E-AC-3 in 0.27 s rather than 0.42 s. The processor
+time is the same.
+
 ## The encoder
 
 `hz-ac3` is a port of FFmpeg's AC-3 encoder (`libavcodec/ac3enc*.c`), and on

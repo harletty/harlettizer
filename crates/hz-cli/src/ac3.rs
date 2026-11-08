@@ -13,6 +13,7 @@
 //! With `--joc` the objects do survive: E-AC-3 carries them beside the 5.1
 //! core by joint object coding ([`crate::joc`]).
 
+use crate::lane::{LANE_DEPTH, Lane, Stage};
 use hz_ac3::{ChannelMode, DELAY, Encoder, FRAME_SAMPLES};
 use hz_analysis::loudness::{ChannelWeight, Meter};
 use hz_core::{Error, Result};
@@ -91,8 +92,14 @@ pub fn run(config: Config) -> Result<()> {
 }
 
 fn encode(config: Config) -> Result<()> {
+    encode_on(config, true)
+}
+
+/// [`encode`], the programme read and rendered on a thread of its own when
+/// `threads`, on the caller's otherwise.
+fn encode_on(config: Config, threads: bool) -> Result<()> {
     let path = config.input.as_path();
-    let mut source = Source::open(path, config.mono_prefix.as_deref())?;
+    let source = Source::open(path, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still
     // to be read: refuse one that is the input, before any work is done.
     hz_io::paths::refuse_inputs(source.files(), &config.out)?;
@@ -226,15 +233,34 @@ fn encode(config: Config) -> Result<()> {
         .iter()
         .map(|label| ChannelWeight::for_speaker_label(label))
         .collect();
-    let mut meter = Meter::new(sample_rate, &weights);
-
-    let mut raw = vec![0i32; FRAME_SAMPLES * stride];
-    let mut input = vec![0f32; FRAME_SAMPLES * stride];
-    let mut mixed = vec![0f64; FRAME_SAMPLES * rendered_width];
-    let mut interleaved = vec![0f32; FRAME_SAMPLES * width];
-    let mut planar = vec![vec![0f32; FRAME_SAMPLES]; width];
+    // The programme is read and rendered a few frames ahead of the encoders,
+    // while they code the frames before: a frame rendered is one read, in
+    // order, whichever thread renders it.
+    let mut render = Lane::new(
+        Render {
+            source,
+            following,
+            fold,
+            meter: Meter::new(sample_rate, &weights),
+            input_scale,
+            stride,
+            width,
+            rendered_width,
+            total,
+            at: 0,
+            raw: vec![0i32; FRAME_SAMPLES * stride],
+            mixed: vec![0f64; FRAME_SAMPLES * rendered_width],
+            interleaved: vec![0f32; FRAME_SAMPLES * width],
+            clipped: 0,
+            peak: 0.0,
+        },
+        "render",
+        threads,
+    );
+    for _ in 0..LANE_DEPTH {
+        render.send(Rendered::new(stride, width));
+    }
     let mut frame = Vec::new();
-    let (mut clipped, mut peak) = (0u64, 0f64);
 
     let lag = if config.joc {
         crate::joc::LATENCY
@@ -244,52 +270,12 @@ fn encode(config: Config) -> Result<()> {
     let mut at = 0u64;
     let mut syncframes = 0u64;
     loop {
-        let want = (total - at).min(FRAME_SAMPLES as u64) as usize;
-        let got = if want == 0 {
-            0
-        } else {
-            source.fill(&mut raw, want)?
-        };
-        for (x, &r) in input[..got * stride].iter_mut().zip(&raw[..got * stride]) {
-            *x = (f64::from(r) * input_scale) as f32;
-        }
-        mixed.fill(0.0);
-        if got > 0 {
-            following.render(
-                &input[..got * stride],
-                stride,
-                got,
-                at,
-                &mut mixed[..got * rendered_width],
-            );
-        }
-        for (frame, out) in mixed
-            .chunks_exact(rendered_width)
-            .zip(interleaved.chunks_exact_mut(width))
-        {
-            for (target, f) in out.iter_mut().enumerate() {
-                let m: f64 = frame
-                    .iter()
-                    .zip(&fold)
-                    .map(|(x, row)| x * row[target])
-                    .sum();
-                peak = peak.max(m.abs());
-                if m.abs() > 1.0 {
-                    clipped += 1;
-                }
-                *f = m.clamp(-1.0, 1.0) as f32;
-            }
-        }
-        meter.push(&interleaved[..got * width]);
-        for (ch, plane) in planar.iter_mut().enumerate() {
-            for (n, v) in plane.iter_mut().enumerate() {
-                *v = interleaved[n * width + ch];
-            }
-        }
+        let rendered = render.recv()?;
+        let got = rendered.got;
 
         frame.clear();
         let mut refs: [&[f32]; 6] = [&[]; 6];
-        for (r, plane) in refs.iter_mut().zip(&planar) {
+        for (r, plane) in refs.iter_mut().zip(&rendered.planar) {
             *r = plane;
         }
         match &mut sink {
@@ -297,14 +283,8 @@ fn encode(config: Config) -> Result<()> {
                 .encode(&refs[..width], &mut frame)
                 .map_err(|e| Error::refused(&config.out, e.0))?,
             Sink::Joc(writer) => {
-                let coded = writer.frame(
-                    &refs[..width],
-                    &input[..FRAME_SAMPLES * stride],
-                    stride,
-                    got,
-                    at,
-                    &mut frame,
-                );
+                let coded =
+                    writer.frame(&refs[..width], &rendered.input, stride, got, at, &mut frame);
                 // The writer hands back whole syncframes, and its encoders
                 // run behind it: those written before a refusal it finds now
                 // are the stream up to it, and stay where they were written.
@@ -332,7 +312,15 @@ fn encode(config: Config) -> Result<()> {
         if ended && syncframes >= syncframes_to_cover(at, lag) {
             break;
         }
+        // Its buffers, for a frame more.
+        render.send(rendered);
     }
+    let Render {
+        mut meter,
+        clipped,
+        peak,
+        ..
+    } = render.into_stage();
     if let Sink::Joc(writer) = &mut sink {
         frame.clear();
         let finished = writer.finish(&mut frame);
@@ -459,6 +447,117 @@ enum Sink {
     Joc(Box<crate::joc::Writer>),
 }
 
+/// The programme read a frame at a time, rendered to 7.1 and folded to the
+/// layout coded, its loudness measured and its peak kept: on a thread of its
+/// own where one can be started ([`Lane`]), rendering frames while the
+/// encoders code the ones before.
+struct Render {
+    source: Source,
+    following: Following,
+    /// A row for each channel of 7.1, a column for each one coded.
+    fold: [[f64; 8]; 8],
+    meter: Meter,
+    input_scale: f64,
+    /// The master's channels, the layout's, and 7.1's.
+    stride: usize,
+    width: usize,
+    rendered_width: usize,
+    /// The samples to encode, and those read.
+    total: u64,
+    at: u64,
+    raw: Vec<i32>,
+    mixed: Vec<f64>,
+    interleaved: Vec<f32>,
+    /// Samples the fold took past full scale, and its highest.
+    clipped: u64,
+    peak: f64,
+}
+
+/// A frame of the programme: the master's samples, `got` of them,
+/// interleaved, and its render, planar in the layout's order. A frame past
+/// the input's end is silence.
+struct Rendered {
+    input: Vec<f32>,
+    planar: Vec<Vec<f32>>,
+    got: usize,
+}
+
+impl Rendered {
+    fn new(stride: usize, width: usize) -> Self {
+        Self {
+            input: vec![0f32; FRAME_SAMPLES * stride],
+            planar: vec![vec![0f32; FRAME_SAMPLES]; width],
+            got: 0,
+        }
+    }
+}
+
+impl Stage for Render {
+    type In = Rendered;
+    type Out = Result<Rendered>;
+
+    /// The next frame, rendered into `frame`'s buffers.
+    fn run(&mut self, mut frame: Rendered) -> Result<Rendered> {
+        let (stride, width, rendered_width) = (self.stride, self.width, self.rendered_width);
+        let want = (self.total - self.at).min(FRAME_SAMPLES as u64) as usize;
+        let got = if want == 0 {
+            0
+        } else {
+            match self.source.fill(&mut self.raw, want) {
+                Ok(got) => got,
+                Err(e) => {
+                    // The encode stops at the failure: nothing past it is read.
+                    self.at = self.total;
+                    return Err(e);
+                }
+            }
+        };
+        for (x, &r) in frame.input[..got * stride]
+            .iter_mut()
+            .zip(&self.raw[..got * stride])
+        {
+            *x = (f64::from(r) * self.input_scale) as f32;
+        }
+        self.mixed.fill(0.0);
+        if got > 0 {
+            self.following.render(
+                &frame.input[..got * stride],
+                stride,
+                got,
+                self.at,
+                &mut self.mixed[..got * rendered_width],
+            );
+        }
+        for (mixed, out) in self
+            .mixed
+            .chunks_exact(rendered_width)
+            .zip(self.interleaved.chunks_exact_mut(width))
+        {
+            for (target, f) in out.iter_mut().enumerate() {
+                let m: f64 = mixed
+                    .iter()
+                    .zip(&self.fold)
+                    .map(|(x, row)| x * row[target])
+                    .sum();
+                self.peak = self.peak.max(m.abs());
+                if m.abs() > 1.0 {
+                    self.clipped += 1;
+                }
+                *f = m.clamp(-1.0, 1.0) as f32;
+            }
+        }
+        self.meter.push(&self.interleaved[..got * width]);
+        for (ch, plane) in frame.planar.iter_mut().enumerate() {
+            for (n, v) in plane.iter_mut().enumerate() {
+                *v = self.interleaved[n * width + ch];
+            }
+        }
+        frame.got = got;
+        self.at += got as u64;
+        Ok(frame)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +574,129 @@ mod tests {
         assert_eq!(syncframes_to_cover(1536 - 833, crate::joc::LATENCY), 1);
         assert_eq!(syncframes_to_cover(1536 - 832, crate::joc::LATENCY), 2);
         assert_eq!(syncframes_to_cover(0, DELAY), 1);
+    }
+
+    /// Ten frames and some: the core's delay is carried out in the silence
+    /// that ends the eleventh, the objects' latency needs a twelfth.
+    const SAMPLES: usize = 10 * FRAME_SAMPLES + 1000;
+
+    /// A master set in `dir` of a 7.1 bed and two objects circling the room,
+    /// a tone on each channel: its config's path.
+    fn master(dir: &std::path::Path) -> PathBuf {
+        const BED: [(&str, u32); 8] = [
+            ("L", 0),
+            ("R", 1),
+            ("C", 2),
+            ("LFE", 3),
+            ("Lss", 4),
+            ("Rss", 5),
+            ("Lrs", 6),
+            ("Rrs", 7),
+        ];
+        const OBJECTS: [u32; 2] = [8, 9];
+        let mut config = String::from(
+            "language: eng\nversion: 0.5.1\npresentations:\n  - type: home\n    simplified: \
+             false\n    metadata: m.atmos.metadata\n    audio: m.atmos.audio\n    offset: 0.0\n    \
+             fps: 24\n    scBedConfiguration: [0, 1, 2, 3, 4, 5, 6, 7]\n    creationTool: test\n    \
+             creationToolVersion: 0.0.0\n    bedInstances:\n      - channels:\n",
+        );
+        for (name, id) in BED {
+            config.push_str(&format!(
+                "          - channel: {name}\n            ID: {id}\n"
+            ));
+        }
+        config.push_str("    objects:\n");
+        for id in OBJECTS {
+            config.push_str(&format!("      - ID: {id}\n"));
+        }
+        let path = dir.join("m.atmos");
+        std::fs::write(&path, config).unwrap();
+
+        let mut events = String::from("sampleRate: 48000\nevents:\n");
+        for (_, id) in BED {
+            events.push_str(&format!(
+                "  - ID: {id}\n    samplePos: 0\n    active: true\n    importance: 1.0\n    \
+                 gain: 0\n    rampLength: 0\n"
+            ));
+        }
+        // Each object somewhere new every 1000 samples, ramping there, the
+        // two going round opposite ways and one of them climbing.
+        for (k, id) in OBJECTS.into_iter().enumerate() {
+            for step in 0..=SAMPLES / 1000 {
+                let turn = (step as f64 / 6.0 + k as f64 / 2.0) * std::f64::consts::TAU;
+                let way = if k == 0 { 1.0 } else { -1.0 };
+                let (x, y, z) = (way * turn.sin(), turn.cos(), (k * step) as f64 / 20.0);
+                events.push_str(&format!(
+                    "  - ID: {id}\n    samplePos: {}\n    active: true\n    pos: [{x:.4}, \
+                     {y:.4}, {z:.4}]\n    snap: false\n    elevation: true\n    zones: all\n    \
+                     size: 0.0\n    importance: 1.0\n    gain: 0\n    rampLength: 512\n",
+                    step * 1000
+                ));
+            }
+        }
+        std::fs::write(dir.join("m.atmos.metadata"), events).unwrap();
+
+        let width = BED.len() + OBJECTS.len();
+        let mut audio = hz_io::container::caf::CafWriter::create(
+            &dir.join("m.atmos.audio"),
+            hz_io::container::pcm::PcmFormat::master(48_000.0, width as u32),
+        )
+        .unwrap();
+        let pcm: Vec<i32> = (0..SAMPLES * width)
+            .map(|i| {
+                let (channel, n) = (i % width, i / width);
+                let hz = 110.0 * (channel + 1) as f64 * 1.37;
+                let phase = std::f64::consts::TAU * hz * n as f64 / 48_000.0;
+                (phase.sin() * f64::from(1 << 20)).round() as i32
+            })
+            .collect();
+        audio.write_frames(&pcm).unwrap();
+        audio.finish().unwrap();
+        path
+    }
+
+    /// The programme rendered on a thread of its own codes to what it codes
+    /// to on the encode's: the same bytes, AC-3 and E-AC-3, with objects and
+    /// without, and as many syncframes as carry the programme out.
+    #[test]
+    fn the_render_on_its_thread_codes_what_one_thread_codes() {
+        let dir = std::env::temp_dir().join(format!("hz-cli-ac3-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = master(&dir);
+        for (name, layout, eac3, joc, kbps) in [
+            ("ac3", Layout::surround_5_1(), false, false, 448),
+            ("eac3-stereo", Layout::stereo(), true, false, 192),
+            ("joc", Layout::surround_5_1(), true, true, 448),
+        ] {
+            let coded = [false, true].map(|threads| {
+                let out = dir.join(format!("{name}-{threads}"));
+                let config = Config {
+                    input: input.clone(),
+                    out: out.clone(),
+                    frames: None,
+                    mono_prefix: None,
+                    layout: layout.clone(),
+                    bit_rate: Some(kbps),
+                    dialnorm: -31,
+                    coupling: true,
+                    eac3,
+                    joc,
+                    progress: false,
+                };
+                encode_on(config, threads).unwrap();
+                std::fs::read(&out).unwrap()
+            });
+            assert!(coded[0] == coded[1], "{name}: the same stream on a thread");
+            let syncframe = kbps as usize * 1000 / 8 * FRAME_SAMPLES / 48_000;
+            let lag = if joc { crate::joc::LATENCY } else { DELAY };
+            assert_eq!(coded[0].len() % syncframe, 0, "{name}");
+            assert_eq!(
+                (coded[0].len() / syncframe) as u64,
+                syncframes_to_cover(SAMPLES as u64, lag),
+                "{name}: the programme carried out, and no further"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

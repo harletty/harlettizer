@@ -515,8 +515,26 @@ so eleven objects keep eight threads busy. On sixteen cores:
 | 60 s at 640 kb/s | 11 | 1124 of 1876 | 3.87 s | 2.30 s | −38 % |
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.80 s | 0.49 s | −37 % |
 
-What is left on the encode's own thread is the render and the budget's
-search for λ, a step at a time.
+The programme itself was rendered on the encode's own thread too, a frame at
+a time between the estimator's: the master read, rendered to 7.1 and folded
+to 5.1, its loudness measured. `harlettizer ac3` renders it on a thread of
+its own, up to four frames ahead of the encoders, with objects or without.
+The frames come back in the order they were read, so the encoders see the
+ones they saw before, and the stream is the same to the byte. Where no
+thread can be started, the programme is rendered on the encode's own. On
+sixteen cores:
+
+| programme | elements | before | after | CPU time |
+|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 0.67 s | 0.58 s | +5 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 1.35 s | 1.27 s | +1 % |
+| 60 s at 640 kb/s | 11 | 2.34 s | 2.10 s | −1 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.45 s | 0.41 s | +5 % |
+| 40 objects, 4 s | 40 → 15 | 0.23 s | 0.20 s | +4 % |
+
+What is left on the encode's own thread is the budget's search for λ, a
+step at a time, and, where there is no fold, each element's samples read
+out of the master for the estimator.
 
 ## Not done
 

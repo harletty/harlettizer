@@ -22,6 +22,7 @@
 //! by `hz-cluster`, a syncframe at a time ([`Folded`]); the core is the
 //! master's whole render either way.
 
+use crate::lane::{Lane, Stage};
 use hz_ac3::{DELAY, Encoder, FRAME_SAMPLES};
 use hz_analysis::truepeak::{self, TruePeak};
 use hz_core::bits::BitWriter;
@@ -34,10 +35,7 @@ use hz_programme::fold::{self, Folder, Member};
 use hz_programme::mix::{Headroom, Mixing};
 use hz_programme::path::{self, Path as Trajectory};
 use hz_render::{Keyframe, Mode};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
 
 /// Elements a payload carries at most, as the reference streams do.
 pub const MAX_ELEMENTS: usize = 15;
@@ -326,139 +324,6 @@ enum Write {
 struct Written {
     syncframe: Option<Result<Vec<u8>>>,
     spent: Option<Job>,
-}
-
-/// Work that keeps its own state from one input to the next and hands back
-/// a result for each, in order.
-trait Stage: Send + 'static {
-    type In: Send + 'static;
-    type Out: Send + 'static;
-    fn run(&mut self, input: Self::In) -> Self::Out;
-}
-
-/// Inputs a stage's thread may be behind by before its caller waits for it.
-const LANE_DEPTH: usize = 4;
-
-/// A [`Stage`] on a thread of its own, working while its caller does; or,
-/// where no thread can be started, on the caller's, as each input comes. The
-/// same results either way, in the same order.
-enum Lane<S: Stage> {
-    Thread {
-        inbox: Option<mpsc::SyncSender<S::In>>,
-        outbox: mpsc::Receiver<S::Out>,
-        handle: Option<JoinHandle<Option<S>>>,
-    },
-    Here {
-        stage: S,
-        done: VecDeque<S::Out>,
-    },
-}
-
-impl<S: Stage> Lane<S> {
-    fn new(mut stage: S, name: &str, threads: bool) -> Self {
-        if threads {
-            let (inbox, inputs) = mpsc::sync_channel(LANE_DEPTH);
-            let (results, outbox) = mpsc::channel();
-            // The stage goes to the thread once it has started: a thread that
-            // cannot be leaves it here.
-            let (give, take) = mpsc::channel::<S>();
-            let spawned = std::thread::Builder::new()
-                .name(name.to_string())
-                .spawn(move || {
-                    let mut stage = take.recv().ok()?;
-                    for input in inputs {
-                        if results.send(stage.run(input)).is_err() {
-                            break;
-                        }
-                    }
-                    Some(stage)
-                });
-            if let Ok(handle) = spawned {
-                match give.send(stage) {
-                    Ok(()) => {
-                        return Self::Thread {
-                            inbox: Some(inbox),
-                            outbox,
-                            handle: Some(handle),
-                        };
-                    }
-                    Err(mpsc::SendError(back)) => stage = back,
-                }
-            }
-        }
-        Self::Here {
-            stage,
-            done: VecDeque::new(),
-        }
-    }
-
-    fn send(&mut self, input: S::In) {
-        match self {
-            Self::Thread { inbox, .. } => {
-                // A thread gone has panicked; waiting for its result says so.
-                if let Some(inbox) = inbox {
-                    let _ = inbox.send(input);
-                }
-            }
-            Self::Here { stage, done } => done.push_back(stage.run(input)),
-        }
-    }
-
-    /// The oldest result not yet taken, waited for.
-    fn recv(&mut self) -> S::Out {
-        match self {
-            Self::Thread { outbox, handle, .. } => match outbox.recv() {
-                Ok(out) => out,
-                Err(_) => panicked(handle),
-            },
-            Self::Here { done, .. } => done.pop_front().expect("a result for every input"),
-        }
-    }
-
-    /// The oldest result not yet taken, if it is ready.
-    fn try_recv(&mut self) -> Option<S::Out> {
-        match self {
-            Self::Thread { outbox, handle, .. } => match outbox.try_recv() {
-                Ok(out) => Some(out),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => panicked(handle),
-            },
-            Self::Here { done, .. } => done.pop_front(),
-        }
-    }
-
-    /// The stage's thread ended, its stage back on the caller's.
-    fn close(&mut self) {
-        if let Self::Thread { inbox, handle, .. } = self {
-            drop(inbox.take());
-            let stage = match handle.take().map(JoinHandle::join) {
-                Some(Ok(Some(stage))) => stage,
-                Some(Err(panic)) => std::panic::resume_unwind(panic),
-                _ => unreachable!("a stage's thread is joined once, and has its stage"),
-            };
-            *self = Self::Here {
-                stage,
-                done: VecDeque::new(),
-            };
-        }
-    }
-
-    /// The stage, once it is on the caller's thread.
-    fn stage(&self) -> Option<&S> {
-        match self {
-            Self::Thread { .. } => None,
-            Self::Here { stage, .. } => Some(stage),
-        }
-    }
-}
-
-/// A stage's thread is gone before its work is, which only a panic does:
-/// carry it on here.
-fn panicked<S>(handle: &mut Option<JoinHandle<S>>) -> ! {
-    match handle.take().map(JoinHandle::join) {
-        Some(Err(panic)) => std::panic::resume_unwind(panic),
-        _ => panic!("a stage's thread ended before its work did"),
-    }
 }
 
 impl Stage for Probe {
