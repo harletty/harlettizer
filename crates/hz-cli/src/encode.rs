@@ -829,10 +829,11 @@ fn run_on(config: Config, threads: bool) -> Result<()> {
         // this one instead and hands each span to the writer as it folds it:
         // the same payloads and units written, and the same error first when
         // one fails — only nothing is ahead. And the same spans folded, which
-        // an overlay's report records block by block: a writer that fails
-        // lets the producer fold one more span and drops it, because on its
-        // thread the producer has the second buffer and folds the span after
-        // the failed one into it before it finds the writer gone.
+        // an overlay's report records block by block: on its thread the
+        // producer folds the span after the one a writer failed on, where
+        // there is one and the read its fold waits for succeeds, before it
+        // finds the writer gone; so here a writer that fails lets the producer
+        // go on to its next hand-over, and drops it.
         Some(fold) => {
             let (spans, from_fold) = std::sync::mpsc::sync_channel::<Result<Produced>>(1);
             let (free, spare) = std::sync::mpsc::channel::<Vec<i32>>();
@@ -1237,13 +1238,16 @@ fn run_on(config: Config, threads: bool) -> Result<()> {
                     }
                     // No thread: each span is written as soon as it is
                     // folded. Where the writer is done the producer stops at
-                    // once; where it failed, one span later. On its thread
-                    // the producer folds the span after the failed one into
-                    // its second buffer — handed back before the failed span
-                    // was taken, so there whether or not the writer still
-                    // is — unless the read it waits for fails first. What
-                    // it hands next, that span or what stopped its read or
-                    // fold, goes nowhere, as a send to a writer gone does.
+                    // once; where it failed, after its next hand-over, if it
+                    // has one. On its thread the producer has a second buffer
+                    // whichever span the writer failed on — the one the span
+                    // before it was written from, or for the first the one
+                    // never taken out — and folds the span after the failed
+                    // one into it if there is one and the read its fold
+                    // waits for succeeds. What it hands then, that span or
+                    // what stopped its read or fold, is never read: the send
+                    // fails, or lands in the channel's empty slot and is
+                    // dropped with it. No buffer comes back for another.
                     Some(mut produce) => produce(&mut |produced| {
                         if failed.is_some() {
                             return false;
@@ -4620,10 +4624,11 @@ mod thread_tests {
     const SPAN: usize = BLOCK_UNITS * 40;
 
     /// Twenty-six spans and a short one: enough for the fold's look-ahead
-    /// to fill and drain, for the last unit to be a tail, and for a read
-    /// that fails part way to leave a stream — the encoder hands an interval
-    /// of four spans back three intervals after it is complete.
-    const SAMPLES: usize = 26 * SPAN + 1000;
+    /// to fill and drain, for the last unit to be a tail — twenty-five
+    /// units and ten samples — and for a read that fails part way to leave
+    /// a stream: the encoder hands an interval of four spans back three
+    /// intervals after it is complete.
+    const SAMPLES: usize = 26 * SPAN + 1010;
 
     /// The master's objects: with its 7.1 bed, thirteen with a position and
     /// fourteen elements, more than any of the folds below keep.
@@ -4762,6 +4767,32 @@ mod thread_tests {
         encoded(input, dir, &out, case, threads, true)
     }
 
+    /// The audio of the master in `dir`, `samples` long, cut to end at
+    /// sample `at`: the header still says `samples`, so the read there fails.
+    fn cut(dir: &Path, samples: usize, at: usize) {
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Fourteen channels of 24 bits.
+        let missing = ((samples - at) * (8 + OBJECTS) * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+    }
+
+    /// The last block an overlay's report records, by its number.
+    fn last_block(report: &[u8]) -> usize {
+        String::from_utf8_lossy(report)
+            .lines()
+            .filter_map(|line| line.strip_prefix("block "))
+            .next_back()
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .expect("a block reported")
+    }
+
     /// A folding encode's spans folded on the writer's thread — which is
     /// where they are folded when no thread can be started — code to what
     /// they code folded on a thread of their own, a span ahead: the same
@@ -4805,16 +4836,7 @@ mod thread_tests {
             .iter()
             .map(|case| coded(&input, &dir, case, false).1)
             .collect();
-        let audio = dir.join("m.atmos.audio");
-        let length = std::fs::metadata(&audio).unwrap().len();
-        // Fourteen channels of 24 bits.
-        let missing = ((SAMPLES - CUT) * (8 + OBJECTS) * 3) as u64;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&audio)
-            .unwrap()
-            .set_len(length - missing)
-            .unwrap();
+        cut(&dir, SAMPLES, CUT);
         // `--frames` stops that case before the cut.
         for (case, whole) in cases()
             .iter()
@@ -4841,10 +4863,10 @@ mod thread_tests {
     /// A stream that cannot be written stops the encode with the same error
     /// whether the fold is on its own thread or the writer's, and with the
     /// same blocks folded: an overlay's report the same to the byte. The
-    /// span after the one that failed is in it, folded by the fold on its
-    /// thread into the buffer it holds before it finds the writer gone, and
-    /// by the fold on the writer's because it goes on one span for that;
-    /// nothing after it is.
+    /// span after the one that failed is in it — the fold on its thread
+    /// folds it into its second buffer before it finds the writer gone, and
+    /// the fold on the writer's goes on to it for that — and nothing after
+    /// it is.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_write_that_fails_stops_a_fold_where_its_thread_stops() {
@@ -4861,6 +4883,43 @@ mod thread_tests {
                 assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
                 assert!(told == retold, "{name}, run {run}: the same blocks folded");
             }
+        }
+    }
+
+    /// The two ways the span after a failed write is not folded, by the
+    /// fold on its thread or on the writer's: the read its fold waits for
+    /// fails — an overlay folds a span once the next is read — or there is
+    /// no such span, the write failing on the master's last. Either way the
+    /// report ends at the span the write failed on, and the write's error is
+    /// the one said. Where the write fails is found from the whole master's
+    /// report, which ends one span after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fold_after_a_failed_write_needs_its_read_and_its_span() {
+        let overlay = cases()
+            .into_iter()
+            .find(|case| case.name == "overlay")
+            .unwrap();
+        let full = Path::new("/dev/full");
+        let dir = crate::fixtures::scratch("encode", "full-then");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        let (whole, _, told) = encoded(&input, &dir, full, &overlay, false, false);
+        let after = last_block(&told);
+        let failed = after - 1;
+        let write = whole.expect_err("the write fails");
+
+        // The audio cut in the span read before the one after is folded.
+        cut(&dir, SAMPLES, (after + 1) * SPAN + 300);
+        // And a master that ends with the span the write fails on.
+        let short = crate::fixtures::scratch("encode", "full-at-end");
+        let ends = crate::fixtures::master_with(&short, after * SPAN, OBJECTS);
+        for (name, input, dir) in [("cut", &input, &dir), ("ends", &ends, &short)] {
+            let [(inline, _, told), (threaded, _, retold)] =
+                [false, true].map(|threads| encoded(input, dir, full, &overlay, threads, false));
+            assert_eq!(inline.as_ref(), Err(&write), "{name}: the write's error");
+            assert_eq!(threaded, inline, "{name}: said the same way");
+            assert_eq!(last_block(&told), failed, "{name}: nothing after it folded");
+            assert!(told == retold, "{name}: the same blocks folded");
         }
     }
 }
