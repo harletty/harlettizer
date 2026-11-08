@@ -611,12 +611,17 @@ right-hand side two runs at a time (`against`); the trade's eight
 candidates in two vectors where they were four (`Trellis::trade_plain`).
 Each sum is still its own, its products taken and added in the same order,
 and nothing fuses a product into a sum (the build is for AVX2, not FMA,
-and Rust fuses none by itself), so every entry, gain and code is the same
-to the bit. The standard library asks the CPU once which build to run;
-every other CPU and architecture runs the first. The steep decision's
-solves were no faster built for AVX2 — a system's steps come one after
-another, not in lanes — and are left as they were. On sixteen cores, with
-AVX2:
+and Rust fuses none by itself), so every entry and gain that is a number
+is the same to the bit, and every code the same. A NaN is a NaN in both
+builds, but where two meet in a sum, which one the sum keeps is the
+build's to choose. Only a target can bring one, from a master's gain that
+is NaN, infinite or loud enough to overflow, and no code depends on its
+bits: a NaN gain quantises to the level nought, and in the trade every
+candidate of its band has the same NaN for an error. The standard library
+asks the CPU once which build to run; every other CPU and architecture
+runs the first. The steep decision's solves were no faster built for AVX2
+— a system's steps come one after another, not in lanes — and are left as
+they were. On sixteen cores, with AVX2:
 
 | programme | elements | payloads quantised coarser | before | after | CPU time |
 |---|---|---|---|---|---|

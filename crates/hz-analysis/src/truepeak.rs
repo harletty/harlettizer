@@ -151,9 +151,11 @@ impl TruePeak {
 ///
 /// Where the CPU has AVX2, [`loudest_in_lanes`] built for it: a vector
 /// holds four lanes where the baseline build's hold two. Each lane is the
-/// same products added in the same order, so every point is the same to the
-/// bit, and so is the loudest. Without AVX2, and on every other
-/// architecture, the baseline build.
+/// same products added in the same order, so every point that is a number
+/// is the same to the bit — a NaN is a NaN in both, though where two meet
+/// the builds may keep different ones — and so is the loudest, which a NaN
+/// never is. Without AVX2, and on every other architecture, the baseline
+/// build.
 fn loudest(taps: &[f64; PHASES * TAPS_PER_PHASE], line: &[f64], peak: f64) -> f64 {
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") {

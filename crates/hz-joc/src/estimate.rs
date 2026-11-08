@@ -3236,9 +3236,17 @@ mod tests {
     /// channels and a window from any sample, on noise and on signals that
     /// carry values no signal has. Where those make a NaN, both builds make
     /// one; which NaN, when two meet in a sum, Rust leaves to the build, so
-    /// a NaN is compared as a NaN. The estimator never meets one — its basis
-    /// and its targets are integer samples, filtered. A CPU without AVX2
-    /// has nothing to compare.
+    /// a NaN is compared as a NaN. The basis never holds one: it is the
+    /// probe's reconstruction of the coded core. A target can — an
+    /// element's samples times the gain its master states, which can be NaN
+    /// or infinite, or loud enough to overflow — and then two NaNs can meet
+    /// in a right-hand side's sum, and the builds can keep different ones.
+    /// No NaN's bits reach a payload: a gain that is NaN quantises to the
+    /// level nought, whichever NaN it is; the bounds and the budget's scale
+    /// only compare, or take a `max`; and a band whose gain or weight is
+    /// NaN gives each of its candidates the same NaN for an error, so that
+    /// the trade's `total_cmp` only meets a NaN with its own bits. A CPU
+    /// without AVX2 has nothing to compare.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_avx2_builds_take_the_sums_the_baseline_build_takes() {

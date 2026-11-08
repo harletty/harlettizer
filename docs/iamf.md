@@ -647,12 +647,13 @@ code, made for AVX2, whose vectors hold four; the standard library asks the
 CPU once which to run, and every other CPU and architecture runs the
 first. Each lane is still the same products added in the same order, and
 nothing fuses a product into a sum (the build is for AVX2, not FMA, and
-Rust fuses none by itself), so every point is the same to the bit. A set
-of lanes now reads its samples as one window, which spares the wider build
-a bounds check for every tap. The reconstruction takes under half the
-cycles it did, and the meter's thread is no longer a bed's longest: the
-encode's own, reading and rendering the programme, now is. So a bed's wall
-time holds and only its CPU time falls. On sixteen cores, with AVX2:
+Rust fuses none by itself), so every point that is a number is the same to
+the bit, and so is the loudest, which a NaN never is. A set of lanes now
+reads its samples as one window, which spares the wider build a bounds
+check for every tap. The reconstruction takes under half the cycles it
+did, and the meter's thread is no longer a bed's longest: the encode's
+own, reading and rendering the programme, now is. So a bed's wall time
+holds and only its CPU time falls. On sixteen cores, with AVX2:
 
 | programme | before | after | CPU time |
 |---|---|---|---|
