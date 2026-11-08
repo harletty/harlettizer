@@ -61,16 +61,33 @@ pub fn run(config: Config) -> Result<()> {
     // its own that the whole encode runs in, so that the thread driving it
     // works in the pool between its own steps. The same stream, to the byte.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(JOC_THREADS));
-    match rayon::ThreadPoolBuilder::new()
+    let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|n| format!("joc-{n}"))
         // The stack the encode has on the main thread.
         .stack_size(8 << 20)
         .build()
-    {
-        Ok(pool) => pool.install(|| encode(config)),
-        Err(_) => encode(config),
-    }
+        // A process that may start no more threads (a task limit) still
+        // encodes, on the thread it has: a pool of that thread alone starts
+        // none, and is what Rayon itself falls back to where there are no
+        // threads. Not `encode` outside any pool: the estimator's work would
+        // start Rayon's global pool, which fails the same way, and panics.
+        // Rayon keeps that thread its own for the rest of the process, and
+        // the stream is the same to the byte.
+        .or_else(|_| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build()
+        })
+        // Refused before anything is opened, the output left as it was.
+        .map_err(|e| {
+            Error::io(
+                &config.out,
+                std::io::Error::other(format!("no thread to encode on: {e}")),
+            )
+        })?;
+    pool.install(|| encode(config))
 }
 
 fn encode(config: Config) -> Result<()> {
