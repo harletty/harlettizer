@@ -520,6 +520,28 @@ is the same to the bit. On sixteen cores:
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.44 s | 0.41 s | −5 % |
 | 40 objects, 4 s | 40 → 15 | 0.23 s | 0.22 s | −6 % |
 
+The steep decision weighs each object's gains band by band, ramped across
+the frame and stepped at each of its 24 slots: 25 small systems a band,
+each solved by Gaussian elimination with partial pivoting. The systems are
+the downmix's alone, the same for every object; only the right-hand sides
+are the object's. So each band's systems are summed and eliminated once
+for a frame's objects (`SteepBand`), and each object's right-hand sides are
+taken through the elimination kept (`Eliminated`): the same swaps and steps,
+in the same order, as beside the system. What is left of a solve is a chain
+of steps, each waiting on the one before: multiplications and subtractions
+down the system, then back up it a row at a time, each row's sum of the
+gains found taken away and the rest divided by its pivot. One split's solve does
+not wait on another's, so four splits are solved a step of each at a time.
+Every gain and error is the same to the bit. On sixteen cores:
+
+| programme | elements | before | after | CPU time |
+|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 0.47 s | 0.43 s | −5 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 1.13 s | 1.08 s | −2 % |
+| 60 s at 640 kb/s | 11 | 1.87 s | 1.81 s | −2 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.37 s | 0.36 s | −2 % |
+| 40 objects, 4 s | 40 → 15 | 0.19 s | 0.19 s | −1 % |
+
 A frame over its budget has some thirty λ tried on it, and every one weighs
 the same candidate levels. A channel's candidates and their weighted errors
 do not depend on λ, so they are laid out once a frame (`Trellis`), and what

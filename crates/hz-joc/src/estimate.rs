@@ -198,6 +198,9 @@ pub struct Estimator {
     /// For the steep decision: each slot's downmix matrices, per band, over
     /// the frame and half the next.
     slot_gram: Vec<[[f64; MAX_CHANNELS]; MAX_CHANNELS]>,
+    /// And each band's systems, from them: the same for every object;
+    /// none until a frame weighs a step.
+    steep: Vec<SteepBand>,
     /// The scratch each object's fit works in, one per thread the objects
     /// are fitted on at once.
     fitters: Vec<Fitter>,
@@ -263,6 +266,7 @@ impl Estimator {
             gram: vec![0.0; (channels * BANDS).pow(2)],
             factor: vec![0.0; (channels * BANDS).pow(2)],
             slot_gram: vec![[[0.0; MAX_CHANNELS]; MAX_CHANNELS]; SPAN * BANDS],
+            steep: Vec::new(),
             fitters: vec![Fitter::new(channels * BANDS)],
             wanted: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             weights: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
@@ -392,9 +396,10 @@ impl Estimator {
             &mut self.gram,
             &mut self.factor,
         );
-        let stepping = self.steep_margin > 0.0;
+        let stepping = self.steep_margin > 0.0 && present.contains(&true);
         if stepping {
             self.slot_matrices();
+            self.steep_systems();
         }
 
         // Each object is fitted from what the decoder holds for it, against
@@ -417,6 +422,7 @@ impl Estimator {
             factor: &self.factor,
             window_root: &self.window_root,
             slot_gram: &self.slot_gram,
+            steep: &self.steep,
             core_slots: &self.core_slots,
         };
         let mut out_objects: Vec<Option<Object>> = (0..objects).map(|_| None).collect();
@@ -477,6 +483,15 @@ impl Estimator {
                     }
                 }
             });
+    }
+
+    /// Each band's systems for the steep decision, from the slots' matrices.
+    fn steep_systems(&mut self) {
+        self.steep.resize_with(BANDS, SteepBand::default);
+        let (n, ridge, slot_gram) = (self.channels, f64::from(self.ridge), &self.slot_gram);
+        each_mut!(self.steep)
+            .enumerate()
+            .for_each(|(band, steep)| steep.lay(slot_gram, band, n, ridge));
     }
 
     /// The frame's payload around its objects; the sequence count steps on.
@@ -706,7 +721,7 @@ impl Estimator {
                 for (i, row) in system.iter_mut().enumerate().take(n) {
                     row[i] += lambda;
                 }
-                let solution = solve(&mut system, &mut rhs, n);
+                let solution = Eliminated::new(system, n).solve(rhs, n);
                 for ch in 0..n {
                     solutions[ch][band] = solution[ch];
                 }
@@ -745,7 +760,64 @@ struct Frame<'a> {
     factor: &'a [f64],
     window_root: &'a [f64],
     slot_gram: &'a [[[f64; MAX_CHANNELS]; MAX_CHANNELS]],
+    steep: &'a [SteepBand],
     core_slots: &'a [[Slot; 2 * SLOTS]],
+}
+
+/// What the steep decision weighs every object against in one band, the
+/// same for each: the ramp's system, eliminated under the ridge, and for
+/// each split the step's — the sum of the slots' matrices from it on, and
+/// that eliminated under the ridge. Worked out once a frame, where each
+/// object worked out its own: only the right-hand sides are the object's.
+#[derive(Clone, Default)]
+struct SteepBand {
+    ramp: Eliminated,
+    /// By split, from one; nought is no step.
+    steps: [[[f64; MAX_CHANNELS]; MAX_CHANNELS]; SLOTS + 1],
+    stepped: [Eliminated; SLOTS + 1],
+}
+
+impl SteepBand {
+    /// Band `band`'s systems from `slot_gram`, each slot's downmix matrices,
+    /// summed slot by slot in the order each object's were: the ramp's from
+    /// the first slot, the steps' from the last.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn lay(
+        &mut self,
+        slot_gram: &[[[f64; MAX_CHANNELS]; MAX_CHANNELS]],
+        band: usize,
+        n: usize,
+        ridge: f64,
+    ) {
+        let cell = |t: usize| &slot_gram[t * BANDS + band];
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        for t in 0..SPAN {
+            let (w, a) = (ramp_weight(t), cell(t));
+            for i in 0..n {
+                for j in 0..n {
+                    system[i][j] += w * w * a[i][j];
+                }
+            }
+        }
+        self.ramp = Eliminated::ridged(system, n, ridge);
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        for t in SLOTS..SPAN {
+            add(&mut system, cell(t), n);
+        }
+        for split in (1..=SLOTS).rev() {
+            if split < SLOTS {
+                add(&mut system, cell(split), n);
+            }
+            self.steps[split] = system;
+            self.stepped[split] = Eliminated::ridged(system, n, ridge);
+        }
+    }
+}
+
+/// The ramp's weight on the frame's gains at slot `t`, `(t + 1)/24`, then
+/// one: the decoder's `(1 − w)·held + w·new`.
+fn ramp_weight(t: usize) -> f64 {
+    ((t + 1) as f64 / SLOTS as f64).min(1.0)
 }
 
 /// The fit by synthesis's normal equations on the window from `from`
@@ -944,7 +1016,6 @@ impl Fitter {
     /// own model of the frame, before synthesis — over the frame and half
     /// the next, against the ramp: each the least-squares gains for its
     /// shape, the ramp from the gains held, the step after the held ones.
-    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
     fn steep_split(
         &mut self,
         frame: &Frame,
@@ -952,103 +1023,9 @@ impl Fitter {
         held: &Matrix,
     ) -> Option<Step> {
         let n = frame.channels;
-        for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
-            *rhs = [0.0; MAX_CHANNELS];
-            *energy = 0.0;
-        }
-        for t in 0..SPAN {
-            let target = &slots[t];
-            for k in 0..SUBBANDS {
-                let cell = t * BANDS + band_of(k);
-                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
-                self.slot_energy[cell] += or * or + oi * oi;
-                for (i, core) in frame.core_slots.iter().enumerate() {
-                    let x = &core[t];
-                    self.slot_rhs[cell][i] +=
-                        f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
-                }
-            }
-        }
+        let (ramped, stepped) = self.weigh(frame, slots, held);
         let held = *held;
         let ridge = f64::from(frame.ridge);
-        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
-        for band in 0..BANDS {
-            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
-            let cell = |t: usize| t * BANDS + band;
-            // The ramp: (1 − w)·h + w·c at slot t, w = (t + 1)/24, then c.
-            let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
-            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
-            let mut rhs = [0f64; MAX_CHANNELS];
-            for t in 0..SPAN {
-                let (w, a, g) = (
-                    weight(t),
-                    &frame.slot_gram[cell(t)],
-                    &self.slot_rhs[cell(t)],
-                );
-                for i in 0..n {
-                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
-                    for j in 0..n {
-                        system[i][j] += w * w * a[i][j];
-                    }
-                }
-            }
-            let c = snap(ridged_solve(system, rhs, n, ridge));
-            for t in 0..SPAN {
-                let w = weight(t);
-                let mix: [f64; MAX_CHANNELS] =
-                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
-                ramped += error(
-                    &frame.slot_gram[cell(t)],
-                    &self.slot_rhs[cell(t)],
-                    self.slot_energy[cell(t)],
-                    &mix,
-                    n,
-                );
-            }
-            // The steps: the held gains on the slots before the split, the
-            // least-squares gains on the rest, the split from late to early so
-            // that the rest's sums build up.
-            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
-            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
-            for t in SLOTS..SPAN {
-                accumulate(
-                    &mut system,
-                    &mut rhs,
-                    &mut energy,
-                    &frame.slot_gram[cell(t)],
-                    &self.slot_rhs[cell(t)],
-                    self.slot_energy[cell(t)],
-                    n,
-                );
-            }
-            let mut before = [0f64; SLOTS + 1];
-            for t in 0..SLOTS {
-                before[t + 1] = before[t]
-                    + error(
-                        &frame.slot_gram[cell(t)],
-                        &self.slot_rhs[cell(t)],
-                        self.slot_energy[cell(t)],
-                        &h,
-                        n,
-                    );
-            }
-            for split in (1..=SLOTS).rev() {
-                let t = split;
-                if t < SLOTS {
-                    accumulate(
-                        &mut system,
-                        &mut rhs,
-                        &mut energy,
-                        &frame.slot_gram[cell(t)],
-                        &self.slot_rhs[cell(t)],
-                        self.slot_energy[cell(t)],
-                        n,
-                    );
-                }
-                let c = ridged_solve(system, rhs, n, ridge);
-                stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
-            }
-        }
         let (split, _) = (1..=SLOTS)
             .map(|split| (split, stepped[split]))
             .min_by(|a, b| a.1.total_cmp(&b.1))?;
@@ -1072,6 +1049,124 @@ impl Fitter {
             signal: self.slot_energy.iter().sum(),
         };
         step.passes(best, frame.steep_margin).then_some(step)
+    }
+
+    /// The object's error over the frame and half the next, ramped, and
+    /// stepped at each split from one: its sums against the downmix, slot
+    /// by slot, kept for the step chosen.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn weigh(
+        &mut self,
+        frame: &Frame,
+        slots: &[Slot; 2 * SLOTS],
+        held: &Matrix,
+    ) -> (f64, [f64; SLOTS + 1]) {
+        let n = frame.channels;
+        for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
+            *rhs = [0.0; MAX_CHANNELS];
+            *energy = 0.0;
+        }
+        for t in 0..SPAN {
+            let target = &slots[t];
+            for k in 0..SUBBANDS {
+                let cell = t * BANDS + band_of(k);
+                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
+                self.slot_energy[cell] += or * or + oi * oi;
+                for (i, core) in frame.core_slots.iter().enumerate() {
+                    let x = &core[t];
+                    self.slot_rhs[cell][i] +=
+                        f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
+                }
+            }
+        }
+        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
+        for band in 0..BANDS {
+            // The band's systems, worked out for the frame: none worked out
+            // is a bug, not a frame without steps.
+            let steep = &frame.steep[band];
+            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+            let cell = |t: usize| t * BANDS + band;
+            // The ramp: (1 − w)·h + w·c at slot t, w = (t + 1)/24, then c.
+            // Its system is the band's; the right-hand side is the object's.
+            let mut rhs = [0f64; MAX_CHANNELS];
+            for t in 0..SPAN {
+                let (w, a, g) = (
+                    ramp_weight(t),
+                    &frame.slot_gram[cell(t)],
+                    &self.slot_rhs[cell(t)],
+                );
+                for i in 0..n {
+                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
+                }
+            }
+            let c = snap(steep.ramp.solve(rhs, n));
+            for t in 0..SPAN {
+                let w = ramp_weight(t);
+                let mix: [f64; MAX_CHANNELS] =
+                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
+                ramped += error(
+                    &frame.slot_gram[cell(t)],
+                    &self.slot_rhs[cell(t)],
+                    self.slot_energy[cell(t)],
+                    &mix,
+                    n,
+                );
+            }
+            // The steps: the held gains on the slots before the split, the
+            // least-squares gains on the rest, the split from late to early so
+            // that the rest's sums build up — the systems the band's, built
+            // up the same way.
+            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
+            for t in SLOTS..SPAN {
+                take(
+                    &mut rhs,
+                    &mut energy,
+                    &self.slot_rhs[cell(t)],
+                    self.slot_energy[cell(t)],
+                    n,
+                );
+            }
+            let mut before = [0f64; SLOTS + 1];
+            for t in 0..SLOTS {
+                before[t + 1] = before[t]
+                    + error(
+                        &frame.slot_gram[cell(t)],
+                        &self.slot_rhs[cell(t)],
+                        self.slot_energy[cell(t)],
+                        &h,
+                        n,
+                    );
+            }
+            let mut rest = [([0f64; MAX_CHANNELS], 0f64); SLOTS + 1];
+            for split in (1..=SLOTS).rev() {
+                if split < SLOTS {
+                    take(
+                        &mut rhs,
+                        &mut energy,
+                        &self.slot_rhs[cell(split)],
+                        self.slot_energy[cell(split)],
+                        n,
+                    );
+                }
+                rest[split] = (rhs, energy);
+            }
+            // Each split's gains and error apart from every other's, a few
+            // splits side by side: one's solve does not wait on the last's.
+            for first in (1..=SLOTS).step_by(SIDE) {
+                let gains = Eliminated::solve_side_by_side::<SIDE>(
+                    std::array::from_fn(|s| &steep.stepped[first + s]),
+                    std::array::from_fn(|s| rest[first + s].0),
+                    n,
+                );
+                for (s, c) in gains.iter().enumerate() {
+                    let split = first + s;
+                    let (rhs, energy) = &rest[split];
+                    stepped[split] +=
+                        before[split] + error(&steep.steps[split], rhs, *energy, c, n);
+                }
+            }
+        }
+        (ramped, stepped)
     }
 
     /// The error in `band` of the object [`Self::steep_split`] last weighed,
@@ -1540,11 +1635,34 @@ fn accumulate(
     e: f64,
     n: usize,
 ) {
+    add(system, a, n);
+    take(rhs, energy, g, e, n);
+}
+
+/// Add one slot's downmix matrix to a running sum.
+#[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+fn add(
+    system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+    a: &[[f64; MAX_CHANNELS]; MAX_CHANNELS],
+    n: usize,
+) {
     for i in 0..n {
-        rhs[i] += g[i];
         for j in 0..n {
             system[i][j] += a[i][j];
         }
+    }
+}
+
+/// Add one slot's object side to running sums.
+fn take(
+    rhs: &mut [f64; MAX_CHANNELS],
+    energy: &mut f64,
+    g: &[f64; MAX_CHANNELS],
+    e: f64,
+    n: usize,
+) {
+    for (rhs, g) in rhs.iter_mut().zip(g).take(n) {
+        *rhs += g;
     }
     *energy += e;
 }
@@ -1556,18 +1674,15 @@ fn snap(gains: [f64; MAX_CHANNELS]) -> [f64; MAX_CHANNELS] {
     gains.map(|g| (g / step).round().clamp(-96.0, 95.0) * step)
 }
 
-/// [`solve`] with a ridge of `ridge` times the mean diagonal.
+/// `system · x = rhs` for the leading `n` unknowns, under a ridge of
+/// `ridge` times the mean diagonal.
 fn ridged_solve(
-    mut system: [[f64; MAX_CHANNELS]; MAX_CHANNELS],
-    mut rhs: [f64; MAX_CHANNELS],
+    system: [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+    rhs: [f64; MAX_CHANNELS],
     n: usize,
     ridge: f64,
 ) -> [f64; MAX_CHANNELS] {
-    let lambda = ridge * (0..n).map(|i| system[i][i]).sum::<f64>() / n as f64 + 1e-12;
-    for (i, row) in system.iter_mut().enumerate().take(n) {
-        row[i] += lambda;
-    }
-    solve(&mut system, &mut rhs, n)
+    Eliminated::ridged(system, n, ridge).solve(rhs, n)
 }
 
 /// The sequence count after `sequence`. Clause 6.3.3.3: nought marks the
@@ -1578,43 +1693,109 @@ pub fn next_sequence(sequence: u16) -> u16 {
     if sequence >= 1023 { 1 } else { sequence + 1 }
 }
 
-/// Solve `system · x = rhs` for the leading `n` unknowns, by Gaussian
-/// elimination with partial pivoting; the system is overwritten.
-#[allow(clippy::needless_range_loop)] // a textbook elimination, indexed as one
-fn solve(
-    system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS],
-    rhs: &mut [f64; MAX_CHANNELS],
-    n: usize,
-) -> [f64; MAX_CHANNELS] {
-    for col in 0..n {
-        let pivot = (col..n)
-            .max_by(|a, b| system[*a][col].abs().total_cmp(&system[*b][col].abs()))
-            .expect("rows");
-        system.swap(col, pivot);
-        rhs.swap(col, pivot);
-        let d = system[col][col];
-        if d.abs() < 1e-30 {
-            continue;
-        }
-        for row in col + 1..n {
-            let f = system[row][col] / d;
-            for k in col..n {
-                system[row][k] -= f * system[col][k];
-            }
-            rhs[row] -= f * rhs[col];
-        }
-    }
-    let mut x = [0f64; MAX_CHANNELS];
-    for row in (0..n).rev() {
-        let d = system[row][row];
-        if d.abs() < 1e-30 {
-            continue;
-        }
-        let s: f64 = (row + 1..n).map(|k| system[row][k] * x[k]).sum();
-        x[row] = (rhs[row] - s) / d;
-    }
-    x
+/// A small system's Gaussian elimination with partial pivoting, worked out
+/// once and kept, so that every right-hand side solved against the system
+/// is taken through its steps without working them out again: the row each
+/// column's pivot came from and, in one matrix, the system left on and
+/// above the diagonal, and below it the factor each row was eliminated by —
+/// row `r` under column `c` numbered as it was when `c` was eliminated. A
+/// right-hand side meets the same steps, in the same order, as it would
+/// eliminated beside the system: to the bit what that gives.
+#[derive(Clone, Copy, Default)]
+struct Eliminated {
+    pivots: [u8; MAX_CHANNELS],
+    lu: [[f64; MAX_CHANNELS]; MAX_CHANNELS],
 }
+
+impl Eliminated {
+    /// The leading `n` rows and columns of `system`, eliminated; a column
+    /// whose pivot is below 10⁻³⁰ is left as it is.
+    #[allow(clippy::needless_range_loop)] // a textbook elimination, indexed as one
+    fn new(mut system: [[f64; MAX_CHANNELS]; MAX_CHANNELS], n: usize) -> Self {
+        let mut pivots = [0u8; MAX_CHANNELS];
+        let mut factors = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        for col in 0..n {
+            let pivot = (col..n)
+                .max_by(|a, b| system[*a][col].abs().total_cmp(&system[*b][col].abs()))
+                .expect("rows");
+            system.swap(col, pivot);
+            pivots[col] = pivot as u8;
+            let d = system[col][col];
+            if d.abs() < 1e-30 {
+                continue;
+            }
+            for row in col + 1..n {
+                let f = system[row][col] / d;
+                for k in col..n {
+                    system[row][k] -= f * system[col][k];
+                }
+                factors[row][col] = f;
+            }
+        }
+        // Below the diagonal, nothing elimination left is read again: a row
+        // is done with once its column is, and the pivots it meets later
+        // swap only rows below their own.
+        for row in 0..n {
+            system[row][..row].copy_from_slice(&factors[row][..row]);
+        }
+        Self { pivots, lu: system }
+    }
+
+    /// [`Self::new`] under a ridge of `ridge` times the mean diagonal.
+    fn ridged(mut system: [[f64; MAX_CHANNELS]; MAX_CHANNELS], n: usize, ridge: f64) -> Self {
+        let lambda = ridge * (0..n).map(|i| system[i][i]).sum::<f64>() / n as f64 + 1e-12;
+        for (i, row) in system.iter_mut().enumerate().take(n) {
+            row[i] += lambda;
+        }
+        Self::new(system, n)
+    }
+
+    /// The system's `x` for the leading `n` unknowns of `rhs`: the
+    /// elimination's swaps and steps, then back substitution.
+    fn solve(&self, rhs: [f64; MAX_CHANNELS], n: usize) -> [f64; MAX_CHANNELS] {
+        let [x] = Self::solve_side_by_side([self], [rhs], n);
+        x
+    }
+
+    /// [`Self::solve`] for each of `K` systems and right-hand sides, taken
+    /// a step of each at a time: each system's steps are its own, in its own
+    /// order, but one's division need not wait on another's.
+    #[allow(clippy::needless_range_loop)] // a textbook elimination, indexed as one
+    fn solve_side_by_side<const K: usize>(
+        systems: [&Self; K],
+        mut rhs: [[f64; MAX_CHANNELS]; K],
+        n: usize,
+    ) -> [[f64; MAX_CHANNELS]; K] {
+        for col in 0..n {
+            for (system, rhs) in systems.iter().zip(&mut rhs) {
+                rhs.swap(col, usize::from(system.pivots[col]));
+                if system.lu[col][col].abs() < 1e-30 {
+                    continue;
+                }
+                for row in col + 1..n {
+                    rhs[row] -= system.lu[row][col] * rhs[col];
+                }
+            }
+        }
+        let mut x = [[0f64; MAX_CHANNELS]; K];
+        for row in (0..n).rev() {
+            for ((system, x), rhs) in systems.iter().zip(&mut x).zip(&rhs) {
+                let d = system.lu[row][row];
+                if d.abs() < 1e-30 {
+                    continue;
+                }
+                let s: f64 = (row + 1..n).map(|k| system.lu[row][k] * x[k]).sum();
+                x[row] = (rhs[row] - s) / d;
+            }
+        }
+        x
+    }
+}
+
+/// How many splits the steep decision solves side by side: six or eight
+/// were no faster than four.
+const SIDE: usize = 4;
+const _: () = assert!(SLOTS.is_multiple_of(SIDE));
 
 /// The gains a dense, single-point object's codes stand for, as the decoder
 /// dequantises them: per channel and band.
@@ -2473,6 +2654,478 @@ mod tests {
                     .map(|signal| dot(&signal[from..], &target[from..]))
                     .collect();
                 assert_eq!(bits(&rhs), bits(&rhs_by_dots), "{n} channels from {from}");
+            }
+        }
+    }
+
+    /// The small solve as it was: the right-hand side eliminated beside the
+    /// system.
+    #[allow(clippy::needless_range_loop)] // a textbook elimination, indexed as one
+    fn solve_beside(
+        mut system: [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+        mut rhs: [f64; MAX_CHANNELS],
+        n: usize,
+    ) -> [f64; MAX_CHANNELS] {
+        for col in 0..n {
+            let pivot = (col..n)
+                .max_by(|a, b| system[*a][col].abs().total_cmp(&system[*b][col].abs()))
+                .expect("rows");
+            system.swap(col, pivot);
+            rhs.swap(col, pivot);
+            let d = system[col][col];
+            if d.abs() < 1e-30 {
+                continue;
+            }
+            for row in col + 1..n {
+                let f = system[row][col] / d;
+                for k in col..n {
+                    system[row][k] -= f * system[col][k];
+                }
+                rhs[row] -= f * rhs[col];
+            }
+        }
+        let mut x = [0f64; MAX_CHANNELS];
+        for row in (0..n).rev() {
+            let d = system[row][row];
+            if d.abs() < 1e-30 {
+                continue;
+            }
+            let s: f64 = (row + 1..n).map(|k| system[row][k] * x[k]).sum();
+            x[row] = (rhs[row] - s) / d;
+        }
+        x
+    }
+
+    /// And under the ridge, as it was.
+    fn ridged_beside(
+        mut system: [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+        rhs: [f64; MAX_CHANNELS],
+        n: usize,
+        ridge: f64,
+    ) -> [f64; MAX_CHANNELS] {
+        let lambda = ridge * (0..n).map(|i| system[i][i]).sum::<f64>() / n as f64 + 1e-12;
+        for (i, row) in system.iter_mut().enumerate().take(n) {
+            row[i] += lambda;
+        }
+        solve_beside(system, rhs, n)
+    }
+
+    /// An elimination kept and taken again for each right-hand side, alone
+    /// or beside other systems', solves to the bit what eliminating each
+    /// beside the system did: on every number of channels, with and without
+    /// the ridge, on systems of every kind the decision meets — full,
+    /// symmetric, singular, a silent channel's nought row, pivots that tie, a
+    /// column below the threshold — and right-hand sides with noughts of
+    /// either sign.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn a_kept_elimination_solves_as_one_beside_the_right_hand_side_to_the_bit() {
+        const KINDS: usize = 6;
+        let mut seed = 53u32;
+        let mut value = || 4.0 * f64::from(noise(&mut seed));
+        for n in 1..=MAX_CHANNELS {
+            let systems: [_; KINDS] = std::array::from_fn(|kind| {
+                let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+                // The Gram matrix of a few vectors: fewer than `n` leaves it
+                // singular, as a band the downmix fills from fewer channels.
+                let gram = |system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+                            vectors: &[[f64; MAX_CHANNELS]]| {
+                    for i in 0..n {
+                        for j in 0..n {
+                            system[i][j] = vectors.iter().map(|v| v[i] * v[j]).sum();
+                        }
+                    }
+                };
+                let mut vectors = [[0f64; MAX_CHANNELS]; 9];
+                for v in &mut vectors {
+                    *v = std::array::from_fn(|_| value());
+                }
+                match kind {
+                    0 => {
+                        for row in &mut system {
+                            *row = std::array::from_fn(|_| value());
+                        }
+                    }
+                    1 => gram(&mut system, &vectors[..n.div_ceil(2)]),
+                    2 => gram(&mut system, &vectors),
+                    3 => {
+                        for v in &mut vectors {
+                            v[n / 2] = 0.0;
+                        }
+                        gram(&mut system, &vectors);
+                    }
+                    4 => {
+                        gram(&mut system, &vectors);
+                        if n > 1 {
+                            system[n - 1] = system[0].map(|x| -x);
+                        }
+                    }
+                    _ => {
+                        gram(&mut system, &vectors);
+                        for row in &mut system {
+                            row[0] = if row[1] > 0.0 { 1e-31 } else { -0.0 };
+                        }
+                    }
+                }
+                system
+            });
+            for ridged in [false, true] {
+                let kept = systems.map(|system| match ridged {
+                    false => Eliminated::new(system, n),
+                    true => Eliminated::ridged(system, n, 1e-5),
+                });
+                for r in 0..5 {
+                    let rhs: [[f64; MAX_CHANNELS]; KINDS] = std::array::from_fn(|_| match r {
+                        3 => {
+                            let mut rhs: [f64; MAX_CHANNELS] = std::array::from_fn(|_| value());
+                            rhs[0] = -0.0;
+                            rhs[n - 1] = 0.0;
+                            rhs
+                        }
+                        // Under a column left as it is, a nought below a
+                        // negative stays the nought it is.
+                        4 => std::array::from_fn(|i| if i % 2 == 0 { -1.0 } else { -0.0 }),
+                        _ => std::array::from_fn(|_| value()),
+                    });
+                    let beside: [_; KINDS] = std::array::from_fn(|kind| match ridged {
+                        false => solve_beside(systems[kind], rhs[kind], n),
+                        true => ridged_beside(systems[kind], rhs[kind], n, 1e-5),
+                    });
+                    let bits = |x: &[f64; MAX_CHANNELS]| x.map(f64::to_bits);
+                    for kind in 0..KINDS {
+                        assert_eq!(
+                            bits(&kept[kind].solve(rhs[kind], n)),
+                            bits(&beside[kind]),
+                            "{n} channels, kind {kind}, right-hand side {r}, ridged {ridged}"
+                        );
+                    }
+                    let side_by_side = Eliminated::solve_side_by_side(kept.each_ref(), rhs, n);
+                    assert_eq!(
+                        side_by_side.each_ref().map(bits),
+                        beside.each_ref().map(bits),
+                        "{n} channels side by side, right-hand side {r}, ridged {ridged}"
+                    );
+                    // As many side by side as the decision takes, every kind
+                    // in every place.
+                    for first in 0..KINDS {
+                        let kind = |s: usize| (first + s) % KINDS;
+                        let as_the_decision_takes_them = Eliminated::solve_side_by_side::<SIDE>(
+                            std::array::from_fn(|s| &kept[kind(s)]),
+                            std::array::from_fn(|s| rhs[kind(s)]),
+                            n,
+                        );
+                        assert_eq!(
+                            as_the_decision_takes_them.each_ref().map(bits),
+                            std::array::from_fn::<_, SIDE, _>(|s| bits(&beside[kind(s)])),
+                            "{n} channels, {SIDE} side by side from kind {first}, \
+                             right-hand side {r}, ridged {ridged}"
+                        );
+                    }
+                }
+            }
+        }
+        // A column left as it is takes nothing from the rows below it, not
+        // even a nought: one taken would turn the next row's nought, and
+        // that row's gain, to the other sign.
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        (system[0][0], system[1][1], system[2][2]) = (1e-31, 1.0, 1.0);
+        let rhs = [-1.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0];
+        let beside = solve_beside(system, rhs, 3).map(f64::to_bits);
+        assert_eq!(beside[1], (-0.0f64).to_bits());
+        let kept = Eliminated::new(system, 3);
+        assert_eq!(kept.solve(rhs, 3).map(f64::to_bits), beside);
+        assert_eq!(
+            Eliminated::solve_side_by_side([&kept; 2], [rhs; 2], 3).map(|x| x.map(f64::to_bits)),
+            [beside; 2]
+        );
+    }
+
+    /// A band's systems as each object summed them for itself, before they
+    /// were the band's: the ramp's, and by split the steps'.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn systems_alone(
+        slot_gram: &[[[f64; MAX_CHANNELS]; MAX_CHANNELS]],
+        band: usize,
+        n: usize,
+    ) -> (
+        [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+        Vec<[[f64; MAX_CHANNELS]; MAX_CHANNELS]>,
+    ) {
+        let cell = |t: usize| t * BANDS + band;
+        let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
+        let mut ramp = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        for t in 0..SPAN {
+            let (w, a) = (weight(t), &slot_gram[cell(t)]);
+            for i in 0..n {
+                for j in 0..n {
+                    ramp[i][j] += w * w * a[i][j];
+                }
+            }
+        }
+        let mut steps = vec![[[0f64; MAX_CHANNELS]; MAX_CHANNELS]; SLOTS + 1];
+        let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+        let add = |system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS], t: usize| {
+            let a = &slot_gram[cell(t)];
+            for i in 0..n {
+                for j in 0..n {
+                    system[i][j] += a[i][j];
+                }
+            }
+        };
+        for t in SLOTS..SPAN {
+            add(&mut system, t);
+        }
+        for split in (1..=SLOTS).rev() {
+            let t = split;
+            if t < SLOTS {
+                add(&mut system, t);
+            }
+            steps[split] = system;
+        }
+        (ramp, steps)
+    }
+
+    /// The systems the steep decision shares out to a frame's objects are
+    /// each object's own to the bit, and solve as each object's solved:
+    /// on five and seven channels, with a silent channel, two carrying one
+    /// signal, and one that starts mid-frame.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // splits indexed as splits
+    fn the_bands_systems_are_each_objects_own_to_the_bit() {
+        let mut seed = 59u32;
+        for config in [0, 1] {
+            let mut estimator = Estimator::new(1, config);
+            let n = estimator.channels();
+            for frame in 0..2 {
+                let mut core: Vec<Vec<f32>> = (0..n)
+                    .map(|_| (0..FRAME).map(|_| noise(&mut seed)).collect())
+                    .collect();
+                core[1].fill(0.0);
+                core[2] = core[0].clone();
+                if frame == 1 {
+                    core[3][..FRAME / 3].fill(0.0);
+                }
+                let object: Vec<f32> = (0..FRAME).map(|_| noise(&mut seed)).collect();
+                let core_refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                estimator.push(&core_refs, &[&object], &[true]);
+            }
+            estimator.slot_matrices();
+            estimator.steep_systems();
+            let ridge = f64::from(estimator.ridge);
+            for band in 0..BANDS {
+                let steep = &estimator.steep[band];
+                let (ramp, steps) = systems_alone(&estimator.slot_gram, band, n);
+                let bits = |s: &[[f64; MAX_CHANNELS]; MAX_CHANNELS]| s.map(|r| r.map(f64::to_bits));
+                for r in 0..3 {
+                    let rhs: [f64; MAX_CHANNELS] =
+                        std::array::from_fn(|_| f64::from(noise(&mut seed)));
+                    assert_eq!(
+                        steep.ramp.solve(rhs, n).map(f64::to_bits),
+                        ridged_beside(ramp, rhs, n, ridge).map(f64::to_bits),
+                        "{n} channels, band {band}, the ramp, right-hand side {r}"
+                    );
+                    for split in 1..=SLOTS {
+                        assert_eq!(
+                            bits(&steep.steps[split]),
+                            bits(&steps[split]),
+                            "{n} channels, band {band}, split {split}"
+                        );
+                        assert_eq!(
+                            steep.stepped[split].solve(rhs, n).map(f64::to_bits),
+                            ridged_beside(steps[split], rhs, n, ridge).map(f64::to_bits),
+                            "{n} channels, band {band}, split {split}, right-hand side {r}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An object's ramp and steps weighed as each object weighed them for
+    /// itself, before the systems were the band's.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn weigh_alone(
+        frame: &super::Frame,
+        slots: &[Slot; 2 * SLOTS],
+        held: &Matrix,
+    ) -> (f64, [f64; SLOTS + 1], Vec<[f64; MAX_CHANNELS]>, Vec<f64>) {
+        let n = frame.channels;
+        let mut slot_rhs = vec![[0.0; MAX_CHANNELS]; SPAN * BANDS];
+        let mut slot_energy = vec![0.0; SPAN * BANDS];
+        for t in 0..SPAN {
+            let target = &slots[t];
+            for k in 0..SUBBANDS {
+                let cell = t * BANDS + band_of(k);
+                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
+                slot_energy[cell] += or * or + oi * oi;
+                for (i, core) in frame.core_slots.iter().enumerate() {
+                    let x = &core[t];
+                    slot_rhs[cell][i] += f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
+                }
+            }
+        }
+        let accumulate = |system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+                          rhs: &mut [f64; MAX_CHANNELS],
+                          energy: &mut f64,
+                          cell: usize| {
+            let (a, g, e) = (&frame.slot_gram[cell], &slot_rhs[cell], slot_energy[cell]);
+            for i in 0..n {
+                rhs[i] += g[i];
+                for j in 0..n {
+                    system[i][j] += a[i][j];
+                }
+            }
+            *energy += e;
+        };
+        let ridge = f64::from(frame.ridge);
+        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
+        for band in 0..BANDS {
+            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+            let cell = |t: usize| t * BANDS + band;
+            let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let mut rhs = [0f64; MAX_CHANNELS];
+            for t in 0..SPAN {
+                let (w, a, g) = (weight(t), &frame.slot_gram[cell(t)], &slot_rhs[cell(t)]);
+                for i in 0..n {
+                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
+                    for j in 0..n {
+                        system[i][j] += w * w * a[i][j];
+                    }
+                }
+            }
+            let c = snap(ridged_beside(system, rhs, n, ridge));
+            for t in 0..SPAN {
+                let w = weight(t);
+                let mix: [f64; MAX_CHANNELS] =
+                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
+                ramped += error(
+                    &frame.slot_gram[cell(t)],
+                    &slot_rhs[cell(t)],
+                    slot_energy[cell(t)],
+                    &mix,
+                    n,
+                );
+            }
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
+            for t in SLOTS..SPAN {
+                accumulate(&mut system, &mut rhs, &mut energy, cell(t));
+            }
+            let mut before = [0f64; SLOTS + 1];
+            for t in 0..SLOTS {
+                before[t + 1] = before[t]
+                    + error(
+                        &frame.slot_gram[cell(t)],
+                        &slot_rhs[cell(t)],
+                        slot_energy[cell(t)],
+                        &h,
+                        n,
+                    );
+            }
+            for split in (1..=SLOTS).rev() {
+                let t = split;
+                if t < SLOTS {
+                    accumulate(&mut system, &mut rhs, &mut energy, cell(t));
+                }
+                let c = ridged_beside(system, rhs, n, ridge);
+                stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
+            }
+        }
+        (ramped, stepped, slot_rhs, slot_energy)
+    }
+
+    /// Each object's ramp and every one of its steps weigh, against the
+    /// systems the band shares out, what they weighed against the object's
+    /// own, to the bit — and its sums against the downmix, which the step
+    /// chosen is weighed again from, are what they were: on five and seven
+    /// channels, under two ridges, for an object of noise, a fixed mix, a mix
+    /// that switches mid-frame and silence, from gains held on the
+    /// quantiser's steps and from noughts.
+    #[test]
+    fn each_objects_steps_weigh_what_they_weighed_to_the_bit() {
+        let mut seed = 61u32;
+        for config in [0, 1] {
+            let mut estimator = Estimator::new(4, config);
+            let n = estimator.channels();
+            for _ in 0..2 {
+                let mut core: Vec<Vec<f32>> = (0..n)
+                    .map(|_| (0..FRAME).map(|_| noise(&mut seed)).collect())
+                    .collect();
+                core[1].fill(0.0);
+                core[2] = core[0].clone();
+                let objects: Vec<Vec<f32>> = vec![
+                    (0..FRAME).map(|_| noise(&mut seed)).collect(),
+                    (0..FRAME).map(|t| 0.5 * core[0][t] - core[3][t]).collect(),
+                    (0..FRAME)
+                        .map(|t| {
+                            if t < FRAME / 3 {
+                                core[0][t]
+                            } else {
+                                core[4][t]
+                            }
+                        })
+                        .collect(),
+                    vec![0.0; FRAME],
+                ];
+                let core_refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                let object_refs: Vec<&[f32]> = objects.iter().map(Vec::as_slice).collect();
+                estimator.push(&core_refs, &object_refs, &[true; 4]);
+            }
+            estimator.slot_matrices();
+            for ridge in [estimator.ridge, 1e-3] {
+                estimator.ridge = ridge;
+                estimator.steep_systems();
+                let frame = super::Frame {
+                    channels: n,
+                    ridge: estimator.ridge,
+                    steep_margin: estimator.steep_margin,
+                    stepping: true,
+                    start: 0,
+                    weighted: &estimator.weighted,
+                    gram: &estimator.gram,
+                    factor: &estimator.factor,
+                    window_root: &estimator.window_root,
+                    slot_gram: &estimator.slot_gram,
+                    steep: &estimator.steep,
+                    core_slots: &estimator.core_slots,
+                };
+                let mut fitter = Fitter::new(n * BANDS);
+                for (o, slots) in estimator.object_slots.iter().enumerate() {
+                    for from_noughts in [false, true] {
+                        let held: Matrix = std::array::from_fn(|_| {
+                            std::array::from_fn(|_| match from_noughts {
+                                false => (noise(&mut seed) * 40.0).round() * STEP,
+                                true => 0.0,
+                            })
+                        });
+                        let (ramped, stepped) = fitter.weigh(&frame, slots, &held);
+                        let (ramped_alone, stepped_alone, rhs_alone, energy_alone) =
+                            weigh_alone(&frame, slots, &held);
+                        let case = format!(
+                            "{n} channels, ridge {ridge}, object {o}, from noughts {from_noughts}"
+                        );
+                        assert_eq!(ramped.to_bits(), ramped_alone.to_bits(), "{case}");
+                        assert_eq!(
+                            stepped.map(f64::to_bits),
+                            stepped_alone.map(f64::to_bits),
+                            "{case}"
+                        );
+                        let bits = |v: &[[f64; MAX_CHANNELS]]| -> Vec<_> {
+                            v.iter().map(|r| r.map(f64::to_bits)).collect()
+                        };
+                        assert_eq!(bits(&fitter.slot_rhs), bits(&rhs_alone), "{case}");
+                        assert_eq!(
+                            fitter
+                                .slot_energy
+                                .iter()
+                                .map(|e| e.to_bits())
+                                .collect::<Vec<_>>(),
+                            energy_alone.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+                            "{case}"
+                        );
+                    }
+                }
             }
         }
     }
