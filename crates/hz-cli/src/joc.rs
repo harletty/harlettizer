@@ -150,7 +150,7 @@ enum Feed {
     /// Each one of the master's, as it is.
     Direct(Box<Direct>),
     /// More of them than a payload carries: folded into fifteen.
-    Folded(Box<Folded>),
+    Folded(Box<Folding>),
 }
 
 /// The master's elements carried as they are.
@@ -185,6 +185,47 @@ struct Folded {
     held: Option<fold::Block<Vec<Vec<f32>>>>,
     elements: Vec<Vec<f32>>,
     renders: Vec<Render>,
+    /// Frames the coder is done with, to make the next blocks into.
+    spare: Vec<Job>,
+}
+
+/// The fold on a thread of its own where one can be started ([`Lane`]), a
+/// frame ahead of the coder: a frame is read and folded while the blocks the
+/// frame before made ready are coded. The fold sees its frames in order, and
+/// the coder its blocks, so that both are what a single thread makes of them.
+struct Folding {
+    lane: Lane<Folded>,
+    /// Frames handed to the fold, and frames whose blocks were coded.
+    sent: u64,
+    taken: u64,
+    /// Frames of input the fold is done with, for the next ones to go in.
+    spare: Vec<Input>,
+}
+
+/// A frame of input for the fold: its core, planar, and the master's
+/// samples it was rendered from, `got` of them, interleaved `stride` wide.
+#[derive(Default)]
+struct Input {
+    core: Vec<Vec<f32>>,
+    master: Vec<f32>,
+    stride: usize,
+    got: usize,
+}
+
+/// What the fold is handed, with the frames the coder is done with: a frame
+/// of input, or the programme's end.
+enum Fold {
+    Frame { input: Input, spare: Vec<Job> },
+    Last { spare: Vec<Job> },
+}
+
+/// What the fold hands back: the blocks it made ready for the coder, in
+/// order, and what it failed at after them, if it failed; and the input it
+/// is done with.
+struct Folds {
+    jobs: Vec<Job>,
+    failed: Option<Error>,
+    spent: Option<Input>,
 }
 
 /// Frames from one statement of the true peak to the next, as the reference
@@ -638,7 +679,13 @@ impl Writer {
             }));
             (feed, count)
         } else {
-            let feed = Feed::Folded(Box::new(Folded::new(&config, elements, out)?));
+            let folded = Folded::new(&config, elements, out)?;
+            let feed = Feed::Folded(Box::new(Folding {
+                lane: Lane::new(folded, "joc-fold", threads),
+                sent: 0,
+                taken: 0,
+                spare: Vec::new(),
+            }));
             (feed, MAX_ELEMENTS)
         };
         Ok(Self {
@@ -674,11 +721,15 @@ impl Writer {
         self.coder.estimator.squeezed()
     }
 
-    /// The fold, when the master's elements were folded.
+    /// The fold, when the master's elements were folded, once the writer is
+    /// finished.
     pub fn folder(&self) -> Option<&Folder<Vec<Vec<f32>>>> {
         match &self.feed {
             Feed::Direct(_) => None,
-            Feed::Folded(folded) => Some(&folded.folder),
+            Feed::Folded(folding) => {
+                let folded = folding.lane.stage().expect("the writer is finished");
+                Some(&folded.folder)
+            }
         }
     }
 
@@ -701,10 +752,25 @@ impl Writer {
                     direct.signals.iter().map(|s| &s[..FRAME_SAMPLES]).collect();
                 self.coder.step(core, &signals, &direct.renders, out)
             }
-            Feed::Folded(folded) => {
-                folded.read(core, input, stride, got);
-                while folded.folder.ready() {
-                    folded.code(&mut self.coder, out)?;
+            Feed::Folded(folding) => {
+                let mut next = folding.spare.pop().unwrap_or_default();
+                next.core.resize_with(core.len(), Vec::new);
+                for (kept, plane) in next.core.iter_mut().zip(core) {
+                    kept.clear();
+                    kept.extend_from_slice(plane);
+                }
+                next.master.clear();
+                next.master.extend_from_slice(&input[..got * stride]);
+                (next.stride, next.got) = (stride, got);
+                let spare = std::mem::take(&mut self.coder.spare);
+                folding.lane.send(Fold::Frame { input: next, spare });
+                folding.sent += 1;
+                // The blocks the frame before made ready, coded while this
+                // one is folded.
+                if folding.sent - folding.taken > 1 {
+                    let folds = folding.lane.recv();
+                    folding.taken += 1;
+                    self.coder.folded(folds, &mut folding.spare, out)?;
                 }
                 Ok(())
             }
@@ -714,11 +780,16 @@ impl Writer {
     /// The frames still held, and the last frame's syncframe, appended to
     /// `out`.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<()> {
-        if let Feed::Folded(folded) = &mut self.feed {
-            while folded.folder.waiting() > 0 {
-                folded.code(&mut self.coder, out)?;
+        if let Feed::Folded(folding) = &mut self.feed {
+            let spare = std::mem::take(&mut self.coder.spare);
+            folding.lane.send(Fold::Last { spare });
+            folding.sent += 1;
+            while folding.taken < folding.sent {
+                let folds = folding.lane.recv();
+                folding.taken += 1;
+                self.coder.folded(folds, &mut folding.spare, out)?;
             }
-            folded.last(&mut self.coder, out)?;
+            folding.lane.close();
         }
         self.coder.finish(out)
     }
@@ -795,6 +866,7 @@ impl Folded {
             held: None,
             elements: vec![vec![0.0; 2 * FRAME_SAMPLES]; MAX_ELEMENTS],
             renders: vec![Render::default(); MAX_ELEMENTS],
+            spare: Vec::new(),
         })
     }
 
@@ -835,16 +907,17 @@ impl Folded {
             .map_err(|why| Error::unsupported(Path::new("the fold"), why.to_string()))
     }
 
-    /// Fold the oldest block, and code the block before it with the core it
-    /// was read with, now that its elements run on into this one.
-    fn code(&mut self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
+    /// Fold the oldest block, and make the block before it ready for the
+    /// coder with the core it was read with, now that its elements run on
+    /// into this one.
+    fn code(&mut self, jobs: &mut Vec<Job>) -> Result<()> {
         let Some(block) = self.fold()? else {
             return Ok(());
         };
         for (element, mixed) in self.elements.iter_mut().zip(&self.folder.mixer.mixed) {
             element[FRAME_SAMPLES..].copy_from_slice(mixed);
         }
-        let result = self.step(coder, out);
+        self.ready(jobs);
         // This block's elements and metadata, held for the next.
         for element in &mut self.elements {
             element.copy_within(FRAME_SAMPLES.., 0);
@@ -860,36 +933,75 @@ impl Folded {
         if let Some(done) = self.held.replace(block) {
             self.folder.recycle(done);
         }
-        result
+        Ok(())
     }
 
-    /// Code the last block held: past it there is nothing, so its elements
-    /// run on into silence.
-    fn last(&mut self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
+    /// Every block still held made ready for the coder: past the last there
+    /// is nothing, so its elements run on into silence.
+    fn end(&mut self, jobs: &mut Vec<Job>) -> Result<()> {
+        while self.folder.waiting() > 0 {
+            self.code(jobs)?;
+        }
         for element in &mut self.elements {
             element[FRAME_SAMPLES..].fill(0.0);
         }
-        self.step(coder, out)?;
+        self.ready(jobs);
         if let Some(done) = self.held.take() {
             self.folder.recycle(done);
         }
         Ok(())
     }
 
-    /// Code the block held, if there is one: its core, and its elements on
-    /// the core's clock, [`hz_joc::qmf::DELAY`] into them.
-    fn step(&self, coder: &mut Coder, out: &mut Vec<u8>) -> Result<()> {
+    /// The block held, if there is one, made ready for the coder: its core,
+    /// and its elements on the core's clock, [`hz_joc::qmf::DELAY`] into
+    /// them.
+    fn ready(&mut self, jobs: &mut Vec<Job>) {
         let Some(held) = &self.held else {
-            return Ok(());
+            return;
         };
         const INTO: usize = hz_joc::qmf::DELAY;
-        let core: Vec<&[f32]> = held.carry.iter().map(Vec::as_slice).collect();
-        let signals: Vec<&[f32]> = self
-            .elements
-            .iter()
-            .map(|e| &e[INTO..INTO + FRAME_SAMPLES])
-            .collect();
-        coder.step(&core, &signals, &self.renders, out)
+        let mut job = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Job::new(held.carry.len(), self.elements.len()));
+        for (kept, plane) in job.core.iter_mut().zip(&held.carry) {
+            kept.copy_from_slice(plane);
+        }
+        for (kept, element) in job.signals.iter_mut().zip(&self.elements) {
+            kept.copy_from_slice(&element[INTO..INTO + FRAME_SAMPLES]);
+        }
+        job.renders.copy_from_slice(&self.renders);
+        jobs.push(job);
+    }
+}
+
+impl Stage for Folded {
+    type In = Fold;
+    type Out = Folds;
+
+    fn run(&mut self, fold: Fold) -> Folds {
+        let mut jobs = Vec::new();
+        let (failed, spent) = match fold {
+            Fold::Frame { input, spare } => {
+                self.spare.extend(spare);
+                let core: Vec<&[f32]> = input.core.iter().map(Vec::as_slice).collect();
+                self.read(&core, &input.master, input.stride, input.got);
+                let mut failed = None;
+                while failed.is_none() && self.folder.ready() {
+                    failed = self.code(&mut jobs).err();
+                }
+                (failed, Some(input))
+            }
+            Fold::Last { spare } => {
+                self.spare.extend(spare);
+                (self.end(&mut jobs).err(), None)
+            }
+        };
+        Folds {
+            jobs,
+            failed,
+            spent,
+        }
     }
 }
 
@@ -983,9 +1095,6 @@ impl Coder {
         renders: &[Render],
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        if let Some(trace) = &mut self.trace {
-            trace.frame(signals, renders)?;
-        }
         let (channels, elements) = (self.channels, self.elements);
         let mut job = self
             .spare
@@ -998,6 +1107,30 @@ impl Coder {
             kept.copy_from_slice(signal);
         }
         job.renders.copy_from_slice(renders);
+        self.push(job, out)
+    }
+
+    /// The blocks the fold made ready, coded in order; then what it failed
+    /// at, if it failed, once the syncframes before it are written. The input
+    /// it is done with is kept in `inputs` for another frame.
+    fn folded(&mut self, folds: Folds, inputs: &mut Vec<Input>, out: &mut Vec<u8>) -> Result<()> {
+        inputs.extend(folds.spent);
+        for job in folds.jobs {
+            self.push(job, out)?;
+        }
+        match folds.failed {
+            Some(e) => self.refuse(e, out),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Coder::step`] with the frame made: handed to the probe, and the
+    /// frame before it fitted.
+    fn push(&mut self, job: Job, out: &mut Vec<u8>) -> Result<()> {
+        if let Some(trace) = &mut self.trace {
+            let signals: Vec<&[f32]> = job.signals.iter().map(Vec::as_slice).collect();
+            trace.frame(&signals, &job.renders)?;
+        }
         self.probe.send(job);
         self.probed += 1;
         if self.probed - self.fitted > 1 {
@@ -1522,11 +1655,18 @@ mod tests {
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
         let mut writer = Writer::build(config(), elements, true, Some(2), &out, threads).unwrap();
+        let fold = match &writer.feed {
+            Feed::Direct(_) => None,
+            Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),
+        };
         for lane in [
             matches!(writer.coder.probe, Lane::Thread { .. }),
             matches!(writer.coder.stream, Lane::Thread { .. }),
-        ] {
-            assert_eq!(lane, threads, "the encoders where they were asked to be");
+        ]
+        .into_iter()
+        .chain(fold)
+        {
+            assert_eq!(lane, threads, "the stages where they were asked to be");
         }
         let mut seed = 9u32;
         let mut stream = Vec::new();
@@ -1678,22 +1818,54 @@ mod tests {
         }
     }
 
-    /// The encoders on threads of their own write the stream the caller's
-    /// writes alone, to the byte — the probe a frame ahead of the fit, the
-    /// stream's encoder a frame behind it, the true peak stated across them:
-    /// elements carried as they are, and folded into fifteen.
+    /// `count` objects, each crossing the room on a path of its own from a
+    /// frame of its own, on the master's channels in order.
+    fn movers(count: usize) -> Vec<Element> {
+        (0..count)
+            .map(|channel| {
+                let angle = channel as f64 / count as f64 * std::f64::consts::TAU;
+                let start = [angle.sin(), angle.cos(), (channel % 3) as f64 / 2.0];
+                let end = [-start[0], -start[1], 1.0 - start[2]];
+                let keyframes = vec![
+                    Keyframe {
+                        position: start,
+                        ..Keyframe::default()
+                    },
+                    Keyframe {
+                        sample_pos: (channel % 5 * FRAME_SAMPLES) as u64,
+                        position: end,
+                        ramp_samples: (6 + channel % 7) as u32 * FRAME_SAMPLES as u32,
+                        ..Keyframe::default()
+                    },
+                ];
+                Element::object(channel, keyframes)
+            })
+            .collect()
+    }
+
+    /// The stages on threads of their own write the stream the caller's
+    /// writes alone, to the byte — the fold a frame ahead of the coder, the
+    /// probe a frame ahead of the fit, the stream's encoder a frame behind
+    /// it, the true peak stated across them: elements carried as they are,
+    /// and folded into fifteen, still and moving.
     #[test]
-    fn the_encoders_on_threads_write_what_one_thread_writes() {
+    fn the_stages_on_threads_write_what_one_thread_writes() {
         const FRAMES: usize = 18;
-        for elements in [2, 20] {
-            let (alone, one, _) = encode_on(beds(elements), FRAMES, false);
-            let (apart, threads, _) = encode_on(beds(elements), FRAMES, true);
-            assert_eq!(apart.written(), FRAMES as u64);
-            assert_eq!(alone.written(), apart.written());
-            assert!(one == threads, "{elements} elements: the streams differ");
+        for what in ["2 beds", "20 beds", "20 moving objects"] {
+            let elements = || match what {
+                "2 beds" => beds(2),
+                "20 beds" => beds(20),
+                _ => movers(20),
+            };
+            let (alone, one, _) = encode_on(elements(), FRAMES, false);
+            let (apart, threads, _) = encode_on(elements(), FRAMES, true);
+            assert_eq!(apart.written(), FRAMES as u64, "{what}");
+            assert_eq!(alone.written(), apart.written(), "{what}");
+            assert!(one == threads, "{what}: the streams differ");
+            assert_eq!(apart.folder().is_some(), what.starts_with("20"), "{what}");
             assert!(
                 matches!(apart.coder.stream, Lane::Here { .. }),
-                "the threads done with once the writer is finished"
+                "{what}: the threads done with once the writer is finished"
             );
         }
     }

@@ -489,8 +489,19 @@ started, both run on the encode's own. On sixteen cores:
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 3.64 s | 1.08 s | 0.93 s | +32 % |
 | 60 s at 640 kb/s, 1124 of 1876 payloads quantised coarser | 11 | 17.69 s | 4.84 s | 3.97 s | +38 % |
 
-What is left on the encode's own thread is the render, the fold past
-fifteen elements, and the budget's search for λ, a step at a time.
+Past fifteen elements, the fold runs on a thread of its own as well, a
+frame ahead of the coder: a frame is read and folded while the blocks the
+frame before made ready are coded. The fold sees its frames in order and the
+coder its blocks, so both are what a single thread makes of them.
+
+| programme | elements | one thread | the core beside the estimator | and the fold beside it | CPU time |
+|---|---|---|---|---|---|
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 3.62 s | 0.88 s | 0.70 s | +37 % |
+| 40 objects, 4 s | 40 → 15 | 1.75 s | 0.48 s | 0.37 s | +42 % |
+| 40 objects and a 7.1.2 bed, 4 s | 49 → 15 | 1.83 s | 0.47 s | 0.37 s | +36 % |
+
+What is left on the encode's own thread is the render and the budget's
+search for λ, a step at a time.
 
 ## Not done
 
