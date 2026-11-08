@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 /// A master set in `dir`, `samples` long, of a 7.1 bed and two objects
 /// circling the room, a tone on each channel: its config's path.
 pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
+    master_with(dir, samples, 2)
+}
+
+/// [`master`] with `objects` objects circling the room, every other one
+/// climbing, on the channels after the bed's: with two, [`master`] itself.
+pub(crate) fn master_with(dir: &Path, samples: usize, objects: usize) -> PathBuf {
     const BED: [(&str, u32); 8] = [
         ("L", 0),
         ("R", 1),
@@ -16,7 +22,7 @@ pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
         ("Lrs", 6),
         ("Rrs", 7),
     ];
-    const OBJECTS: [u32; 2] = [8, 9];
+    let ids = || (BED.len() as u32..).take(objects);
     let mut config = String::from(
         "language: eng\nversion: 0.5.1\npresentations:\n  - type: home\n    simplified: \
          false\n    metadata: m.atmos.metadata\n    audio: m.atmos.audio\n    offset: 0.0\n    \
@@ -29,7 +35,7 @@ pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
         ));
     }
     config.push_str("    objects:\n");
-    for id in OBJECTS {
+    for id in ids() {
         config.push_str(&format!("      - ID: {id}\n"));
     }
     let path = dir.join("m.atmos");
@@ -42,13 +48,14 @@ pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
              gain: 0\n    rampLength: 0\n"
         ));
     }
-    // Each object somewhere new every 1000 samples, ramping there, the
-    // two going round opposite ways and one of them climbing.
-    for (k, id) in OBJECTS.into_iter().enumerate() {
+    // Each object somewhere new every 1000 samples, ramping there, each
+    // going round the other way from the one before, set apart from the
+    // others, and every other one climbing.
+    for (k, id) in ids().enumerate() {
         for step in 0..=samples / 1000 {
-            let turn = (step as f64 / 6.0 + k as f64 / 2.0) * std::f64::consts::TAU;
-            let way = if k == 0 { 1.0 } else { -1.0 };
-            let (x, y, z) = (way * turn.sin(), turn.cos(), (k * step) as f64 / 20.0);
+            let turn = (step as f64 / 6.0 + k as f64 / objects as f64) * std::f64::consts::TAU;
+            let way = if k % 2 == 0 { 1.0 } else { -1.0 };
+            let (x, y, z) = (way * turn.sin(), turn.cos(), (k % 2 * step) as f64 / 20.0);
             events.push_str(&format!(
                 "  - ID: {id}\n    samplePos: {}\n    active: true\n    pos: [{x:.4}, \
                  {y:.4}, {z:.4}]\n    snap: false\n    elevation: true\n    zones: all\n    \
@@ -59,7 +66,7 @@ pub(crate) fn master(dir: &Path, samples: usize) -> PathBuf {
     }
     std::fs::write(dir.join("m.atmos.metadata"), events).unwrap();
 
-    let width = BED.len() + OBJECTS.len();
+    let width = BED.len() + objects;
     let mut audio = hz_io::container::caf::CafWriter::create(
         &dir.join("m.atmos.audio"),
         hz_io::container::pcm::PcmFormat::master(48_000.0, width as u32),
