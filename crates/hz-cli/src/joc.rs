@@ -34,7 +34,10 @@ use hz_programme::fold::{self, Folder, Member};
 use hz_programme::mix::{Headroom, Mixing};
 use hz_programme::path::{self, Path as Trajectory};
 use hz_render::{Keyframe, Mode};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 /// Elements a payload carries at most, as the reference streams do.
 pub const MAX_ELEMENTS: usize = 15;
@@ -188,34 +191,337 @@ struct Folded {
 /// streams state theirs.
 const TRUE_PEAK_EVERY: u64 = 16;
 
-/// The two encoders and the estimator, and what passes between them.
+/// The estimator, and the two encoders around it, each on a thread of its
+/// own where one can be started ([`Lane`]): the probe, coding a frame's core
+/// while the gains of the frame before are fitted; and the stream's encoder,
+/// writing the frame before that. Each sees its frames in order and keeps its
+/// own state from one to the next, so that the stream is the one a single
+/// thread writes, to the byte.
 struct Coder {
-    probe: Encoder,
-    real: Encoder,
+    probe: Lane<Probe>,
+    stream: Lane<Stream>,
     estimator: Estimator,
     elements: usize,
     lfe: bool,
-    /// Every Evolution frame's bytes, and the probe's stand-in for one.
+    /// Every Evolution frame's bytes.
     size: usize,
-    placeholder: Vec<u8>,
-    /// Where each element is at the end of the last two frames that went
-    /// in, and how it renders, frame `k` at `k % 2`: the object metadata is
-    /// written a frame behind.
-    renders: [Vec<Render>; 2],
-    /// The last frame of core that went in, for the stream's encoder a frame
-    /// behind, and what the probe decoded of it.
-    core: Vec<Vec<f32>>,
-    probed: Vec<Vec<f32>>,
-    frames_in: u64,
-    written: u64,
-    scratch: Vec<u8>,
-    /// The true peak of the core since it was last stated, the core
-    /// interleaved for it, and the programme information every frame states.
-    peak: TruePeak,
-    interleaved: Vec<f32>,
     information: Vec<u8>,
+    /// How each element renders at the end of the frame fitted last: its
+    /// syncframe's object metadata, and so the room its payload has.
+    renders: Vec<Render>,
+    /// Frames handed to the probe, frames whose gains were fitted, and
+    /// syncframes the stream is still writing and has written.
+    probed: u64,
+    fitted: u64,
+    writing: u64,
+    written: u64,
+    /// Every element is in every frame.
+    present: Vec<bool>,
+    /// Frames the stream is done with, for the next ones to go in.
+    spare: Vec<Job>,
+    channels: usize,
     trace: Option<Trace>,
     out: PathBuf,
+}
+
+/// A frame on its way through the coder: the core that went in, what the
+/// probe decoded of it, and the elements' samples and renders its gains are
+/// fitted from and its object metadata states.
+struct Job {
+    core: Vec<Vec<f32>>,
+    decoded: Vec<Vec<f32>>,
+    signals: Vec<Vec<f32>>,
+    renders: Vec<Render>,
+}
+
+impl Job {
+    fn new(channels: usize, elements: usize) -> Self {
+        Self {
+            core: vec![vec![0.0; FRAME_SAMPLES]; channels],
+            decoded: vec![vec![0.0; FRAME_SAMPLES]; channels],
+            signals: vec![vec![0.0; FRAME_SAMPLES]; elements],
+            renders: vec![Render::default(); elements],
+        }
+    }
+}
+
+/// The encoder ahead of the stream's: it codes each frame first, carrying a
+/// placeholder of the Evolution frame's size, so that its core is the one
+/// the stream's encoder will code, and decodes it for the gains to be fitted
+/// to.
+struct Probe {
+    encoder: Encoder,
+    placeholder: Vec<u8>,
+    scratch: Vec<u8>,
+    out: PathBuf,
+}
+
+/// The encoder that writes the stream, a frame behind the estimator, and the
+/// meter of the true peak the stream's loudness states.
+struct Stream {
+    encoder: Encoder,
+    /// The frame that went in last, written once its payload comes.
+    held: Option<Job>,
+    written: u64,
+    lfe: bool,
+    size: usize,
+    information: Vec<u8>,
+    /// The true peak of the core since it was last stated, and the core
+    /// interleaved for it.
+    peak: TruePeak,
+    interleaved: Vec<f32>,
+    out: PathBuf,
+}
+
+/// What the stream is handed: a frame, with the payload of the frame before
+/// it once there is one; or, at the end, the last frame's payload.
+enum Write {
+    Frame { job: Job, joc: Option<Vec<u8>> },
+    Last { joc: Option<Vec<u8>> },
+}
+
+/// What the stream hands back: the syncframe it wrote, if it wrote one, and
+/// the frame it is done with.
+struct Written {
+    syncframe: Option<Result<Vec<u8>>>,
+    spent: Option<Job>,
+}
+
+/// Work that keeps its own state from one input to the next and hands back
+/// a result for each, in order.
+trait Stage: Send + 'static {
+    type In: Send + 'static;
+    type Out: Send + 'static;
+    fn run(&mut self, input: Self::In) -> Self::Out;
+}
+
+/// Inputs a stage's thread may be behind by before its caller waits for it.
+const LANE_DEPTH: usize = 4;
+
+/// A [`Stage`] on a thread of its own, working while its caller does; or,
+/// where no thread can be started, on the caller's, as each input comes. The
+/// same results either way, in the same order.
+enum Lane<S: Stage> {
+    Thread {
+        inbox: Option<mpsc::SyncSender<S::In>>,
+        outbox: mpsc::Receiver<S::Out>,
+        handle: Option<JoinHandle<Option<S>>>,
+    },
+    Here {
+        stage: S,
+        done: VecDeque<S::Out>,
+    },
+}
+
+impl<S: Stage> Lane<S> {
+    fn new(mut stage: S, name: &str, threads: bool) -> Self {
+        if threads {
+            let (inbox, inputs) = mpsc::sync_channel(LANE_DEPTH);
+            let (results, outbox) = mpsc::channel();
+            // The stage goes to the thread once it has started: a thread that
+            // cannot be leaves it here.
+            let (give, take) = mpsc::channel::<S>();
+            let spawned = std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    let mut stage = take.recv().ok()?;
+                    for input in inputs {
+                        if results.send(stage.run(input)).is_err() {
+                            break;
+                        }
+                    }
+                    Some(stage)
+                });
+            if let Ok(handle) = spawned {
+                match give.send(stage) {
+                    Ok(()) => {
+                        return Self::Thread {
+                            inbox: Some(inbox),
+                            outbox,
+                            handle: Some(handle),
+                        };
+                    }
+                    Err(mpsc::SendError(back)) => stage = back,
+                }
+            }
+        }
+        Self::Here {
+            stage,
+            done: VecDeque::new(),
+        }
+    }
+
+    fn send(&mut self, input: S::In) {
+        match self {
+            Self::Thread { inbox, .. } => {
+                // A thread gone has panicked; waiting for its result says so.
+                if let Some(inbox) = inbox {
+                    let _ = inbox.send(input);
+                }
+            }
+            Self::Here { stage, done } => done.push_back(stage.run(input)),
+        }
+    }
+
+    /// The oldest result not yet taken, waited for.
+    fn recv(&mut self) -> S::Out {
+        match self {
+            Self::Thread { outbox, handle, .. } => match outbox.recv() {
+                Ok(out) => out,
+                Err(_) => panicked(handle),
+            },
+            Self::Here { done, .. } => done.pop_front().expect("a result for every input"),
+        }
+    }
+
+    /// The oldest result not yet taken, if it is ready.
+    fn try_recv(&mut self) -> Option<S::Out> {
+        match self {
+            Self::Thread { outbox, handle, .. } => match outbox.try_recv() {
+                Ok(out) => Some(out),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => panicked(handle),
+            },
+            Self::Here { done, .. } => done.pop_front(),
+        }
+    }
+
+    /// The stage's thread ended, its stage back on the caller's.
+    fn close(&mut self) {
+        if let Self::Thread { inbox, handle, .. } = self {
+            drop(inbox.take());
+            let stage = match handle.take().map(JoinHandle::join) {
+                Some(Ok(Some(stage))) => stage,
+                Some(Err(panic)) => std::panic::resume_unwind(panic),
+                _ => unreachable!("a stage's thread is joined once, and has its stage"),
+            };
+            *self = Self::Here {
+                stage,
+                done: VecDeque::new(),
+            };
+        }
+    }
+
+    /// The stage, once it is on the caller's thread.
+    fn stage(&self) -> Option<&S> {
+        match self {
+            Self::Thread { .. } => None,
+            Self::Here { stage, .. } => Some(stage),
+        }
+    }
+}
+
+/// A stage's thread is gone before its work is, which only a panic does:
+/// carry it on here.
+fn panicked<S>(handle: &mut Option<JoinHandle<S>>) -> ! {
+    match handle.take().map(JoinHandle::join) {
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        _ => panic!("a stage's thread ended before its work did"),
+    }
+}
+
+impl Stage for Probe {
+    type In = Job;
+    type Out = Result<Job>;
+
+    fn run(&mut self, mut job: Job) -> Result<Job> {
+        self.encoder.carry_skip_field(&self.placeholder);
+        self.scratch.clear();
+        let core: Vec<&[f32]> = job.core.iter().map(Vec::as_slice).collect();
+        self.encoder
+            .encode(&core, &mut self.scratch)
+            .map_err(|e| Error::refused(&self.out, e.0))?;
+        for (ch, decoded) in job.decoded.iter_mut().enumerate() {
+            decoded.copy_from_slice(self.encoder.decoded(ch).expect("reconstructing"));
+        }
+        Ok(job)
+    }
+}
+
+impl Stage for Stream {
+    type In = Write;
+    type Out = Written;
+
+    fn run(&mut self, write: Write) -> Written {
+        let channels = self.encoder.channels();
+        let latency = truepeak::LATENCY * channels;
+        match write {
+            Write::Frame { job, joc } => {
+                // The meter closes the frame before's interval when it is
+                // written, and its reconstruction runs behind: so the first
+                // samples of this frame go in first, and the rest after.
+                for (ch, plane) in job.core.iter().enumerate() {
+                    for (n, &sample) in plane.iter().enumerate() {
+                        self.interleaved[n * channels + ch] = sample;
+                    }
+                }
+                self.peak.push(&self.interleaved[..latency]);
+                let syncframe = joc.map(|joc| self.write(&joc));
+                self.peak.push(&self.interleaved[latency..]);
+                Written {
+                    syncframe,
+                    spent: self.held.replace(job),
+                }
+            }
+            Write::Last { joc } => {
+                // Past the programme's end is silence: the meter's
+                // reconstruction of the last frame runs out into it.
+                self.interleaved[..latency].fill(0.0);
+                self.peak.push(&self.interleaved[..latency]);
+                let syncframe = joc.map(|joc| self.write(&joc));
+                Written {
+                    syncframe,
+                    spent: self.held.take(),
+                }
+            }
+        }
+    }
+}
+
+impl Stream {
+    /// Stream frame `written` with its payload: the frame held, carrying its
+    /// Evolution frame, checked against what the probe made of it.
+    fn write(&mut self, joc: &[u8]) -> Result<Vec<u8>> {
+        let frame = self.written;
+        let held = self
+            .held
+            .as_ref()
+            .expect("a frame goes in before its payload");
+        let oamd = oamd(self.lfe, &held.renders, &self.out)?;
+        let loudness = loudness(frame, Some(&mut self.peak));
+        let mut evolution = evolution_frame(&loudness, &self.information, &oamd, joc);
+        if evolution.len() > self.size {
+            return Err(Error::refused(
+                &self.out,
+                format!(
+                    "syncframe {frame}: an Evolution frame of {} bytes, past the {} every frame \
+                     is given",
+                    evolution.len(),
+                    self.size
+                ),
+            ));
+        }
+        pad(&mut evolution, self.size);
+        self.encoder.carry_skip_field(&evolution);
+        let core: Vec<&[f32]> = held.core.iter().map(Vec::as_slice).collect();
+        let mut syncframe = Vec::new();
+        self.encoder
+            .encode(&core, &mut syncframe)
+            .map_err(|e| Error::refused(&self.out, e.0))?;
+        for (ch, probed) in held.decoded.iter().enumerate() {
+            if self.encoder.decoded(ch).expect("reconstructing") != probed.as_slice() {
+                return Err(Error::refused(
+                    &self.out,
+                    format!(
+                        "syncframe {frame}: the core written is not the core the gains were \
+                         fitted to"
+                    ),
+                ));
+            }
+        }
+        self.written += 1;
+        Ok(syncframe)
+    }
 }
 
 /// `HZ_JOC_TRACE=<dir>`: what the stream was meant to carry, for a decoder's
@@ -304,6 +610,19 @@ impl Writer {
         downmix: Option<u8>,
         out: &Path,
     ) -> Result<Self> {
+        Self::build(config, elements, lfe, downmix, out, true)
+    }
+
+    /// [`Writer::new`], its encoders on threads of their own when `threads`
+    /// and they can be started, on the caller's otherwise.
+    fn build(
+        config: hz_ac3::Config,
+        elements: Vec<Element>,
+        lfe: bool,
+        downmix: Option<u8>,
+        out: &Path,
+        threads: bool,
+    ) -> Result<Self> {
         let count = elements.len();
         if count == 0 {
             return Err(Error::unsupported(
@@ -324,13 +643,15 @@ impl Writer {
         };
         Ok(Self {
             feed,
-            coder: Coder::new(config, carried, lfe, downmix, out)?,
+            coder: Coder::new(config, carried, lfe, downmix, out, threads)?,
         })
     }
 
-    /// The stream's encoder, for what it reports.
+    /// The stream's encoder, for what it reports, once the writer is
+    /// finished.
     pub fn encoder(&self) -> &Encoder {
-        &self.coder.real
+        let stream = self.coder.stream.stage();
+        &stream.expect("the writer is finished").encoder
     }
 
     /// Syncframes written so far.
@@ -579,6 +900,7 @@ impl Coder {
         lfe: bool,
         downmix: Option<u8>,
         out: &Path,
+        threads: bool,
     ) -> Result<Self> {
         let encoder = || {
             let mut encoder =
@@ -588,36 +910,18 @@ impl Coder {
         };
         let (probe, real) = (encoder()?, encoder()?);
         let channels = probe.channels();
-        let mut coder = Self {
-            probe,
-            real,
-            estimator: Estimator::new(count, 0),
-            elements: count,
-            lfe,
-            size: 0,
-            placeholder: Vec::new(),
-            renders: [largest(count), largest(count)],
-            core: vec![vec![0.0; FRAME_SAMPLES]; channels],
-            probed: vec![vec![0.0; FRAME_SAMPLES]; channels],
-            frames_in: 0,
-            written: 0,
-            scratch: Vec::new(),
-            peak: TruePeak::new(channels),
-            interleaved: vec![0.0; channels * FRAME_SAMPLES],
-            information: information(downmix),
-            trace: Trace::open(count)?,
-            out: out.to_path_buf(),
-        };
+        let information = information(downmix);
+        let renders = largest(count);
         // Room for the payloads the references carry, and never less than
         // the smallest one these elements can make, so that the budget can
         // always bring a payload under it. What the object metadata takes
         // depends on how the elements render — a size, a screen factor — and
         // the frame's size is the stream's, so it is measured with every
         // field that costs bits stated — the true peak among them.
-        let overhead = coder.overhead(TRUE_PEAK_EVERY - 1)?;
+        let overhead = overhead(TRUE_PEAK_EVERY - 1, lfe, &renders, &information, out)?;
         let floor = overhead + smallest_payload(count);
-        coder.size = (overhead + ROOM_PER_ELEMENT * count + 8).max(floor);
-        if coder.size > SKIP_LIMIT {
+        let mut size = (overhead + ROOM_PER_ELEMENT * count + 8).max(floor);
+        if size > SKIP_LIMIT {
             if floor > SKIP_LIMIT {
                 return Err(Error::unsupported(
                     out,
@@ -627,15 +931,51 @@ impl Coder {
                     ),
                 ));
             }
-            coder.size = SKIP_LIMIT;
+            size = SKIP_LIMIT;
         }
-        coder.placeholder = vec![0; coder.size];
-        Ok(coder)
+        let probe = Probe {
+            encoder: probe,
+            placeholder: vec![0; size],
+            scratch: Vec::new(),
+            out: out.to_path_buf(),
+        };
+        let stream = Stream {
+            encoder: real,
+            held: None,
+            written: 0,
+            lfe,
+            size,
+            information: information.clone(),
+            peak: TruePeak::new(channels),
+            interleaved: vec![0.0; channels * FRAME_SAMPLES],
+            out: out.to_path_buf(),
+        };
+        Ok(Self {
+            probe: Lane::new(probe, "joc-probe", threads),
+            stream: Lane::new(stream, "joc-stream", threads),
+            estimator: Estimator::new(count, 0),
+            elements: count,
+            lfe,
+            size,
+            information,
+            renders,
+            probed: 0,
+            fitted: 0,
+            writing: 0,
+            written: 0,
+            present: vec![true; count],
+            spare: Vec::new(),
+            channels,
+            trace: Trace::open(count)?,
+            out: out.to_path_buf(),
+        })
     }
 
     /// One frame: its core, each element's samples on the decoded core's
     /// clock, and where each element is at the frame's end. Appends to `out`
-    /// the syncframe of the frame before, once there is one.
+    /// the syncframes the stream has written since, the first once there is
+    /// one: the probe codes this frame while the gains of the one before are
+    /// fitted, and the stream's encoder writes the one before that.
     fn step(
         &mut self,
         core: &[&[f32]],
@@ -643,187 +983,194 @@ impl Coder {
         renders: &[Render],
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        self.renders[(self.frames_in % 2) as usize].copy_from_slice(renders);
         if let Some(trace) = &mut self.trace {
             trace.frame(signals, renders)?;
         }
-        // The meter closes the frame before's interval when it is written,
-        // below, and its reconstruction runs behind: so the first samples of
-        // this frame go in first, and the rest after.
-        let channels = core.len();
-        for (ch, plane) in core.iter().enumerate() {
-            for (n, &sample) in plane.iter().enumerate() {
-                self.interleaved[n * channels + ch] = sample;
-            }
+        let (channels, elements) = (self.channels, self.elements);
+        let mut job = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Job::new(channels, elements));
+        for (kept, plane) in job.core.iter_mut().zip(core) {
+            kept.copy_from_slice(plane);
         }
-        self.peak
-            .push(&self.interleaved[..truepeak::LATENCY * channels]);
-        self.probe.carry_skip_field(&self.placeholder);
-        self.scratch.clear();
-        self.probe
-            .encode(core, &mut self.scratch)
-            .map_err(|e| Error::refused(&self.out, e.0))?;
-        // The payload this frame's push hands back is the last frame's.
-        if self.frames_in > 0 {
-            self.estimator.budget = self.room(self.frames_in - 1)?;
+        for (kept, signal) in job.signals.iter_mut().zip(signals) {
+            kept.copy_from_slice(signal);
         }
-        let decoded: Vec<&[f32]> = CORE
-            .iter()
-            .map(|&ch| self.probe.decoded(ch).expect("reconstructing"))
-            .collect();
-        let present = vec![true; signals.len()];
-        if let Some(joc) = self.estimator.push(&decoded, signals, &present) {
-            self.write(&joc.to_bytes(), out)?;
+        job.renders.copy_from_slice(renders);
+        self.probe.send(job);
+        self.probed += 1;
+        if self.probed - self.fitted > 1 {
+            self.fit(out)?;
         }
-        for (ch, (kept, probed)) in self.core.iter_mut().zip(&mut self.probed).enumerate() {
-            kept.copy_from_slice(core[ch]);
-            probed.copy_from_slice(self.probe.decoded(ch).expect("reconstructing"));
-        }
-        // When frame `k` is written, the meter has frames up to it and the
-        // next frame's first samples, its reconstruction of frame `k` done.
-        self.peak
-            .push(&self.interleaved[truepeak::LATENCY * channels..]);
-        self.frames_in += 1;
         Ok(())
     }
 
-    /// The last frame's syncframe, appended to `out`.
+    /// The last frames' syncframes, appended to `out`.
     fn finish(&mut self, out: &mut Vec<u8>) -> Result<()> {
         if let Some(trace) = &mut self.trace {
             trace.finish()?;
         }
-        if self.frames_in == 0 {
-            return Ok(());
+        if self.probed > self.fitted {
+            self.fit(out)?;
         }
-        self.estimator.budget = self.room(self.frames_in - 1)?;
-        // Past the programme's end is silence: the meter's reconstruction
-        // of the last frame runs out into it.
-        let channels = self.core.len();
-        self.interleaved[..truepeak::LATENCY * channels].fill(0.0);
-        self.peak
-            .push(&self.interleaved[..truepeak::LATENCY * channels]);
-        if let Some(joc) = self.estimator.finish() {
-            self.write(&joc.to_bytes(), out)?;
+        if self.fitted > 0 {
+            match self.room(self.fitted - 1) {
+                Ok(room) => self.estimator.budget = room,
+                Err(e) => return self.refuse(e, out),
+            }
+            let joc = self.estimator.finish().map(|joc| joc.to_bytes());
+            self.stream.send(Write::Last { joc });
+            self.writing += 1;
         }
+        self.settle(out)?;
+        self.probe.close();
+        self.stream.close();
         Ok(())
     }
 
-    /// Stream frame `written` with its payload: the core that went in a frame
-    /// ago, carrying its Evolution frame, checked against what the probe made
-    /// of it.
-    fn write(&mut self, joc: &[u8], out: &mut Vec<u8>) -> Result<()> {
-        let frame = self.written;
-        let oamd = self.oamd(frame)?;
-        let loudness = self.loudness(frame, true);
-        let mut evolution = evolution_frame(&loudness, &self.information, &oamd, joc);
-        if evolution.len() > self.size {
-            return Err(Error::refused(
-                &self.out,
-                format!(
-                    "syncframe {frame}: an Evolution frame of {} bytes, past the {} every frame \
-                     is given",
-                    evolution.len(),
-                    self.size
-                ),
-            ));
-        }
-        pad(&mut evolution, self.size);
-        self.real.carry_skip_field(&evolution);
-        let core: Vec<&[f32]> = self.core.iter().map(Vec::as_slice).collect();
-        self.real
-            .encode(&core, out)
-            .map_err(|e| Error::refused(&self.out, e.0))?;
-        for (ch, probed) in self.probed.iter().enumerate() {
-            if self.real.decoded(ch).expect("reconstructing") != probed.as_slice() {
-                return Err(Error::refused(
-                    &self.out,
-                    format!(
-                        "syncframe {frame}: the core written is not the core the gains were \
-                         fitted to"
-                    ),
-                ));
+    /// Fit the gains of the oldest frame the probe has, and hand it to the
+    /// stream with the payload of the frame before it, which the fit hands
+    /// back.
+    fn fit(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let job = match self.probe.recv() {
+            Ok(job) => job,
+            Err(e) => return self.refuse(e, out),
+        };
+        if self.fitted > 0 {
+            match self.room(self.fitted - 1) {
+                Ok(room) => self.estimator.budget = room,
+                Err(e) => return self.refuse(e, out),
             }
         }
-        self.written += 1;
+        let decoded = CORE.map(|ch| job.decoded[ch].as_slice());
+        let signals: Vec<&[f32]> = job.signals.iter().map(Vec::as_slice).collect();
+        let joc = self
+            .estimator
+            .push(&decoded, &signals, &self.present)
+            .map(|joc| joc.to_bytes());
+        self.renders.copy_from_slice(&job.renders);
+        self.stream.send(Write::Frame { job, joc });
+        self.writing += 1;
+        self.fitted += 1;
+        while let Some(written) = self.stream.try_recv() {
+            self.take(written, out)?;
+        }
         Ok(())
     }
 
-    /// The payload bytes stream frame `frame` leaves joint object coding.
-    fn room(&mut self, frame: u64) -> Result<usize> {
-        Ok(self.size.saturating_sub(self.overhead(frame)?))
+    /// A syncframe the stream wrote, appended to `out`, and the frame it is
+    /// done with kept for another.
+    fn take(&mut self, written: Written, out: &mut Vec<u8>) -> Result<()> {
+        self.writing -= 1;
+        if let Some(spent) = written.spent {
+            self.spare.push(spent);
+        }
+        if let Some(syncframe) = written.syncframe {
+            out.extend_from_slice(&syncframe?);
+            self.written += 1;
+        }
+        Ok(())
     }
 
-    /// What stream frame `frame`'s Evolution frame takes besides its joint
-    /// object coding payload, the payload's size field at its longest.
-    fn overhead(&mut self, frame: u64) -> Result<usize> {
-        let placeholder = [0u8; 256];
-        let (loudness, oamd) = (self.loudness(frame, false), self.oamd(frame)?);
-        Ok(
-            evolution_frame(&loudness, &self.information, &oamd, &placeholder).len()
-                - placeholder.len(),
-        )
+    /// Every syncframe the stream is still writing, waited for and appended
+    /// to `out`.
+    fn settle(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        while self.writing > 0 {
+            let written = self.stream.recv();
+            self.take(written, out)?;
+        }
+        Ok(())
     }
 
-    /// Stream frame `frame`'s loudness payload. Every [`TRUE_PEAK_EVERY`]th
-    /// frame states the core's true peak since the one before — measured,
-    /// and the meter started again, when `measure`; a stand-in of the same
-    /// size when only its size is wanted. No practice is claimed, and no
-    /// integrated loudness: one has to match the stream's dialnorm, which is
-    /// the user's.
-    fn loudness(&mut self, frame: u64, measure: bool) -> Vec<u8> {
-        let stated = (frame + 1).is_multiple_of(TRUE_PEAK_EVERY);
-        let true_peak = stated.then(|| {
-            if measure {
-                let peak = self.peak.take();
-                true_peak_code(if peak > 0.0 {
-                    20.0 * peak.log10()
-                } else {
-                    f64::NEG_INFINITY
-                })
+    /// Stop at `e`, found coding a frame the stream's encoder has not reached:
+    /// once the syncframes before it are written, as a single thread would
+    /// have written them before it found it — or at the refusal of one of
+    /// them, which it would have found first.
+    fn refuse(&mut self, e: Error, out: &mut Vec<u8>) -> Result<()> {
+        self.settle(out)?;
+        Err(e)
+    }
+
+    /// The payload bytes stream frame `frame` leaves joint object coding,
+    /// the frame fitted last.
+    fn room(&self, frame: u64) -> Result<usize> {
+        let overhead = overhead(frame, self.lfe, &self.renders, &self.information, &self.out)?;
+        Ok(self.size.saturating_sub(overhead))
+    }
+}
+
+/// What stream frame `frame`'s Evolution frame takes besides its joint
+/// object coding payload, the payload's size field at its longest: its
+/// elements rendering as `renders`.
+fn overhead(
+    frame: u64,
+    lfe: bool,
+    renders: &[Render],
+    information: &[u8],
+    out: &Path,
+) -> Result<usize> {
+    let placeholder = [0u8; 256];
+    let (loudness, oamd) = (loudness(frame, None), oamd(lfe, renders, out)?);
+    Ok(evolution_frame(&loudness, information, &oamd, &placeholder).len() - placeholder.len())
+}
+
+/// Stream frame `frame`'s loudness payload. Every [`TRUE_PEAK_EVERY`]th
+/// frame states the core's true peak since the one before — measured, and
+/// the meter started again, given the meter; a stand-in of the same size
+/// when only its size is wanted. No practice is claimed, and no integrated
+/// loudness: one has to match the stream's dialnorm, which is the user's.
+fn loudness(frame: u64, meter: Option<&mut TruePeak>) -> Vec<u8> {
+    let stated = (frame + 1).is_multiple_of(TRUE_PEAK_EVERY);
+    let true_peak = stated.then(|| match meter {
+        Some(meter) => {
+            let peak = meter.take();
+            true_peak_code(if peak > 0.0 {
+                20.0 * peak.log10()
             } else {
-                0
-            }
-        });
-        Loudness {
-            true_peak,
-            ..Loudness::default()
+                f64::NEG_INFINITY
+            })
         }
-        .to_bytes()
+        None => 0,
+    });
+    Loudness {
+        true_peak,
+        ..Loudness::default()
     }
+    .to_bytes()
+}
 
-    /// Stream frame `frame`'s object metadata: one block, each element moving
-    /// across the frame to where it is at the frame's end, as the reference
-    /// streams move theirs — timed on the clock of the objects a decoder
-    /// plays, [`LATENCY`] behind the master's: the metadata comes with its
-    /// access unit, and so does the audio it places. Each element rendered
-    /// as its feed says.
-    fn oamd(&mut self, frame: u64) -> Result<Vec<u8>> {
-        let mut objects = Vec::with_capacity(self.elements + 1);
-        if self.lfe {
-            objects.push(Object {
-                active: true,
-                gain: Gain::Unity,
-                render: None,
-            });
-        }
-        for &render in &self.renders[(frame % 2) as usize] {
-            objects.push(Object {
-                active: true,
-                gain: Gain::Unity,
-                render: Some(render),
-            });
-        }
-        ObjectAudioMetadata {
-            lfe: self.lfe,
-            blocks: vec![Block {
-                offset: 0,
-                ramp: Ramp::Long,
-                objects,
-            }],
-        }
-        .write()
-        .map_err(|e| Error::unsupported(&self.out, e.to_string()))
+/// A syncframe's object metadata: one block, each element moving across the
+/// frame to where it is at the frame's end, as the reference streams move
+/// theirs — timed on the clock of the objects a decoder plays, [`LATENCY`]
+/// behind the master's: the metadata comes with its access unit, and so does
+/// the audio it places. Each element rendered as its feed says.
+fn oamd(lfe: bool, renders: &[Render], out: &Path) -> Result<Vec<u8>> {
+    let mut objects = Vec::with_capacity(renders.len() + 1);
+    if lfe {
+        objects.push(Object {
+            active: true,
+            gain: Gain::Unity,
+            render: None,
+        });
     }
+    for &render in renders {
+        objects.push(Object {
+            active: true,
+            gain: Gain::Unity,
+            render: Some(render),
+        });
+    }
+    ObjectAudioMetadata {
+        lfe,
+        blocks: vec![Block {
+            offset: 0,
+            ramp: Ramp::Long,
+            objects,
+        }],
+    }
+    .write()
+    .map_err(|e| Error::unsupported(out, e.to_string()))
 }
 
 /// Renders for `count` elements that make the largest object metadata
@@ -1161,10 +1508,26 @@ mod tests {
 
     /// [`encode`], and the core that went in, interleaved.
     fn encode_keeping_core(elements: Vec<Element>, frames: usize) -> (Writer, Vec<u8>, Vec<f32>) {
+        encode_on(elements, frames, true)
+    }
+
+    /// [`encode_keeping_core`], the encoders on threads of their own when
+    /// `threads`, on the caller's otherwise.
+    fn encode_on(
+        elements: Vec<Element>,
+        frames: usize,
+        threads: bool,
+    ) -> (Writer, Vec<u8>, Vec<f32>) {
         let mut kept = Vec::new();
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
-        let mut writer = Writer::new(config(), elements, true, Some(2), &out).unwrap();
+        let mut writer = Writer::build(config(), elements, true, Some(2), &out, threads).unwrap();
+        for lane in [
+            matches!(writer.coder.probe, Lane::Thread { .. }),
+            matches!(writer.coder.stream, Lane::Thread { .. }),
+        ] {
+            assert_eq!(lane, threads, "the encoders where they were asked to be");
+        }
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for k in 0..frames {
@@ -1312,6 +1675,26 @@ mod tests {
             } else {
                 assert_eq!(peak, None, "frame {sequence}");
             }
+        }
+    }
+
+    /// The encoders on threads of their own write the stream the caller's
+    /// writes alone, to the byte — the probe a frame ahead of the fit, the
+    /// stream's encoder a frame behind it, the true peak stated across them:
+    /// elements carried as they are, and folded into fifteen.
+    #[test]
+    fn the_encoders_on_threads_write_what_one_thread_writes() {
+        const FRAMES: usize = 18;
+        for elements in [2, 20] {
+            let (alone, one, _) = encode_on(beds(elements), FRAMES, false);
+            let (apart, threads, _) = encode_on(beds(elements), FRAMES, true);
+            assert_eq!(apart.written(), FRAMES as u64);
+            assert_eq!(alone.written(), apart.written());
+            assert!(one == threads, "{elements} elements: the streams differ");
+            assert!(
+                matches!(apart.coder.stream, Lane::Here { .. }),
+                "the threads done with once the writer is finished"
+            );
         }
     }
 

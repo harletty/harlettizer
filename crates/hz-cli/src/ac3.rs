@@ -296,14 +296,24 @@ fn encode(config: Config) -> Result<()> {
             Sink::Plain(encoder) => encoder
                 .encode(&refs[..width], &mut frame)
                 .map_err(|e| Error::refused(&config.out, e.0))?,
-            Sink::Joc(writer) => writer.frame(
-                &refs[..width],
-                &input[..FRAME_SAMPLES * stride],
-                stride,
-                got,
-                at,
-                &mut frame,
-            )?,
+            Sink::Joc(writer) => {
+                let coded = writer.frame(
+                    &refs[..width],
+                    &input[..FRAME_SAMPLES * stride],
+                    stride,
+                    got,
+                    at,
+                    &mut frame,
+                );
+                // The writer hands back whole syncframes, and its encoders
+                // run behind it: those written before a refusal it finds now
+                // are the stream up to it, and stay where they were written.
+                if coded.is_err() {
+                    out.write_all(&frame)
+                        .map_err(|e| Error::io(&config.out, e))?;
+                }
+                coded?
+            }
         }
         out.write_all(&frame)
             .map_err(|e| Error::io(&config.out, e))?;
@@ -325,9 +335,10 @@ fn encode(config: Config) -> Result<()> {
     }
     if let Sink::Joc(writer) = &mut sink {
         frame.clear();
-        writer.finish(&mut frame)?;
+        let finished = writer.finish(&mut frame);
         out.write_all(&frame)
             .map_err(|e| Error::io(&config.out, e))?;
+        finished?;
     }
     out.flush().map_err(|e| Error::io(&config.out, e))?;
     if at == 0 {
