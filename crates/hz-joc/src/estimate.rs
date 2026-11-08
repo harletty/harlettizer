@@ -1080,7 +1080,10 @@ impl Fitter {
             }
         }
         let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
-        for (band, steep) in frame.steep.iter().enumerate() {
+        for band in 0..BANDS {
+            // The band's systems, worked out for the frame: none worked out
+            // is a bug, not a frame without steps.
+            let steep = &frame.steep[band];
             let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
             let cell = |t: usize| t * BANDS + band;
             // The ramp: (1 − w)·h + w·c at slot t, w = (t + 1)/24, then c.
@@ -2802,16 +2805,22 @@ mod tests {
                         beside.each_ref().map(bits),
                         "{n} channels side by side, right-hand side {r}, ridged {ridged}"
                     );
-                    let as_the_decision_takes_them = Eliminated::solve_side_by_side::<SIDE>(
-                        std::array::from_fn(|kind| &kept[kind]),
-                        std::array::from_fn(|kind| rhs[kind]),
-                        n,
-                    );
-                    assert_eq!(
-                        as_the_decision_takes_them.each_ref().map(bits),
-                        std::array::from_fn::<_, SIDE, _>(|kind| bits(&beside[kind])),
-                        "{n} channels, {SIDE} side by side, right-hand side {r}, ridged {ridged}"
-                    );
+                    // As many side by side as the decision takes, every kind
+                    // in every place.
+                    for first in 0..KINDS {
+                        let kind = |s: usize| (first + s) % KINDS;
+                        let as_the_decision_takes_them = Eliminated::solve_side_by_side::<SIDE>(
+                            std::array::from_fn(|s| &kept[kind(s)]),
+                            std::array::from_fn(|s| rhs[kind(s)]),
+                            n,
+                        );
+                        assert_eq!(
+                            as_the_decision_takes_them.each_ref().map(bits),
+                            std::array::from_fn::<_, SIDE, _>(|s| bits(&beside[kind(s)])),
+                            "{n} channels, {SIDE} side by side from kind {first}, \
+                             right-hand side {r}, ridged {ridged}"
+                        );
+                    }
                 }
             }
         }
@@ -2939,7 +2948,7 @@ mod tests {
         frame: &super::Frame,
         slots: &[Slot; 2 * SLOTS],
         held: &Matrix,
-    ) -> (f64, [f64; SLOTS + 1]) {
+    ) -> (f64, [f64; SLOTS + 1], Vec<[f64; MAX_CHANNELS]>, Vec<f64>) {
         let n = frame.channels;
         let mut slot_rhs = vec![[0.0; MAX_CHANNELS]; SPAN * BANDS];
         let mut slot_energy = vec![0.0; SPAN * BANDS];
@@ -3023,14 +3032,16 @@ mod tests {
                 stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
             }
         }
-        (ramped, stepped)
+        (ramped, stepped, slot_rhs, slot_energy)
     }
 
     /// Each object's ramp and every one of its steps weigh, against the
     /// systems the band shares out, what they weighed against the object's
-    /// own, to the bit: on five and seven channels, for an object of noise,
-    /// a fixed mix, a mix that switches mid-frame and silence, from gains
-    /// held on the quantiser's steps and from noughts.
+    /// own, to the bit — and its sums against the downmix, which the step
+    /// chosen is weighed again from, are what they were: on five and seven
+    /// channels, under two ridges, for an object of noise, a fixed mix, a mix
+    /// that switches mid-frame and silence, from gains held on the
+    /// quantiser's steps and from noughts.
     #[test]
     fn each_objects_steps_weigh_what_they_weighed_to_the_bit() {
         let mut seed = 61u32;
@@ -3062,42 +3073,58 @@ mod tests {
                 estimator.push(&core_refs, &object_refs, &[true; 4]);
             }
             estimator.slot_matrices();
-            estimator.steep_systems();
-            let frame = super::Frame {
-                channels: n,
-                ridge: estimator.ridge,
-                steep_margin: estimator.steep_margin,
-                stepping: true,
-                start: 0,
-                weighted: &estimator.weighted,
-                gram: &estimator.gram,
-                factor: &estimator.factor,
-                window_root: &estimator.window_root,
-                slot_gram: &estimator.slot_gram,
-                steep: &estimator.steep,
-                core_slots: &estimator.core_slots,
-            };
-            let mut fitter = Fitter::new(n * BANDS);
-            for (o, slots) in estimator.object_slots.iter().enumerate() {
-                for from_noughts in [false, true] {
-                    let held: Matrix = std::array::from_fn(|_| {
-                        std::array::from_fn(|_| match from_noughts {
-                            false => (noise(&mut seed) * 40.0).round() * STEP,
-                            true => 0.0,
-                        })
-                    });
-                    let (ramped, stepped) = fitter.weigh(&frame, slots, &held);
-                    let (ramped_alone, stepped_alone) = weigh_alone(&frame, slots, &held);
-                    assert_eq!(
-                        ramped.to_bits(),
-                        ramped_alone.to_bits(),
-                        "{n} channels, object {o}, from noughts {from_noughts}"
-                    );
-                    assert_eq!(
-                        stepped.map(f64::to_bits),
-                        stepped_alone.map(f64::to_bits),
-                        "{n} channels, object {o}, from noughts {from_noughts}"
-                    );
+            for ridge in [estimator.ridge, 1e-3] {
+                estimator.ridge = ridge;
+                estimator.steep_systems();
+                let frame = super::Frame {
+                    channels: n,
+                    ridge: estimator.ridge,
+                    steep_margin: estimator.steep_margin,
+                    stepping: true,
+                    start: 0,
+                    weighted: &estimator.weighted,
+                    gram: &estimator.gram,
+                    factor: &estimator.factor,
+                    window_root: &estimator.window_root,
+                    slot_gram: &estimator.slot_gram,
+                    steep: &estimator.steep,
+                    core_slots: &estimator.core_slots,
+                };
+                let mut fitter = Fitter::new(n * BANDS);
+                for (o, slots) in estimator.object_slots.iter().enumerate() {
+                    for from_noughts in [false, true] {
+                        let held: Matrix = std::array::from_fn(|_| {
+                            std::array::from_fn(|_| match from_noughts {
+                                false => (noise(&mut seed) * 40.0).round() * STEP,
+                                true => 0.0,
+                            })
+                        });
+                        let (ramped, stepped) = fitter.weigh(&frame, slots, &held);
+                        let (ramped_alone, stepped_alone, rhs_alone, energy_alone) =
+                            weigh_alone(&frame, slots, &held);
+                        let case = format!(
+                            "{n} channels, ridge {ridge}, object {o}, from noughts {from_noughts}"
+                        );
+                        assert_eq!(ramped.to_bits(), ramped_alone.to_bits(), "{case}");
+                        assert_eq!(
+                            stepped.map(f64::to_bits),
+                            stepped_alone.map(f64::to_bits),
+                            "{case}"
+                        );
+                        let bits = |v: &[[f64; MAX_CHANNELS]]| -> Vec<_> {
+                            v.iter().map(|r| r.map(f64::to_bits)).collect()
+                        };
+                        assert_eq!(bits(&fitter.slot_rhs), bits(&rhs_alone), "{case}");
+                        assert_eq!(
+                            fitter
+                                .slot_energy
+                                .iter()
+                                .map(|e| e.to_bits())
+                                .collect::<Vec<_>>(),
+                            energy_alone.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+                            "{case}"
+                        );
+                    }
                 }
             }
         }

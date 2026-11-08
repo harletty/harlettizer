@@ -527,7 +527,8 @@ for a frame's objects (`SteepBand`), and each object's right-hand sides are
 taken through the elimination kept (`Eliminated`): the same swaps and steps,
 in the same order, as beside the system. What is left of a solve is a chain
 of steps, each waiting on the one before: multiplications and subtractions
-down the system, then a division a row back up it. One split's solve does
+down the system, then back up it a row at a time, each row's sum of the
+gains found taken away and the rest divided by its pivot. One split's solve does
 not wait on another's, so four splits are solved a step of each at a time.
 Every gain and error is the same to the bit. On sixteen cores:
 
