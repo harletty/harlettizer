@@ -198,7 +198,8 @@ pub struct Estimator {
     /// For the steep decision: each slot's downmix matrices, per band, over
     /// the frame and half the next.
     slot_gram: Vec<[[f64; MAX_CHANNELS]; MAX_CHANNELS]>,
-    /// And each band's systems, from them: the same for every object.
+    /// And each band's systems, from them: the same for every object;
+    /// none until a frame weighs a step.
     steep: Vec<SteepBand>,
     /// The scratch each object's fit works in, one per thread the objects
     /// are fitted on at once.
@@ -265,7 +266,7 @@ impl Estimator {
             gram: vec![0.0; (channels * BANDS).pow(2)],
             factor: vec![0.0; (channels * BANDS).pow(2)],
             slot_gram: vec![[[0.0; MAX_CHANNELS]; MAX_CHANNELS]; SPAN * BANDS],
-            steep: vec![SteepBand::default(); BANDS],
+            steep: Vec::new(),
             fitters: vec![Fitter::new(channels * BANDS)],
             wanted: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
             weights: vec![[[0.0; BANDS]; MAX_CHANNELS]; objects],
@@ -395,7 +396,7 @@ impl Estimator {
             &mut self.gram,
             &mut self.factor,
         );
-        let stepping = self.steep_margin > 0.0;
+        let stepping = self.steep_margin > 0.0 && present.contains(&true);
         if stepping {
             self.slot_matrices();
             self.steep_systems();
@@ -486,6 +487,7 @@ impl Estimator {
 
     /// Each band's systems for the steep decision, from the slots' matrices.
     fn steep_systems(&mut self) {
+        self.steep.resize_with(BANDS, SteepBand::default);
         let (n, ridge, slot_gram) = (self.channels, f64::from(self.ridge), &self.slot_gram);
         each_mut!(self.steep)
             .enumerate()
@@ -1014,13 +1016,51 @@ impl Fitter {
     /// own model of the frame, before synthesis — over the frame and half
     /// the next, against the ramp: each the least-squares gains for its
     /// shape, the ramp from the gains held, the step after the held ones.
-    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
     fn steep_split(
         &mut self,
         frame: &Frame,
         slots: &[Slot; 2 * SLOTS],
         held: &Matrix,
     ) -> Option<Step> {
+        let n = frame.channels;
+        let (ramped, stepped) = self.weigh(frame, slots, held);
+        let held = *held;
+        let ridge = f64::from(frame.ridge);
+        let (split, _) = (1..=SLOTS)
+            .map(|split| (split, stepped[split]))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        // The best step weighed again with its gains rounded to the
+        // quantiser's steps, as the decoder will have them: a gain between
+        // two steps looks better reached at once than ramped to, until both
+        // round to the step already held.
+        let mut best = 0.0;
+        for band in 0..BANDS {
+            let (error, gains) = self.step_error(frame, band, split, &held, ridge);
+            best += error;
+            for (ch, gain) in gains.iter().enumerate().take(n) {
+                self.step_gains[ch][band] = *gain as f32;
+            }
+        }
+        // And it must buy back a share of the object's own energy: where
+        // both errors are down at the quantiser's, their ratio is noise.
+        let step = Step {
+            split,
+            ramped,
+            signal: self.slot_energy.iter().sum(),
+        };
+        step.passes(best, frame.steep_margin).then_some(step)
+    }
+
+    /// The object's error over the frame and half the next, ramped, and
+    /// stepped at each split from one: its sums against the downmix, slot
+    /// by slot, kept for the step chosen.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn weigh(
+        &mut self,
+        frame: &Frame,
+        slots: &[Slot; 2 * SLOTS],
+        held: &Matrix,
+    ) -> (f64, [f64; SLOTS + 1]) {
         let n = frame.channels;
         for (rhs, energy) in self.slot_rhs.iter_mut().zip(&mut self.slot_energy) {
             *rhs = [0.0; MAX_CHANNELS];
@@ -1039,8 +1079,6 @@ impl Fitter {
                 }
             }
         }
-        let held = *held;
-        let ridge = f64::from(frame.ridge);
         let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
         for (band, steep) in frame.steep.iter().enumerate() {
             let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
@@ -1125,29 +1163,7 @@ impl Fitter {
                 }
             }
         }
-        let (split, _) = (1..=SLOTS)
-            .map(|split| (split, stepped[split]))
-            .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        // The best step weighed again with its gains rounded to the
-        // quantiser's steps, as the decoder will have them: a gain between
-        // two steps looks better reached at once than ramped to, until both
-        // round to the step already held.
-        let mut best = 0.0;
-        for band in 0..BANDS {
-            let (error, gains) = self.step_error(frame, band, split, &held, ridge);
-            best += error;
-            for (ch, gain) in gains.iter().enumerate().take(n) {
-                self.step_gains[ch][band] = *gain as f32;
-            }
-        }
-        // And it must buy back a share of the object's own energy: where
-        // both errors are down at the quantiser's, their ratio is noise.
-        let step = Step {
-            split,
-            ramped,
-            signal: self.slot_energy.iter().sum(),
-        };
-        step.passes(best, frame.steep_margin).then_some(step)
+        (ramped, stepped)
     }
 
     /// The error in `band` of the object [`Self::steep_split`] last weighed,
@@ -2786,6 +2802,16 @@ mod tests {
                         beside.each_ref().map(bits),
                         "{n} channels side by side, right-hand side {r}, ridged {ridged}"
                     );
+                    let as_the_decision_takes_them = Eliminated::solve_side_by_side::<SIDE>(
+                        std::array::from_fn(|kind| &kept[kind]),
+                        std::array::from_fn(|kind| rhs[kind]),
+                        n,
+                    );
+                    assert_eq!(
+                        as_the_decision_takes_them.each_ref().map(bits),
+                        std::array::from_fn::<_, SIDE, _>(|kind| bits(&beside[kind])),
+                        "{n} channels, {SIDE} side by side, right-hand side {r}, ridged {ridged}"
+                    );
                 }
             }
         }
@@ -2901,6 +2927,177 @@ mod tests {
                             "{n} channels, band {band}, split {split}, right-hand side {r}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// An object's ramp and steps weighed as each object weighed them for
+    /// itself, before the systems were the band's.
+    #[allow(clippy::needless_range_loop)] // matrices indexed as matrices
+    fn weigh_alone(
+        frame: &super::Frame,
+        slots: &[Slot; 2 * SLOTS],
+        held: &Matrix,
+    ) -> (f64, [f64; SLOTS + 1]) {
+        let n = frame.channels;
+        let mut slot_rhs = vec![[0.0; MAX_CHANNELS]; SPAN * BANDS];
+        let mut slot_energy = vec![0.0; SPAN * BANDS];
+        for t in 0..SPAN {
+            let target = &slots[t];
+            for k in 0..SUBBANDS {
+                let cell = t * BANDS + band_of(k);
+                let (or, oi) = (f64::from(target.real[k]), f64::from(target.imaginary[k]));
+                slot_energy[cell] += or * or + oi * oi;
+                for (i, core) in frame.core_slots.iter().enumerate() {
+                    let x = &core[t];
+                    slot_rhs[cell][i] += f64::from(x.real[k]) * or + f64::from(x.imaginary[k]) * oi;
+                }
+            }
+        }
+        let accumulate = |system: &mut [[f64; MAX_CHANNELS]; MAX_CHANNELS],
+                          rhs: &mut [f64; MAX_CHANNELS],
+                          energy: &mut f64,
+                          cell: usize| {
+            let (a, g, e) = (&frame.slot_gram[cell], &slot_rhs[cell], slot_energy[cell]);
+            for i in 0..n {
+                rhs[i] += g[i];
+                for j in 0..n {
+                    system[i][j] += a[i][j];
+                }
+            }
+            *energy += e;
+        };
+        let ridge = f64::from(frame.ridge);
+        let (mut ramped, mut stepped) = (0f64, [0f64; SLOTS + 1]);
+        for band in 0..BANDS {
+            let h: [f64; MAX_CHANNELS] = std::array::from_fn(|ch| f64::from(held[ch][band]));
+            let cell = |t: usize| t * BANDS + band;
+            let weight = |t: usize| ((t + 1) as f64 / SLOTS as f64).min(1.0);
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let mut rhs = [0f64; MAX_CHANNELS];
+            for t in 0..SPAN {
+                let (w, a, g) = (weight(t), &frame.slot_gram[cell(t)], &slot_rhs[cell(t)]);
+                for i in 0..n {
+                    rhs[i] += w * (g[i] - (1.0 - w) * (0..n).map(|j| a[i][j] * h[j]).sum::<f64>());
+                    for j in 0..n {
+                        system[i][j] += w * w * a[i][j];
+                    }
+                }
+            }
+            let c = snap(ridged_beside(system, rhs, n, ridge));
+            for t in 0..SPAN {
+                let w = weight(t);
+                let mix: [f64; MAX_CHANNELS] =
+                    std::array::from_fn(|ch| (1.0 - w) * h[ch] + w * c[ch]);
+                ramped += error(
+                    &frame.slot_gram[cell(t)],
+                    &slot_rhs[cell(t)],
+                    slot_energy[cell(t)],
+                    &mix,
+                    n,
+                );
+            }
+            let mut system = [[0f64; MAX_CHANNELS]; MAX_CHANNELS];
+            let (mut rhs, mut energy) = ([0f64; MAX_CHANNELS], 0f64);
+            for t in SLOTS..SPAN {
+                accumulate(&mut system, &mut rhs, &mut energy, cell(t));
+            }
+            let mut before = [0f64; SLOTS + 1];
+            for t in 0..SLOTS {
+                before[t + 1] = before[t]
+                    + error(
+                        &frame.slot_gram[cell(t)],
+                        &slot_rhs[cell(t)],
+                        slot_energy[cell(t)],
+                        &h,
+                        n,
+                    );
+            }
+            for split in (1..=SLOTS).rev() {
+                let t = split;
+                if t < SLOTS {
+                    accumulate(&mut system, &mut rhs, &mut energy, cell(t));
+                }
+                let c = ridged_beside(system, rhs, n, ridge);
+                stepped[split] += before[split] + error(&system, &rhs, energy, &c, n);
+            }
+        }
+        (ramped, stepped)
+    }
+
+    /// Each object's ramp and every one of its steps weigh, against the
+    /// systems the band shares out, what they weighed against the object's
+    /// own, to the bit: on five and seven channels, for an object of noise,
+    /// a fixed mix, a mix that switches mid-frame and silence, from gains
+    /// held on the quantiser's steps and from noughts.
+    #[test]
+    fn each_objects_steps_weigh_what_they_weighed_to_the_bit() {
+        let mut seed = 61u32;
+        for config in [0, 1] {
+            let mut estimator = Estimator::new(4, config);
+            let n = estimator.channels();
+            for _ in 0..2 {
+                let mut core: Vec<Vec<f32>> = (0..n)
+                    .map(|_| (0..FRAME).map(|_| noise(&mut seed)).collect())
+                    .collect();
+                core[1].fill(0.0);
+                core[2] = core[0].clone();
+                let objects: Vec<Vec<f32>> = vec![
+                    (0..FRAME).map(|_| noise(&mut seed)).collect(),
+                    (0..FRAME).map(|t| 0.5 * core[0][t] - core[3][t]).collect(),
+                    (0..FRAME)
+                        .map(|t| {
+                            if t < FRAME / 3 {
+                                core[0][t]
+                            } else {
+                                core[4][t]
+                            }
+                        })
+                        .collect(),
+                    vec![0.0; FRAME],
+                ];
+                let core_refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+                let object_refs: Vec<&[f32]> = objects.iter().map(Vec::as_slice).collect();
+                estimator.push(&core_refs, &object_refs, &[true; 4]);
+            }
+            estimator.slot_matrices();
+            estimator.steep_systems();
+            let frame = super::Frame {
+                channels: n,
+                ridge: estimator.ridge,
+                steep_margin: estimator.steep_margin,
+                stepping: true,
+                start: 0,
+                weighted: &estimator.weighted,
+                gram: &estimator.gram,
+                factor: &estimator.factor,
+                window_root: &estimator.window_root,
+                slot_gram: &estimator.slot_gram,
+                steep: &estimator.steep,
+                core_slots: &estimator.core_slots,
+            };
+            let mut fitter = Fitter::new(n * BANDS);
+            for (o, slots) in estimator.object_slots.iter().enumerate() {
+                for from_noughts in [false, true] {
+                    let held: Matrix = std::array::from_fn(|_| {
+                        std::array::from_fn(|_| match from_noughts {
+                            false => (noise(&mut seed) * 40.0).round() * STEP,
+                            true => 0.0,
+                        })
+                    });
+                    let (ramped, stepped) = fitter.weigh(&frame, slots, &held);
+                    let (ramped_alone, stepped_alone) = weigh_alone(&frame, slots, &held);
+                    assert_eq!(
+                        ramped.to_bits(),
+                        ramped_alone.to_bits(),
+                        "{n} channels, object {o}, from noughts {from_noughts}"
+                    );
+                    assert_eq!(
+                        stepped.map(f64::to_bits),
+                        stepped_alone.map(f64::to_bits),
+                        "{n} channels, object {o}, from noughts {from_noughts}"
+                    );
                 }
             }
         }
