@@ -3399,14 +3399,19 @@ mod tests {
 
     const HARD_RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
 
-    /// Fold one block per entry of `blocks` through one overlay of
-    /// [`left_side_parts`], the source at that gain and asking to be there,
-    /// with the fallback off so the drift stays where the fit put it; and
-    /// what each block wrote.
-    fn fold_adrift(blocks: &[(f64, [f64; 3])], masking: f64) -> (Fold, Vec<Vec<i32>>) {
-        let parts = left_side_parts();
-        let elements = parts.len() - 1;
-        let mut fold = overlay_fold(&parts, 1, elements);
+    /// Fold `blocks` blocks through one overlay of `parts`, whose last
+    /// `sources` objects are the sources, with the fallback off so the drift
+    /// stays where the fit put it; `set` shapes each block's states, by the
+    /// block's index. And what each block wrote.
+    fn fold_blocks(
+        parts: &[Part],
+        sources: usize,
+        masking: f64,
+        blocks: usize,
+        set: impl Fn(usize, &mut [(usize, Keyframe)]),
+    ) -> (Fold, Vec<Vec<i32>>) {
+        let elements = parts.len() - sources;
+        let mut fold = overlay_fold(parts, sources, elements);
         if let Shape::Overlaid(overlaid) = &mut fold.shape {
             overlaid.bounds.fallback = false;
             overlaid.bounds.masking = masking;
@@ -3414,18 +3419,15 @@ mod tests {
         let frames = 1280;
         let block = noisy_block(parts.len(), frames);
         let mut written = Vec::new();
-        for (gain, position) in blocks {
-            let mut states = states_of(&parts);
-            for state in states.iter_mut().skip(elements) {
-                state.1.gain = *gain;
-                state.1.position = *position;
-            }
+        for index in 0..blocks {
+            let mut states = states_of(parts);
+            set(index, &mut states);
             let mut out = vec![0i32; frames * elements];
             fold_span(
                 &mut fold,
                 std::path::Path::new("a master"),
                 &states,
-                &parts,
+                parts,
                 &block,
                 parts.len(),
                 frames,
@@ -3437,6 +3439,20 @@ mod tests {
             written.push(out);
         }
         (fold, written)
+    }
+
+    /// Fold one block per entry of `blocks` through one overlay of
+    /// [`left_side_parts`], the source at that gain and asking to be there.
+    fn fold_adrift(blocks: &[(f64, [f64; 3])], masking: f64) -> (Fold, Vec<Vec<i32>>) {
+        let parts = left_side_parts();
+        let elements = parts.len() - 1;
+        fold_blocks(&parts, 1, masking, blocks.len(), |index, states| {
+            let (gain, position) = blocks[index];
+            for state in states.iter_mut().skip(elements) {
+                state.1.gain = gain;
+                state.1.position = position;
+            }
+        })
     }
 
     /// And a pause ends a **run**: two stretches of drift either side of one
@@ -3567,6 +3583,58 @@ mod tests {
         assert_eq!(
             overlaid.worst_run, 3,
             "the source came back in place and the run went on"
+        );
+    }
+
+    /// **A masked block with nowhere to go holds a drift run too.** It has
+    /// not shown the source back in place, so it is no more a break than a
+    /// masked block adrift is. Two sources: the first adrift and heard,
+    /// except for one block in which every element is muted and it is
+    /// masked under the second, which sits at the left front and is the
+    /// loudest thing left. Ending the run there split one refusable run into
+    /// two that each pass.
+    #[test]
+    fn a_masked_block_with_no_carrier_holds_a_drift_run() {
+        let mut parts = left_side_parts();
+        let left = hz_render::fold::bed_position("L").expect("a bed channel");
+        parts.push(Part::Object {
+            source_channel: 5,
+            keyframes: vec![Keyframe {
+                position: left,
+                ..Keyframe::default()
+            }],
+            bed: None,
+        });
+        let elements = parts.len() - 2;
+        let muted = 3;
+        let (fold, _) = fold_blocks(&parts, 2, overlay::OVERLAY_MASKING, 7, |index, states| {
+            let quiet = if index == muted { -30.0 } else { -10.0 };
+            states[elements].1.gain = 10f64.powf(quiet / 20.0);
+            if index == muted {
+                for state in &mut states[1..elements] {
+                    state.1.gain = 0.0;
+                }
+            }
+        });
+        let Shape::Overlaid(overlaid) = &fold.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(overlaid.stranded, 2, "both sources had nowhere to go once");
+        assert_eq!(
+            overlaid.over_stranded, 1,
+            "only the loud source was judged stranded"
+        );
+        assert_eq!(
+            overlaid.worst_run, 6,
+            "the masked block with no carrier broke the run"
+        );
+        assert_eq!(
+            overlaid.worst_run_at,
+            Some(overlay::RunAt {
+                source: 0,
+                first: 0,
+                last: 6
+            })
         );
     }
 

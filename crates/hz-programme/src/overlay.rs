@@ -974,8 +974,11 @@ impl Overlaid {
                     // stranded throughout divided by one.
                     self.stranded += 1;
                     self.drifted += 1;
-                    self.run[index] = 0;
                     if exposed {
+                        // A drift run ends where a stranded one begins. A masked
+                        // block with nowhere to go does neither: it has not shown
+                        // the source back in place, so the run it is in holds.
+                        self.run[index] = 0;
                         self.over_stranded += 1;
                         if self.stranded_run[index] == 0 {
                             self.stranded_from[index] = self.reported_blocks;
