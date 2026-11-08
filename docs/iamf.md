@@ -299,7 +299,7 @@ carrier.
 The options are `encode`'s, with its names and its defaults, from one
 definition shared by both commands: the guards `--overlay-drift`,
 `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`,
-`--overlay-fallback`, the preference `--overlay-beds`, `--overlay-spare`,
+`--overlay-masking`, `--overlay-fallback`, the preference `--overlay-beds`, `--overlay-spare`,
 `--overlay-report`, and the four that shape what a mix makes —
 `--fold-depth` (the mixed elements' depth, 20 bits unless asked; an IA
 sequence takes 16 to 24 and never more than its `--bits`, and FLAC takes the
@@ -606,7 +606,7 @@ encapsulation requires (§6.2.2), from the codec config's roll distance.
 | `--elements <N>` | what the bed and dialogue elements leave of 28 | With `--objects`: the most object elements; more objects than that are folded into them |
 | `--overlay <K>` | | With `--objects`: keep the master's elements and pan its last K objects onto them, as `encode --overlay` |
 | `--voices-to-bed <K>` | | With `--objects`: render the last K objects into a dialogue element of their own — labelled, ±12 dB for a listener, the loudness anchored on it — and carry the rest as `--objects` does |
-| `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | as `encode` | With `--overlay`: as for `encode` |
+| `--overlay-beds`, `--overlay-drift`, `--overlay-spread`, `--overlay-wobble`, `--overlay-level`, `--overlay-cost`, `--overlay-masking`, `--overlay-fallback`, `--overlay-spare`, `--overlay-report` | as `encode` | With `--overlay`: as for `encode` |
 | `--fold-depth`, `--dialnorm`, `--headroom`, `--loudness` | `20`, `-31`, `limit`, `flat` | With `--overlay`, or `--objects` folding: as for `encode`; the depth 16 to 24 |
 | `--progress` | off | As for `encode` |
 

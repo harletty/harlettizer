@@ -3369,14 +3369,10 @@ mod tests {
         assert_eq!(overlaid.motion.invented(), 0.0);
     }
 
-    /// And a pause ends a **run**: two stretches of drift either side of one
-    /// are two runs, not a single long one. A run is what refuses on its own,
-    /// whatever the share, so joining two across a silence would refuse a
-    /// programme for a fault it does not have.
-    #[test]
-    fn a_pause_ends_a_run_of_drift() {
-        // Every element down the left side and a source at hard right: the
-        // fit cannot place it, so every voiced block is past the drift bound.
+    /// Every element down the left side and a source after them: put at
+    /// [`HARD_RIGHT`], the fit cannot place it, so every block it is heard in
+    /// is past the drift bound.
+    fn left_side_parts() -> Vec<Part> {
         let mut parts = vec![Part::Lfe { source_channel: 0 }];
         for (index, label) in ["L", "Lss", "Lrs"].iter().enumerate() {
             let position = hz_render::fold::bed_position(label).expect("a bed channel");
@@ -3393,33 +3389,45 @@ mod tests {
         parts.push(Part::Object {
             source_channel: 4,
             keyframes: vec![Keyframe {
-                position: [1.0, 0.0, 0.0],
+                position: HARD_RIGHT,
                 ..Keyframe::default()
             }],
             bed: None,
         });
+        parts
+    }
 
-        // Three blocks adrift, one silent, three adrift: the longest run is
-        // three, not six. The fallback is off so the drift stays.
-        let gains = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0];
-        let elements = parts.len() - 1;
-        let mut fold = overlay_fold(&parts, 1, elements);
+    const HARD_RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
+
+    /// Fold `blocks` blocks through one overlay of `parts`, whose last
+    /// `sources` objects are the sources, with the fallback off so the drift
+    /// stays where the fit put it; `set` shapes each block's states, by the
+    /// block's index. And what each block wrote.
+    fn fold_blocks(
+        parts: &[Part],
+        sources: usize,
+        masking: f64,
+        blocks: usize,
+        set: impl Fn(usize, &mut [(usize, Keyframe)]),
+    ) -> (Fold, Vec<Vec<i32>>) {
+        let elements = parts.len() - sources;
+        let mut fold = overlay_fold(parts, sources, elements);
         if let Shape::Overlaid(overlaid) = &mut fold.shape {
             overlaid.bounds.fallback = false;
+            overlaid.bounds.masking = masking;
         }
         let frames = 1280;
         let block = noisy_block(parts.len(), frames);
-        for gain in gains {
-            let mut states = states_of(&parts);
-            for state in states.iter_mut().skip(elements) {
-                state.1.gain = gain;
-            }
+        let mut written = Vec::new();
+        for index in 0..blocks {
+            let mut states = states_of(parts);
+            set(index, &mut states);
             let mut out = vec![0i32; frames * elements];
             fold_span(
                 &mut fold,
                 std::path::Path::new("a master"),
                 &states,
-                &parts,
+                parts,
                 &block,
                 parts.len(),
                 frames,
@@ -3428,7 +3436,36 @@ mod tests {
                 &mut out,
             )
             .expect("the span folds");
+            written.push(out);
         }
+        (fold, written)
+    }
+
+    /// Fold one block per entry of `blocks` through one overlay of
+    /// [`left_side_parts`], the source at that gain and asking to be there.
+    fn fold_adrift(blocks: &[(f64, [f64; 3])], masking: f64) -> (Fold, Vec<Vec<i32>>) {
+        let parts = left_side_parts();
+        let elements = parts.len() - 1;
+        fold_blocks(&parts, 1, masking, blocks.len(), |index, states| {
+            let (gain, position) = blocks[index];
+            for state in states.iter_mut().skip(elements) {
+                state.1.gain = gain;
+                state.1.position = position;
+            }
+        })
+    }
+
+    /// And a pause ends a **run**: two stretches of drift either side of one
+    /// are two runs, not a single long one. A run is what refuses on its own,
+    /// whatever the share, so joining two across a silence would refuse a
+    /// programme for a fault it does not have.
+    #[test]
+    fn a_pause_ends_a_run_of_drift() {
+        // Three blocks adrift, one silent, three adrift: the longest run is
+        // three, not six.
+        let gains = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0];
+        let blocks: Vec<_> = gains.iter().map(|gain| (*gain, HARD_RIGHT)).collect();
+        let (fold, _) = fold_adrift(&blocks, overlay::OVERLAY_MASKING);
 
         let Shape::Overlaid(overlaid) = &fold.shape else {
             panic!("an overlay")
@@ -3438,6 +3475,166 @@ mod tests {
             overlaid.worst_run, 3,
             "the silence did not end the run: it reached {}",
             overlaid.worst_run
+        );
+        // Two runs of three: the first is the one named, ending on its third
+        // block, so that a refusal points at where it started going wrong.
+        assert_eq!(
+            overlaid.worst_run_at,
+            Some(overlay::RunAt {
+                source: 0,
+                first: 0,
+                last: 2
+            })
+        );
+    }
+
+    /// What the drift guard refuses, if anything: the remarks on where a
+    /// source is, which all say how far it was from where it asked to be.
+    fn drift_refusals(fold: &Fold) -> Vec<String> {
+        let Shape::Overlaid(overlaid) = &fold.shape else {
+            panic!("an overlay")
+        };
+        let totals = overlay::Totals {
+            blocks: overlaid.reported_blocks,
+            mean: 0.0,
+            clipped: 0,
+            limiter: None,
+        };
+        overlay::remarks(overlaid, &totals, BLOCK_UNITS as f64 * unit_seconds(48_000))
+            .into_iter()
+            .filter(|remark| remark.refused && remark.said.contains("from where it asked to be"))
+            .map(|remark| remark.said)
+            .collect()
+    }
+
+    /// **A masked voice is not judged on where it is.** The same source,
+    /// adrift for longer than a refused run, thirty decibels under the
+    /// elements and then ten: masked, nobody can hear where it is and the
+    /// guard passes it; ten under, it is heard and refused. With the margin
+    /// declined the masked one is refused as it always was. And the mix is
+    /// the same bit for bit whatever the margin, because only the count
+    /// changes: a masked voice is still a voice.
+    #[test]
+    fn a_masked_source_is_not_judged_on_where_it_is() {
+        let blocks = 80;
+        let at = |decibels: f64| vec![(10f64.powf(decibels / 20.0), HARD_RIGHT); blocks];
+
+        let (masked, written) = fold_adrift(&at(-30.0), overlay::OVERLAY_MASKING);
+        let Shape::Overlaid(overlaid) = &masked.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(overlaid.drifted, blocks as u64, "the source was audible");
+        assert_eq!(overlaid.exposed, 0, "a masked block was judged");
+        assert_eq!((overlaid.over_drift, overlaid.worst_run), (0, 0));
+        assert_eq!(overlaid.worst_run_at, None);
+        assert!(
+            overlaid.worst_drift > overlay::OVERLAY_DRIFT,
+            "the source was not adrift, so this proves nothing"
+        );
+        assert_eq!(drift_refusals(&masked), Vec::<String>::new());
+
+        let (declined, unmasked) = fold_adrift(&at(-30.0), 0.0);
+        assert_eq!(written, unmasked, "the margin changed what was written");
+        assert_eq!(drift_refusals(&declined).len(), 1);
+
+        let (heard, _) = fold_adrift(&at(-10.0), overlay::OVERLAY_MASKING);
+        let Shape::Overlaid(overlaid) = &heard.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(overlaid.exposed, blocks as u64);
+        assert_eq!(overlaid.worst_run, blocks as u64);
+        assert_eq!(drift_refusals(&heard).len(), 1);
+    }
+
+    /// **A masked block inside a run neither extends it nor ends it**, and
+    /// the stretch named says how long of it the source was masked in. A
+    /// masked block that shows the source back in place does end it: where
+    /// the carriers put a source is geometry, whatever its level.
+    #[test]
+    fn a_masked_block_holds_a_run_unless_the_source_is_back() {
+        let heard = (10f64.powf(-10.0 / 20.0), HARD_RIGHT);
+        let masked = (10f64.powf(-30.0 / 20.0), HARD_RIGHT);
+        let left = hz_render::fold::bed_position("L").expect("a bed channel");
+        let back = (10f64.powf(-30.0 / 20.0), left);
+
+        let (fold, _) = fold_adrift(
+            &[heard, heard, heard, masked, masked, heard, heard, heard],
+            overlay::OVERLAY_MASKING,
+        );
+        let Shape::Overlaid(overlaid) = &fold.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(overlaid.worst_run, 6, "two masked blocks broke the run");
+        let at = overlaid.worst_run_at.expect("a run");
+        assert_eq!((at.first, at.last), (0, 7));
+        let block = BLOCK_UNITS as f64 * unit_seconds(48_000);
+        assert_eq!(
+            at.when(overlaid.worst_run, block),
+            "from 0:00:00.0 to 0:00:00.2, not counting the 0.1 s it was masked in"
+        );
+
+        let (fold, _) = fold_adrift(
+            &[heard, heard, heard, back, heard, heard, heard],
+            overlay::OVERLAY_MASKING,
+        );
+        let Shape::Overlaid(overlaid) = &fold.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(
+            overlaid.worst_run, 3,
+            "the source came back in place and the run went on"
+        );
+    }
+
+    /// **A masked block with nowhere to go holds a drift run too.** It has
+    /// not shown the source back in place, so it is no more a break than a
+    /// masked block adrift is. Two sources: the first adrift and heard,
+    /// except for one block in which every element is muted and it is
+    /// masked under the second, which sits at the left front and is the
+    /// loudest thing left. Ending the run there split one refusable run into
+    /// two that each pass.
+    #[test]
+    fn a_masked_block_with_no_carrier_holds_a_drift_run() {
+        let mut parts = left_side_parts();
+        let left = hz_render::fold::bed_position("L").expect("a bed channel");
+        parts.push(Part::Object {
+            source_channel: 5,
+            keyframes: vec![Keyframe {
+                position: left,
+                ..Keyframe::default()
+            }],
+            bed: None,
+        });
+        let elements = parts.len() - 2;
+        let muted = 3;
+        let (fold, _) = fold_blocks(&parts, 2, overlay::OVERLAY_MASKING, 7, |index, states| {
+            let quiet = if index == muted { -30.0 } else { -10.0 };
+            states[elements].1.gain = 10f64.powf(quiet / 20.0);
+            if index == muted {
+                for state in &mut states[1..elements] {
+                    state.1.gain = 0.0;
+                }
+            }
+        });
+        let Shape::Overlaid(overlaid) = &fold.shape else {
+            panic!("an overlay")
+        };
+        assert_eq!(overlaid.stranded, 2, "both sources had nowhere to go once");
+        assert_eq!(
+            overlaid.over_stranded, 1,
+            "only the loud source was judged stranded"
+        );
+        assert_eq!(
+            overlaid.worst_run, 6,
+            "the masked block with no carrier broke the run"
+        );
+        assert_eq!(
+            overlaid.worst_run_at,
+            Some(overlay::RunAt {
+                source: 0,
+                first: 0,
+                last: 6
+            })
         );
     }
 
