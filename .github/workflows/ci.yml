@@ -70,6 +70,32 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      # Some kernels are built twice, for the x86-64 baseline and for AVX2,
+      # and tests hold the two builds to the same bits. Only optimised code
+      # can tell them apart: the dev profile builds the workspace's own
+      # crates unoptimised, where neither build is vectorised and the
+      # comparisons pass whatever the kernels do. So those crates' tests run
+      # again in release, and their test binaries, the AVX2 builds among
+      # them, are searched for a fused multiply-add, which none may hold.
+      - name: Kernels built for AVX2 (release)
+        run: |
+          grep -qw avx2 /proc/cpuinfo || echo "::warning::no AVX2 on this runner: its builds are not compared"
+          cargo test --release -p hz-analysis -p hz-joc
+          tests=$(cargo test --release -p hz-analysis -p hz-joc --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable')
+          test -n "$tests"
+          objdump -d --no-show-raw-insn $tests > "$RUNNER_TEMP/kernels.s"
+          for kernel in loudest_avx2 upper_avx2 against_avx2 trade_plain_avx2; do
+            grep -q "$kernel" "$RUNNER_TEMP/kernels.s" \
+              || { echo "::error::$kernel is not in the test binaries"; exit 1; }
+          done
+          if grep -E '\bvfn?m(add|sub)' "$RUNNER_TEMP/kernels.s"; then
+            echo "::error::a fused multiply-add in the test binaries"
+            exit 1
+          fi
+        env:
+          RUSTFLAGS: -D warnings
+
       # IAMF's Opus substreams are coded by the system's libopus, behind a
       # feature the default build leaves off; this is the one job that has
       # the library and so the one place that code is built and tested.
