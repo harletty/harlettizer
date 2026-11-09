@@ -310,6 +310,11 @@ struct Stream {
     peak: TruePeak,
     interleaved: Vec<f32>,
     out: PathBuf,
+    /// Tests only: a syncframe this encoder comes to write only once it is
+    /// told to, as a thread of its own can be slow to come to one, and what
+    /// tells it ([`Stream::wait`]).
+    #[cfg(test)]
+    hold: Option<(u64, std::sync::mpsc::Receiver<()>)>,
 }
 
 /// What the stream is handed: a frame, with the payload of the frame before
@@ -388,6 +393,8 @@ impl Stream {
     /// Stream frame `written` with its payload: the frame held, carrying its
     /// Evolution frame, checked against what the probe made of it.
     fn write(&mut self, joc: &[u8]) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        self.wait();
         let frame = self.written;
         let held = self
             .held
@@ -427,6 +434,22 @@ impl Stream {
         }
         self.written += 1;
         Ok(syncframe)
+    }
+
+    /// Tests only: before writing the syncframe it is held to, wait until
+    /// told to go on, or until nothing is left to tell it — once. The
+    /// stream's encoder on a thread of its own is late with that syncframe,
+    /// however late the test needs: what the coder finds of it, and when, is
+    /// what it finds of a thread that is slow to come to it. Never on the
+    /// caller's thread, which would wait for itself.
+    #[cfg(test)]
+    fn wait(&mut self) {
+        match self.hold.take() {
+            Some((at, told)) if at == self.written => {
+                let _ = told.recv();
+            }
+            other => self.hold = other,
+        }
     }
 }
 
@@ -931,6 +954,8 @@ impl Coder {
             peak: TruePeak::new(channels),
             interleaved: vec![0.0; channels * FRAME_SAMPLES],
             out: out.to_path_buf(),
+            #[cfg(test)]
+            hold: None,
         };
         Ok(Self {
             probe: Lane::new(probe, "joc-probe", threads),
@@ -1994,6 +2019,27 @@ mod tests {
         threads: bool,
         prepare: impl FnOnce(Writer) -> Writer,
     ) -> Ended {
+        driven_after(
+            elements,
+            frames,
+            quiet,
+            fails,
+            threads,
+            prepare,
+            &mut |_| {},
+        )
+    }
+
+    /// [`driven`], handing `after` each frame once it is coded.
+    fn driven_after(
+        elements: Vec<Element>,
+        frames: usize,
+        quiet: usize,
+        fails: Option<usize>,
+        threads: bool,
+        prepare: impl FnOnce(Writer) -> Writer,
+        after: &mut dyn FnMut(usize),
+    ) -> Ended {
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
         let writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
@@ -2030,6 +2076,7 @@ mod tests {
                     stream,
                 };
             }
+            after(frame);
         }
         let error = writer.finish(&mut stream).err().map(|e| e.to_string());
         Ended {
@@ -2061,6 +2108,21 @@ mod tests {
         }
     }
 
+    /// `writer`, its stream's encoder made to wait before it writes
+    /// syncframe `at` until `told` ([`Stream::wait`]): its stage taken back
+    /// from its thread and set on a new one.
+    fn holding(writer: Writer, at: usize, told: std::sync::mpsc::Receiver<()>) -> Writer {
+        let Writer { feed, mut coder } = writer;
+        let mut stream = coder.stream.into_stage();
+        stream.hold = Some((at as u64, told));
+        coder.stream = Lane::new(stream, "joc-stream", true);
+        assert!(
+            matches!(coder.stream, Lane::Thread { .. }),
+            "a thread for the stream's encoder to wait on"
+        );
+        Writer { feed, coder }
+    }
+
     /// A refusal of the stream's encoder still on its way back is what the
     /// encode stops at, as on one thread, which meets it before it reads on.
     /// The coder makes room for eight bytes more than the stream's Evolution
@@ -2071,12 +2133,15 @@ mod tests {
     /// to the stream's encoder — two frames on, the probe's and the
     /// estimator's, and with a fold [`fold_lag`] more — and leaves the
     /// syncframes before it, those the encode that fits writes. On threads
-    /// the refusal is still on its way back then, and is met further on: by
-    /// a later frame, as the frames keep going in; or, when the read of the
-    /// next frame fails, by [`Writer::stop`], which stops at the refusal all
-    /// the same. A read that fails at the frame one thread meets it at is
-    /// what the encode stops at, with the same syncframes. Carried as they
-    /// are, and folded.
+    /// the refusal is most often still on its way back then, and is met
+    /// further on: by a later frame, as the frames keep going in; or, when
+    /// the read of the next frame fails, by [`Writer::stop`], which stops at
+    /// the refusal all the same. A read that fails at the frame one thread
+    /// meets it at is what the encode stops at, with the same syncframes,
+    /// the last of them still being written. Half the threaded runs make
+    /// sure of what is still on its way, the stream's encoder held back from
+    /// it until the frame that hands it in is coded. Carried as they are,
+    /// and folded.
     #[test]
     fn a_refusal_on_its_way_back_is_what_the_encode_stops_at() {
         const FRAMES: usize = 12;
@@ -2141,26 +2206,53 @@ mod tests {
                 };
                 assert_eq!(one.error.as_deref(), Some(error), "{failing}");
                 assert!(one.stream == alone.stream, "{failing}: the stream left");
-                // Threaded runs that met the refusal further on than one
-                // thread: the refusal on its way back when one thread meets
-                // it. It is handed to the stream's encoder just before the
-                // coder looks for what it has written, while the syncframe
-                // before it is still being written: of 576 runs counted,
-                // loaded and not, 572 met it further on, and no eight met it
-                // at once. All eight of a test meeting it at once is how that
-                // path would go untested.
-                let mut further = 0;
+                // Threaded runs as they come, the stream's encoder quick or
+                // slow to come to the refused syncframe — of 576 counted,
+                // loaded and not, 572 met the refusal further on than one
+                // thread — and, every other one, held back from the last
+                // syncframe the encode hands it until the frame that hands
+                // it in is coded: the refused one, or where the read fails
+                // first the one before it. The coder looks for it then and
+                // finds nothing, and can only meet it further on: the
+                // refusal by a later frame, or either by `Writer::stop`.
+                let met_at = alone.frame;
+                let held = if fails == Some(met_at) {
+                    refused - 1
+                } else {
+                    refused
+                };
+                let handed_in = held + 2 + fold_lag(what);
                 for attempt in 0..8 {
-                    let apart = run(fails, true, overstated);
-                    assert_eq!(apart.error, one.error, "{failing}, run {attempt}");
-                    assert!(
-                        apart.same(&one),
-                        "{failing}, run {attempt}: the stream left"
-                    );
-                    further += usize::from(apart.frame > one.frame);
-                }
-                if error == refusal {
-                    assert!(further > 0, "{failing}: never met further on");
+                    let holds = attempt % 2 == 1;
+                    let apart = if holds {
+                        let (tell, told) = std::sync::mpsc::channel();
+                        let prepare = move |writer| holding(overstated(writer), held, told);
+                        let mut after = |frame| {
+                            if frame == handed_in {
+                                let _ = tell.send(());
+                            }
+                        };
+                        driven_after(
+                            elements_of(what),
+                            FRAMES,
+                            QUIET,
+                            fails,
+                            true,
+                            prepare,
+                            &mut after,
+                        )
+                    } else {
+                        run(fails, true, overstated)
+                    };
+                    let label = format!("{failing}, run {attempt}");
+                    assert_eq!(apart.error, one.error, "{label}");
+                    assert!(apart.same(&one), "{label}: the stream left");
+                    if holds {
+                        match fails {
+                            Some(frame) => assert_eq!(apart.frame, frame, "{label}: by the stop"),
+                            None => assert!(apart.frame > met_at, "{label}: further on"),
+                        }
+                    }
                 }
             }
         }
