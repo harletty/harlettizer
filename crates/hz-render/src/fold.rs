@@ -181,8 +181,23 @@ struct Row {
     spacing: f64,
 }
 
+impl Row {
+    /// Whether `other` is this row to the bit: its depth, its spacing, and
+    /// each speaker's place and channel, in order.
+    fn is(&self, other: &Row) -> bool {
+        self.y.to_bits() == other.y.to_bits()
+            && self.spacing.to_bits() == other.spacing.to_bits()
+            && self.speakers.len() == other.speakers.len()
+            && self
+                .speakers
+                .iter()
+                .zip(&other.speakers)
+                .all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1 == b.1)
+    }
+}
+
 /// How many channels the fold renders on before any matrix: 7.1.
-const RENDERED: usize = 8;
+pub const RENDERED: usize = 8;
 
 /// Which of the two folds a stream declares.
 ///
@@ -365,8 +380,14 @@ impl ObjectFold {
     /// nothing: the 7.1 render is a fixed-size array on the stack whatever the
     /// target layout is.
     pub fn gains(&self, position: [f64; 3], gains: &mut [f64]) {
+        self.gains_from(&self.render(position), gains);
+    }
+
+    /// The gains from a 7.1 render of this fold's — its own, or another's
+    /// that [renders as](ObjectFold::renders_as) it does — taken through the
+    /// presentation's matrix: [`ObjectFold::gains`] once the render is made.
+    pub fn gains_from(&self, rendered: &[f64; RENDERED], gains: &mut [f64]) {
         debug_assert_eq!(gains.len(), self.channels);
-        let rendered = self.render(position);
         match &self.matrix {
             None => gains.copy_from_slice(&rendered[..self.channels]),
             Some(matrix) => {
@@ -383,8 +404,19 @@ impl ObjectFold {
         }
     }
 
+    /// Whether `other` renders every position as this does: the same rows,
+    /// every depth, place and spacing the same to the bit, so that the same
+    /// render makes the same gains whatever the values are — a negative zero
+    /// or a NaN among them. Every fold renders on 7.1's, whatever it then
+    /// folds to, so a render made once serves every presentation of a set.
+    pub fn renders_as(&self, other: &ObjectFold) -> bool {
+        std::ptr::eq(self, other)
+            || (self.rows.len() == other.rows.len()
+                && self.rows.iter().zip(&other.rows).all(|(a, b)| a.is(b)))
+    }
+
     /// The 7.1 gains, before any presentation matrix.
-    fn render(&self, position: [f64; 3]) -> [f64; RENDERED] {
+    pub fn render(&self, position: [f64; 3]) -> [f64; RENDERED] {
         let mut rendered = [0.0f64; RENDERED];
         let [x, y, z] = position;
 
@@ -402,6 +434,136 @@ impl ObjectFold {
         // Within each row on x, equal power, divided by that row's spacing.
         let mut total = 0.0;
         for (index, row) in self.rows.iter().enumerate().take(depth.len()) {
+            let across = depth[index] / depth_norm;
+            if across == 0.0 {
+                continue;
+            }
+            // Each speaker's fade, once: the norm is made of them and then
+            // each is divided by it.
+            let mut fades = [0.0f64; RENDERED];
+            let fades = &mut fades[..row.speakers.len()];
+            let mut width_sum = 0.0;
+            for (fade, (sx, _)) in fades.iter_mut().zip(&row.speakers) {
+                let t = ((x - sx).abs() / row.spacing).clamp(0.0, 1.0);
+                let w = (std::f64::consts::FRAC_PI_2 * t).cos();
+                *fade = w;
+                width_sum += w * w;
+            }
+            let width_norm = if width_sum > 0.0 {
+                width_sum.sqrt()
+            } else {
+                1.0
+            };
+            for (fade, (_, channel)) in fades.iter().zip(&row.speakers) {
+                let w = fade / width_norm;
+                let g = across * w;
+                rendered[*channel] = g;
+                total += g * g;
+            }
+        }
+
+        let scale = elevation_scale(z) / if total > 0.0 { total.sqrt() } else { 1.0 };
+        for g in rendered.iter_mut() {
+            *g *= scale;
+        }
+        rendered
+    }
+}
+
+/// One position's 7.1 render, made by the first fold of a set of
+/// presentations to ask for it and kept for the others.
+///
+/// A set of presentations is three folds and a renderer, and each fold
+/// renders the position on 7.1 before its matrix narrows it: three times the
+/// same render, from the same rows and the same position. So the render is
+/// made once and every fold that [renders as](ObjectFold::renders_as) the one
+/// that made it takes its gains from it — the same render, and so the same
+/// gains, to the bit. A position other than the one kept, or a fold on rows
+/// of its own, makes a render of its own, which is then the one kept.
+#[derive(Debug, Clone, Default)]
+pub struct Renders<'a> {
+    /// The fold that made the render, the position it was made for — to the
+    /// bit — and the render.
+    made: Option<(&'a ObjectFold, [u64; 3], [f64; RENDERED])>,
+}
+
+impl<'a> Renders<'a> {
+    /// `renderer`'s gains for an object at `position` with this `size` into
+    /// `out`, as [`crate::Renderer::gains`] writes them: a fold's from the
+    /// render kept, when it is of this position and by a fold that renders as
+    /// this one does, or from one made now and kept; anything else's as it
+    /// makes them.
+    pub fn gains(
+        &mut self,
+        renderer: &'a dyn crate::Renderer,
+        position: [f64; 3],
+        size: f64,
+        out: &mut [f64],
+    ) {
+        let Some(fold) = renderer.as_fold() else {
+            renderer.gains(position, size, out);
+            return;
+        };
+        let at = position.map(f64::to_bits);
+        let rendered = match &self.made {
+            Some((by, made_at, rendered)) if *made_at == at && fold.renders_as(by) => *rendered,
+            _ => {
+                let rendered = fold.render(position);
+                self.made = Some((fold, at, rendered));
+                rendered
+            }
+        };
+        fold.gains_from(&rendered, out);
+    }
+}
+
+impl crate::Renderer for ObjectFold {
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// The size is ignored, and that is what the fold does.
+    ///
+    /// A presentation is rows and columns of a cube with a matrix after them;
+    /// there is nowhere in it for a width. A wide object arrives at a
+    /// presentation as a point, and the only place its width can go is the
+    /// clustering — spread over several elements rather than given a width the
+    /// output will not carry. So a metric that includes a fold sees a width
+    /// thrown away only through whatever renderer it is measured beside, which
+    /// is why the 7.1.4 row is panned and not folded.
+    fn gains(&self, position: [f64; 3], _size: f64, out: &mut [f64]) {
+        ObjectFold::gains(self, position, out);
+    }
+
+    fn as_fold(&self) -> Option<&ObjectFold> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 7.1 render as it was written before each fade was kept: every
+    /// cosine taken twice. The oracle the render is held to, to the bit.
+    fn render_as_it_was(fold: &ObjectFold, position: [f64; 3]) -> [f64; RENDERED] {
+        let mut rendered = [0.0f64; RENDERED];
+        let [x, y, z] = position;
+        let mut depth = [0.0f64; 4];
+        let mut sum = 0.0;
+        for (index, row) in fold.rows.iter().enumerate().take(depth.len()) {
+            let t = ((y - row.y).abs()).clamp(0.0, 1.0);
+            let w = (std::f64::consts::FRAC_PI_2 * t).cos();
+            depth[index] = w;
+            sum += w * w;
+        }
+        let depth_norm = if sum > 0.0 { sum.sqrt() } else { 1.0 };
+        let mut total = 0.0;
+        for (index, row) in fold.rows.iter().enumerate().take(depth.len()) {
             let across = depth[index] / depth_norm;
             if across == 0.0 {
                 continue;
@@ -425,41 +587,95 @@ impl ObjectFold {
                 total += g * g;
             }
         }
-
         let scale = elevation_scale(z) / if total > 0.0 { total.sqrt() } else { 1.0 };
         for g in rendered.iter_mut() {
             *g *= scale;
         }
         rendered
     }
-}
 
-impl crate::Renderer for ObjectFold {
-    fn channels(&self) -> usize {
-        self.channels
+    /// Positions across the cube and past it, on its grid and off it, with
+    /// both zeros and a NaN.
+    fn positions() -> Vec<[f64; 3]> {
+        let mut seed = 7u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            f64::from(seed >> 8) / f64::from(1u32 << 23) - 1.0
+        };
+        let mut out = Vec::new();
+        let grid = [-1.5, -1.0, -0.5, -0.0, 0.0, 0.25, 0.5, 1.0, 1.5];
+        for &x in &grid {
+            for &y in &grid {
+                for z in [0.0, 0.4, 1.0] {
+                    out.push([x, y, z]);
+                }
+            }
+        }
+        out.extend((0..2000).map(|_| [next() * 1.2, next() * 1.2, next().abs()]));
+        out.push([f64::NAN, 0.3, 0.2]);
+        out.push([0.3, f64::NAN, 0.2]);
+        out
     }
 
-    /// The size is ignored, and that is what the fold does.
-    ///
-    /// A presentation is rows and columns of a cube with a matrix after them;
-    /// there is nowhere in it for a width. A wide object arrives at a
-    /// presentation as a point, and the only place its width can go is the
-    /// clustering — spread over several elements rather than given a width the
-    /// output will not carry. So a metric that includes a fold sees a width
-    /// thrown away only through whatever renderer it is measured beside, which
-    /// is why the 7.1.4 row is panned and not folded.
-    fn gains(&self, position: [f64; 3], _size: f64, out: &mut [f64]) {
-        ObjectFold::gains(self, position, out);
+    fn bits(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|v| v.to_bits()).collect()
     }
 
-    fn name(&self) -> &str {
-        self.name
+    #[test]
+    fn each_fade_taken_once_renders_what_taking_it_twice_did() {
+        let fold = ObjectFold::for_layout(&Layout::surround_7_1()).expect("7.1 folds");
+        for position in positions() {
+            assert_eq!(
+                bits(&fold.render(position)),
+                bits(&render_as_it_was(&fold, position)),
+                "{position:?}"
+            );
+        }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[test]
+    fn one_render_serves_every_fold_of_the_presentations() {
+        use crate::Renderer;
+        let renderers: Vec<Box<dyn Renderer>> = vec![
+            Box::new(ObjectFold::for_layout(&Layout::stereo()).unwrap()),
+            Box::new(ObjectFold::with_mode(&Layout::surround_5_1(), FoldMode::SameSide).unwrap()),
+            Box::new(ObjectFold::for_layout(&Layout::surround_7_1()).unwrap()),
+            Box::new(crate::Panner::new(&Layout::surround_7_1_4()).unwrap()),
+        ];
+        // Each fold renders on 7.1's rows, whatever it folds to.
+        let first = renderers[0].as_fold().unwrap();
+        assert!(
+            renderers[..3]
+                .iter()
+                .all(|r| r.as_fold().unwrap().renders_as(first))
+        );
+        assert!(renderers[3].as_fold().is_none());
+        let mut renders = Renders::default();
+        let mut previous = [0.0; 3];
+        for (n, position) in positions().into_iter().enumerate() {
+            // Now and then a position asked for again, or its zero's sign
+            // turned, which is another position to the bit.
+            let position = match n % 7 {
+                3 => previous,
+                5 => [-position[0] * 0.0, position[1], position[2]],
+                _ => position,
+            };
+            for renderer in &renderers {
+                let size = if n % 2 == 0 { 0.0 } else { 0.3 };
+                let mut shared = vec![0.0; renderer.channels()];
+                let mut own = vec![0.0; renderer.channels()];
+                renders.gains(renderer.as_ref(), position, size, &mut shared);
+                renderer.gains(position, size, &mut own);
+                assert_eq!(
+                    bits(&shared),
+                    bits(&own),
+                    "{position:?} on {}",
+                    renderer.name()
+                );
+            }
+            previous = position;
+        }
+    }
 
     #[test]
     fn the_elevation_scale_is_flat_at_both_ends_and_falls_between() {

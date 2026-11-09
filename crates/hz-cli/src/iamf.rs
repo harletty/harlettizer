@@ -658,6 +658,148 @@ mod tests {
         }
     }
 
+    /// Objects the fold tests' master has, beside its 7.1 bed, and the object
+    /// elements they are folded into.
+    const FOLDED_OBJECTS: u32 = 7;
+    const FOLDED_INTO: usize = 4;
+
+    /// `input`'s objects folded ([`FOLDED_INTO`]) into `out`, `frames` of it
+    /// when that is given, on threads of their own when `threads`: how the
+    /// encode ended.
+    fn folded(
+        input: &Path,
+        out: PathBuf,
+        (codec, frame): (Codec, usize),
+        frames: Option<u64>,
+        threads: bool,
+    ) -> std::result::Result<(), String> {
+        let config = Config {
+            input: input.to_path_buf(),
+            out,
+            frames,
+            mono_prefix: None,
+            codec,
+            bits: 24,
+            frame,
+            headphones: Headphones::Stereo,
+            progress: false,
+            objects: Some(PositionKind::Cart16),
+            elements: Some(FOLDED_INTO),
+            overlay: None,
+            voices_to_bed: None,
+            overlaying: overlay::Options::default(),
+            mixing: Mixing::default(),
+        };
+        run_on(config, threads).map_err(|e| e.to_string())
+    }
+
+    /// The codecs a fold is coded with in its tests, and their frames.
+    fn fold_codecs() -> Vec<(Codec, usize)> {
+        let mut codecs = vec![(Codec::Flac, 1024), (Codec::Lpcm, 2048)];
+        if cfg!(feature = "opus") {
+            codecs.push((Codec::Opus { bitrate: 64_000 }, OPUS_FRAME));
+        }
+        codecs
+    }
+
+    /// The fold tests' master, its audio cut to `kept` samples of the ones
+    /// its header says it has: its config's path.
+    fn folded_master(dir: &Path, kept: Option<usize>) -> PathBuf {
+        let input = fixtures::master_of(dir, SAMPLES, FOLDED_OBJECTS);
+        if let Some(kept) = kept {
+            let audio = dir.join("m.atmos.audio");
+            let length = std::fs::metadata(&audio).unwrap().len();
+            // The 7.1 bed and the objects, 24 bits each.
+            let width = 8 + FOLDED_OBJECTS as usize;
+            let missing = ((SAMPLES - kept) * width * 3) as u64;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&audio)
+                .unwrap()
+                .set_len(length - missing)
+                .unwrap();
+        }
+        input
+    }
+
+    /// More objects than elements: the fold, read and placed on lanes of its
+    /// own ahead of the loop and mixed on the loop's, writes what one thread
+    /// writes — whole, cut short by `--frames` mid-unit, and with audio that
+    /// ends before its header says, where it stops with the same error and
+    /// the same units left.
+    #[test]
+    fn a_fold_on_a_lane_of_its_own_writes_what_one_thread_writes() {
+        let dir = fixtures::scratch("iamf", "fold");
+        let input = folded_master(&dir, None);
+        let fold = |out: PathBuf, codec: Codec, frame: usize, frames: Option<u64>, threads| {
+            folded(&input, out, (codec, frame), frames, threads)
+        };
+        let codecs = fold_codecs();
+        let mut runs = Vec::new();
+        for (n, &(codec, frame)) in codecs.iter().enumerate() {
+            for frames in [None, Some(5 * 1024 + 77)] {
+                let made = [false, true].map(|threads| {
+                    let out = dir.join(format!("fold-{n}-{frames:?}-{threads}.iamf"));
+                    let ended = fold(out.clone(), codec, frame, frames, threads);
+                    (ended, std::fs::read(&out).unwrap())
+                });
+                assert_eq!(made[0].0, Ok(()), "{codec:?} {frames:?}");
+                assert_eq!(made[1].0, Ok(()), "{codec:?} {frames:?}");
+                assert!(
+                    made[0].1 == made[1].1,
+                    "{codec:?} {frames:?}: the same sequence"
+                );
+                runs.push(made[0].1.len());
+            }
+        }
+        assert!(runs.iter().all(|&len| len > 0));
+
+        // Cut in the sixth unit of 1024.
+        let dir = fixtures::scratch("iamf", "fold-cut");
+        let input = folded_master(&dir, Some(5 * 1024 + 300));
+        let alone = dir.join("cut-false.iamf");
+        let inline = folded(&input, alone.clone(), (Codec::Flac, 1024), None, false);
+        assert!(inline.is_err(), "the read fails");
+        let alone = std::fs::read(&alone).unwrap();
+        assert!(units(&alone) > 0, "the units before it written");
+        for run in 0..8 {
+            let beside = dir.join("cut-true.iamf");
+            let threaded = folded(&input, beside.clone(), (Codec::Flac, 1024), None, true);
+            assert_eq!(threaded, inline, "run {run}: said the same way");
+            assert!(
+                alone == std::fs::read(&beside).unwrap(),
+                "run {run}: the same units left"
+            );
+        }
+
+        // `--frames` stops the encode in the sixth unit of 1024, and the
+        // audio ends a few blocks past what one thread reads for it: the
+        // reading, a few blocks ahead, may meet the end, and nothing comes of
+        // it — the encode ends as one thread ends it, the same units written.
+        let dir = fixtures::scratch("iamf", "fold-past");
+        let input = folded_master(&dir, Some(10 * 1024 + 300));
+        for (n, codec) in fold_codecs().into_iter().enumerate() {
+            let frames = Some(5 * 1024 + 77);
+            let alone = dir.join(format!("past-{n}-false.iamf"));
+            let inline = folded(&input, alone.clone(), codec, frames, false);
+            assert_eq!(
+                inline,
+                Ok(()),
+                "{codec:?}: one thread reads short of the end"
+            );
+            let alone = std::fs::read(&alone).unwrap();
+            for run in 0..8 {
+                let beside = dir.join(format!("past-{n}-true.iamf"));
+                let threaded = folded(&input, beside.clone(), codec, frames, true);
+                assert_eq!(threaded, inline, "{codec:?}, run {run}");
+                assert!(
+                    alone == std::fs::read(&beside).unwrap(),
+                    "{codec:?}, run {run}: the same sequence"
+                );
+            }
+        }
+    }
+
     /// Audio that ends before its header says, in the sixth unit of 1024:
     /// the encode stops there with the same error, on threads or not, and
     /// leaves the same units — the five read whole.
@@ -731,6 +873,28 @@ mod tests {
             for run in 0..8 {
                 let threaded = encoded(&input, full.clone(), &case, true);
                 assert_eq!(threaded, inline, "{name}, run {run}");
+            }
+        }
+
+        // And a fold, its blocks read and placed ahead of the writer: the
+        // failure the reading meets ahead of the push that fails is held
+        // with its block, which the encode never takes.
+        let dir = fixtures::scratch("iamf", "full-fold");
+        let input = folded_master(&dir, Some(CUT));
+        for codec in fold_codecs() {
+            let inline = folded(&input, full.clone(), codec, None, false);
+            assert!(inline.is_err(), "{codec:?}");
+            if codec == (Codec::Flac, 1024) {
+                assert!(
+                    inline
+                        .as_ref()
+                        .is_err_and(|e| e.contains("No space left on device")),
+                    "a fold: the write first, as one thread meets it: {inline:?}"
+                );
+            }
+            for run in 0..8 {
+                let threaded = folded(&input, full.clone(), codec, None, true);
+                assert_eq!(threaded, inline, "a fold, {codec:?}, run {run}");
             }
         }
     }

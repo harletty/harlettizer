@@ -61,7 +61,9 @@
 //! rather than least squares.
 
 use hz_core::Result;
+use hz_render::fold::Renders;
 use hz_render::{PointPanner, Renderer};
+use std::cell::RefCell;
 
 /// Directions of a uniform sphere, kept for the comparison that ruled it out.
 ///
@@ -81,7 +83,20 @@ const REFERENCE_DIRECTIONS: usize = 24;
 /// themselves**, stacked: the gain vectors a delivery stream actually produces
 /// on 2.0, 5.1, 7.1 and 7.1.4, one after another in one tall vector, so the
 /// fit optimises exactly what the metric measures rather than a proxy for it.
-pub enum Reference {
+///
+/// What a position radiates is a function of the position and the size and
+/// nothing else, and a fold asks for the same positions block after block
+/// while its scene stands still — every object's target, every element where
+/// it stood, every candidate the search tries around it. So the vectors made
+/// last are kept, each under its position and size to the bit, and one asked
+/// for again is the one kept: the same panning of the same position.
+pub struct Reference {
+    shape: Shape,
+    kept: RefCell<Radiated>,
+}
+
+/// What a reference is made of.
+enum Shape {
     /// A panner onto a set of directions.
     Directions { panner: PointPanner, rows: usize },
     /// Every presentation the stream is played through, stacked.
@@ -107,7 +122,14 @@ impl Reference {
     /// A reference over given presentations, stacked.
     pub fn over_presentations(renderers: Vec<Box<dyn Renderer>>) -> Result<Self> {
         let rows = renderers.iter().map(|r| r.channels()).sum();
-        Ok(Self::Presentations { renderers, rows })
+        Ok(Self::shaped(Shape::Presentations { renderers, rows }))
+    }
+
+    fn shaped(shape: Shape) -> Self {
+        Self {
+            shape,
+            kept: RefCell::new(Radiated::default()),
+        }
     }
 
     /// The reference this was: an ordinary immersive layout's directions.
@@ -134,38 +156,110 @@ impl Reference {
     /// with a width is not the same operator on two different layouts, so a fit
     /// made on one is not a fit on the other.
     pub fn over(points: &[[f64; 3]]) -> Result<Self> {
-        Ok(Self::Directions {
+        Ok(Self::shaped(Shape::Directions {
             panner: PointPanner::new(points)?,
             rows: points.len(),
-        })
+        }))
     }
 
     /// How tall the fitted vector is.
     pub fn rows(&self) -> usize {
-        match self {
-            Self::Directions { rows, .. } | Self::Presentations { rows, .. } => *rows,
+        match &self.shape {
+            Shape::Directions { rows, .. } | Shape::Presentations { rows, .. } => *rows,
         }
     }
 
     /// What a source at `position` with this `size` radiates, as one vector
-    /// over whatever the reference is.
+    /// over whatever the reference is: the one kept for that position and
+    /// size, when there is one — see [`Reference`] — or made now, and kept.
     pub fn radiated(&self, position: [f64; 3], size: f64, out: &mut Vec<f64>) {
+        let at = [
+            position[0].to_bits(),
+            position[1].to_bits(),
+            position[2].to_bits(),
+            size.to_bits(),
+        ];
+        let mut kept = self.kept.borrow_mut();
+        if let Some(vector) = kept.get(at) {
+            out.clear();
+            out.extend_from_slice(vector);
+            return;
+        }
+        self.make(position, size, out);
+        kept.keep(at, out);
+    }
+
+    /// What [`Reference::radiated`] hands back, made.
+    fn make(&self, position: [f64; 3], size: f64, out: &mut Vec<f64>) {
         out.clear();
-        match self {
-            Self::Directions { panner, rows } => {
+        match &self.shape {
+            Shape::Directions { panner, rows } => {
                 let mut gains = vec![0.0f32; *rows];
                 panner.gains(position, size, &mut gains);
                 out.extend(gains.iter().map(|gain| f64::from(*gain)));
             }
-            Self::Presentations { renderers, rows } => {
+            Shape::Presentations { renderers, rows } => {
                 out.resize(*rows, 0.0);
                 let mut at = 0;
+                // The folds' 7.1 render made once for all of them.
+                let mut renders = Renders::default();
                 for renderer in renderers {
                     let channels = renderer.channels();
-                    renderer.gains(position, size, &mut out[at..at + channels]);
+                    renders.gains(
+                        renderer.as_ref(),
+                        position,
+                        size,
+                        &mut out[at..at + channels],
+                    );
                     at += channels;
                 }
             }
+        }
+    }
+}
+
+/// The vectors a reference made last, each under the position and size it
+/// was made for, to the bit: a table of [`Radiated::SLOTS`], each position's
+/// slot fixed by it, so that keeping one lets go of whatever was in its slot.
+/// Which are kept changes how often a vector is made, never what one is.
+#[derive(Default)]
+struct Radiated {
+    slots: Vec<Option<([u64; 4], Vec<f64>)>>,
+}
+
+impl Radiated {
+    /// Enough for every position a fold of a still scene asks for in a
+    /// block — its targets, its elements and its search's candidates — with
+    /// room left over.
+    const SLOTS: usize = 4096;
+
+    fn slot(at: [u64; 4]) -> usize {
+        let mut h = 0u64;
+        for word in at {
+            h = (h ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            h ^= h >> 29;
+        }
+        (h as usize) & (Self::SLOTS - 1)
+    }
+
+    fn get(&self, at: [u64; 4]) -> Option<&[f64]> {
+        match self.slots.get(Self::slot(at)) {
+            Some(Some((kept, vector))) if *kept == at => Some(vector),
+            _ => None,
+        }
+    }
+
+    fn keep(&mut self, at: [u64; 4], vector: &[f64]) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(Self::SLOTS, || None);
+        }
+        match &mut self.slots[Self::slot(at)] {
+            Some((kept, held)) => {
+                *kept = at;
+                held.clear();
+                held.extend_from_slice(vector);
+            }
+            empty => *empty = Some((at, vector.to_vec())),
         }
     }
 }
@@ -530,14 +624,7 @@ fn solve_within(a: &[Vec<f64>], b: &[f64], paths: usize, allowed: Option<&[bool]
                 }
             }
         }
-        out.clear();
-        out.extend(a.iter().map(|column| {
-            column
-                .iter()
-                .zip(&residual)
-                .map(|(v, r)| v * r)
-                .sum::<f64>()
-        }));
+        projections(a, &residual, out);
     };
 
     let mut free = vec![false; n];
@@ -601,6 +688,75 @@ fn solve_within(a: &[Vec<f64>], b: &[f64], paths: usize, allowed: Option<&[bool]
     x
 }
 
+/// Each column of `a` against `residual` — the sum of their products, in
+/// order — into `out`.
+///
+/// Four columns at a time, each its own sum: every one is the same additions
+/// in the same order as one column alone, from the same start, so the same
+/// value to the bit; but four of them are independent, and a processor adds
+/// them side by side where one sum waits on the addition before it.
+fn projections(a: &[Vec<f64>], residual: &[f64], out: &mut Vec<f64>) {
+    let one =
+        |column: &Vec<f64>| -> f64 { column.iter().zip(residual).map(|(v, r)| v * r).sum::<f64>() };
+    out.clear();
+    let mut fours = a.chunks_exact(4);
+    for four in &mut fours {
+        let [c0, c1, c2, c3] = four else {
+            unreachable!("chunks of four")
+        };
+        let len = residual.len();
+        if c0.len() != len || c1.len() != len || c2.len() != len || c3.len() != len {
+            out.extend(four.iter().map(one));
+            continue;
+        }
+        // Where `Sum` starts a sum of floats.
+        let start: f64 = std::iter::empty::<f64>().sum();
+        let mut sums = [start; 4];
+        for ((((v0, v1), v2), v3), r) in c0.iter().zip(c1).zip(c2).zip(c3).zip(residual) {
+            sums[0] += v0 * r;
+            sums[1] += v1 * r;
+            sums[2] += v2 * r;
+            sums[3] += v3 * r;
+        }
+        out.extend(sums);
+    }
+    out.extend(fours.remainder().iter().map(one));
+}
+
+/// Each pair's inner product — the sum of the first's values times the
+/// second's, in order — into `out`.
+///
+/// Four pairs at a time, as [`projections`] sums its columns: each the same
+/// additions in the same order from the same start as one pair alone, side
+/// by side.
+fn dots(pairs: &[(&[f64], &[f64])], out: &mut Vec<f64>) {
+    let one =
+        |(u, v): &(&[f64], &[f64])| -> f64 { u.iter().zip(*v).map(|(u, v)| u * v).sum::<f64>() };
+    out.clear();
+    let mut fours = pairs.chunks_exact(4);
+    for four in &mut fours {
+        let [(u0, v0), (u1, v1), (u2, v2), (u3, v3)] = four else {
+            unreachable!("chunks of four")
+        };
+        let len = u0.len();
+        if [v0, u1, v1, u2, v2, u3, v3].iter().any(|s| s.len() != len) {
+            out.extend(four.iter().map(one));
+            continue;
+        }
+        // Where `Sum` starts a sum of floats.
+        let start: f64 = std::iter::empty::<f64>().sum();
+        let mut sums = [start; 4];
+        for k in 0..len {
+            sums[0] += u0[k] * v0[k];
+            sums[1] += u1[k] * v1[k];
+            sums[2] += u2[k] * v2[k];
+            sums[3] += u3[k] * v3[k];
+        }
+        out.extend(sums);
+    }
+    out.extend(fours.remainder().iter().map(one));
+}
+
 /// Unconstrained least squares over the freed elements only, by the normal
 /// equations.
 ///
@@ -613,11 +769,22 @@ fn least_squares(a: &[Vec<f64>], b: &[f64], free: &[bool], _rows: usize) -> Vec<
     let mut normal = vec![0.0; size * size];
     let mut rhs = vec![0.0; size];
 
-    for (row, column) in columns.iter().enumerate() {
-        rhs[row] = a[*column].iter().zip(b).map(|(v, t)| v * t).sum();
-        for (other_row, other) in columns.iter().enumerate() {
-            normal[row * size + other_row] =
-                a[*column].iter().zip(&a[*other]).map(|(u, v)| u * v).sum();
+    // Each freed column against the target, then against every freed column,
+    // row by row: the inner products, summed side by side ([`dots`]).
+    let mut pairs: Vec<(&[f64], &[f64])> = Vec::with_capacity(size * (size + 1));
+    for column in &columns {
+        pairs.push((&a[*column], b));
+        for other in &columns {
+            pairs.push((&a[*column], &a[*other]));
+        }
+    }
+    let mut sums = Vec::with_capacity(pairs.len());
+    dots(&pairs, &mut sums);
+    let mut sums = sums.into_iter();
+    for row in 0..size {
+        rhs[row] = sums.next().expect("an inner product a pair");
+        for other_row in 0..size {
+            normal[row * size + other_row] = sums.next().expect("an inner product a pair");
         }
     }
     // A ridge that is negligible against the scale of the problem, so that a
@@ -681,6 +848,143 @@ fn solve(matrix: &mut [f64], rhs: &mut [f64], size: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bits(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Values of every sign and size, both zeros and products that are
+    /// negative zeros among them, as a fit's columns are.
+    fn values(seed: &mut u32, count: usize) -> Vec<f64> {
+        (0..count)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                match *seed >> 28 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => 1e-300,
+                    _ => f64::from(*seed >> 8) / f64::from(1u32 << 23) - 1.0,
+                }
+            })
+            .collect()
+    }
+
+    /// Four columns at a time sum what one at a time did, to the bit: every
+    /// width a fit has, a column of another length among them, and sums that
+    /// are a negative zero.
+    #[test]
+    fn projections_side_by_side_are_the_ones_made_alone() {
+        let mut seed = 3u32;
+        for columns in 0..=13 {
+            for rows in [0, 1, 2, 7, 28, 30] {
+                let residual = values(&mut seed, rows);
+                let mut a: Vec<Vec<f64>> = (0..columns).map(|_| values(&mut seed, rows)).collect();
+                if columns == 9 {
+                    a[5].pop();
+                }
+                if columns == 6 {
+                    // A sum of negative zeros is one.
+                    a[1] = vec![-0.0; rows];
+                }
+                let alone: Vec<f64> = a
+                    .iter()
+                    .map(|column| {
+                        column
+                            .iter()
+                            .zip(&residual)
+                            .map(|(v, r)| v * r)
+                            .sum::<f64>()
+                    })
+                    .collect();
+                let mut out = vec![7.0];
+                projections(&a, &residual, &mut out);
+                assert_eq!(bits(&out), bits(&alone), "{columns} columns of {rows}");
+            }
+        }
+        // Products that are all negative zeros sum to one, from where `Sum`
+        // starts; from a positive zero they would not.
+        let mut out = Vec::new();
+        let zeros = vec![0.0, 0.0];
+        projections(
+            &[zeros.clone(), zeros.clone(), zeros.clone(), zeros],
+            &[-1.0, -2.0],
+            &mut out,
+        );
+        assert!(
+            out.iter().all(|v| v.to_bits() == (-0.0f64).to_bits()),
+            "{out:?}"
+        );
+    }
+
+    /// And so do the least squares' inner products, pairs of any length.
+    #[test]
+    fn inner_products_side_by_side_are_the_ones_made_alone() {
+        let mut seed = 5u32;
+        for count in 0..=11 {
+            let owned: Vec<(Vec<f64>, Vec<f64>)> = (0..count)
+                .map(|n| {
+                    let len = if n == 6 { 3 } else { 28 };
+                    (values(&mut seed, len), values(&mut seed, 28))
+                })
+                .collect();
+            let pairs: Vec<(&[f64], &[f64])> = owned
+                .iter()
+                .map(|(u, v)| (u.as_slice(), v.as_slice()))
+                .collect();
+            let alone: Vec<f64> = pairs
+                .iter()
+                .map(|(u, v)| u.iter().zip(*v).map(|(u, v)| u * v).sum::<f64>())
+                .collect();
+            let mut out = Vec::new();
+            dots(&pairs, &mut out);
+            assert_eq!(bits(&out), bits(&alone), "{count} pairs");
+        }
+    }
+
+    /// The fit's reference as it was made before its folds shared a render
+    /// and it kept what it made: each presentation asked on its own, every
+    /// time. The oracle [`Reference::radiated`] is held to, to the bit —
+    /// over positions asked for again and again, more of them than it keeps,
+    /// both zeros and sizes that differ only in their sign among them.
+    #[test]
+    fn the_presentations_radiate_what_each_alone_did() {
+        let reference = Reference::new().unwrap();
+        let Shape::Presentations { renderers, rows } = &reference.shape else {
+            unreachable!("the presentations")
+        };
+        let mut seed = 11u32;
+        let pool: Vec<[f64; 3]> = (0..3 * Radiated::SLOTS)
+            .map(|n| {
+                let p = values(&mut seed, 3);
+                match n % 50 {
+                    0 => [0.0, 1.0, 0.0],
+                    1 => [-0.0, 1.0, 0.0],
+                    _ => [p[0] * 1.3, p[1] * 1.3, p[2].abs()],
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for n in 0..12 * Radiated::SLOTS {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            // Mostly a few hundred positions, now and then any of the pool.
+            let pick = if n % 7 == 0 {
+                (seed >> 8) as usize % pool.len()
+            } else {
+                (seed >> 8) as usize % 300
+            };
+            let position = pool[pick];
+            let size = [0.0, -0.0, 0.2, 1.0][(seed >> 4) as usize % 4];
+            let mut alone = vec![0.0; *rows];
+            let mut at = 0;
+            for renderer in renderers {
+                let channels = renderer.channels();
+                renderer.gains(position, size, &mut alone[at..at + channels]);
+                at += channels;
+            }
+            reference.radiated(position, size, &mut out);
+            assert_eq!(bits(&out), bits(&alone), "{position:?} {size}");
+        }
+    }
 
     /// A problem whose answer is obvious: the target is one column, so that
     /// column gets one and the rest get nothing.

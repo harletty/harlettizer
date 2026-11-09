@@ -242,6 +242,15 @@ impl Mixer {
         }
     }
 
+    /// As [`Mixer::judge`], on a scene weighed elsewhere: `objects`.
+    pub fn judge_on(&mut self, objects: &[hz_cluster::Object], clustering: &Clustering) {
+        if let Ok(report) =
+            hz_cluster::metric::error_with(objects, clustering, &self.renderers, &self.floor)
+        {
+            self.cost.judged(&report);
+        }
+    }
+
     /// Decide one overlay block on the finished scene, and account for it —
     /// see [`Overlaid::span`].
     pub fn overlay(

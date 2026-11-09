@@ -663,8 +663,64 @@ holds and only its CPU time falls. On sixteen cores, with AVX2:
 
 What is left bounds each programme differently. A bed in FLAC still waits
 on the measurement where the CPU has no AVX2; a bed in Opus as much on the
-threads coding its coupled pairs. Past 27 objects, the fold runs on the
-encode's own thread, and it is most of that thread's work.
+threads coding its coupled pairs.
+
+Past 27 objects the fold ran on the encode's own thread, and it was most of
+that thread's work, which was seven cycles in ten of the encode's. It now
+runs in three parts, each ahead of the next, as the E-AC-3 encode folds a
+frame ahead of its coder. The master is read on a thread of its own a few blocks
+ahead, each block's objects given their gains and weighed for the look-ahead.
+The elements are placed on another, a unit ahead. The mix, its limiter and
+what it cost are worked out on the encode's own thread, beside the coding of
+the elements and the measurement. Each part takes the blocks in the order
+they were read and keeps its own state from one to the next, so each makes
+what it made on one thread, and the sequence is the same to the byte. A read
+that fails is met where the encode takes the block that met it, after the
+blocks before it are written, as on one thread. Where no thread can be
+started, all three run on the encode's own, a block at a time as before.
+
+And the placing does less, each value from the same operations in the same
+order as before:
+
+- Every fold of the presentations renders a position on 7.1 before its
+  matrix narrows it, so the render is made once for the three
+  (`hz_render::fold::Renders`), and each speaker's fade once for its row's
+  norm and its own gain.
+- What a position radiates over the presentations is kept under the position
+  and size it was made for, to the bit, and handed back when the same one is
+  asked for again (`hz_cluster::fit::Reference`): a still scene's targets and
+  elements, block after block, and the places the search tries around them.
+- The search keeps the vector its best place was scored on rather than
+  panning it again, and scores a member of no size where it stands on its
+  target, which is the same panning.
+- The metric pans each object and each element once a presentation, not three
+  times and twice.
+- The fit's projections and its least squares' inner products are summed four
+  at a time, each from the same start and in the same order.
+- An object's gain is taken once for a standstill: the value every sample of
+  it was handed.
+- A block is placed on the scene the look-ahead weighed it as. The mixer's own
+  scene weighed every block again, from the same samples in the same order,
+  and so to the same energies.
+
+The same placing makes the fold of a TrueHD encode with `--cluster` and of
+an E-AC-3 encode with more than fifteen elements, and they gain from it too
+(see `docs/joc.md`). On sixteen cores, wall time, the same sequence either
+way:
+
+| programme | before | after | CPU time |
+|---|---|---|---|
+| 40 objects folded into 27, 4 s, FLAC | 0.24 s | 0.12 s | −21 % |
+| the same, Opus | 0.25 s | 0.13 s | −16 % |
+| a 7.1.2 bed and 40 objects, 42 folded into 20 beside a 7.1 bed, 4 s, FLAC | 0.21 s | 0.12 s | −17 % |
+| the same, Opus | 0.22 s | 0.13 s | −3 % |
+| a 7.1.2 bed and 30 objects, 32 folded into 20, 8 s, FLAC | 0.37 s | 0.19 s | −20 % |
+| the same, Opus | 0.39 s | 0.21 s | −11 % |
+
+What bounds a fold now is the placing, a block at a time on its thread —
+each object's fit and the search for each element's place, a little over a
+quarter of the encode's cycles — and the encode's own thread beside it,
+mixing, coding and measuring, about as many.
 
 ## Options
 

@@ -683,6 +683,21 @@ What is left on the encode's own thread is the budget's search for λ, a
 step at a time, and, where there is no fold, each element's samples read
 out of the master for the estimator.
 
+The fold's placing is the IAMF encode's, and does less now, each value from
+the same operations in the same order: a position's 7.1 render made once
+for the three folds of the presentations, what a position radiates kept
+under its position and size to the bit, the search's best place not panned
+a second time, the metric's gains made once a presentation, the fit's sums
+taken four at a time, and each block placed on the scene the look-ahead
+weighed it as — see `docs/iamf.md`. The payloads are the same to the byte.
+On sixteen cores:
+
+| programme | elements | before | after | CPU time |
+|---|---|---|---|---|
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.26 s | 0.24 s | −8 % |
+| 40 objects, 4 s | 40 → 15 | 0.14 s | 0.13 s | −8 % |
+| 40 objects and a 7.1.2 bed, 4 s | 49 → 15 | 0.14 s | 0.13 s | +4 % |
+
 ## Not done
 
 - Two data points a frame, which the references never use, and a steep slope
