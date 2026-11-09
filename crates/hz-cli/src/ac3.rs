@@ -693,16 +693,7 @@ mod tests {
         const CUT: usize = 5 * FRAME_SAMPLES + 300;
         let dir = scratch("cut");
         let input = master(&dir);
-        let audio = dir.join("m.atmos.audio");
-        let length = std::fs::metadata(&audio).unwrap().len();
-        // Ten channels of 24 bits.
-        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&audio)
-            .unwrap()
-            .set_len(length - missing)
-            .unwrap();
+        cut(&dir, SAMPLES, CUT, 10);
         for case in cases() {
             let (inline, alone) = coded(&input, &dir, &case, false);
             let (name, _, _, joc, kbps) = case;
@@ -718,6 +709,70 @@ mod tests {
                 assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
                 assert!(alone == beside, "{name}, run {run}: the same stream left");
             }
+        }
+    }
+
+    /// The audio of the master in `dir`, `samples` long and `channels`
+    /// wide, cut at sample `at`, its header still saying `samples`.
+    fn cut(dir: &std::path::Path, samples: usize, at: usize, channels: usize) {
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Samples of 24 bits.
+        let missing = ((samples - at) * channels * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+    }
+
+    /// A master of more elements than a payload carries, whose audio ends
+    /// before its header says, in the thirteenth frame: its elements folded
+    /// into fifteen, the encode stops there with the same error on threads
+    /// or not, and leaves the same stream behind — six syncframes fewer than
+    /// the twelve frames read. A block is folded once the blocks the fold
+    /// looks ahead to are read — [`hz_cluster::smooth::SMOOTHING`]'s
+    /// `ahead`, two, which every fold steers by — and made ready for the
+    /// coder once the one after it is folded; what the fold makes of a frame
+    /// is taken when the next goes in; and the coder writes two fewer than
+    /// it is given, as without a fold.
+    #[test]
+    fn a_read_that_fails_on_a_folded_master_stops_where_one_thread_stops() {
+        const SAMPLES: usize = 16 * FRAME_SAMPLES + 1000;
+        const CUT: usize = 12 * FRAME_SAMPLES + 300;
+        // A 7.1 bed's seven channels besides the LFE, and ten objects.
+        const OBJECTS: usize = 10;
+        let dir = scratch("cut-folded");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        let elements = parts_of(&input, &Source::open(&input, None).unwrap())
+            .unwrap()
+            .iter()
+            .filter(|part| !matches!(part, Part::Lfe { .. }))
+            .count();
+        assert!(
+            elements > crate::joc::MAX_ELEMENTS,
+            "{elements} elements: folded"
+        );
+        cut(&dir, SAMPLES, CUT, 8 + OBJECTS);
+        let [.., case] = cases();
+        let (inline, alone) = coded(&input, &dir, &case, false);
+        let Err(error) = &inline else {
+            panic!("the read fails");
+        };
+        assert!(error.contains("m.atmos.audio"), "the read's error: {error}");
+        let lag = hz_cluster::smooth::SMOOTHING.ahead + 2;
+        let written = CUT / FRAME_SAMPLES - lag - 2;
+        assert_eq!(written, 6);
+        assert_eq!(
+            alone.len(),
+            written * syncframe(case.4),
+            "six of twelve read"
+        );
+        for run in 0..8 {
+            let (threaded, beside) = coded(&input, &dir, &case, true);
+            assert_eq!(threaded, inline, "run {run}: said the same way");
+            assert!(alone == beside, "run {run}: the same stream left");
         }
     }
 }

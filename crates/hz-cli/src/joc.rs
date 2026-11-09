@@ -310,6 +310,11 @@ struct Stream {
     peak: TruePeak,
     interleaved: Vec<f32>,
     out: PathBuf,
+    /// Tests only: a syncframe this encoder comes to write only once it is
+    /// told to, as a thread of its own can be slow to come to one, and what
+    /// tells it ([`Stream::wait`]).
+    #[cfg(test)]
+    hold: Option<(u64, std::sync::mpsc::Receiver<()>)>,
 }
 
 /// What the stream is handed: a frame, with the payload of the frame before
@@ -388,6 +393,8 @@ impl Stream {
     /// Stream frame `written` with its payload: the frame held, carrying its
     /// Evolution frame, checked against what the probe made of it.
     fn write(&mut self, joc: &[u8]) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        self.wait();
         let frame = self.written;
         let held = self
             .held
@@ -427,6 +434,22 @@ impl Stream {
         }
         self.written += 1;
         Ok(syncframe)
+    }
+
+    /// Tests only: before writing the syncframe it is held to, wait until
+    /// told to go on, or until nothing is left to tell it — once. The
+    /// stream's encoder on a thread of its own is late with that syncframe,
+    /// however late the test needs: what the coder finds of it, and when, is
+    /// what it finds of a thread that is slow to come to it. Never on the
+    /// caller's thread, which would wait for itself.
+    #[cfg(test)]
+    fn wait(&mut self) {
+        match self.hold.take() {
+            Some((at, told)) if at == self.written => {
+                let _ = told.recv();
+            }
+            other => self.hold = other,
+        }
     }
 }
 
@@ -931,6 +954,8 @@ impl Coder {
             peak: TruePeak::new(channels),
             interleaved: vec![0.0; channels * FRAME_SAMPLES],
             out: out.to_path_buf(),
+            #[cfg(test)]
+            hold: None,
         };
         Ok(Self {
             probe: Lane::new(probe, "joc-probe", threads),
@@ -1529,35 +1554,11 @@ mod tests {
         let width = elements.len();
         let out = PathBuf::from("test.ec3");
         let mut writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
-        let fold = match &writer.feed {
-            Feed::Direct(_) => None,
-            Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),
-        };
-        for lane in [
-            matches!(writer.coder.probe, Lane::Thread { .. }),
-            matches!(writer.coder.stream, Lane::Thread { .. }),
-        ]
-        .into_iter()
-        .chain(fold)
-        {
-            assert_eq!(lane, threads, "the stages where they were asked to be");
-        }
+        assert_lanes(&writer, threads);
         let mut seed = 9u32;
         let mut stream = Vec::new();
         for k in 0..frames {
-            let input: Vec<f32> = (0..width * FRAME_SAMPLES)
-                .map(|_| 0.3 * noise(&mut seed))
-                .collect();
-            let core: Vec<Vec<f32>> = (0..6)
-                .map(|ch| {
-                    (0..FRAME_SAMPLES)
-                        .map(|n| match ch {
-                            0 | 1 if ch < width => input[n * width + ch],
-                            _ => 0.05 * noise(&mut seed),
-                        })
-                        .collect()
-                })
-                .collect();
+            let (input, core) = noisy(&mut seed, width);
             for n in 0..FRAME_SAMPLES {
                 kept.extend(core.iter().map(|plane| plane[n]));
             }
@@ -1575,6 +1576,46 @@ mod tests {
         }
         writer.finish(&mut stream).unwrap();
         (writer, stream, kept)
+    }
+
+    /// The writer's stages on threads of their own when `threads`, and on
+    /// the caller's otherwise: a lane falls back to the caller's thread when
+    /// it cannot start one, and a comparison of the two would be of one
+    /// thread with itself.
+    fn assert_lanes(writer: &Writer, threads: bool) {
+        let fold = match &writer.feed {
+            Feed::Direct(_) => None,
+            Feed::Folded(folding) => Some(matches!(folding.lane, Lane::Thread { .. })),
+        };
+        for lane in [
+            matches!(writer.coder.probe, Lane::Thread { .. }),
+            matches!(writer.coder.stream, Lane::Thread { .. }),
+        ]
+        .into_iter()
+        .chain(fold)
+        {
+            assert_eq!(lane, threads, "the stages where they were asked to be");
+        }
+    }
+
+    /// A frame of noise on each of `width` master channels, interleaved,
+    /// and the core that goes with it, planar: the first two channels (where
+    /// there are two) on its L and R, quieter noise on the rest.
+    fn noisy(seed: &mut u32, width: usize) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let input: Vec<f32> = (0..width * FRAME_SAMPLES)
+            .map(|_| 0.3 * noise(seed))
+            .collect();
+        let core = (0..6)
+            .map(|ch| {
+                (0..FRAME_SAMPLES)
+                    .map(|n| match ch {
+                        0 | 1 if ch < width => input[n * width + ch],
+                        _ => 0.05 * noise(seed),
+                    })
+                    .collect()
+            })
+            .collect();
+        (input, core)
     }
 
     /// Every Evolution frame of `size` bytes in `stream`, found by its sync
@@ -1942,6 +1983,383 @@ mod tests {
                 }
             }
             assert!(smallest_payload(count) < SKIP_LIMIT);
+        }
+    }
+
+    /// The bytes of a syncframe at [`config`]'s bit rate.
+    const SYNCFRAME: usize = 448_000 / 8 * FRAME_SAMPLES / 48_000;
+
+    /// How an encode through a writer ended: the error it stopped at, if it
+    /// stopped, at which frame, and the stream it left.
+    struct Ended {
+        error: Option<String>,
+        frame: usize,
+        stream: Vec<u8>,
+    }
+
+    impl Ended {
+        /// Whether `other` left what this did: the same error, the same
+        /// bytes — wherever it met it.
+        fn same(&self, other: &Self) -> bool {
+            self.error == other.error && self.stream == other.stream
+        }
+    }
+
+    /// `elements` coded as `ac3`'s encode codes them, on threads when
+    /// `threads`, the writer `prepare`d before its first frame: `frames`
+    /// frames of [`noisy`], the elements silent in the first `quiet` — or
+    /// the frames before frame `fails`, whose read fails and stops the
+    /// writer. How it ended, and every syncframe the writer handed back,
+    /// those before an error too, as the encode writes them.
+    fn driven(
+        elements: Vec<Element>,
+        frames: usize,
+        quiet: usize,
+        fails: Option<usize>,
+        threads: bool,
+        prepare: impl FnOnce(Writer) -> Writer,
+    ) -> Ended {
+        driven_after(
+            elements,
+            frames,
+            quiet,
+            fails,
+            threads,
+            prepare,
+            &mut |_| {},
+        )
+    }
+
+    /// [`driven`], handing `after` each frame once it is coded.
+    fn driven_after(
+        elements: Vec<Element>,
+        frames: usize,
+        quiet: usize,
+        fails: Option<usize>,
+        threads: bool,
+        prepare: impl FnOnce(Writer) -> Writer,
+        after: &mut dyn FnMut(usize),
+    ) -> Ended {
+        let width = elements.len();
+        let out = PathBuf::from("test.ec3");
+        let writer = Writer::new(config(), elements, true, Some(2), &out, threads).unwrap();
+        let mut writer = prepare(writer);
+        assert_lanes(&writer, threads);
+        let mut seed = 9u32;
+        let mut stream = Vec::new();
+        for frame in 0..frames {
+            if fails == Some(frame) {
+                let read = Error::io(
+                    Path::new("m.atmos.audio"),
+                    std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                );
+                let error = Some(writer.stop(read, &mut stream).to_string());
+                return Ended {
+                    error,
+                    frame,
+                    stream,
+                };
+            }
+            let (mut input, mut core) = noisy(&mut seed, width);
+            if frame < quiet {
+                input.fill(0.0);
+                for plane in core.iter_mut().take(width.min(2)) {
+                    plane.fill(0.0);
+                }
+            }
+            let refs: Vec<&[f32]> = core.iter().map(Vec::as_slice).collect();
+            let at = (frame * FRAME_SAMPLES) as u64;
+            if let Err(e) = writer.frame(&refs, &input, width, FRAME_SAMPLES, at, &mut stream) {
+                return Ended {
+                    error: Some(e.to_string()),
+                    frame,
+                    stream,
+                };
+            }
+            after(frame);
+        }
+        let error = writer.finish(&mut stream).err().map(|e| e.to_string());
+        Ended {
+            error,
+            frame: frames,
+            stream,
+        }
+    }
+
+    /// The elements of what a test codes: two carried as they are, or
+    /// twenty folded into fifteen.
+    fn elements_of(what: &str) -> Vec<Element> {
+        match what {
+            "2 beds" => beds(2),
+            _ => beds(20),
+        }
+    }
+
+    /// Frames from one going in to its block reaching the coder, for what a
+    /// test codes: none for elements carried as they are. Folded, a block
+    /// is folded once the blocks the fold looks ahead to are read
+    /// ([`hz_cluster::smooth::SMOOTHING`]'s `ahead`, which [`Folder`] steers
+    /// by), made ready for the coder once the block after it is folded, and
+    /// taken from the fold's lane as the next frame goes in.
+    fn fold_lag(what: &str) -> usize {
+        match what {
+            "2 beds" => 0,
+            _ => hz_cluster::smooth::SMOOTHING.ahead + 2,
+        }
+    }
+
+    /// `writer`, its stream's encoder made to wait before it writes
+    /// syncframe `at` until `told` ([`Stream::wait`]): its stage taken back
+    /// from its thread and set on a new one.
+    fn holding(writer: Writer, at: usize, told: std::sync::mpsc::Receiver<()>) -> Writer {
+        let Writer { feed, mut coder } = writer;
+        let mut stream = coder.stream.into_stage();
+        stream.hold = Some((at as u64, told));
+        coder.stream = Lane::new(stream, "joc-stream", true);
+        assert!(
+            matches!(coder.stream, Lane::Thread { .. }),
+            "a thread for the stream's encoder to wait on"
+        );
+        Writer { feed, coder }
+    }
+
+    /// A refusal of the stream's encoder still on its way back is what the
+    /// encode stops at, as on one thread, which meets it before it reads on.
+    /// The coder makes room for eight bytes more than the stream's Evolution
+    /// frames have: the first four frames' elements are silent, and the
+    /// payloads fitted to them take less than the room there is; the first
+    /// fitted to loud ones takes more than the stream's, which refuses it.
+    /// One thread meets the refusal coding the frame that hands that payload
+    /// to the stream's encoder — two frames on, the probe's and the
+    /// estimator's, and with a fold [`fold_lag`] more — and leaves the
+    /// syncframes before it, those the encode that fits writes. On threads
+    /// the refusal is most often still on its way back then, and is met
+    /// further on: by a later frame, as the frames keep going in; or, when
+    /// the read of the next frame fails, by [`Writer::stop`], which stops at
+    /// the refusal all the same. A read that fails at the frame one thread
+    /// meets it at is what the encode stops at, with the same syncframes,
+    /// the last of them still being written. Half the threaded runs make
+    /// sure of what is still on its way, the stream's encoder held back from
+    /// it until the frame that hands it in is coded. Carried as they are,
+    /// and folded.
+    #[test]
+    fn a_refusal_on_its_way_back_is_what_the_encode_stops_at() {
+        const FRAMES: usize = 12;
+        const QUIET: usize = 4;
+        let overstated = |mut writer: Writer| {
+            writer.coder.size += 8;
+            writer
+        };
+        for what in ["2 beds", "20 beds"] {
+            let run = |fails, threads, prepare: fn(Writer) -> Writer| {
+                driven(elements_of(what), FRAMES, QUIET, fails, threads, prepare)
+            };
+            let alone = run(None, false, overstated);
+            let refusal = alone.error.clone().expect("refused");
+            let refused: usize = refusal
+                .strip_prefix("test.ec3: refused: syncframe ")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|frame| frame.parse().ok())
+                .unwrap_or_else(|| panic!("{what}: the stream's refusal: {refusal}"));
+            let size = Writer::new(
+                config(),
+                elements_of(what),
+                true,
+                Some(2),
+                Path::new("-"),
+                false,
+            )
+            .unwrap()
+            .evolution_bytes();
+            assert!(
+                refusal.ends_with(&format!(" bytes, past the {size} every frame is given")),
+                "{what}: {refusal}"
+            );
+            assert!(
+                (QUIET - 1..=QUIET).contains(&refused),
+                "{what}: the first payload fitted to loud elements, not {refused}"
+            );
+            assert_eq!(
+                alone.frame,
+                refused + 2 + fold_lag(what),
+                "{what}: where one thread meets it"
+            );
+            assert!(alone.frame + 1 < FRAMES, "{what}: frames past it");
+            // The encode that fits, as far as the frame one thread meets the
+            // refusal at.
+            let whole = driven(elements_of(what), alone.frame, QUIET, None, false, |w| w);
+            assert_eq!(whole.error, None, "{what}: the encode that fits");
+            assert!(
+                alone.stream == whole.stream[..refused * SYNCFRAME],
+                "{what}: the syncframes before the refusal, as the encode that fits writes them"
+            );
+            let read = "m.atmos.audio: unexpected end of file";
+            for (fails, error) in [
+                (None, refusal.as_str()),
+                (Some(alone.frame), read),
+                (Some(alone.frame + 1), refusal.as_str()),
+            ] {
+                let one = run(fails, false, overstated);
+                let failing = match fails {
+                    None => format!("{what}, every read made"),
+                    Some(frame) => format!("{what}, the read failing at frame {frame}"),
+                };
+                assert_eq!(one.error.as_deref(), Some(error), "{failing}");
+                assert!(one.stream == alone.stream, "{failing}: the stream left");
+                // Threaded runs as they come, the stream's encoder quick or
+                // slow to come to the refused syncframe — of 576 counted,
+                // loaded and not, 572 met the refusal further on than one
+                // thread — and, every other one, held back from the last
+                // syncframe the encode hands it until the frame that hands
+                // it in is coded: the refused one, or where the read fails
+                // first the one before it. The coder looks for it then and
+                // finds nothing, and can only meet it further on: the
+                // refusal by a later frame, or either by `Writer::stop`.
+                let met_at = alone.frame;
+                let held = if fails == Some(met_at) {
+                    refused - 1
+                } else {
+                    refused
+                };
+                let handed_in = held + 2 + fold_lag(what);
+                for attempt in 0..8 {
+                    let holds = attempt % 2 == 1;
+                    let apart = if holds {
+                        let (tell, told) = std::sync::mpsc::channel();
+                        let prepare = move |writer| holding(overstated(writer), held, told);
+                        let mut after = |frame| {
+                            if frame == handed_in {
+                                let _ = tell.send(());
+                            }
+                        };
+                        driven_after(
+                            elements_of(what),
+                            FRAMES,
+                            QUIET,
+                            fails,
+                            true,
+                            prepare,
+                            &mut after,
+                        )
+                    } else {
+                        run(fails, true, overstated)
+                    };
+                    let label = format!("{failing}, run {attempt}");
+                    assert_eq!(apart.error, one.error, "{label}");
+                    assert!(apart.same(&one), "{label}: the stream left");
+                    if holds {
+                        match fails {
+                            Some(frame) => assert_eq!(apart.frame, frame, "{label}: by the stop"),
+                            None => assert!(apart.frame > met_at, "{label}: further on"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A trace into `dir` for `elements` elements, as `HZ_JOC_TRACE` opens
+    /// one, but whose element files cannot be written — they are open to be
+    /// read — each holding `capacity` bytes before it has to: it fails as on
+    /// a full disk, when its bytes go out. Handed to the coder in place of
+    /// the variable, which tests on threads of one process would race on.
+    fn failing_trace(dir: &Path, elements: usize, capacity: usize) -> Trace {
+        let files = (0..elements)
+            .map(|n| {
+                let path = dir.join(format!("element-{n}.f32"));
+                std::fs::write(&path, []).unwrap();
+                std::io::BufWriter::with_capacity(capacity, std::fs::File::open(&path).unwrap())
+            })
+            .collect();
+        let positions = std::fs::File::create(dir.join("positions.csv")).unwrap();
+        Trace {
+            files,
+            positions: std::io::BufWriter::new(positions),
+            skip: DELAY,
+        }
+    }
+
+    /// `writer` tracing into [`failing_trace`].
+    fn with_trace(mut writer: Writer, dir: &Path, capacity: usize) -> Writer {
+        writer.coder.trace = Some(failing_trace(dir, writer.coder.elements, capacity));
+        writer
+    }
+
+    /// A trace that fails to write a frame stops the encode there, once the
+    /// syncframes before it are written, as on one thread: the trace's error,
+    /// and two syncframes fewer than the frames traced — those the encode
+    /// untraced writes. Its element files fail on the seventh frame's
+    /// samples, carried as they are and folded; and folded, on the tenth's
+    /// too, one of the last blocks, coded as the encode finishes.
+    #[test]
+    fn a_trace_that_fails_a_frame_stops_the_encode_where_one_thread_stops() {
+        const FRAMES: usize = 12;
+        for (what, traced) in [("2 beds", &[6][..]), ("20 beds", &[6, 9])] {
+            let whole = driven(elements_of(what), FRAMES, 0, None, false, |w| w);
+            assert_eq!(whole.error, None, "{what}");
+            for &traced in traced {
+                let case = format!("{what}, {traced} frames traced");
+                let name = format!("trace-{}-{traced}", what.replace(' ', "-"));
+                let dir = crate::fixtures::scratch("joc", &name);
+                // Four bytes a sample, the first frame's from the core's
+                // delay on: `traced` frames' fit, and half the next's.
+                let capacity = 4 * (traced * FRAME_SAMPLES - DELAY) + 2 * FRAME_SAMPLES;
+                let run = |threads| {
+                    driven(elements_of(what), FRAMES, 0, None, threads, |w| {
+                        with_trace(w, &dir, capacity)
+                    })
+                };
+                let alone = run(false);
+                let error = alone.error.as_deref().expect("the trace fails");
+                assert!(error.starts_with("HZ_JOC_TRACE: "), "{case}: {error}");
+                let at = (traced + fold_lag(what)).min(FRAMES);
+                assert_eq!(alone.frame, at, "{case}: the frame that hands it in");
+                assert!(
+                    alone.stream == whole.stream[..(traced - 2) * SYNCFRAME],
+                    "{case}: the syncframes before it"
+                );
+                for attempt in 0..8 {
+                    let apart = run(true);
+                    assert_eq!(apart.error, alone.error, "{case}, run {attempt}");
+                    assert!(apart.same(&alone), "{case}, run {attempt}: the stream left");
+                }
+            }
+        }
+    }
+
+    /// A trace that fails to write out its last bytes stops the encode
+    /// before the last frames are coded, once the syncframes before them are
+    /// written, as on one thread: the trace's error, and two syncframes fewer
+    /// than the frames that went in — those the encode untraced writes.
+    /// Carried as they are and folded.
+    #[test]
+    fn a_trace_that_fails_at_the_end_stops_the_encode_where_one_thread_stops() {
+        const FRAMES: usize = 10;
+        // Every frame's samples fit, and go out at the end.
+        let capacity = 4 * FRAMES * FRAME_SAMPLES;
+        for what in ["2 beds", "20 beds"] {
+            let name = format!("trace-end-{}", what.replace(' ', "-"));
+            let dir = crate::fixtures::scratch("joc", &name);
+            let run = |threads| {
+                driven(elements_of(what), FRAMES, 0, None, threads, |w| {
+                    with_trace(w, &dir, capacity)
+                })
+            };
+            let whole = driven(elements_of(what), FRAMES, 0, None, false, |w| w);
+            assert_eq!(whole.error, None, "{what}");
+            let alone = run(false);
+            let error = alone.error.as_deref().expect("the trace fails");
+            assert!(error.starts_with("HZ_JOC_TRACE: "), "{what}: {error}");
+            assert_eq!(alone.frame, FRAMES, "{what}: at the end");
+            assert!(
+                alone.stream == whole.stream[..(FRAMES - 2) * SYNCFRAME],
+                "{what}: the syncframes before the last two"
+            );
+            for attempt in 0..8 {
+                let apart = run(true);
+                assert_eq!(apart.error, alone.error, "{what}, run {attempt}");
+                assert!(apart.same(&alone), "{what}, run {attempt}: the stream left");
+            }
         }
     }
 }
