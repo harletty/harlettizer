@@ -246,7 +246,8 @@ prediction from frame to frame, so it runs in order too, ahead of the
 others, on two threads of its own. The first makes the core's input from
 each input frame and analyses it — the filter bank, the LFE's decimation,
 the masking curve and the peaks, which depend on the input alone — a frame
-ahead of the second, which allocates the bits, writes the core frame and
+ahead of the second — as far ahead as the frames handed out — which
+allocates the bits, writes the core frame and
 reconstructs it as a decoder will, then hands the input frame on with it.
 With `--adpcm` the second spreads the predictor search, most of its work
 then, over fifteen threads more: a subband's search depends on its own
@@ -265,19 +266,21 @@ Thirty seconds of a twelve-waveform programme, on sixteen cores:
 
 | `--layout` | one thread | threads | × real time |
 |---|---|---|---|
-| `7.1.4` | 4.36 s | 0.35 s | 87 |
-| `5.1` | 3.22 s | 0.28 s | 108 |
+| `7.1.4` | 4.36 s | 0.34 s | 88 |
+| `5.1` | 3.22 s | 0.28 s | 107 |
 | `7.1.4 --adpcm` | | 0.98 s | 31 |
 
 The core's two threads and the render's, on the caller's, now take about
 as long as each other: in 7.1.4 the analysis and the render are the wall
 together, in 5.1 the analysis, most of it the masking model's sums. Ninety
-seconds of a master take 0.97 s in 7.1.4 and 0.79 s in 5.1.
+seconds of a master take 0.96 s in 7.1.4 and 0.80 s in 5.1.
 
-With threads, a frame comes back from `Encoder::encode` a fixed number of
-calls after it went in, however fast the threads code it: an encode cut
-short — by a read that fails, say — leaves the same frames written on any
-machine with as many threads.
+With threads, a frame comes back from `Encoder::encode` some calls after
+it went in, as soon as the threads have coded it. An encode cut short — by
+a read that fails — stops the encoder (`Encoder::stop`), which sends every
+frame still with the threads, so the file holds what one thread leaves, on
+any machine; or the refusal one thread would have met before the read
+ends the stream, as it would have.
 
 ## Not done
 

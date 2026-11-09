@@ -54,8 +54,9 @@ const LFE_HISTORY: usize = 8;
 /// One channel's synthesis filter state (`hist1`, `offset`, `hist2`).
 ///
 /// The ring buffer holds its 24-bit samples as `f64`, and the window is
-/// taken in `f64`: every sample and every window coefficient is an integer
-/// under 2^23 in magnitude, so each product is an integer under 2^46, and
+/// taken in `f64`: every sample is an integer of at most 2^23 in magnitude
+/// and every window coefficient one under it, so each product is an integer
+/// under 2^46, and
 /// every sum the window makes — eight products and an overlap under 2^49 —
 /// an integer under 2^51. All of them are exact in an `f64`, so the sums
 /// are the decoder's 64-bit integer sums, in any order; the vector unit

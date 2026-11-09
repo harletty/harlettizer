@@ -41,10 +41,10 @@
 //!
 //! A frame's analysis — the filter bank, the LFE's decimation, the masking
 //! curve and the peaks — depends on nothing but the input, this frame's and
-//! the last's, so one encoder can make it a frame ahead of another that
-//! allocates and writes (`Encoder::analyse`, `Encoder::encode_analysed`);
-//! and with ADPCM, the predictor search can run on threads beside the
-//! encoder's own ([`Encoder::with_search_threads`]).
+//! the last's, so one encoder can make it ahead of another that allocates
+//! and writes (`Encoder::analyse`, `Encoder::encode_analysed`); and with
+//! ADPCM, the predictor search can run on threads beside the encoder's own
+//! ([`Encoder::with_search_threads`]).
 //!
 //! Channels are indexed as FFmpeg indexes them: coded channels in their coded
 //! order (centre, left, right, left surround, right surround for 5.1), then
@@ -407,6 +407,9 @@ struct State {
     /// `cb_to_add` by the signed difference of two levels, from −256 to
     /// 256: nought at either end, where the difference is 256 or more.
     add_by_difference: [i32; 513],
+    /// The least difference from which `cb_to_add` is nought: an `add_cb`
+    /// of levels that far apart adds nothing to the louder.
+    silent_gap: i32,
     /// `cb_to_level`, then noughts that no level of one or more reaches.
     cb_to_level: [i32; 2048 + LEVEL_SPAN],
     /// For `get_cb`: per bucket of levels, the centibels of its loudest.
@@ -578,6 +581,7 @@ impl Encoder {
             mdct_window: [0; 512],
             cb_to_add: [0; 256],
             add_by_difference: [0; 513],
+            silent_gap: 256,
             cb_to_level: [0; 2048 + LEVEL_SPAN],
             level_buckets: [0; 32 << LEVEL_BUCKET_BITS],
             lfe_fir_64i: [0; 512],
@@ -937,16 +941,23 @@ impl State {
 
         // The denominators start at `CA_CB` and the unnormalised curve at
         // −2047, and an `add_cb` never lowers what it adds to: with no
-        // `cb_to_add` below nought, a level 256 cB or more under either
-        // floor leaves it as it is. A bin's power is at most `add_cb(0, 0)`;
-        // the curve adds `a − denominator`, at most `a − CA_CB`.
+        // `cb_to_add` below nought, a level `silent_gap` (164) cB or more
+        // under either floor leaves it as it is. A bin's power is at most
+        // `add_cb(0, 0)`; the curve adds `a − denominator`, at most
+        // `a − CA_CB`.
+        self.silent_gap = self
+            .cb_to_add
+            .iter()
+            .rposition(|&a| a != 0)
+            .map_or(0, |last| last as i32 + 1);
         for (at, add) in self.add_by_difference.iter_mut().enumerate() {
             *add = self.cb_to_add.get(at.abs_diff(256)).copied().unwrap_or(0);
         }
         let floors = self.cb_to_add.iter().all(|&a| a >= 0);
         let most_power = self.cb_to_add[0];
-        let raises_denominator = |a: i32| !floors || most_power + a > CA_CB - 256;
-        let raises_curve = |a: i32| !floors || a - CA_CB > -2047 - 256;
+        let gap = self.silent_gap;
+        let raises_denominator = |a: i32| !floors || most_power + a > CA_CB - gap;
+        let raises_curve = |a: i32| !floors || a - CA_CB > -2047 - gap;
         // The hull of the indices where `raises` holds, empty when nowhere.
         fn hull(raises: impl Fn(usize) -> bool, len: usize) -> (usize, usize) {
             let first = (0..len).find(|&i| raises(i));
@@ -1163,9 +1174,9 @@ impl State {
         {
             let (first, end) = (usize::from(first), usize::from(end));
             let mut d = [CA_CB; DENOMINATOR_LANES];
-            // A run of bins whose levels are all 256 cB or more under a
-            // denominator leaves it as it is: an `add_cb` adds nought to
-            // the louder there, and the denominator only grows.
+            // A run of bins whose levels are all `silent_gap` cB or more
+            // under a denominator leaves it as it is: an `add_cb` adds
+            // nought to the louder there, and the denominator only grows.
             let mut bin = first;
             while bin < end {
                 let n = (end - bin).min(DENOMINATOR_RUN);
@@ -1178,7 +1189,7 @@ impl State {
                         *level = p + a;
                         loudest = loudest.max(*level);
                     }
-                    moves |= loudest > d - 256;
+                    moves |= loudest > d - self.silent_gap;
                 }
                 if moves {
                     for i in 0..n {
@@ -1977,7 +1988,9 @@ pub(crate) mod tests {
 
     /// Streams and their reconstructions as the encoder wrote them before it
     /// was made faster, hashed: every layout, rates from the lowest a layout
-    /// takes to the highest, three sample rates, ADPCM on and off.
+    /// takes to the highest, three sample rates, ADPCM on and off. The
+    /// hashes are what this test's body makes run against the encoder and
+    /// decoder of commit 072235e, before the change.
     #[test]
     fn the_stream_and_its_reconstruction_are_unchanged() {
         use crate::core_decode::CoreDecoder;
@@ -2105,6 +2118,51 @@ pub(crate) mod tests {
                 assert_eq!(got, want, "{layout:?}, frame {f}: searched on threads");
                 if f == 0 {
                     for encoder in [&mut here, &mut apart, &mut threads] {
+                        encoder.restart_prediction();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The encoder writes the frames it wrote before its stages were made
+    /// faster and some of them moved: the analysis, the predictor search
+    /// and the masking curve as they were, in the order they were in —
+    /// every layout, ADPCM on and off, searched here and on threads.
+    #[test]
+    fn the_encoder_writes_what_it_wrote() {
+        for (layout, adpcm, bit_rate, lfe_history_quirk) in [
+            (Layout::FivePointOne, false, 1_509_000, false),
+            (Layout::FivePointOne, true, 1_509_000, true),
+            (Layout::FivePointZero, true, 768_000, false),
+            (Layout::TwoTwo, false, 1_000_000, false),
+            (Layout::Stereo, true, 3_840_000, false),
+            (Layout::Mono, false, 160_000, false),
+        ] {
+            let config = Config {
+                layout,
+                adpcm,
+                bit_rate,
+                lfe_history_quirk,
+                ..Config::reference_five_one()
+            };
+            let mut was = Encoder::new(config.clone()).unwrap();
+            let mut here = Encoder::new(config.clone()).unwrap();
+            let mut threads = Encoder::new(config).unwrap().with_search_threads(3);
+            let channels = layout.channels();
+            for (f, frame) in stage_input(24, channels)
+                .chunks_exact(FRAME_SAMPLES * channels)
+                .enumerate()
+            {
+                let mut want = Vec::new();
+                before::encode(&mut was, frame, &mut want);
+                for (encoder, how) in [(&mut here, "here"), (&mut threads, "on threads")] {
+                    let mut got = Vec::new();
+                    encoder.encode(frame, &mut got);
+                    assert_eq!(got, want, "{layout:?}, frame {f}, searched {how}");
+                }
+                if f == 0 {
+                    for encoder in [&mut was, &mut here, &mut threads] {
                         encoder.restart_prediction();
                     }
                 }
@@ -2291,6 +2349,124 @@ pub(crate) mod tests {
             }
         }
 
+        pub fn calc_masking(s: &mut State, mdct: &mut Mdct, input: &[i32]) {
+            let mut masking = [[-2047i32; 256]; SUBSUBFRAMES];
+            let mut data = [0i32; 512];
+            for (ssf, curve) in masking.iter_mut().enumerate() {
+                for ch in 0..s.fullband_channels {
+                    let chi = s.channel_order[ch] as usize;
+                    let first = 128 + 256 * ssf;
+                    let from_history = 512 - first;
+                    data[..from_history].copy_from_slice(&s.history[ch][first..]);
+                    for (k, d) in data[from_history..].iter_mut().enumerate() {
+                        *d = input[k * s.channels + chi];
+                    }
+                    adjust_jnd(s, mdct, &data, curve);
+                }
+            }
+            s.masking_curve_cb = masking;
+            for i in 0..256 {
+                let mut m = 2048;
+                for curve in &s.masking_curve_cb {
+                    m = m.min(curve[i]);
+                }
+                s.eff_masking_curve_cb[i] = m;
+            }
+
+            for band in 0..32 {
+                s.band_masking_cb[band] = 2048;
+                let mut update = |f: usize, spectrum: i32| {
+                    let value = s.eff_masking_curve_cb[f] - spectrum;
+                    if value < s.band_masking_cb[band] {
+                        s.band_masking_cb[band] = value;
+                    }
+                };
+                if band == 0 {
+                    for f in 0..4 {
+                        update(f, 0);
+                    }
+                } else {
+                    for f in 0..8 {
+                        update(8 * band - 4 + f, s.band_spectrum[7 - f]);
+                    }
+                }
+                if band == 31 {
+                    for f in 0..4 {
+                        update(256 - 4 + f, 0);
+                    }
+                } else {
+                    for f in 0..8 {
+                        update(8 * band + 4 + f, s.band_spectrum[f]);
+                    }
+                }
+            }
+        }
+
+        pub fn adpcm_analysis(s: &mut State, adpcm: &Adpcm) {
+            s.consumed_adpcm_bits = 0;
+            let mut estimated_diff = [0i32; SUBBAND_SAMPLES];
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    match adpcm.subband_analysis(&s.subband[ch][band], &mut estimated_diff) {
+                        Some(vq) => {
+                            s.prediction_mode[ch][band] = i32::from(vq);
+                            // Twelve bits for the predictor's index.
+                            s.consumed_adpcm_bits += 12;
+                            s.diff_peak_cb[ch][band] = s.find_peak(&estimated_diff);
+                        }
+                        None => s.prediction_mode[ch][band] = -1,
+                    }
+                }
+            }
+        }
+
+        /// `Encoder::encode` as it was, its stages in their order and as
+        /// they were where they have changed.
+        pub fn encode(encoder: &mut Encoder, pcm: &[i32], out: &mut Vec<u8>) {
+            let Encoder {
+                config,
+                state,
+                mdct,
+                adpcm,
+                ..
+            } = &mut *encoder;
+            let s = &mut **state;
+            subband_transform(s, pcm);
+            if s.lfe_channel {
+                lfe_downsample(s, pcm);
+            }
+            calc_masking(s, mdct, pcm);
+            if let Some(adpcm) = adpcm {
+                adpcm_analysis(s, adpcm);
+            }
+            s.find_peaks();
+            s.assign_bits();
+            if s.lfe_channel {
+                let (scale, quant) = s.calc_one_scale(s.lfe_peak_cb, 11);
+                s.lfe_scale_factor = scale;
+                s.lfe_quant = quant;
+                for (code, &sample) in s.lfe_codes.iter_mut().zip(&s.downsampled_lfe) {
+                    *code = quantize_value(sample, quant);
+                }
+            }
+            s.shift_history(pcm, config.lfe_history_quirk);
+            s.fill_in_adpcm_buffer();
+
+            let header = encoder.header();
+            let s = &*encoder.state;
+            let w = &mut encoder.writer;
+            w.clear();
+            header.write(w);
+            s.put_primary_audio_header(w);
+            for _ in 0..SUBFRAMES {
+                s.put_subframe(w);
+            }
+            w.align_to(8);
+            let start = out.len();
+            out.extend_from_slice(w.bytes());
+            out.resize(start + s.frame_size, 0);
+        }
+
         pub fn init_quantization_noise(s: &mut State, noise: i32, forbid_zero: bool) -> i32 {
             let mut ret = USED_26ABITS | USED_1ABITS;
             s.consumed_bits = 132 + 333 * s.fullband_channels as i32;
@@ -2420,6 +2596,17 @@ pub(crate) mod tests {
             let x = lcg(&mut seed);
             assert_eq!(s.get_cb(x), before::get_cb(s, x), "{x}");
         }
+    }
+
+    /// `cb_to_add` is nought from 164 cB on, and only from there: what
+    /// the masking model leaves out is left out from there.
+    #[test]
+    fn levels_164_cb_apart_add_nothing() {
+        let encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &*encoder.state;
+        assert_eq!(s.silent_gap, 164);
+        assert!(s.cb_to_add[164..].iter().all(|&a| a == 0));
+        assert_ne!(s.cb_to_add[163], 0);
     }
 
     #[test]

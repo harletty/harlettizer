@@ -195,6 +195,16 @@ impl Sink {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    // The lossless layer on every thread but one, the core on two more, and
+    // the render on this one, which mostly waits for them: the same stream,
+    // to the byte, several times sooner.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+    encode_on(config, threads)
+}
+
+/// [`run`], the lossless layer on `threads` threads of its own — nought for
+/// everything on this one.
+fn encode_on(config: Config, threads: usize) -> Result<()> {
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still
@@ -270,10 +280,6 @@ pub fn run(config: Config) -> Result<()> {
 
     let mut dca = DcaConfig::reference(config.layout, config.bits);
     dca.core.adpcm = config.adpcm;
-    // The lossless layer on every thread but one, the core on one more, and
-    // the render on this one, which mostly waits for them: the same stream,
-    // to the byte, several times sooner.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
     let mut encoder = Encoder::new(dca)
         .map_err(|e| Error::unsupported(&config.out, e.0))?
         .with_threads(threads);
@@ -306,7 +312,28 @@ pub fn run(config: Config) -> Result<()> {
     let mut refused = None;
     'blocks: while at < total {
         let want = (total - at).min(BLOCK as u64) as usize;
-        let got = source.fill(&mut raw, want)?;
+        let got = match source.fill(&mut raw, want) {
+            Ok(got) => got,
+            // The frames before stay where a single thread would have left
+            // them: those the threads still have are coded and written
+            // first — or the refusal one of them meets, which a single
+            // thread would have met before this read, ends the stream as it
+            // would have.
+            Err(e) => {
+                stream.clear();
+                let stopped = encoder.stop(&mut stream);
+                sent += sink
+                    .frames(&stream, 0)
+                    .map_err(|e| Error::io(&config.out, e))?;
+                match stopped {
+                    Ok(()) => return Err(e),
+                    Err(e) => {
+                        refused = Some(e);
+                        break 'blocks;
+                    }
+                }
+            }
+        };
         if got == 0 {
             break;
         }
@@ -488,4 +515,67 @@ pub fn run(config: Config) -> Result<()> {
         bytes as f64 * 8.0 / seconds / 1000.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Forty frames and some.
+    const SAMPLES: usize = 40 * FRAME_SAMPLES + 300;
+
+    /// Audio that ends before its header says, in the thirtieth frame: the
+    /// fourth block's read fails, after 24 frames handed to the encoder.
+    /// The encode stops there with the same error, on threads or not, and
+    /// leaves the same stream behind — the 23 frames one thread has sent,
+    /// the 24th waiting for the core that decodes to it — however many
+    /// threads, and however far they got: a few runs each to show it.
+    #[test]
+    fn a_read_that_fails_stops_the_encode_where_one_thread_stops() {
+        const CUT: usize = 29 * FRAME_SAMPLES + 100;
+        let dir = crate::fixtures::scratch("dts", "cut");
+        let input = crate::fixtures::master(&dir, SAMPLES);
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Ten channels of 24 bits.
+        let missing = ((SAMPLES - CUT) * 10 * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+        let out = dir.join("cut.dts");
+        let coded = |layout: DcaLayout, threads: usize| {
+            let config = Config {
+                input: input.clone(),
+                out: out.clone(),
+                frames: None,
+                mono_prefix: None,
+                layout,
+                bits: 24,
+                adpcm: false,
+                progress: false,
+            };
+            let ended = encode_on(config, threads).map_err(|e| e.to_string());
+            (ended, std::fs::read(&out).unwrap())
+        };
+        let every = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+        for layout in [DcaLayout::FivePointOne, DcaLayout::SevenPointOneFour] {
+            let (inline, alone) = coded(layout, 0);
+            assert!(inline.is_err(), "{layout:?}: the read fails");
+            let frames: Vec<_> = hz_dca::split::frames(&alone)
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(frames.len(), 23, "{layout:?}: the frames sent");
+            for threads in [1, 2, 3, 8, every] {
+                for run in 0..if threads == every { 8 } else { 2 } {
+                    let (threaded, beside) = coded(layout, threads);
+                    let at = format!("{layout:?}, {threads} threads, run {run}");
+                    assert_eq!(threaded, inline, "{at}: said the same way");
+                    assert!(alone == beside, "{at}: the same stream left");
+                }
+            }
+        }
+    }
 }

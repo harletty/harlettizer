@@ -190,9 +190,9 @@ enum Analysed {
 
 /// The core's input made from each frame ([`lossless::Encoder::core_input`])
 /// and the first half of the core's work ([`encoder::Encoder::analyse`]),
-/// a frame ahead of the rest, on a thread of its own: they depend on
-/// nothing but the input, so they can run while the core allocates and
-/// writes the frame before.
+/// ahead of the rest, on a thread of its own: they depend on nothing but
+/// the input, so they can run while the core allocates and writes the
+/// frames before — as many frames ahead as the caller has handed out.
 struct Analyser {
     lossless: lossless::Encoder,
     core: encoder::Encoder,
@@ -383,8 +383,8 @@ impl Pool {
         if workers.is_empty() {
             return None;
         }
-        // The analysis a frame ahead of the core where its thread starts,
-        // with the core otherwise.
+        // The analysis ahead of the core where its thread starts, with the
+        // core otherwise.
         let analyser = Analyser {
             lossless: lossless::Encoder::new(config.clone()).ok()?,
             core: encoder::Encoder::new(core.clone()).ok()?,
@@ -683,15 +683,17 @@ impl Encoder {
     /// at, which is settled on the caller's thread, in order; the core,
     /// which carries its prediction from frame to frame, runs ahead of them
     /// in order: its input and its analysis, which depend on the input
-    /// alone, a frame ahead of the rest of it, and with ADPCM its predictor
-    /// search spread over up to fifteen threads more, or `threads` where
-    /// that is fewer ([`encoder::Encoder::with_search_threads`]). The stream
-    /// is the same to the byte; the frames come out of [`Encoder::encode`]
-    /// later, up to twice as many calls behind the input as there are
-    /// threads. Nought, the default, codes everything on the caller's
-    /// thread; threads that cannot be started do too, and so does an encoder
-    /// that has had a frame already: the threads are chosen before the stream
-    /// starts.
+    /// alone, on one thread ahead of the rest of it, and with ADPCM its
+    /// predictor search spread over up to fifteen threads more, or `threads`
+    /// where that is fewer ([`encoder::Encoder::with_search_threads`]). The
+    /// stream is the same to the byte; a frame comes out of
+    /// [`Encoder::encode`] up to 2 · `threads` + 2 calls after the one that
+    /// took it — as many as are out to the threads at once, which the
+    /// threads that start set — and [`Encoder::stop`] sends, where the
+    /// input stops short, what one thread would have sent. Nought, the
+    /// default, codes everything on the caller's thread; threads that cannot
+    /// be started do too, and so does an encoder that has had a frame
+    /// already: the threads are chosen before the stream starts.
     ///
     /// With threads, a frame refused once it is coded — for the navigation
     /// word as for the peak rate — ends the stream, and the frames the
@@ -713,10 +715,9 @@ impl Encoder {
     /// frames that are ready: the frame before this one, since the core runs
     /// a frame ahead (nothing on the first call), and, where the stream may
     /// smooth, only once the encoder has looked far enough past it — or,
-    /// with threads ([`Encoder::with_threads`]), once as many frames are
-    /// out to them as they take at once: a frame comes back as many calls
-    /// later as that, however fast they code it. [`Encoder::finish`] sends
-    /// the rest.
+    /// with threads ([`Encoder::with_threads`]), once they have coded it.
+    /// [`Encoder::finish`] sends the rest; [`Encoder::stop`], what one
+    /// thread would have sent by now, where the stream stops short.
     ///
     /// A refusal leaves in `out` nothing of the refused frame's own, and,
     /// with threads, the frames before it that the calls before would have
@@ -770,6 +771,25 @@ impl Encoder {
         }
         self.pending.copy_from_slice(pcm);
         self.waiting = true;
+        Ok(())
+    }
+
+    /// Where the input stops short of its end — a read that fails, say —
+    /// send what one thread would have sent by now: with threads, every
+    /// frame handed to them, once they have coded it, settled as the calls
+    /// that handed them out would have settled them on one thread; or the
+    /// refusal one of them meets, which one thread would have met first,
+    /// leaving in `out` the frames before it. A refusal that has ended the
+    /// stream already is returned again. The frame waiting for its core
+    /// stays unsent, as on one thread; the encoder can go on, or
+    /// [`Encoder::finish`].
+    pub fn stop(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
+        if let Some(refused) = &self.ended {
+            return Err(refused.clone());
+        }
+        if self.pool.is_some() {
+            self.settle_back(out, Until::Settled(self.handed_out()))?;
+        }
         Ok(())
     }
 
@@ -878,10 +898,8 @@ impl Encoder {
     }
 
     /// Settle, in order, the frames the pool has coded, and send what is
-    /// ready — waiting for the pool until `until`, and settling no further
-    /// than it: which frames a call sends depends on the calls alone, not on
-    /// how far the threads have got. A frame refused leaves `out` as the
-    /// frames before it left it, and ends the stream.
+    /// ready — waiting for the pool until `until`. A frame refused leaves
+    /// `out` as the frames before it left it, and ends the stream.
     fn settle_back(&mut self, out: &mut Vec<u8>, until: Until) -> Result<(), Refused> {
         loop {
             let settled = self.frames;
@@ -889,12 +907,7 @@ impl Encoder {
             while let Ok(job) = pool.done.try_recv() {
                 pool.place(job, settled);
             }
-            while let Some(Some(_)) = self
-                .pool
-                .as_ref()
-                .filter(|p| !Self::enough(p, self.frames, until))
-                .and_then(|p| p.back.front())
-            {
+            while let Some(Some(_)) = self.pool.as_ref().and_then(|p| p.back.front()) {
                 let pool = self.pool.as_mut().expect("settling from the pool");
                 let mut job = pool
                     .back
@@ -917,7 +930,11 @@ impl Encoder {
             }
             let settled = self.frames;
             let pool = self.pool.as_mut().expect("settling from the pool");
-            if Self::enough(pool, settled, until) {
+            let enough = match until {
+                Until::Room => pool.in_flight <= pool.most,
+                Until::Settled(frames) => settled >= frames,
+            };
+            if enough {
                 return Ok(());
             }
             let job = pool
@@ -925,15 +942,6 @@ impl Encoder {
                 .recv()
                 .expect("the pool's threads give back every frame");
             pool.place(job, settled);
-        }
-    }
-
-    /// Whether `pool`, with `settled` frames settled, has gone as far as
-    /// `until`.
-    fn enough(pool: &Pool, settled: u64, until: Until) -> bool {
-        match until {
-            Until::Room => pool.in_flight <= pool.most,
-            Until::Settled(frames) => settled >= frames,
         }
     }
 
@@ -1387,47 +1395,104 @@ mod tests {
         }
     }
 
-    /// Threads asked for once the stream has started change nothing: the
-    /// core has a frame in hand that a core of their own would not.
-    /// With threads, which frames a call hands back depends on the calls
-    /// alone: once the pool is full, each call the one the pool's depth
-    /// behind, however far the threads have got — so a stream cut short by
-    /// a failing read has the frames it would have had on any machine with
-    /// as many threads.
+    /// `calls` frames of `pcm` and a stop on `threads` threads: what was
+    /// sent, and how the encoder ended — at the first refusal, as a caller
+    /// stops at it. A stop after that sends nothing more.
+    fn stopped_after(
+        config: Config,
+        pcm: &[i32],
+        threads: usize,
+        calls: usize,
+    ) -> (Vec<u8>, Result<(), Refused>) {
+        let channels = config.lossless.layout.channels();
+        let mut encoder = Encoder::new(config).unwrap().with_threads(threads);
+        let mut stream = Vec::new();
+        let mut ended = Ok(());
+        for (call, frame) in pcm.chunks(FRAME_SAMPLES * channels).take(calls).enumerate() {
+            ended = encoder.encode(frame, &mut stream);
+            if ended.is_err() {
+                break;
+            }
+            if threads > 0 && call % 4 == 2 {
+                // Let the threads get ahead of the calls.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        if ended.is_ok() {
+            ended = encoder.stop(&mut stream);
+        }
+        let sent = stream.len();
+        let again = encoder.stop(&mut stream);
+        assert_eq!(stream.len(), sent, "a second stop sends nothing");
+        if threads > 0 && ended.is_err() && again.is_err() {
+            // A refusal of a coded frame ends a stream on threads.
+            assert_eq!(again, ended);
+        }
+        (stream, ended)
+    }
+
+    /// An encode stopped short — after any number of frames, threads or
+    /// none, however far the threads had got — has sent what one thread
+    /// sends by then, to the byte, or met the refusal one thread meets
+    /// first, with the frames before it.
     #[test]
-    fn frames_go_out_when_the_calls_say_however_fast_the_threads() {
-        for (layout, threads, adpcm) in [
-            (Layout::FivePointOne, 1, false),
-            (Layout::FivePointOne, 3, true),
-            (Layout::SevenPointOneFour, 2, false),
-        ] {
+    fn a_stop_sends_what_one_thread_has_sent() {
+        let smoothed = |layout: Layout, ceiling: u32, lookahead: usize| {
             let mut config = Config::reference(layout, 24);
-            config.core.adpcm = adpcm;
-            let channels = layout.channels();
-            let mut encoder = Encoder::new(config).unwrap().with_threads(threads);
-            let most = encoder.pool.as_ref().map(|pool| pool.most as u64);
-            let Some(most) = most else {
-                // No thread could be started: nothing to compare.
-                continue;
-            };
-            let pcm = tones(channels, most as usize + 12);
-            let mut stream = Vec::new();
-            for (call, frame) in pcm.chunks(FRAME_SAMPLES * channels).enumerate() {
-                encoder.encode(frame, &mut stream).unwrap();
-                if call % 3 == 1 {
-                    // Give the threads time to get ahead.
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            config.peak.ceiling = ceiling;
+            config.peak.buffer_code = 1;
+            config.peak.lookahead = lookahead;
+            config
+        };
+        let adpcm = {
+            let mut config = Config::reference(Layout::FivePointOne, 24);
+            config.core.adpcm = true;
+            config
+        };
+        let cases = [
+            (Config::reference(Layout::FivePointOne, 24), tones(6, 25)),
+            (adpcm, tones(6, 25)),
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 10),
+            ),
+            // Refused for the peak rate, with frames sent ahead before it.
+            (
+                smoothed(Layout::SevenPointOne, 7_000_000, 4),
+                bursts(8, 25, 0),
+            ),
+            // Sent ahead, and not refused.
+            (
+                smoothed(Layout::SevenPointOne, 8_500_000, 16),
+                bursts(8, 25, 0),
+            ),
+            // A corner past 24 bits with its height: refused by the check.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 0),
+            ),
+            // A bed too large for the navigation word to reach past.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 1),
+            ),
+        ];
+        let every = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+        for (case, (config, pcm)) in cases.iter().enumerate() {
+            for calls in [3, 11, 22] {
+                let alone = stopped_after(config.clone(), pcm, 0, calls);
+                for threads in [1, 2, 3, 8, every] {
+                    let spread = stopped_after(config.clone(), pcm, threads, calls);
+                    let at = format!("case {case}, {calls} calls, {threads} threads");
+                    assert_eq!(spread.1, alone.1, "{at}");
+                    assert!(spread.0 == alone.0, "{at}: the stream");
                 }
-                let sent = substreams(&stream).len() as u64;
-                assert_eq!(
-                    sent,
-                    (call as u64).saturating_sub(most),
-                    "{layout:?}, call {call}"
-                );
             }
         }
     }
 
+    /// Threads asked for once the stream has started change nothing: the
+    /// core has a frame in hand that a core of their own would not.
     #[test]
     fn threads_asked_for_late_change_nothing() {
         let config = Config::reference(Layout::FivePointOne, 24);
