@@ -139,6 +139,36 @@ impl<S: Stage> Lane<S> {
     }
 }
 
+/// `work` on a thread of its own in `scope`, `run` doing it there, when
+/// `threads` and one can be started: `None`, the thread joined when the scope
+/// ends. Otherwise `work` itself, for the caller to do on its own thread.
+///
+/// What a [`Lane`] is for work that borrows from its caller and drives itself
+/// rather than taking inputs one by one. The same hand-over: `work` goes to
+/// the thread once it has started, so that one which cannot be leaves it
+/// here, where [`std::thread::Scope::spawn`] would panic.
+pub(crate) fn beside<'scope, W: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    threads: bool,
+    work: W,
+    run: impl FnOnce(W) + Send + 'scope,
+) -> Option<W> {
+    if !threads {
+        return Some(work);
+    }
+    let (give, take) = mpsc::channel::<W>();
+    // Unnamed, as `Scope::spawn` would have started it.
+    let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+        if let Ok(work) = take.recv() {
+            run(work);
+        }
+    });
+    match spawned {
+        Ok(_) => give.send(work).err().map(|mpsc::SendError(back)| back),
+        Err(_) => Some(work),
+    }
+}
+
 /// A stage's thread is gone before its work is, which only a panic does:
 /// carry it on here.
 fn panicked<S>(handle: &mut Option<JoinHandle<S>>) -> ! {
