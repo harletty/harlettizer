@@ -487,6 +487,13 @@ struct Live {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    run_on(config, true)
+}
+
+/// [`run`], a folding encode's spans read and folded on a thread of their own
+/// when `threads` and one can be started, or on the caller's, between the
+/// writes: the same stream either way.
+fn run_on(config: Config, threads: bool) -> Result<()> {
     let mut source = Source::open(&config.input, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still
     // to be read: refuse one that is the input, before any work is done.
@@ -817,6 +824,16 @@ pub fn run(config: Config) -> Result<()> {
         // producer owns everything it touches: the source, the fold and its
         // running cost, the live objects, and the count that says when a
         // payload is due — which is why nothing here decides that any more.
+        //
+        // Where no thread can be started (a task limit), the producer runs on
+        // this one instead and hands each span to the writer as it folds it:
+        // the same payloads and units written, and the same error first when
+        // one fails — only nothing is ahead. And the same spans folded, which
+        // an overlay's report records block by block: on its thread the
+        // producer folds the span after the one a writer failed on, where
+        // there is one and the read its fold waits for succeeds, before it
+        // finds the writer gone; so here a writer that fails lets the producer
+        // go on to its next hand-over, and drops it.
         Some(fold) => {
             let (spans, from_fold) = std::sync::mpsc::sync_channel::<Result<Produced>>(1);
             let (free, spare) = std::sync::mpsc::channel::<Vec<i32>>();
@@ -837,12 +854,14 @@ pub fn run(config: Config) -> Result<()> {
                 .map_err(|why| Error::unsupported(input, why.to_string()))?;
 
             std::thread::scope(|scope| -> Result<()> {
-                scope.spawn(move || {
+                // Each span folded, or what stopped the producer, goes to
+                // `hand`, which says whether the writer wants any more.
+                let produce = move |hand: &mut dyn FnMut(Result<Produced>) -> bool| {
                     let mut block = vec![0i32; span * source_channels];
                     let mut since_payload = REFRESH;
                     let mut at = 0u64;
-                    let fail = |why| {
-                        let _ = spans.send(Err(why));
+                    let fail = |hand: &mut dyn FnMut(Result<Produced>) -> bool, why| {
+                        let _ = hand(Err(why));
                     };
                     // Some spans of latency, in the *energy* only — as many
                     // as the fold looks ahead. A span is read, what its
@@ -879,7 +898,8 @@ pub fn run(config: Config) -> Result<()> {
                     let mut give =
                         |read: Option<&[f64]>,
                          waiting: Option<&Waiting>,
-                         since_payload: &mut u64|
+                         since_payload: &mut u64,
+                         hand: &mut dyn FnMut(Result<Produced>) -> bool|
                          -> std::result::Result<bool, hz_core::Error> {
                             if let Some(read) = read {
                                 fold.record(read);
@@ -1007,21 +1027,19 @@ pub fn run(config: Config) -> Result<()> {
                                 );
                             }
 
-                            Ok(spans
-                                .send(Ok(Produced {
-                                    frames: waiting.frames,
-                                    samples,
-                                    payloads,
-                                    presentations,
-                                }))
-                                .is_ok())
+                            Ok(hand(Ok(Produced {
+                                frames: waiting.frames,
+                                samples,
+                                payloads,
+                                presentations,
+                            })))
                         };
 
                     loop {
                         let done = at >= limit || {
                             let frames = match source.read(&mut block) {
                                 Ok(frames) => frames,
-                                Err(why) => return fail(why),
+                                Err(why) => return fail(hand, why),
                             };
                             if frames == 0 {
                                 true
@@ -1098,10 +1116,10 @@ pub fn run(config: Config) -> Result<()> {
                                 } else {
                                     None
                                 };
-                                match give(Some(&ahead), ready.as_ref(), &mut since_payload) {
+                                match give(Some(&ahead), ready.as_ref(), &mut since_payload, hand) {
                                     Ok(true) => {}
                                     Ok(false) => return,
-                                    Err(why) => return fail(why),
+                                    Err(why) => return fail(hand, why),
                                 }
                                 match ready {
                                     Some(ready) => {
@@ -1125,85 +1143,130 @@ pub fn run(config: Config) -> Result<()> {
                             // The last spans have less after them to look at,
                             // and are placed for what there is.
                             while let Some(ready) = waiting.pop_front() {
-                                match give(None, Some(&ready), &mut since_payload) {
+                                match give(None, Some(&ready), &mut since_payload, hand) {
                                     Ok(true) => {}
                                     Ok(false) => return,
-                                    Err(why) => return fail(why),
+                                    Err(why) => return fail(hand, why),
                                 }
                             }
                             return;
                         }
                     }
-                });
-
-                let mut write = || -> Result<()> {
-                    'spans: while let Ok(produced) = from_fold.recv() {
-                        let produced = produced?;
-                        if let Some(presentations) = &produced.presentations {
-                            encoder.set_presentations(presentations);
-                            if let Some(loudness) = &mut loudness {
-                                loudness.fold(presentations);
-                            }
-                        }
-                        let mut due = produced.payloads.into_iter();
-                        let mut done = 0usize;
-                        while done < produced.frames {
-                            if at >= limit {
-                                break 'spans;
-                            }
-                            let unit_frames = frame.min(produced.frames - done);
-                            let tail = unit_frames < frame;
-                            unit.fill(0);
-                            unit[..unit_frames * elements].copy_from_slice(
-                                &produced.samples[done * elements..(done + unit_frames) * elements],
-                            );
-                            // Each unit takes its own, where it has one. A
-                            // fold puts one on the first unit of its block,
-                            // which is where the ramp it declares starts; an
-                            // overlay puts one wherever the master moved
-                            // something, which is the cadence a plain encode
-                            // writes at.
-                            if let Some(stated) = due.next().flatten() {
-                                encoder.set_evolution_at(
-                                    OAMD_PAYLOAD,
-                                    &stated.bytes,
-                                    stated.sample_offset,
-                                );
-                                payloads += 1;
-                            }
-                            if let Some(loudness) = &mut loudness {
-                                loudness.state(&mut encoder, &unit, elements, unit_frames);
-                            }
-                            emit(
-                                &mut encoder,
-                                &mut stream,
-                                &config.out,
-                                &unit,
-                                elements,
-                                unit_frames,
-                                tail,
-                            )?;
-                            done += unit_frames;
-                            at += unit_frames as u64;
-                            units += 1;
-                            if let Some(progress) = &mut progress {
-                                progress.at(at);
-                            }
-                            if tail {
-                                break 'spans;
-                            }
-                        }
-                        let _ = free.send(produced.samples);
-                    }
-                    Ok(())
                 };
-                let written = write();
+
+                // One span written, a unit at a time: whether the writer
+                // wants the next one.
+                let mut write = |produced: Result<Produced>| -> Result<bool> {
+                    let produced = produced?;
+                    if let Some(presentations) = &produced.presentations {
+                        encoder.set_presentations(presentations);
+                        if let Some(loudness) = &mut loudness {
+                            loudness.fold(presentations);
+                        }
+                    }
+                    let mut due = produced.payloads.into_iter();
+                    let mut done = 0usize;
+                    while done < produced.frames {
+                        if at >= limit {
+                            return Ok(false);
+                        }
+                        let unit_frames = frame.min(produced.frames - done);
+                        let tail = unit_frames < frame;
+                        unit.fill(0);
+                        unit[..unit_frames * elements].copy_from_slice(
+                            &produced.samples[done * elements..(done + unit_frames) * elements],
+                        );
+                        // Each unit takes its own, where it has one. A fold
+                        // puts one on the first unit of its block, which is
+                        // where the ramp it declares starts; an overlay puts
+                        // one wherever the master moved something, which is
+                        // the cadence a plain encode writes at.
+                        if let Some(stated) = due.next().flatten() {
+                            encoder.set_evolution_at(
+                                OAMD_PAYLOAD,
+                                &stated.bytes,
+                                stated.sample_offset,
+                            );
+                            payloads += 1;
+                        }
+                        if let Some(loudness) = &mut loudness {
+                            loudness.state(&mut encoder, &unit, elements, unit_frames);
+                        }
+                        emit(
+                            &mut encoder,
+                            &mut stream,
+                            &config.out,
+                            &unit,
+                            elements,
+                            unit_frames,
+                            tail,
+                        )?;
+                        done += unit_frames;
+                        at += unit_frames as u64;
+                        units += 1;
+                        if let Some(progress) = &mut progress {
+                            progress.at(at);
+                        }
+                        if tail {
+                            return Ok(false);
+                        }
+                    }
+                    let _ = free.send(produced.samples);
+                    Ok(true)
+                };
+                // What stopped the writer, if anything did: the spans come in
+                // the order they were folded, and the producer's own failure
+                // after the last of them.
+                let mut failed = None;
+                // The producer on a thread of its own, one span ahead; or
+                // still here, where none could be started.
+                let left = crate::lane::beside(scope, threads, produce, move |mut produce| {
+                    produce(&mut |produced: Result<Produced>| spans.send(produced).is_ok())
+                });
+                match left {
+                    None => {
+                        while let Ok(produced) = from_fold.recv() {
+                            match write(produced) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(why) => {
+                                    failed = Some(why);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // No thread: each span is written as soon as it is
+                    // folded. Where the writer is done the producer stops at
+                    // once; where it failed, after its next hand-over, if it
+                    // has one. On its thread the producer has a second buffer
+                    // whichever span the writer failed on — the one the span
+                    // before it was written from, or for the first the one
+                    // never taken out — and folds the span after the failed
+                    // one into it if there is one and the read its fold
+                    // waits for succeeds. What it hands then, that span or
+                    // what stopped its read or fold, is never read: the send
+                    // fails, or lands in the channel's empty slot and is
+                    // dropped with it. No buffer comes back for another.
+                    Some(mut produce) => produce(&mut |produced| {
+                        if failed.is_some() {
+                            return false;
+                        }
+                        match write(produced) {
+                            Ok(more) => more,
+                            Err(why) => {
+                                failed = Some(why);
+                                true
+                            }
+                        }
+                    }),
+                }
                 // Whichever end stopped first, the other is waiting on a
                 // channel: dropping both is what lets the producer finish
                 // rather than block on a buffer that will never come back.
                 drop(free);
                 drop(from_fold);
-                written
+                failed.map_or(Ok(()), Err)
             })?;
         }
 
@@ -1647,7 +1710,8 @@ fn sample_offset_of<'a>(
 
 /// One span of audio, mixed and ready, and what its block of metadata says.
 ///
-/// What crosses from the thread that folds to the thread that writes.
+/// What crosses from the thread that folds to the thread that writes — or,
+/// where there is only the one, from the fold to the writer.
 struct Produced {
     frames: usize,
     samples: Vec<i32>,
@@ -4547,6 +4611,318 @@ mod tests {
         let mut gains = vec![0.0; 8];
         fold.gains(placed[2].0, &mut gains);
         assert!(gains.iter().any(|gain| *gain > 0.1), "{gains:?}");
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A span is a block of access units, an access unit forty samples at
+    /// 48 kHz.
+    const SPAN: usize = BLOCK_UNITS * 40;
+
+    /// Twenty-six spans and a short one: enough for the fold's look-ahead
+    /// to fill and drain, for the last unit to be a tail — twenty-five
+    /// units and ten samples — and for a read that fails part way to leave
+    /// a stream: the encoder hands an interval of four spans back three
+    /// intervals after it is complete.
+    const SAMPLES: usize = 26 * SPAN + 1010;
+
+    /// The master's objects: with its 7.1 bed, thirteen with a position and
+    /// fourteen elements, more than any of the folds below keep.
+    const OBJECTS: usize = 6;
+
+    /// How a test encodes the master: `--cluster`, `--overlay`,
+    /// `--presentations`, `--frames`, and whether an overlay keeps the
+    /// guards it refuses a stream by.
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        cluster: Option<usize>,
+        overlay: Option<usize>,
+        presentations: bool,
+        frames: Option<u64>,
+        guarded: bool,
+    }
+
+    const PLAIN: Case = Case {
+        name: "plain",
+        cluster: None,
+        overlay: None,
+        presentations: false,
+        frames: None,
+        guarded: false,
+    };
+
+    /// A clustering, one with presentations, one stopped by `--frames` part
+    /// way through a span, and an overlay of the last two objects onto the
+    /// other twelve elements — which, with its guards, is refused once its
+    /// stream is written.
+    fn cases() -> [Case; 5] {
+        [
+            Case {
+                name: "cluster",
+                cluster: Some(9),
+                ..PLAIN
+            },
+            Case {
+                name: "cluster-presentations",
+                cluster: Some(12),
+                presentations: true,
+                ..PLAIN
+            },
+            Case {
+                name: "cluster-frames",
+                cluster: Some(9),
+                frames: Some(4 * SPAN as u64 + 700),
+                ..PLAIN
+            },
+            Case {
+                name: "overlay",
+                overlay: Some(2),
+                ..PLAIN
+            },
+            Case {
+                name: "overlay-refused",
+                overlay: Some(2),
+                guarded: true,
+                ..PLAIN
+            },
+        ]
+    }
+
+    fn config(input: &Path, out: &Path, case: &Case) -> Config {
+        let declined = overlay::Bounds {
+            drift: 0.0,
+            spread: 0.0,
+            wobble: 0.0,
+            level: 0.0,
+            cost: 0.0,
+            ..overlay::Bounds::default()
+        };
+        Config {
+            input: input.to_path_buf(),
+            out: out.to_path_buf(),
+            frames: case.frames,
+            mono_prefix: None,
+            fast: true,
+            cluster: case.cluster,
+            overlay: case.overlay,
+            overlaying: overlay::Options {
+                bounds: if case.guarded {
+                    overlay::Bounds::default()
+                } else {
+                    declined
+                },
+                ..overlay::Options::default()
+            },
+            drc: None,
+            beds: Beds::Auto,
+            mixing: Mixing::default(),
+            smooth_behind: SMOOTHING.behind,
+            fold_hold: hz_cluster::place::HOLDING,
+            presentations: case.presentations,
+            progress: false,
+            fold_search: hz_cluster::place::PASSES,
+            settings: hz_io::settings::Settings::default(),
+        }
+    }
+
+    /// What an encode left: how it ended, the stream, and an overlay's
+    /// report of every block it folded (empty without one).
+    type Left = (std::result::Result<(), String>, Vec<u8>, Vec<u8>);
+
+    /// `input` encoded as `case` says to `out`, its spans folded on a thread
+    /// of their own when `threads`, on the writer's otherwise, and an
+    /// overlay reporting each block it folds to a file in `dir`: what it
+    /// left, the stream read back from `out` when `read_out`.
+    fn encoded(
+        input: &Path,
+        dir: &Path,
+        out: &Path,
+        case: &Case,
+        threads: bool,
+        read_out: bool,
+    ) -> Left {
+        let report = dir.join(format!("{}.report", case.name));
+        let mut config = config(input, out, case);
+        if case.overlay.is_some() {
+            config.overlaying.report = Some(report.clone());
+        }
+        let ended = run_on(config, threads).map_err(|e| e.to_string());
+        let stream = if read_out {
+            std::fs::read(out).unwrap()
+        } else {
+            Vec::new()
+        };
+        (ended, stream, std::fs::read(&report).unwrap_or_default())
+    }
+
+    /// [`encoded`] into `dir`. On threads or not, to the same files, which
+    /// an error may name.
+    fn coded(input: &Path, dir: &Path, case: &Case, threads: bool) -> Left {
+        let out = dir.join(format!("{}.thd", case.name));
+        encoded(input, dir, &out, case, threads, true)
+    }
+
+    /// The audio of the master in `dir`, `samples` long, cut to end at
+    /// sample `at`: the header still says `samples`, so the read there fails.
+    fn cut(dir: &Path, samples: usize, at: usize) {
+        let audio = dir.join("m.atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        // Fourteen channels of 24 bits.
+        let missing = ((samples - at) * (8 + OBJECTS) * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+    }
+
+    /// The last block an overlay's report records, by its number. Only the
+    /// tests that write to a full device read it, and they run on Linux.
+    #[cfg(target_os = "linux")]
+    fn last_block(report: &[u8]) -> usize {
+        String::from_utf8_lossy(report)
+            .lines()
+            .filter_map(|line| line.strip_prefix("block "))
+            .next_back()
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .expect("a block reported")
+    }
+
+    /// A folding encode's spans folded on the writer's thread — which is
+    /// where they are folded when no thread can be started — code to what
+    /// they code folded on a thread of their own, a span ahead: the same
+    /// bytes, clustered, with presentations, stopped short and overlaid,
+    /// and the same blocks reported; and an overlay outside its bounds
+    /// refused the same way, once the same stream is written.
+    #[test]
+    fn a_fold_on_the_writers_thread_codes_what_its_own_thread_codes() {
+        let dir = crate::fixtures::scratch("encode", "fold");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        for case in cases() {
+            let name = case.name;
+            let [(inline, alone, told), (threaded, beside, retold)] =
+                [false, true].map(|threads| coded(&input, &dir, &case, threads));
+            if case.guarded {
+                let refused = inline.as_ref().expect_err("refused");
+                assert!(refused.contains("outside"), "{name}: {refused}");
+            } else {
+                assert_eq!(inline, Ok(()), "{name}");
+            }
+            assert_eq!(threaded, inline, "{name}: said the same way");
+            assert!(!alone.is_empty(), "{name}: a stream");
+            assert!(alone == beside, "{name}: the same stream on one thread");
+            assert_eq!(told.is_empty(), case.overlay.is_none(), "{name}: a report");
+            assert!(told == retold, "{name}: the same blocks folded");
+        }
+    }
+
+    /// Audio that ends before its header says, in the twenty-third span: the
+    /// encode stops there with the same error on one thread as with the fold
+    /// on its own, and leaves the same stream behind — what was folded
+    /// before the failed read written, and nothing after it — and the same
+    /// blocks reported. A fold ahead of the writer that left more or less
+    /// behind by how far it got is given a few runs to show it.
+    #[test]
+    fn a_read_that_fails_stops_a_fold_where_one_thread_stops() {
+        const CUT: usize = 22 * SPAN + 300;
+        let dir = crate::fixtures::scratch("encode", "cut");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        let whole: Vec<Vec<u8>> = cases()
+            .iter()
+            .map(|case| coded(&input, &dir, case, false).1)
+            .collect();
+        cut(&dir, SAMPLES, CUT);
+        // `--frames` stops that case before the cut.
+        for (case, whole) in cases()
+            .iter()
+            .zip(&whole)
+            .filter(|(case, _)| case.frames.is_none())
+        {
+            let name = case.name;
+            let (inline, alone, told) = coded(&input, &dir, case, false);
+            assert!(inline.is_err(), "{name}: the read fails");
+            assert!(
+                !alone.is_empty(),
+                "{name}: what was folded before it is written"
+            );
+            assert!(alone.len() < whole.len(), "{name}: and no more");
+            for run in 0..8 {
+                let (threaded, beside, retold) = coded(&input, &dir, case, true);
+                assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
+                assert!(alone == beside, "{name}, run {run}: the same stream left");
+                assert!(told == retold, "{name}, run {run}: the same blocks folded");
+            }
+        }
+    }
+
+    /// A stream that cannot be written stops the encode with the same error
+    /// whether the fold is on its own thread or the writer's, and with the
+    /// same blocks folded: an overlay's report the same to the byte. The
+    /// span after the one that failed is in it — the fold on its thread
+    /// folds it into its second buffer before it finds the writer gone, and
+    /// the fold on the writer's goes on to it for that — and nothing after
+    /// it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_that_fails_stops_a_fold_where_its_thread_stops() {
+        let dir = crate::fixtures::scratch("encode", "full");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        let full = Path::new("/dev/full");
+        for case in cases() {
+            let name = case.name;
+            let (inline, _, told) = encoded(&input, &dir, full, &case, false, false);
+            assert!(inline.is_err(), "{name}: the write fails");
+            assert_eq!(told.is_empty(), case.overlay.is_none(), "{name}: a report");
+            for run in 0..4 {
+                let (threaded, _, retold) = encoded(&input, &dir, full, &case, true, false);
+                assert_eq!(threaded, inline, "{name}, run {run}: said the same way");
+                assert!(told == retold, "{name}, run {run}: the same blocks folded");
+            }
+        }
+    }
+
+    /// The two ways the span after a failed write is not folded, by the
+    /// fold on its thread or on the writer's: the read its fold waits for
+    /// fails — an overlay folds a span once the next is read — or there is
+    /// no such span, the write failing on the master's last. Either way the
+    /// report ends at the span the write failed on, and the write's error is
+    /// the one said. Where the write fails is found from the whole master's
+    /// report, which ends one span after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fold_after_a_failed_write_needs_its_read_and_its_span() {
+        let overlay = cases()
+            .into_iter()
+            .find(|case| case.name == "overlay")
+            .unwrap();
+        let full = Path::new("/dev/full");
+        let dir = crate::fixtures::scratch("encode", "full-then");
+        let input = crate::fixtures::master_with(&dir, SAMPLES, OBJECTS);
+        let (whole, _, told) = encoded(&input, &dir, full, &overlay, false, false);
+        let after = last_block(&told);
+        let failed = after - 1;
+        let write = whole.expect_err("the write fails");
+
+        // The audio cut in the span read before the one after is folded.
+        cut(&dir, SAMPLES, (after + 1) * SPAN + 300);
+        // And a master that ends with the span the write fails on.
+        let short = crate::fixtures::scratch("encode", "full-at-end");
+        let ends = crate::fixtures::master_with(&short, after * SPAN, OBJECTS);
+        for (name, input, dir) in [("cut", &input, &dir), ("ends", &ends, &short)] {
+            let [(inline, _, told), (threaded, _, retold)] =
+                [false, true].map(|threads| encoded(input, dir, full, &overlay, threads, false));
+            assert_eq!(inline.as_ref(), Err(&write), "{name}: the write's error");
+            assert_eq!(threaded, inline, "{name}: said the same way");
+            assert_eq!(last_block(&told), failed, "{name}: nothing after it folded");
+            assert!(told == retold, "{name}: the same blocks folded");
+        }
     }
 }
 
