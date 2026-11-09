@@ -2359,3 +2359,120 @@ thread is building the presentations, 1.2 s, and writing the units, 1.7 s,
 the latter for the reason the section before gave. So about 1050 % on this
 material is where it stops short of changing what is written; more channels
 would take more of the machine, and a stereo programme takes two threads of it.
+
+## The front of the pipeline, and a pool woken for nothing
+
+With the folds off, what sets an encode's pace is the preparing: of the four
+intervals the encoder works on at once — one's folds worked out, the one
+before it prepared, the one before that decided block by block, the one before
+that written — the preparing and its second-filter trials were the longest
+every interval, and `HZ_TIME` said they were the wall clock. On a thirty-second
+master, eleven objects and an LFE in twelve elements, the preparing was 0.38 s
+and the trials 0.39 s of a 0.84 s encode.
+
+Most of the preparing was not work. Its first pass over the units took 0.13 s
+across the pool and 0.04 s on one thread: 128 tasks of a few microseconds
+each, the first thing asked of a pool of thirty-two that had gone to sleep
+while the interval was read, and every thread woken for it. Threads spinning
+idle, looking for work, were 13 % of the encode's cycles. Five steps, each
+byte-identical, measured one after another in the same sitting, median of
+five:
+
+| | wall | `--fast` | CPU |
+|---|---|---|---|
+| before | 0.84 s | 0.61 s | 14.3 s |
+| the first pass made where the folds are worked out, the domain asked where the matrices are applied | 0.81 s | 0.59 s | 13.8 s |
+| a destination's matrices judged as soon as they are suggested | 0.78 s | 0.58 s | 13.5 s |
+| every channel's trials in one list, longest first | 0.77 s | 0.57 s | 13.1 s |
+| the second pass on one thread, the matrices in eight runs | 0.71 s | 0.54 s | 12.1 s |
+| two threads a channel, and a thread a channel for the blocks | **0.69 s** | **0.49 s** | **11.6 s** |
+
+**The first pass** — de-interleaving through the permutation, certifying,
+measuring the dead bits — reads nothing but the interval's own samples and
+what its plan decided, so it is made on the thread that works the plan out,
+beside the preparing of the interval before, which leaves that thread idle
+without folds. With folds to build it is not: building them is as long as the
+preparing, and the pass stays with the preparing there.
+
+**The matrices** were two passes across the pool, the candidates suggested
+and then judged, and the slowest destination of the first waited for the
+slowest of the second. A destination's judgement reads its own candidates and
+nothing another destination's suggesting writes, so each thread judges its
+destination as soon as its candidates exist. Whether a channel is past the
+codec's domain once they are applied is asked by the thread that applied
+them, of a unit still in its cache, rather than in a pass of its own.
+
+**The trials** were five a channel, the channels split across the pool and
+each channel's five across what was left. In one list, the four designs of
+every channel before the mode with none, which takes two thirds as long, a
+free thread takes the longest trial left. Each trial's cost depends on its
+channel and its mode and nothing else, and they are reduced a channel at a
+time in the designs' order with the same strict `<`, so the choice is the
+one the trials make one after another.
+
+**The second pass** — the dead bits off, the cascade off — is a few
+operations a sample and was the pass that woke the pool once the first had
+gone; on the preparing thread, unit after unit, it is cheaper than the waking,
+and each unit is copied out for the matrices to be suggested on while it is
+still in the cache. The matrices then wake the pool with work worth waking
+for. Applying them a unit a task woke every thread for each unit; in eight
+runs, 0.75 s became 0.74, and four or sixteen runs measured the same.
+
+**The pools.** The encoder's was sized to the machine, thirty-two threads
+for twelve channels; two a channel is as fast — 0.69 s against 0.68 at
+twenty-four — and carrying folds faster, 1.04 s against 0.98, where the
+building of the folds shares the pool and the threads spinning in it shared
+the cores. The channel search had two threads for every three
+channels, since its blocks took threads the preparing was waiting for; with
+the preparing lighter, a thread a channel takes the leftover channels' second
+round away: 0.54 s to 0.49 at `--fast`, where the blocks are the longer half,
+and a 5.1 fixture from 0.87 s to 0.61.
+
+| | before | after |
+|---|---|---|
+| thirty seconds, twelve elements | 0.87 s | **0.70 s** |
+| the same, `--fast` | 0.64 s | **0.49 s** |
+| the same, carrying folds | 1.00 s | **0.96 s** |
+| the same, `--cluster 12` | 1.01 s | **0.84 s** |
+| sixty seconds, twelve elements | 1.40 s | **1.13 s** |
+| ninety seconds, fourteen elements | 2.46 s | **1.99 s** |
+| the same, `--fast` | 1.67 s | **1.37 s** |
+| forty objects into twelve, four seconds | 0.19 s | **0.17 s** |
+
+Release, Ryzen 9 9950X shared with other work, median of five to seven taken
+in turn. The idle spinning is down from 13 % of the cycles to 4 % and the
+cycles from 64.5 G to 54.0 G; the search's own cycles did not move.
+
+The encoder alone, through `xtask mlp --no-verify`, on the film fixtures:
+
+| | before | after | CPU before | after |
+|---|---|---|---|---|
+| mono | 0.50 s | 0.48 s | 1.2 s | 1.0 s |
+| stereo | 0.59 s | 0.55 s | 4.6 s | 2.1 s |
+| 5.1 | 1.04 s | 0.82 s | 9.9 s | 6.3 s |
+| 7.1 | 1.17 s | 0.88 s | 13.4 s | 9.5 s |
+| sixteen channels, `busy16` | 0.18 s | 0.17 s | 2.4 s | 2.2 s |
+
+Mono had no pool of its own, since one channel had nothing to spread, and its
+five trials went to the global pool; it has one now, five threads wide.
+
+### What did not pay
+
+**The trials moved to the channel search**, each channel deciding its second
+filter and then walking its blocks on the same thread, so the trials would
+overlap the next interval's preparing: the channel search went from 0.58 s
+to between 1.0 and 1.6 s. A channel's walk cannot start until its trials are
+done, and a thread waiting on trials stolen by another thread waits for
+whatever that thread took next.
+
+**A pool of sixteen** — the machine's cores rather than its threads — took
+14 % off the CPU and nothing off the wall clock: the trials ran slower, 0.37 s
+to 0.46, and everything else faster by as much.
+
+### What is left
+
+Of 0.70 s, the preparing is now 0.20 s, most of it suggesting and judging the
+matrices, and the trials 0.40 s — which is the search itself, 44 blocks a
+channel in five modes, and as fast as the machine runs it. Carrying folds,
+building them — 0.68 s on the thread that works the plan out — is now as long
+as the preparing and the trials beside it, and is what to look at next there.
