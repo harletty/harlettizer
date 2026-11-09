@@ -2516,7 +2516,7 @@ mod tests {
                     .any(|gains| gains.iter().flatten().any(|g| g.abs() >= bound)),
                 "no gain held at a bound"
             );
-            for threads in [2, 3, 8] {
+            for threads in [2, 3, 6, 8] {
                 assert!(
                     fit(threads, budget) == one,
                     "{threads} threads, a budget of {budget}"
