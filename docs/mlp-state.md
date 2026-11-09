@@ -174,9 +174,13 @@ Encoder alone, release, best of three, on a Ryzen 9 9950X: **about 3 ms per
 channel-second** at full effort. `hz-cli` and `xtask` build `hz-mlp` with its
 `parallel` feature. The encoder has a pool of its own, two threads a channel,
 never fewer than a channel's five second-filter trials and never more than the
-machine has, and the channel search another, a thread a channel. `HZ_TIME=1` in the environment makes the encoder time its phases
-and print them when the stream is finished; `suggest` there includes judging
-the matrices, and `build` the first pass over the units when it is made there.
+machine has, and the channel search another, a thread a channel.
+
+`HZ_TIME=1` in the environment makes the encoder time its phases and print
+them when the stream is finished. `suggest` includes judging the matrices, and
+`matrices` is only admitting them. The first pass over the units is counted
+where it is made: in `build` when there are no folds to build, since the
+planning thread makes it then, and in `prepare` when there are.
 
 **The fork is once an interval, never once an access unit.** Four things run
 across a pool — the second-filter trials, every channel's in one list handed

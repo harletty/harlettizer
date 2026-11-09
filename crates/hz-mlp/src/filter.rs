@@ -235,7 +235,8 @@ pub struct Coding {
 const SECOND_FILTERS: [&[f64]; 4] = [&[0.83], &[1.5, 0.6], &[1.8, 0.85], &[1.72, 0.77]];
 
 /// The most trials [`pick_second`] runs for one channel: the mode with no
-/// second filter, and every design.
+/// second filter, and every design. What the narrowest pool is sized to.
+#[cfg(feature = "parallel")]
 pub(crate) const MOST_TRIALS: usize = 1 + SECOND_FILTERS.len();
 
 /// How much of a channel's coded past each [`crate::encoder`] history keeps:

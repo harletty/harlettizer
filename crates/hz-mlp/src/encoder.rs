@@ -245,11 +245,12 @@ impl Default for Decided {
 /// Two threads a channel, never fewer than one channel's trials and never
 /// more than the machine has: the widest thing it runs is the second-filter
 /// trials, five a channel and four of them long, and every thread past what
-/// they fill is one more to wake at each pass and to spin when it ends. Measured against thirty-two threads,
-/// on a thirty-second programme at twelve elements: 0.69 s against 0.68 at
-/// twenty-four, and 1.04 s against 0.98 carrying folds, for 4 % and 13 % less
-/// CPU; a stereo and a 5.1 fixture are as fast or faster at four and twelve
-/// threads, for a fifth less.
+/// they fill is one more to wake at each pass and to spin when it ends.
+/// Measured against thirty-two threads, on a thirty-second programme at
+/// twelve elements: 0.69 s against 0.68 at twenty-four, and 1.04 s against
+/// 0.98 carrying folds, for 4 % and 13 % less CPU; a stereo and a 5.1
+/// fixture are as fast or faster at four and twelve threads, for a fifth
+/// less.
 ///
 /// Without the feature it is a unit, and every `install` below is the closure
 /// called where it stands.
@@ -1515,10 +1516,15 @@ impl Encoder {
             buffers.ready = false;
             buffers
         };
-        if !taken_in.ready {
-            self.intake().take_in(&held, &mut taken_in);
-        }
-        self.timed_phase(3, |encoder| encoder.prepare(&held, taken_in));
+        // Taken in here where the plan did not, unit after unit on this
+        // thread, and timed as preparing: `HZ_TIME`'s `build` counts the
+        // pass when the plan makes it and `prepare` when this does.
+        self.timed_phase(3, |encoder| {
+            if !taken_in.ready {
+                encoder.intake().take_in(&held, &mut taken_in);
+            }
+            encoder.prepare(&held, taken_in)
+        });
         self.timed_phase(5, |encoder| encoder.decide_second_filters(held.len()));
         self.intervals_decided += 1;
         let channels = self.channels;
@@ -1770,17 +1776,15 @@ impl Encoder {
     /// certify what each early substream puts out, decide the matrices on the
     /// whole of it, and apply them.
     ///
-    /// The units are independent of one another once each channel's dead-bit
-    /// shift is known, so they go across the pool in two passes, one before
-    /// the matrices are decided and one after; `prepared` holds the channels
-    /// as they stand before the matrices between the two, which is what the
-    /// matrices are suggested and judged on. What is not independent is the
-    /// shift a silent unit inherits from the unit before it, and that is a
-    /// pass of its own between them which takes no time at all. This used to
-    /// walk the units one after another on one thread — two and a half
-    /// seconds of twenty-five on four minutes of a programme — and gather the
-    /// interval for the matrices a second time, with the cascade taken off
-    /// twice.
+    /// The units are independent of one another but for one thing, the shift
+    /// a silent unit inherits from the unit before it, which is a pass of its
+    /// own and takes no time at all. Then the second pass takes the dead bits and the cascade off, unit
+    /// after unit on this thread, copying each into `prepared` — which holds
+    /// the channels as they stand before the matrices, and is what the
+    /// matrices are suggested and judged on, a destination a thread. Only
+    /// applying the decided matrices goes across the pool by units, in runs.
+    /// All of it once: this used to gather the interval for the matrices a
+    /// second time, with the cascade taken off twice.
     fn prepare(&mut self, held: &[Held], taken_in: TakenIn) {
         let width = self.coded.frame_size;
         let channels = self.channels;
@@ -2824,12 +2828,13 @@ impl Planning {
         let start = std::time::Instant::now();
         self.settle_the_shifts(held);
         self.build_the_presentations(held);
-        // Only where there are no folds to build: building them is as long
-        // as the preparing beside it, and taking the interval in here then
-        // makes this the longer of the two. Measured on thirty seconds at
-        // twelve elements carrying folds: the building 0.64 s alone and 0.73
-        // with it, the preparing 0.71 s without it — so there it stays with
-        // the preparing, which takes it in as it always did.
+        // Only where there are no folds to build. Building them is about as
+        // long as the preparing and the trials beside it — on thirty seconds
+        // at twelve elements carrying folds, the building 0.64 s alone and
+        // 0.73 with this pass, against 0.71 — and the encode measured the
+        // same with the pass on either thread. So with folds it is made by
+        // the preparing thread, on that thread alone, as the first thing it
+        // does with the interval: see [`Encoder::decide`].
         if self.wants.is_empty() {
             self.take_in(held);
             self.taken_in.ready = true;
@@ -4702,6 +4707,75 @@ mod front_tests {
         assert_eq!(reused.widest, fresh.widest);
     }
 
+    /// Taken in by its plan or by the preparing, an interval is prepared the
+    /// same: the permutation and the shifts the plan takes it in under are
+    /// the ones the encoder installs from the plan before it prepares. And a
+    /// plan with folds to build leaves taking it in to the preparing.
+    #[test]
+    fn an_interval_taken_in_by_its_plan_is_prepared_as_one_taken_in_after() {
+        let channels = 12;
+        let prepared = |permuted: bool, by_the_plan: bool| {
+            let mut noise = Noise(0x0f0f_1234_5678_9abc);
+            let mut encoder = encoder(channels, SampleBits::TwentyFour);
+            let frame = encoder.coded.frame_size;
+            let held = units(&mut noise, channels, frame, 24);
+            let mut planning = encoder.planning().plan(&held);
+            assert!(planning.taken_in.ready, "no folds: the plan takes it in");
+            if permuted {
+                // What a built fold leaves: a permutation and held shifts of
+                // its own, and the interval taken in under them.
+                planning.permutation = (0..channels).map(|c| (c * 5) % channels).collect();
+                planning.interval_shift = Some((0..channels).map(|c| (c % 4) as u8).collect());
+                planning.take_in(&held);
+                planning.taken_in.ready = true;
+            }
+            if !by_the_plan {
+                planning.taken_in.ready = false;
+            }
+            let front = encoder.decide(Deferred {
+                held,
+                planning,
+                dynamic_range: [None; MAX_SUBSTREAMS],
+            });
+            let record = front.record;
+            (
+                record.prepared,
+                record.prepared_shifts,
+                record.prepared_checks,
+                record.max_shift,
+                record.max_output_bits,
+                encoder.permutation.clone(),
+            )
+        };
+        for permuted in [false, true] {
+            let by_the_plan = prepared(permuted, true);
+            assert_eq!(
+                by_the_plan,
+                prepared(permuted, false),
+                "permuted: {permuted}"
+            );
+            assert!(
+                by_the_plan
+                    .0
+                    .iter()
+                    .any(|plane| plane.iter().any(|s| *s != 0))
+            );
+        }
+
+        let mut noise = Noise(0x0f0f_1234_5678_9abc);
+        let mut encoder = encoder(channels, SampleBits::TwentyFour);
+        let held = units(&mut noise, channels, encoder.coded.frame_size, 24);
+        encoder.wants = vec![crate::hierarchy::Presentation {
+            channels: 2,
+            rows: vec![vec![0.25; channels]; 2],
+        }];
+        let planning = encoder.planning().plan(&held);
+        assert!(
+            !planning.taken_in.ready,
+            "folds wanted: the preparing takes it in"
+        );
+    }
+
     #[test]
     fn the_domain_is_checked_where_the_matrices_are_applied_and_says_the_same() {
         let mut noise = Noise(0xdead_beef_cafe_f00d);
@@ -4845,6 +4919,116 @@ mod front_tests {
         );
     }
 
+    /// `Encoder::judge_matrix` as it was, reading a destination's candidates
+    /// from the encoder once every destination's had been suggested: its code
+    /// verbatim, its comments left out.
+    fn judge_matrix_as_it_was(this: &Encoder, dest: usize, scratch: &mut [i32]) -> Judged {
+        let frames = this.coded.frame_size;
+        let copies = this.coded.ranges[..this.coded.substreams]
+            .iter()
+            .filter(|range| range.last >= dest)
+            .count();
+        let last = this.coded.ranges[this.coded.substreams - 1];
+
+        let units = (this.prepared[dest].len() / frames).max(1);
+        let trials: Vec<usize> = (0..TRIAL_UNITS.min(units))
+            .map(|which| which * units / TRIAL_UNITS.min(units))
+            .collect();
+
+        let mut plain = 0usize;
+        for unit in &trials {
+            let at = unit * frames;
+            let (context, samples) = if *unit == 0 {
+                (this.past[dest].window(), &this.prepared[dest][..frames])
+            } else {
+                (
+                    &this.prepared[dest][..at],
+                    &this.prepared[dest][at..at + frames],
+                )
+            };
+            plain = plain.saturating_add(restart_cost(context, samples, scratch));
+        }
+
+        let mut best: Option<(Primitive, usize)> = None;
+        let mut refused = 0u64;
+        let domain = this.domain_of(dest);
+        let mut matrixed: Vec<i32> = Vec::with_capacity(this.prepared[dest].len());
+        for index in 0..this.candidates[dest].len() {
+            let Some(candidate) = Primitive::fit(
+                dest,
+                &this.candidates[dest][index].sources,
+                &this.candidates[dest][index].weights,
+                matrix::FRACTION,
+            ) else {
+                continue;
+            };
+
+            matrixed.clear();
+            for frame in 0..this.prepared[dest].len() {
+                let mut sum = 0i64;
+                for (source, weight) in this.candidates[dest][index]
+                    .sources
+                    .iter()
+                    .zip(&this.candidates[dest][index].weights)
+                {
+                    sum += i64::from(*weight) * i64::from(this.prepared[*source][frame]);
+                }
+                matrixed.push(this.prepared[dest][frame] - (sum >> matrix::FRACTION) as i32);
+            }
+
+            if matrixed
+                .iter()
+                .any(|sample| !(-domain..domain).contains(sample))
+            {
+                if std::env::var_os("HZ_DOMAIN").is_some() {
+                    let worst = matrixed.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                    let count = matrixed
+                        .iter()
+                        .filter(|s| !(-domain..domain).contains(s))
+                        .count();
+                    let peak = this.prepared[dest]
+                        .iter()
+                        .map(|s| s.unsigned_abs())
+                        .max()
+                        .unwrap_or(0);
+                    eprintln!(
+                        "domain: dest {dest} sources {:?} weights {:?} worst {worst} over {count} of {} (dest peak {peak})",
+                        this.candidates[dest][index].sources,
+                        this.candidates[dest][index].weights,
+                        matrixed.len()
+                    );
+                }
+                refused += 1;
+                continue;
+            }
+
+            let description = crate::rate::matrix(candidate.cost_bits(&last), copies);
+            let mut cost =
+                (description * trials.len()).div_ceil(units) + MATRIX_MARGIN * trials.len();
+            for unit in &trials {
+                let at = unit * frames;
+                let context = if *unit == 0 {
+                    this.past[dest].window()
+                } else {
+                    &matrixed[..at]
+                };
+                cost =
+                    cost.saturating_add(restart_cost(context, &matrixed[at..at + frames], scratch));
+                if cost >= plain {
+                    break;
+                }
+            }
+            if cost < plain && best.as_ref().is_none_or(|(_, before)| cost < *before) {
+                best = Some((candidate, cost));
+            }
+        }
+
+        Judged {
+            best: best.map(|(candidate, _)| candidate),
+            refused,
+        }
+    }
+
     #[test]
     fn the_matrices_judged_as_they_are_suggested_are_the_ones_judged_after() {
         let mut noise = Noise(0x5555_aaaa_3333_cccc);
@@ -4880,10 +5064,12 @@ mod front_tests {
             let candidates = encoder.candidates.clone();
             let mut scratch = vec![0i32; frame];
             for (dest, judged) in fused.iter().enumerate() {
+                // Judged after every destination's candidates exist, the way
+                // `Encoder::judge_matrices` did, by the judge as it was.
                 let alone = if candidates[dest].is_empty() {
                     Judged::default()
                 } else {
-                    encoder.judge_matrix(dest, &candidates[dest], &mut scratch)
+                    judge_matrix_as_it_was(&encoder, dest, &mut scratch)
                 };
                 assert_eq!(judged.best, alone.best, "{channels} channels, dest {dest}");
                 assert_eq!(
