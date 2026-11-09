@@ -470,10 +470,10 @@ feature these pieces run at once on rayon's threads. Each still takes its
 sums in the order one thread takes them, and the payloads are the same to
 the byte.
 
-`harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most eight
-threads. Past eight, a frame's pieces are too few to share out, and the
-encoder's own steps between them are one thread's: more threads wait more
-than they work.
+`harlettizer ac3 --eac3 --joc` runs the encode on a pool of at most six
+threads (eight until the banks were made quicker, below). Past six, a
+frame's pieces are too few to share out, and the encoder's own steps between
+them are one thread's: more threads wait more than they work.
 
 The E-AC-3 core, coded twice a frame, runs beside the estimator. The probe
 codes a frame's core on a thread of its own while the gains of the frame
@@ -601,6 +601,83 @@ sixteen cores:
 | 60 s at 640 kb/s | 11 | 2.34 s | 2.10 s | −1 % |
 | 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 0.45 s | 0.41 s | +5 % |
 | 40 objects, 4 s | 40 → 15 | 0.23 s | 0.20 s | +4 % |
+
+A release build runs on any x86-64 CPU, so its vectors hold two `f64`.
+Where the CPU has AVX2, the normal equations' sums and the trade's search
+run a second build of the same code, made for AVX2, whose vectors hold
+four: the system four rows at a time where the first build takes two, so
+that as many vectors of sums are under way at once (`upper`); its
+right-hand side two runs at a time (`against`); the trade's eight
+candidates in two vectors where they were four (`Trellis::trade_plain`).
+Each sum is still its own, its products taken and added in the same order,
+and nothing fuses a product into a sum (the build is for AVX2, not FMA,
+and Rust fuses none by itself), so every entry and gain that is a number
+is the same to the bit, and every code the same. A NaN is a NaN in both
+builds, but where two meet in a sum, which one the sum keeps is the
+build's to choose. Only a target can bring one, from a master's gain that
+is NaN, infinite or loud enough to overflow, and no code depends on its
+bits: a NaN gain quantises to the level nought, and in the trade every
+candidate of its band has the same NaN for an error. The standard library
+asks the CPU once which build to run; every other CPU and architecture
+runs the first. The steep decision's solves were no faster built for AVX2
+— a system's steps come one after another, not in lanes — and are left as
+they were. On sixteen cores, with AVX2:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.49 s | 0.46 s | −6 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.84 s | 0.76 s | −9 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.52 s | 1.44 s | −7 % |
+
+Each slot through each bank is a 64-point DFT between two rotations, taken
+the radix-2 way: the input put in bit-reversed order, then six stages of 32
+butterflies, each pairing two places by a twiddle. Taken one at a time, each
+butterfly waited on its loads and their bounds checks, and the banks' DFTs
+were the largest single item of a frame's work. Read as sixteen rows of
+four, an input's lane in its row holds the top two bits of its bit-reversed
+place, reversed: a place with bits b0 to b5 is in row 8·b0 + 4·b1 + 2·b2 + b3
+and lane 2·b4 + b5. The first four stages pair places that differ in one of
+bits nought to three, so each of their butterflies pairs two rows, four
+places at once by one twiddle. Then four rows at a time are turned, so that
+each butterfly of the last two stages pairs two of them by four consecutive
+twiddles, and the output comes out in order (`qmf::dft`). Every butterfly is
+still the plain DFT's, its products, sums and twiddle the same, and every
+place goes through its stages in the same order, so every band is the same
+to the bit. The tests keep the plain DFT and both banks as they were, and
+hold these to them on signed zeros, infinities and NaN too. The banks hand
+the DFT their input in order, rather than scattered into bit-reversed
+places, and write their histories through slices checked once. On sixteen
+cores:
+
+| programme | elements | payloads quantised coarser | before | after | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.43 s | 0.40 s | −8 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.77 s | 0.73 s | −4 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.33 s | 1.26 s | −5 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.26 s | 0.24 s | −4 % |
+
+With the banks that much quicker, eight threads were more than a frame's
+pieces keep busy. Eleven objects, or twelve, are fitted in six runs of two
+on eight threads as on six. Thirteen to fifteen are fitted in runs of three
+on six where eight took runs of two, and the 39 → 15 row shows that this
+costs nothing there. A thread with nothing to do looks for work again and
+again before it sleeps: on eight threads, that looking was a fifth of the
+processor's time at 384 kb/s and on the 60 s master. On six, the encode is
+as soon or sooner, and the processor a fifth to a quarter less busy. The
+stream is the same on one thread as on sixteen. Measured on one machine
+only, of sixteen cores and 32 threads, with programmes of eleven and fifteen
+elements:
+
+| programme | elements | payloads quantised coarser | eight threads | six | CPU time |
+|---|---|---|---|---|---|
+| twelve waveforms, 30 s at 768 kb/s | 11 | 9 of 941 | 0.40 s | 0.38 s | −17 % |
+| twelve waveforms, 30 s at 384 kb/s | 11 | 719 of 941 | 0.73 s | 0.69 s | −22 % |
+| 60 s at 640 kb/s | 11 | 1124 of 1876 | 1.26 s | 1.14 s | −26 % |
+| 30 broadband objects and a 7.1.2 bed, 8 s | 39 → 15 | 250 of 251 | 0.24 s | 0.24 s | −20 % |
+
+On the same machine, five threads were no sooner than six, and four
+slower; seven, twelve and sixteen slower than six too, sixteen by a fifth to
+a third. A machine of other cores may well want another number.
 
 What is left on the encode's own thread is the budget's search for λ, a
 step at a time, and, where there is no fold, each element's samples read

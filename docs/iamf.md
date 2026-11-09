@@ -641,10 +641,30 @@ about half the time it did:
 | fourteen waveforms, 90 s, rendered to the bed, FLAC | 0.68 s | 0.55 s | −12 % |
 | the same as 13 objects and an LFE, Opus | 0.71 s | 0.51 s | −7 % |
 
+A release build runs on any x86-64 CPU, so its vectors hold two `f64`.
+Where the CPU has AVX2, the reconstruction runs a second build of the same
+code, made for AVX2, whose vectors hold four; the standard library asks the
+CPU once which to run, and every other CPU and architecture runs the
+first. Each lane is still the same products added in the same order, and
+nothing fuses a product into a sum (the build is for AVX2, not FMA, and
+Rust fuses none by itself), so every point that is a number is the same to
+the bit, and so is the loudest, which a NaN never is. A set of lanes now
+reads its samples as one window, which spares the wider build a bounds
+check for every tap. The reconstruction takes under half the cycles it
+did, and the meter's thread is no longer a bed's longest: the encode's
+own, reading and rendering the programme, now is. So a bed's wall time
+holds and only its CPU time falls. On sixteen cores, with AVX2:
+
+| programme | before | after | CPU time |
+|---|---|---|---|
+| twelve waveforms, 30 s, rendered to the bed, FLAC | 0.19 s | 0.19 s | −8 % |
+| the same, LPCM | 0.16 s | 0.16 s | −16 % |
+| the same as 11 objects and an LFE, FLAC | 0.15 s | 0.13 s | −11 % |
+
 What is left bounds each programme differently. A bed in FLAC still waits
-on the measurement; a bed in Opus as much on the threads coding its coupled
-pairs. Past 27 objects, the fold runs on the encode's own thread, and it is
-most of that thread's work.
+on the measurement where the CPU has no AVX2; a bed in Opus as much on the
+threads coding its coupled pairs. Past 27 objects, the fold runs on the
+encode's own thread, and it is most of that thread's work.
 
 ## Options
 
