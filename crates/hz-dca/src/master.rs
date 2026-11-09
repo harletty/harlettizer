@@ -57,6 +57,7 @@ use crate::lossless::{self, Layout};
 use crate::navigation::Navigation;
 use crate::peak::{self, Smoother};
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, mpsc};
 
 pub use crate::encoder::Unsupported;
@@ -169,6 +170,10 @@ struct Job {
     core_frame: Vec<u8>,
     coded: lossless::Coded,
 }
+
+/// A frame back from the threads that code the lossless frames, or the
+/// panic one of them ended on.
+type Back = std::thread::Result<Box<Job>>;
 
 /// What the core's thread is handed.
 enum Ahead {
@@ -316,7 +321,8 @@ struct Pool {
     analysing: bool,
     analyser: Option<std::thread::JoinHandle<()>>,
     front: Option<std::thread::JoinHandle<()>>,
-    done: mpsc::Receiver<Box<Job>>,
+    /// Frames coded, or what a thread that panicked panicked with.
+    done: mpsc::Receiver<Back>,
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Frames handed to the pool so far: the index of the next.
     queued: u64,
@@ -349,7 +355,7 @@ impl Pool {
             layout: config.layout,
         };
         let (jobs, inbox) = mpsc::channel::<Box<Job>>();
-        let (outbox, done) = mpsc::channel::<Box<Job>>();
+        let (outbox, done) = mpsc::channel::<Back>();
         let inbox = Arc::new(Mutex::new(inbox));
         let mut workers = Vec::with_capacity(threads);
         for n in 0..threads {
@@ -368,9 +374,15 @@ impl Pool {
                         let Ok(Ok(mut job)) = next else {
                             return;
                         };
-                        let core = job.against.then_some(&*job.core);
-                        encoder.code_apart(&job.pcm, core, &mut job.coded);
-                        if outbox.send(job).is_err() {
+                        // A panic goes back in the frame's place, for the
+                        // caller to panic with: the others keep the way back
+                        // open, so the frame it waits for would never come.
+                        let coded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let core = job.against.then_some(&*job.core);
+                            encoder.code_apart(&job.pcm, core, &mut job.coded);
+                        }));
+                        let panicked = coded.is_err();
+                        if outbox.send(coded.map(|()| job)).is_err() || panicked {
                             return;
                         }
                     }
@@ -431,8 +443,10 @@ impl Pool {
         })
     }
 
-    /// Put a frame back from the pool in its place.
-    fn place(&mut self, job: Box<Job>, settled: u64) {
+    /// Put a frame back from the pool in its place — or, from a thread
+    /// that panicked coding it, panic with it.
+    fn place(&mut self, back: Back, settled: u64) {
+        let job = back.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         let at = (job.index - settled) as usize;
         if self.back.len() <= at {
             self.back.resize_with(at + 1, || None);
@@ -686,10 +700,12 @@ impl Encoder {
     /// alone, on one thread ahead of the rest of it, and with ADPCM its
     /// predictor search spread over up to fifteen threads more, or `threads`
     /// where that is fewer ([`encoder::Encoder::with_search_threads`]). The
-    /// stream is the same to the byte; a frame comes out of
-    /// [`Encoder::encode`] up to 2 · `threads` + 2 calls after the one that
-    /// took it — as many as are out to the threads at once, which the
-    /// threads that start set — and [`Encoder::stop`] sends, where the
+    /// stream is the same to the byte; the frame call *f* of
+    /// [`Encoder::encode`] takes is settled once the threads have coded it,
+    /// by call *f* + 2 · `threads` + 3 at the latest — the threads take
+    /// 2 · `threads` + 2 frames at once, `threads` counting those that start
+    /// — and sent then, or once the encoder has looked far enough past it
+    /// where the stream may smooth; [`Encoder::stop`] sends, where the
     /// input stops short, what one thread would have sent. Nought, the
     /// default, codes everything on the caller's thread; threads that cannot
     /// be started do too, and so does an encoder that has had a frame
@@ -1489,6 +1505,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A thread coding lossless frames that panics makes the encoder panic
+    /// too, rather than leave it waiting — in `encode` or in `stop` — for
+    /// the frame the panic took while the other threads keep the way back
+    /// open.
+    #[test]
+    fn a_lossless_thread_that_panics_makes_the_encoder_panic() {
+        let config = Config::reference(Layout::SevenPointOneFour, 24);
+        let mut encoder = Encoder::new(config).unwrap().with_threads(3);
+        let Some(pool) = encoder.pool.as_mut() else {
+            // No thread could be started: nothing to panic.
+            return;
+        };
+        // The first frame to code into buffers a 5.1's encoder made, which a
+        // 7.1.4's refuses with a panic (`lossless::Encoder::code_apart`):
+        // one thread panics, the others go on.
+        let five_one =
+            lossless::Encoder::new(Config::reference(Layout::FivePointOne, 24).lossless).unwrap();
+        pool.spare.push(Box::new(Job {
+            index: 0,
+            pcm: Vec::new(),
+            core_input: Vec::new(),
+            analysis: Box::default(),
+            core: Box::new(CoreDecoder::new()),
+            against: false,
+            core_frame: Vec::new(),
+            coded: five_one.coded(),
+        }));
+        let pcm = tones(12, 4);
+        let (ended, end) = mpsc::channel();
+        std::thread::spawn(move || {
+            let stopped = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut stream = Vec::new();
+                for frame in pcm.chunks(FRAME_SAMPLES * 12) {
+                    let _ = encoder.encode(frame, &mut stream);
+                }
+                let _ = encoder.stop(&mut stream);
+            }));
+            let _ = ended.send(stopped.is_err());
+        });
+        let panicked = end
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the encoder ends");
+        assert!(panicked, "the encoder panics");
     }
 
     /// Threads asked for once the stream has started change nothing: the

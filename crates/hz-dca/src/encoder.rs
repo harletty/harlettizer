@@ -2420,8 +2420,11 @@ pub(crate) mod tests {
             }
         }
 
-        /// `Encoder::encode` as it was, its stages in their order and as
-        /// they were where they have changed.
+        /// `Encoder::encode` as it was: its stages in their order, the
+        /// analysis, the LFE's decimation, the masking curve and the
+        /// predictor search as they were, the LFE's scale searched for. The
+        /// SNR search is today's, with an oracle of its own
+        /// (`the_snr_search_passes_are_as_they_were`).
         pub fn encode(encoder: &mut Encoder, pcm: &[i32], out: &mut Vec<u8>) {
             let Encoder {
                 config,

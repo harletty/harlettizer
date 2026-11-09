@@ -248,6 +248,9 @@ impl Searchers {
                             for (input, (vq, diff)) in inputs.iter().zip(found.iter_mut()) {
                                 *vq = adpcm.subband_analysis(input, diff);
                             }
+                            // A result for every subband: a run short of
+                            // room would leave the caller reading a stale
+                            // predictor for the rest as though searched.
                             assert_eq!(inputs.len(), found.len(), "every subband searched");
                         }));
                         let panicked = searched.is_err();

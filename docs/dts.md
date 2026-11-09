@@ -245,10 +245,10 @@ them in order on the caller's, where the render stays. The core carries its
 prediction from frame to frame, so it runs in order too, ahead of the
 others, on two threads of its own. The first makes the core's input from
 each input frame and analyses it — the filter bank, the LFE's decimation,
-the masking curve and the peaks, which depend on the input alone — a frame
-ahead of the second — as far ahead as the frames handed out — which
-allocates the bits, writes the core frame and
-reconstructs it as a decoder will, then hands the input frame on with it.
+the masking curve and the peaks, which depend on the input alone — ahead of
+the second, by as many frames as have been handed out, while the second
+allocates the bits, writes the core frame and reconstructs it as a decoder
+will, then hands the input frame on with it.
 With `--adpcm` the second spreads the predictor search, most of its work
 then, over fifteen threads more: a subband's search depends on its own
 samples alone. The stream is the same to the byte as one thread writes it,
