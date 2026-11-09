@@ -195,6 +195,16 @@ impl Sink {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    // The lossless layer on every thread but one, the core on two more, and
+    // the render on this one, which mostly waits for them: the same stream,
+    // to the byte, several times sooner.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+    encode_on(config, threads)
+}
+
+/// [`run`], the lossless layer on `threads` threads of its own — nought for
+/// everything on this one.
+fn encode_on(config: Config, threads: usize) -> Result<()> {
     let path = config.input.as_path();
     let mut source = Source::open(path, config.mono_prefix.as_deref())?;
     // Creating the output truncates it, and every file of the input is still
@@ -270,10 +280,6 @@ pub fn run(config: Config) -> Result<()> {
 
     let mut dca = DcaConfig::reference(config.layout, config.bits);
     dca.core.adpcm = config.adpcm;
-    // The lossless layer on every thread but one, the core on one more, and
-    // the render on this one, which mostly waits for them: the same stream,
-    // to the byte, several times sooner.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
     let mut encoder = Encoder::new(dca)
         .map_err(|e| Error::unsupported(&config.out, e.0))?
         .with_threads(threads);
@@ -306,7 +312,28 @@ pub fn run(config: Config) -> Result<()> {
     let mut refused = None;
     'blocks: while at < total {
         let want = (total - at).min(BLOCK as u64) as usize;
-        let got = source.fill(&mut raw, want)?;
+        let got = match source.fill(&mut raw, want) {
+            Ok(got) => got,
+            // The frames before stay where a single thread would have left
+            // them: those the threads still have are coded and written
+            // first — or the refusal one of them meets, which a single
+            // thread would have met before this read, ends the stream as it
+            // would have.
+            Err(e) => {
+                stream.clear();
+                let stopped = encoder.stop(&mut stream);
+                sent += sink
+                    .frames(&stream, 0)
+                    .map_err(|e| Error::io(&config.out, e))?;
+                match stopped {
+                    Ok(()) => return Err(e),
+                    Err(e) => {
+                        refused = Some(e);
+                        break 'blocks;
+                    }
+                }
+            }
+        };
         if got == 0 {
             break;
         }
@@ -488,4 +515,220 @@ pub fn run(config: Config) -> Result<()> {
         bytes as f64 * 8.0 / seconds / 1000.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Forty frames and some.
+    const SAMPLES: usize = 40 * FRAME_SAMPLES + 300;
+
+    /// Audio that ends before its header says, in the thirtieth frame: the
+    /// fourth block's read fails, after 24 frames handed to the encoder.
+    const CUT: usize = 29 * FRAME_SAMPLES + 100;
+
+    /// The master at `input`, of `channels` 24-bit channels, cut at [`CUT`].
+    fn cut(input: &Path, channels: usize) {
+        let audio = input.with_extension("atmos.audio");
+        let length = std::fs::metadata(&audio).unwrap().len();
+        let missing = ((SAMPLES - CUT) * channels * 3) as u64;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap()
+            .set_len(length - missing)
+            .unwrap();
+    }
+
+    /// A 7.1.4 bed in `dir`, [`SAMPLES`] long: tones, then from frame 22
+    /// on white noise at −6 dBFS in every channel, which no navigation word
+    /// can reach past (docs/dts.md): its config's path.
+    fn noise_from_frame_22(dir: &Path) -> PathBuf {
+        const BED: [(&str, u32); 12] = [
+            ("L", 0),
+            ("R", 1),
+            ("C", 2),
+            ("LFE", 3),
+            ("Lrs", 6),
+            ("Rrs", 7),
+            ("Lss", 4),
+            ("Rss", 5),
+            ("Lfh", 8),
+            ("Rfh", 9),
+            ("Lrh", 12),
+            ("Rrh", 13),
+        ];
+        let ids: Vec<String> = BED.iter().map(|(_, id)| id.to_string()).collect();
+        let mut config = format!(
+            "language: eng\nversion: 0.5.1\npresentations:\n  - type: home\n    simplified: \
+             false\n    metadata: m.atmos.metadata\n    audio: m.atmos.audio\n    offset: 0.0\n    \
+             fps: 24\n    scBedConfiguration: [{}]\n    creationTool: test\n    \
+             creationToolVersion: 0.0.0\n    bedInstances:\n      - channels:\n",
+            ids.join(", ")
+        );
+        let mut events = String::from("sampleRate: 48000\nevents:\n");
+        for (name, id) in BED {
+            config.push_str(&format!(
+                "          - channel: {name}\n            ID: {id}\n"
+            ));
+            events.push_str(&format!(
+                "  - ID: {id}\n    samplePos: 0\n    active: true\n    importance: 1.0\n    \
+                 gain: 0\n    rampLength: 0\n"
+            ));
+        }
+        config.push_str("    objects: []\n");
+        let path = dir.join("m.atmos");
+        std::fs::write(&path, config).unwrap();
+        std::fs::write(dir.join("m.atmos.metadata"), events).unwrap();
+        let mut audio = hz_io::container::caf::CafWriter::create(
+            &dir.join("m.atmos.audio"),
+            hz_io::container::pcm::PcmFormat::master(48_000.0, BED.len() as u32),
+        )
+        .unwrap();
+        let pcm: Vec<i32> = (0..SAMPLES * BED.len())
+            .map(|i| {
+                let (channel, n) = (i % BED.len(), i / BED.len());
+                if n < 22 * FRAME_SAMPLES {
+                    let hz = 110.0 * (channel + 1) as f64 * 1.37;
+                    let phase = std::f64::consts::TAU * hz * n as f64 / 48_000.0;
+                    (phase.sin() * f64::from(1 << 20)).round() as i32
+                } else {
+                    let mut x = (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    x ^= x >> 29;
+                    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    x ^= x >> 32;
+                    ((x as i64 % (1 << 22)) as i32).clamp(-(1 << 22), (1 << 22) - 1)
+                }
+            })
+            .collect();
+        audio.write_frames(&pcm).unwrap();
+        audio.finish().unwrap();
+        path
+    }
+
+    /// An encode the cut audio stops: the same error, on threads or not,
+    /// and the same stream left — raw or in Matroska, ADPCM or not —
+    /// however many threads, and however far they got: a few runs each to
+    /// show it.
+    ///
+    /// From the tones, the read fails: one thread has sent 23 frames, the
+    /// 24th waiting for the core that decodes to it, and the threads' are
+    /// sent when the read fails. From the noise, frame 22 is refused: one
+    /// thread meets the refusal sending it, before the read; on threads
+    /// the read can fail first, and the refusal comes back from the frames
+    /// the threads still have, the stream ending at it as on one thread.
+    #[test]
+    fn a_read_that_fails_stops_the_encode_where_one_thread_stops() {
+        let tones = crate::fixtures::scratch("dts", "cut-tones");
+        let tones = {
+            let input = crate::fixtures::master(&tones, SAMPLES);
+            cut(&input, 10);
+            input
+        };
+        let noise = crate::fixtures::scratch("dts", "cut-noise");
+        let noise = {
+            let input = noise_from_frame_22(&noise);
+            cut(&input, 12);
+            input
+        };
+        let every = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+        for (input, layout, mka, adpcm, sent, said) in [
+            (
+                &tones,
+                DcaLayout::FivePointOne,
+                false,
+                false,
+                Some(23),
+                "failed to fill",
+            ),
+            (
+                &tones,
+                DcaLayout::SevenPointOneFour,
+                false,
+                false,
+                Some(23),
+                "failed to fill",
+            ),
+            (
+                &tones,
+                DcaLayout::SevenPointOneFour,
+                true,
+                false,
+                None,
+                "failed to fill",
+            ),
+            (
+                &tones,
+                DcaLayout::FivePointOne,
+                false,
+                true,
+                Some(23),
+                "failed to fill",
+            ),
+            (
+                &tones,
+                DcaLayout::FivePointOne,
+                true,
+                true,
+                None,
+                "failed to fill",
+            ),
+            (
+                &noise,
+                DcaLayout::SevenPointOneFour,
+                false,
+                false,
+                Some(22),
+                "frame 22",
+            ),
+            (
+                &noise,
+                DcaLayout::SevenPointOneFour,
+                true,
+                false,
+                None,
+                "frame 22",
+            ),
+        ] {
+            let out = input.with_file_name(if mka { "cut.mka" } else { "cut.dts" });
+            let coded = |threads: usize| {
+                let config = Config {
+                    input: input.clone(),
+                    out: out.clone(),
+                    frames: None,
+                    mono_prefix: None,
+                    layout,
+                    bits: 24,
+                    adpcm,
+                    progress: false,
+                };
+                let ended = encode_on(config, threads).map_err(|e| e.to_string());
+                (ended, std::fs::read(&out).unwrap())
+            };
+            let case = format!("{layout:?}, mka {mka}, adpcm {adpcm}, {said}");
+            let (inline, alone) = coded(0);
+            let error = inline.as_ref().expect_err("the encode stops short");
+            assert!(error.contains(said), "{case}: {error}");
+            if let Some(sent) = sent {
+                let frames: Vec<_> = hz_dca::split::frames(&alone)
+                    .collect::<std::result::Result<_, _>>()
+                    .unwrap();
+                assert_eq!(frames.len(), sent, "{case}: the frames sent");
+            }
+            for threads in [1, 2, 3, 8, every] {
+                let runs = match (threads == every, sent.is_some() && !adpcm) {
+                    (true, true) => 8,
+                    (true, false) => 3,
+                    (false, _) => 1,
+                };
+                for run in 0..runs {
+                    let (threaded, beside) = coded(threads);
+                    let at = format!("{case}, {threads} threads, run {run}");
+                    assert_eq!(threaded, inline, "{at}: said the same way");
+                    assert!(alone == beside, "{at}: the same stream left");
+                }
+            }
+        }
+    }
 }

@@ -47,6 +47,7 @@
 use crate::bits::Bits;
 use crate::core_decode::CoreDecoder;
 use crate::encoder;
+use crate::encoder::Analysis;
 use crate::encoder::FRAME_SAMPLES;
 use crate::exss::{
     AssetDescriptor, AssetStatics, ChannelMapping, Coding, ExssHeader, Presentation, StaticFields,
@@ -56,6 +57,7 @@ use crate::lossless::{self, Layout};
 use crate::navigation::Navigation;
 use crate::peak::{self, Smoother};
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, mpsc};
 
 pub use crate::encoder::Unsupported;
@@ -160,12 +162,18 @@ struct Job {
     index: u64,
     pcm: Vec<i32>,
     core_input: Vec<i32>,
+    /// The core's analysis of `core_input`, when the analyser makes it.
+    analysis: Box<Analysis>,
     /// The reconstruction, and whether the frame is coded against it.
     core: Box<CoreDecoder>,
     against: bool,
     core_frame: Vec<u8>,
     coded: lossless::Coded,
 }
+
+/// A frame back from the threads that code the lossless frames, or the
+/// panic one of them ended on.
+type Back = std::thread::Result<Box<Job>>;
 
 /// What the core's thread is handed.
 enum Ahead {
@@ -174,6 +182,49 @@ enum Ahead {
     /// The end of the input: the core's input made from silence, for the
     /// frame waiting.
     Finish(Vec<i32>),
+}
+
+/// What the core's thread is handed when the core's analysis runs ahead of
+/// it on a thread of its own ([`Analyser`]): [`Ahead`], analysed.
+enum Analysed {
+    /// An input frame, its core's input analysed into `job.analysis`.
+    Frame(Box<Job>),
+    /// The end of the input: silence, analysed.
+    Finish(Box<Analysis>),
+}
+
+/// The core's input made from each frame ([`lossless::Encoder::core_input`])
+/// and the first half of the core's work ([`encoder::Encoder::analyse`]),
+/// ahead of the rest, on a thread of its own: they depend on nothing but
+/// the input, so they can run while the core allocates and writes the
+/// frames before — as many frames ahead as the caller has handed out.
+struct Analyser {
+    lossless: lossless::Encoder,
+    core: encoder::Encoder,
+}
+
+impl Analyser {
+    fn run(mut self, inbox: mpsc::Receiver<Ahead>, onward: mpsc::Sender<Analysed>) {
+        for ahead in inbox {
+            let analysed = match ahead {
+                Ahead::Frame(mut job) => {
+                    job.core_input.clear();
+                    job.core_input
+                        .extend_from_slice(self.lossless.core_input(&job.pcm));
+                    self.core.analyse(&job.core_input, &mut job.analysis);
+                    Analysed::Frame(job)
+                }
+                Ahead::Finish(silence) => {
+                    let mut analysis = Box::default();
+                    self.core.analyse(&silence, &mut analysis);
+                    Analysed::Finish(analysis)
+                }
+            };
+            if onward.send(analysed).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// The core running a frame ahead of the lossless layer on a thread of its
@@ -191,6 +242,7 @@ struct Front {
 }
 
 impl Front {
+    /// The whole core here.
     fn run(mut self, inbox: mpsc::Receiver<Ahead>, jobs: mpsc::Sender<Box<Job>>) {
         for ahead in inbox {
             self.core_frame.clear();
@@ -205,25 +257,55 @@ impl Front {
                     None
                 }
             };
-            let Some(mut job) = std::mem::replace(&mut self.waiting, next) else {
-                // As in `Encoder::encode`: the first core frame decodes to
-                // the silence before the input.
-                self.core.restart_prediction();
-                continue;
-            };
-            self.decoder.decode(&self.core);
-            job.index = self.index;
-            job.against = against_core_at(self.index, self.layout);
-            if job.against {
-                job.core.as_mut().clone_from(&self.decoder);
-            }
-            job.core_frame.clear();
-            job.core_frame.extend_from_slice(&self.core_frame);
-            if jobs.send(job).is_err() {
+            if !self.hand_on(next, &jobs) {
                 return;
             }
-            self.index += 1;
         }
+    }
+
+    /// The core from each frame's analysis, made on the analyser's thread.
+    fn run_analysed(mut self, inbox: mpsc::Receiver<Analysed>, jobs: mpsc::Sender<Box<Job>>) {
+        for analysed in inbox {
+            self.core_frame.clear();
+            let next = match analysed {
+                Analysed::Frame(job) => {
+                    self.core
+                        .encode_analysed(&job.analysis, &mut self.core_frame);
+                    Some(job)
+                }
+                Analysed::Finish(analysis) => {
+                    self.core.encode_analysed(&analysis, &mut self.core_frame);
+                    None
+                }
+            };
+            if !self.hand_on(next, &jobs) {
+                return;
+            }
+        }
+    }
+
+    /// With the core frame just encoded, hand on the frame waiting for it,
+    /// and keep `next` waiting; false once the others have stopped.
+    fn hand_on(&mut self, next: Option<Box<Job>>, jobs: &mpsc::Sender<Box<Job>>) -> bool {
+        let Some(mut job) = std::mem::replace(&mut self.waiting, next) else {
+            // As in `Encoder::encode`: the first core frame decodes to
+            // the silence before the input.
+            self.core.restart_prediction();
+            return true;
+        };
+        self.decoder.decode(&self.core);
+        job.index = self.index;
+        job.against = against_core_at(self.index, self.layout);
+        if job.against {
+            job.core.as_mut().clone_from(&self.decoder);
+        }
+        job.core_frame.clear();
+        job.core_frame.extend_from_slice(&self.core_frame);
+        if jobs.send(job).is_err() {
+            return false;
+        }
+        self.index += 1;
+        true
     }
 }
 
@@ -233,10 +315,14 @@ impl Front {
 /// its size is written at, which settling decides, so the stream is the one
 /// the encoder writes alone, to the byte.
 struct Pool {
-    /// The core's thread and its queue.
+    /// The core's threads — its analysis's and its own — and their queue.
     ahead: Option<mpsc::Sender<Ahead>>,
+    /// Whether the analyser makes the core's input, rather than the caller.
+    analysing: bool,
+    analyser: Option<std::thread::JoinHandle<()>>,
     front: Option<std::thread::JoinHandle<()>>,
-    done: mpsc::Receiver<Box<Job>>,
+    /// Frames coded, or what a thread that panicked panicked with.
+    done: mpsc::Receiver<Back>,
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Frames handed to the pool so far: the index of the next.
     queued: u64,
@@ -259,7 +345,9 @@ impl Pool {
     /// others can be started.
     fn new(threads: usize, config: &lossless::Config, core: &encoder::Config) -> Option<Self> {
         let front = Front {
-            core: encoder::Encoder::new(core.clone()).ok()?,
+            core: encoder::Encoder::new(core.clone())
+                .ok()?
+                .with_search_threads(threads.min(SEARCH_THREADS)),
             decoder: CoreDecoder::new(),
             core_frame: Vec::new(),
             waiting: None,
@@ -267,7 +355,7 @@ impl Pool {
             layout: config.layout,
         };
         let (jobs, inbox) = mpsc::channel::<Box<Job>>();
-        let (outbox, done) = mpsc::channel::<Box<Job>>();
+        let (outbox, done) = mpsc::channel::<Back>();
         let inbox = Arc::new(Mutex::new(inbox));
         let mut workers = Vec::with_capacity(threads);
         for n in 0..threads {
@@ -286,9 +374,15 @@ impl Pool {
                         let Ok(Ok(mut job)) = next else {
                             return;
                         };
-                        let core = job.against.then_some(&*job.core);
-                        encoder.code_apart(&job.pcm, core, &mut job.coded);
-                        if outbox.send(job).is_err() {
+                        // A panic goes back in the frame's place, for the
+                        // caller to panic with: the others keep the way back
+                        // open, so the frame it waits for would never come.
+                        let coded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let core = job.against.then_some(&*job.core);
+                            encoder.code_apart(&job.pcm, core, &mut job.coded);
+                        }));
+                        let panicked = coded.is_err();
+                        if outbox.send(coded.map(|()| job)).is_err() || panicked {
                             return;
                         }
                     }
@@ -301,16 +395,43 @@ impl Pool {
         if workers.is_empty() {
             return None;
         }
+        // The analysis ahead of the core where its thread starts, with the
+        // core otherwise.
+        let analyser = Analyser {
+            lossless: lossless::Encoder::new(config.clone()).ok()?,
+            core: encoder::Encoder::new(core.clone()).ok()?,
+        };
         let (ahead, frames) = mpsc::channel::<Ahead>();
+        let (onward, analysed) = mpsc::channel::<Analysed>();
+        let analysing = std::thread::Builder::new()
+            .name("core-analysis".into())
+            .spawn(move || analyser.run(frames, onward));
         // Should the core's thread not start, its queue to the others closes
-        // with it, and they end.
-        let front = std::thread::Builder::new()
-            .name("core".into())
-            .spawn(move || front.run(frames, jobs))
-            .ok()?;
+        // with it, and they end; so does the analyser's, once its own queue
+        // closes as this returns.
+        let (ahead, analyser, front) = match analysing {
+            Ok(analyser) => {
+                let front = std::thread::Builder::new()
+                    .name("core".into())
+                    .spawn(move || front.run_analysed(analysed, jobs))
+                    .ok()?;
+                (ahead, Some(analyser), front)
+            }
+            Err(_) => {
+                let (ahead, frames) = mpsc::channel::<Ahead>();
+                let front = std::thread::Builder::new()
+                    .name("core".into())
+                    .spawn(move || front.run(frames, jobs))
+                    .ok()?;
+                (ahead, None, front)
+            }
+        };
+        let analysing = analyser.is_some();
         let most = 2 * workers.len() + 2;
         Some(Self {
             ahead: Some(ahead),
+            analysing,
+            analyser,
             front: Some(front),
             done,
             workers,
@@ -322,8 +443,10 @@ impl Pool {
         })
     }
 
-    /// Put a frame back from the pool in its place.
-    fn place(&mut self, job: Box<Job>, settled: u64) {
+    /// Put a frame back from the pool in its place — or, from a thread
+    /// that panicked coding it, panic with it.
+    fn place(&mut self, back: Back, settled: u64) {
+        let job = back.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         let at = (job.index - settled) as usize;
         if self.back.len() <= at {
             self.back.resize_with(at + 1, || None);
@@ -334,9 +457,12 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // Closing the core's queue is what tells its thread to stop, and its
-        // stopping closes the others'.
+        // Closing the core's queue is what tells its threads to stop, and
+        // their stopping closes the others'.
         self.ahead = None;
+        if let Some(analyser) = self.analyser.take() {
+            let _ = analyser.join();
+        }
         if let Some(front) = self.front.take() {
             let _ = front.join();
         }
@@ -345,6 +471,10 @@ impl Drop for Pool {
         }
     }
 }
+
+/// The most threads that search for the core's predictors beside the
+/// core's own, with ADPCM ([`encoder::Encoder::with_search_threads`]).
+const SEARCH_THREADS: usize = 15;
 
 /// How far [`Encoder::settle_back`] goes before it returns.
 #[derive(Clone, Copy)]
@@ -562,16 +692,24 @@ impl Encoder {
     }
 
     /// Code the lossless frames on `threads` threads of their own, and the
-    /// core on one more: the lossless layer is most of the work, and a frame
+    /// core on two more: the lossless layer is most of the work, and a frame
     /// of it depends on nothing before it but the width its size is written
     /// at, which is settled on the caller's thread, in order; the core,
     /// which carries its prediction from frame to frame, runs ahead of them
-    /// in order on its own. The stream is the same to the byte; the frames
-    /// come out of [`Encoder::encode`] later, up to twice as many calls
-    /// behind the input as there are threads. Nought, the default, codes
-    /// everything on the caller's thread; threads that cannot be started do
-    /// too, and so does an encoder that has had a frame already: the threads
-    /// are chosen before the stream starts.
+    /// in order: its input and its analysis, which depend on the input
+    /// alone, on one thread ahead of the rest of it, and with ADPCM its
+    /// predictor search spread over up to fifteen threads more, or `threads`
+    /// where that is fewer ([`encoder::Encoder::with_search_threads`]). The
+    /// stream is the same to the byte; the frame call *f* of
+    /// [`Encoder::encode`] takes is settled once the threads have coded it,
+    /// by call *f* + 2 · `threads` + 3 at the latest — the threads take
+    /// 2 · `threads` + 2 frames at once, `threads` counting those that start
+    /// — and sent then, or once the encoder has looked far enough past it
+    /// where the stream may smooth; [`Encoder::stop`] sends, where the
+    /// input stops short, what one thread would have sent. Nought, the
+    /// default, codes everything on the caller's thread; threads that cannot
+    /// be started do too, and so does an encoder that has had a frame
+    /// already: the threads are chosen before the stream starts.
     ///
     /// With threads, a frame refused once it is coded — for the navigation
     /// word as for the peak rate — ends the stream, and the frames the
@@ -594,7 +732,8 @@ impl Encoder {
     /// a frame ahead (nothing on the first call), and, where the stream may
     /// smooth, only once the encoder has looked far enough past it — or,
     /// with threads ([`Encoder::with_threads`]), once they have coded it.
-    /// [`Encoder::finish`] sends the rest.
+    /// [`Encoder::finish`] sends the rest; [`Encoder::stop`], what one
+    /// thread would have sent by now, where the stream stops short.
     ///
     /// A refusal leaves in `out` nothing of the refused frame's own, and,
     /// with threads, the frames before it that the calls before would have
@@ -648,6 +787,25 @@ impl Encoder {
         }
         self.pending.copy_from_slice(pcm);
         self.waiting = true;
+        Ok(())
+    }
+
+    /// Where the input stops short of its end — a read that fails, say —
+    /// send what one thread would have sent by now: with threads, every
+    /// frame handed to them, once they have coded it, settled as the calls
+    /// that handed them out would have settled them on one thread; or the
+    /// refusal one of them meets, which one thread would have met first,
+    /// leaving in `out` the frames before it. A refusal that has ended the
+    /// stream already is returned again. The frame waiting for its core
+    /// stays unsent, as on one thread; the encoder can go on, or
+    /// [`Encoder::finish`].
+    pub fn stop(&mut self, out: &mut Vec<u8>) -> Result<(), Refused> {
+        if let Some(refused) = &self.ended {
+            return Err(refused.clone());
+        }
+        if self.pool.is_some() {
+            self.settle_back(out, Until::Settled(self.handed_out()))?;
+        }
         Ok(())
     }
 
@@ -723,6 +881,7 @@ impl Encoder {
                 index: 0,
                 pcm: Vec::with_capacity(pcm.len()),
                 core_input: Vec::new(),
+                analysis: Box::default(),
                 core: Box::new(CoreDecoder::new()),
                 against: false,
                 core_frame: Vec::with_capacity(self.core.frame_size()),
@@ -731,9 +890,11 @@ impl Encoder {
         });
         job.pcm.clear();
         job.pcm.extend_from_slice(pcm);
-        job.core_input.clear();
-        job.core_input
-            .extend_from_slice(self.lossless.core_input(pcm));
+        if !pool.analysing {
+            job.core_input.clear();
+            job.core_input
+                .extend_from_slice(self.lossless.core_input(pcm));
+        }
         job
     }
 
@@ -863,9 +1024,9 @@ impl Encoder {
             let header = header(&mut self.exss, bytes);
             let start = out.len();
             let core = self.core.frame_size();
-            out.extend(self.cores.drain(..core));
+            send_front(&mut self.cores, core, out);
             out.extend_from_slice(&header);
-            out.extend(self.lossless_stream.drain(..carry.bytes));
+            send_front(&mut self.lossless_stream, carry.bytes, out);
             let sent = out.len() - start;
             debug_assert!(
                 sent <= self.rate.budget,
@@ -907,6 +1068,16 @@ impl Encoder {
     pub fn core_frame_size(&self) -> usize {
         self.core.frame_size()
     }
+}
+
+/// Move the first `n` bytes of `queue` to the end of `out`, a slice at a
+/// time.
+fn send_front(queue: &mut VecDeque<u8>, n: usize, out: &mut Vec<u8>) {
+    let (first, second) = queue.as_slices();
+    let from_first = first.len().min(n);
+    out.extend_from_slice(&first[..from_first]);
+    out.extend_from_slice(&second[..n - from_first]);
+    queue.drain(..n);
 }
 
 /// The lossless asset descriptor's tail when the asset carries the DTS:X
@@ -1238,6 +1409,147 @@ mod tests {
                 "no case refused with {refused:?}"
             );
         }
+    }
+
+    /// `calls` frames of `pcm` and a stop on `threads` threads: what was
+    /// sent, and how the encoder ended — at the first refusal, as a caller
+    /// stops at it. A stop after that sends nothing more.
+    fn stopped_after(
+        config: Config,
+        pcm: &[i32],
+        threads: usize,
+        calls: usize,
+    ) -> (Vec<u8>, Result<(), Refused>) {
+        let channels = config.lossless.layout.channels();
+        let mut encoder = Encoder::new(config).unwrap().with_threads(threads);
+        let mut stream = Vec::new();
+        let mut ended = Ok(());
+        for (call, frame) in pcm.chunks(FRAME_SAMPLES * channels).take(calls).enumerate() {
+            ended = encoder.encode(frame, &mut stream);
+            if ended.is_err() {
+                break;
+            }
+            if threads > 0 && call % 4 == 2 {
+                // Let the threads get ahead of the calls.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        if ended.is_ok() {
+            ended = encoder.stop(&mut stream);
+        }
+        let sent = stream.len();
+        let again = encoder.stop(&mut stream);
+        assert_eq!(stream.len(), sent, "a second stop sends nothing");
+        if threads > 0 && ended.is_err() && again.is_err() {
+            // A refusal of a coded frame ends a stream on threads.
+            assert_eq!(again, ended);
+        }
+        (stream, ended)
+    }
+
+    /// An encode stopped short — after any number of frames, threads or
+    /// none, however far the threads had got — has sent what one thread
+    /// sends by then, to the byte, or met the refusal one thread meets
+    /// first, with the frames before it.
+    #[test]
+    fn a_stop_sends_what_one_thread_has_sent() {
+        let smoothed = |layout: Layout, ceiling: u32, lookahead: usize| {
+            let mut config = Config::reference(layout, 24);
+            config.peak.ceiling = ceiling;
+            config.peak.buffer_code = 1;
+            config.peak.lookahead = lookahead;
+            config
+        };
+        let adpcm = {
+            let mut config = Config::reference(Layout::FivePointOne, 24);
+            config.core.adpcm = true;
+            config
+        };
+        let cases = [
+            (Config::reference(Layout::FivePointOne, 24), tones(6, 25)),
+            (adpcm, tones(6, 25)),
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 10),
+            ),
+            // Refused for the peak rate, with frames sent ahead before it.
+            (
+                smoothed(Layout::SevenPointOne, 7_000_000, 4),
+                bursts(8, 25, 0),
+            ),
+            // Sent ahead, and not refused.
+            (
+                smoothed(Layout::SevenPointOne, 8_500_000, 16),
+                bursts(8, 25, 0),
+            ),
+            // A corner past 24 bits with its height: refused by the check.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 0),
+            ),
+            // A bed too large for the navigation word to reach past.
+            (
+                Config::reference(Layout::SevenPointOneFour, 24),
+                bursts(12, 25, 1),
+            ),
+        ];
+        let every = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1));
+        for (case, (config, pcm)) in cases.iter().enumerate() {
+            for calls in [3, 11, 22] {
+                let alone = stopped_after(config.clone(), pcm, 0, calls);
+                for threads in [1, 2, 3, 8, every] {
+                    let spread = stopped_after(config.clone(), pcm, threads, calls);
+                    let at = format!("case {case}, {calls} calls, {threads} threads");
+                    assert_eq!(spread.1, alone.1, "{at}");
+                    assert!(spread.0 == alone.0, "{at}: the stream");
+                }
+            }
+        }
+    }
+
+    /// A thread coding lossless frames that panics makes the encoder panic
+    /// too, rather than leave it waiting — in `encode` or in `stop` — for
+    /// the frame the panic took while the other threads keep the way back
+    /// open.
+    #[test]
+    fn a_lossless_thread_that_panics_makes_the_encoder_panic() {
+        let config = Config::reference(Layout::SevenPointOneFour, 24);
+        let mut encoder = Encoder::new(config).unwrap().with_threads(3);
+        let Some(pool) = encoder.pool.as_mut() else {
+            // No thread could be started: nothing to panic.
+            return;
+        };
+        // The first frame to code into buffers a 5.1's encoder made, which a
+        // 7.1.4's refuses with a panic (`lossless::Encoder::code_apart`):
+        // one thread panics, the others go on.
+        let five_one =
+            lossless::Encoder::new(Config::reference(Layout::FivePointOne, 24).lossless).unwrap();
+        pool.spare.push(Box::new(Job {
+            index: 0,
+            pcm: Vec::new(),
+            core_input: Vec::new(),
+            analysis: Box::default(),
+            core: Box::new(CoreDecoder::new()),
+            against: false,
+            core_frame: Vec::new(),
+            coded: five_one.coded(),
+        }));
+        let pcm = tones(12, 4);
+        let (ended, end) = mpsc::channel();
+        std::thread::spawn(move || {
+            let stopped = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut stream = Vec::new();
+                for frame in pcm.chunks(FRAME_SAMPLES * 12) {
+                    let _ = encoder.encode(frame, &mut stream);
+                }
+                let _ = encoder.stop(&mut stream);
+            }));
+            let _ = ended.send(stopped.is_err());
+        });
+        let panicked = end
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the encoder ends");
+        assert!(panicked, "the encoder panics");
     }
 
     /// Threads asked for once the stream has started change nothing: the

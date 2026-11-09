@@ -242,21 +242,45 @@ thirds of it — and a lossless frame depends on nothing before it but the
 width its size is written at. So `harlettizer dts` codes those frames on
 every thread but one (`hz_dca::master::Encoder::with_threads`) and settles
 them in order on the caller's, where the render stays. The core carries its
-prediction from frame to frame, so it runs in order too, on a thread of its
-own, ahead of the others: it hands each input frame on with the core frame
-that reconstructs it. The stream is the same to the byte as one thread
-writes it, refusals included.
+prediction from frame to frame, so it runs in order too, ahead of the
+others, on two threads of its own. The first makes the core's input from
+each input frame and analyses it — the filter bank, the LFE's decimation,
+the masking curve and the peaks, which depend on the input alone — ahead of
+the second, by as many frames as have been handed out, while the second
+allocates the bits, writes the core frame and reconstructs it as a decoder
+will, then hands the input frame on with it.
+With `--adpcm` the second spreads the predictor search, most of its work
+then, over fifteen threads more: a subband's search depends on its own
+samples alone. The stream is the same to the byte as one thread writes it,
+refusals included.
+
+The core encoder itself makes the same values as the port it started as,
+three times sooner: a level's centibels are looked up rather than searched
+for, the masking model's chains of centibel sums run side by side and leave
+out the steps that cannot move them, the filter bank's products go through
+the vector unit, each pass of the SNR search requantises only the subbands
+it moves, and the decoder's synthesis window is taken in `f64`, where its
+integers are exact.
 
 Thirty seconds of a twelve-waveform programme, on sixteen cores:
 
 | `--layout` | one thread | threads | × real time |
 |---|---|---|---|
-| `7.1.4` | 4.98 s | 0.99 s | 30 |
-| `5.1` | 3.85 s | 0.99 s | 30 |
+| `7.1.4` | 4.36 s | 0.34 s | 88 |
+| `5.1` | 3.22 s | 0.28 s | 107 |
+| `7.1.4 --adpcm` | | 0.98 s | 31 |
 
-The core's thread is now the whole of the wall time, whatever the layout:
-the core encoder is nine tenths of it, the decoder that reconstructs it the
-rest. Going further means coding the core itself faster, frame after frame.
+The core's two threads and the render's, on the caller's, now take about
+as long as each other: in 7.1.4 the analysis and the render are the wall
+together, in 5.1 the analysis, most of it the masking model's sums. Ninety
+seconds of a master take 0.96 s in 7.1.4 and 0.80 s in 5.1.
+
+With threads, a frame comes back from `Encoder::encode` some calls after
+it went in, as soon as the threads have coded it. An encode cut short — by
+a read that fails — stops the encoder (`Encoder::stop`), which sends every
+frame still with the threads, so the file holds what one thread leaves, on
+any machine; or the refusal one thread would have met before the read
+ends the stream, as it would have.
 
 ## Not done
 

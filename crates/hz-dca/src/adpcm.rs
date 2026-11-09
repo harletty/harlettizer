@@ -18,6 +18,8 @@
 //! history is the decoder's.
 
 use crate::tables::{ADPCM_COEFFS, ADPCM_VB, SoftFloat};
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, mpsc};
 
 /// Subband samples per frame.
 const LEN: usize = 16;
@@ -37,6 +39,20 @@ pub(crate) fn norm(a: i64, bits: i32) -> i32 {
 #[inline(always)]
 pub(crate) fn mul32(a: i32, b: i32) -> i32 {
     norm(i64::from(a) * i64::from(b), 32)
+}
+
+/// [`mul32`] from the unsigned product of the two words, which a vector
+/// unit has: a signed word is its unsigned one less 2^32 when negative, so
+/// the signed product is the unsigned one less 2^32 times each operand that
+/// the other's sign takes away — a difference in the high half alone, which
+/// is all that `mul32` keeps. The same value for every pair.
+#[inline(always)]
+pub(crate) fn mul32_unsigned(a: i32, b: i32) -> i32 {
+    let product = u64::from(a as u32) * u64::from(b as u32) + (1 << 31);
+    let high = (product >> 32) as u32;
+    let a_short = if b < 0 { a as u32 } else { 0 };
+    let b_short = if a < 0 { b as u32 } else { 0 };
+    high.wrapping_sub(a_short).wrapping_sub(b_short) as i32
 }
 
 /// `clip23`: saturate to 24 bits signed.
@@ -181,6 +197,140 @@ impl Adpcm {
     }
 }
 
+/// What [`Adpcm::subband_analysis`] finds for a subband: the predictor,
+/// and the prediction error it was chosen on.
+pub(crate) type Found = (Option<u16>, [i32; LEN]);
+
+/// Threads that search for predictors beside the caller, each over its own
+/// run of a frame's subbands. A subband's search depends on nothing but its
+/// own twenty samples, so where it runs changes nothing it finds.
+pub(crate) struct Searchers {
+    adpcm: Arc<Adpcm>,
+    /// One queue to each thread.
+    queues: Vec<mpsc::Sender<Box<Run>>>,
+    /// Runs searched, or what a thread that panicked panicked with.
+    done: mpsc::Receiver<Searched>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// Runs given back, to hand out again.
+    #[allow(clippy::vec_box)]
+    spare: Vec<Box<Run>>,
+}
+
+/// A run back from a thread, or the panic it ended on: handed on to the
+/// caller, whose search panics with it rather than wait for a run that
+/// will not come.
+type Searched = std::thread::Result<Box<Run>>;
+
+/// A run of subbands to search, from `first`, and what was found.
+struct Run {
+    first: usize,
+    inputs: Vec<[i32; LEN + ADPCM_COEFFS]>,
+    found: Vec<Found>,
+}
+
+impl Searchers {
+    /// Up to `threads` threads searching with `adpcm`; `None` when not one
+    /// can be started.
+    pub(crate) fn new(adpcm: &Arc<Adpcm>, threads: usize) -> Option<Self> {
+        let (finished, done) = mpsc::channel::<Searched>();
+        let mut queues = Vec::with_capacity(threads);
+        let mut handles = Vec::with_capacity(threads);
+        for n in 0..threads {
+            let (queue, runs) = mpsc::channel::<Box<Run>>();
+            let adpcm = Arc::clone(adpcm);
+            let finished = finished.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("predictors-{n}"))
+                .spawn(move || {
+                    for mut run in runs {
+                        let searched = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let Run { inputs, found, .. } = &mut *run;
+                            for (input, (vq, diff)) in inputs.iter().zip(found.iter_mut()) {
+                                *vq = adpcm.subband_analysis(input, diff);
+                            }
+                            // A result for every subband: a run short of
+                            // room would leave the caller reading a stale
+                            // predictor for the rest as though searched.
+                            assert_eq!(inputs.len(), found.len(), "every subband searched");
+                        }));
+                        let panicked = searched.is_err();
+                        if finished.send(searched.map(|()| run)).is_err() || panicked {
+                            return;
+                        }
+                    }
+                });
+            match spawned {
+                Ok(handle) => {
+                    queues.push(queue);
+                    handles.push(handle);
+                }
+                Err(_) => break,
+            }
+        }
+        (!handles.is_empty()).then(|| Self {
+            adpcm: Arc::clone(adpcm),
+            queues,
+            done,
+            threads: handles,
+            spare: Vec::new(),
+        })
+    }
+
+    /// [`Adpcm::subband_analysis`] of each of `inputs`, into `found`: the
+    /// first run here, the others on the threads.
+    pub(crate) fn search(&mut self, inputs: &[[i32; LEN + ADPCM_COEFFS]], found: &mut [Found]) {
+        debug_assert_eq!(inputs.len(), found.len());
+        let per = inputs.len().div_ceil(self.queues.len() + 1);
+        let mut out = 0;
+        for (k, queue) in self.queues.iter().enumerate() {
+            let first = (k + 1) * per;
+            if first >= inputs.len() {
+                break;
+            }
+            let end = (first + per).min(inputs.len());
+            let mut run = self.spare.pop().unwrap_or_else(|| {
+                Box::new(Run {
+                    first: 0,
+                    inputs: Vec::with_capacity(per),
+                    found: Vec::with_capacity(per),
+                })
+            });
+            run.first = first;
+            run.inputs.clear();
+            run.inputs.extend_from_slice(&inputs[first..end]);
+            run.found.clear();
+            run.found.resize(end - first, (None, [0; LEN]));
+            queue
+                .send(run)
+                .expect("a searcher runs as long as the encoder");
+            out += 1;
+        }
+        let here = per.min(inputs.len());
+        for (input, (vq, diff)) in inputs[..here].iter().zip(&mut found[..here]) {
+            *vq = self.adpcm.subband_analysis(input, diff);
+        }
+        for _ in 0..out {
+            let searched = self
+                .done
+                .recv()
+                .expect("every searcher gives its run back, or its panic");
+            let run = searched.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            found[run.first..][..run.found.len()].copy_from_slice(&run.found);
+            self.spare.push(run);
+        }
+    }
+}
+
+impl Drop for Searchers {
+    fn drop(&mut self) {
+        // Closing the queues is what stops the threads.
+        self.queues.clear();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// `apply_filter`: the prediction error energy of one predictor, from the
 /// autocorrelation.
 #[inline(always)]
@@ -243,4 +393,43 @@ pub(crate) fn code_subband(
         work[ADPCM_COEFFS + i] = work[ADPCM_COEFFS + i].wrapping_add(dequantised[0]);
     }
     next_hist.copy_from_slice(&work[LEN..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A search thread that panics makes the search panic too, rather than
+    /// leave it waiting for a run that will not come while the other
+    /// threads keep their way back open.
+    #[test]
+    fn a_searcher_that_panics_makes_the_search_panic() {
+        let adpcm = Arc::new(Adpcm::new());
+        let Some(mut searchers) = Searchers::new(&adpcm, 3) else {
+            // No thread could be started: nothing to panic.
+            return;
+        };
+        // A run with a subband more than it has room for: the first thread
+        // searches the others, then panics — by when the search has handed
+        // it its own run, which it will never give back.
+        let broken = Box::new(Run {
+            first: 0,
+            inputs: vec![[1 << 12; LEN + ADPCM_COEFFS]; 2000],
+            found: vec![(None, [0; LEN]); 1999],
+        });
+        searchers.queues[0].send(broken).unwrap();
+        let (ended, end) = mpsc::channel();
+        std::thread::spawn(move || {
+            let inputs = [[1 << 12; LEN + ADPCM_COEFFS]; 40];
+            let mut found = [(None, [0; LEN]); 40];
+            let searched = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                searchers.search(&inputs, &mut found);
+            }));
+            let _ = ended.send(searched.is_err());
+        });
+        let panicked = end
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the search ends");
+        assert!(panicked, "the search panics");
+    }
 }

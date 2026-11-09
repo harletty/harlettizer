@@ -52,12 +52,32 @@ const LFE_SAMPLES: usize = 8;
 const LFE_HISTORY: usize = 8;
 
 /// One channel's synthesis filter state (`hist1`, `offset`, `hist2`).
+///
+/// The ring buffer holds its 24-bit samples as `f64`, and the window is
+/// taken in `f64`: every sample is an integer of at most 2^23 in magnitude
+/// and every window coefficient one under it, so each product is an integer
+/// under 2^46, and
+/// every sum the window makes — eight products and an overlap under 2^49 —
+/// an integer under 2^51. All of them are exact in an `f64`, so the sums
+/// are the decoder's 64-bit integer sums, in any order; the vector unit
+/// multiplies `f64`s as it cannot 64-bit integers.
 #[derive(Clone)]
 struct Synthesis {
-    buffer: [i32; 512],
+    buffer: [f64; 512],
     offset: usize,
     overlap: [i32; 32],
 }
+
+/// `FIR_32BANDS_NONPERFECT_FIXED` as `f64`s, exactly.
+static WINDOW: [f64; 512] = {
+    let mut window = [0.0; 512];
+    let mut i = 0;
+    while i < 512 {
+        window[i] = FIR_32BANDS_NONPERFECT_FIXED[i] as f64;
+        i += 1;
+    }
+    window
+};
 
 /// The core decoder's state, and the frame it last reconstructed.
 #[derive(Clone)]
@@ -85,7 +105,7 @@ impl CoreDecoder {
         Self {
             subband: [[[0; ADPCM_COEFFS + BLOCKS]; SUBBANDS]; MAX_CODED],
             synthesis: std::array::from_fn(|_| Synthesis {
-                buffer: [0; 512],
+                buffer: [0.0; 512],
                 offset: 0,
                 overlap: [0; 32],
             }),
@@ -207,41 +227,34 @@ impl Synthesis {
     /// `synth_filter_fixed`: 32 subband samples to 32 output samples, the
     /// cosine modulation into the ring buffer and the window across it.
     fn filter(&mut self, input: &[i32; 32], out: &mut [i32; 32]) {
-        let window = &FIR_32BANDS_NONPERFECT_FIXED;
         let at = self.offset;
-        imdct_half_32(
-            (&mut self.buffer[at..at + 32])
-                .try_into()
-                .expect("32 samples"),
-            input,
-        );
-        let buf = &self.buffer;
+        let mut block = [0i32; 32];
+        imdct_half_32(&mut block, input);
+        for (b, &x) in self.buffer[at..at + 32].iter_mut().zip(&block) {
+            *b = f64::from(x);
+        }
+        let mut a: [f64; 16] = std::array::from_fn(|i| (i64::from(self.overlap[i]) << 21) as f64);
+        let mut b: [f64; 16] =
+            std::array::from_fn(|i| (i64::from(self.overlap[i + 16]) << 21) as f64);
+        let mut c = [0.0f64; 16];
+        let mut d = [0.0f64; 16];
+        // The window runs from the newest block to the buffer's end, then
+        // wraps to its start.
+        for (j, window) in WINDOW.chunks_exact(64).enumerate() {
+            let base = (at + 64 * j) & 511;
+            let buf: &[f64; 32] = self.buffer[base..base + 32].try_into().expect("32 samples");
+            for i in 0..16 {
+                a[i] += window[i] * buf[i];
+                b[i] += window[i + 16] * buf[15 - i];
+                c[i] += window[i + 32] * buf[16 + i];
+                d[i] += window[i + 48] * buf[31 - i];
+            }
+        }
         for i in 0..16 {
-            let mut a = i64::from(self.overlap[i]) << 21;
-            let mut b = i64::from(self.overlap[i + 16]) << 21;
-            let mut c = 0i64;
-            let mut d = 0i64;
-            let mut tap = |j: usize, base: usize| {
-                a += i64::from(window[i + j]) * i64::from(buf[base + i]);
-                b += i64::from(window[i + j + 16]) * i64::from(buf[base + 15 - i]);
-                c += i64::from(window[i + j + 32]) * i64::from(buf[base + 16 + i]);
-                d += i64::from(window[i + j + 48]) * i64::from(buf[base + 31 - i]);
-            };
-            // The window runs from the newest block to the buffer's end, then
-            // wraps to its start.
-            let mut j = 0;
-            while j < 512 - at {
-                tap(j, at + j);
-                j += 64;
-            }
-            while j < 512 {
-                tap(j, at + j - 512);
-                j += 64;
-            }
-            out[i] = clip23(norm(a, 21));
-            out[i + 16] = clip23(norm(b, 21));
-            self.overlap[i] = norm(c, 21);
-            self.overlap[i + 16] = norm(d, 21);
+            out[i] = clip23(norm(a[i] as i64, 21));
+            out[i + 16] = clip23(norm(b[i] as i64, 21));
+            self.overlap[i] = norm(c[i] as i64, 21);
+            self.overlap[i + 16] = norm(d[i] as i64, 21);
         }
         self.offset = (at + 512 - 32) & 511;
     }

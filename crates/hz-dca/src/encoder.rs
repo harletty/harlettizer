@@ -29,15 +29,33 @@
 //! The tables built at construction come from `f64` arithmetic in the same
 //! order FFmpeg's C evaluates it, through the platform's `libm`.
 //!
+//! The loops are not FFmpeg's: they make the same values faster. A level's
+//! centibels are looked up by bucket rather than searched for; the masking
+//! model's chains of centibel sums run side by side, each in its own order,
+//! leaving out the steps that cannot change what they add to; the integer
+//! products the analysis sums in wrapping arithmetic, which any order sums
+//! alike, are made from the unsigned product a vector unit has; and each
+//! pass of the SNR search requantises only the subbands it moves, which
+//! depend on nothing else within a frame. The tests keep the loops as they
+//! were ported, to compare against.
+//!
+//! A frame's analysis — the filter bank, the LFE's decimation, the masking
+//! curve and the peaks — depends on nothing but the input, this frame's and
+//! the last's, so one encoder can make it ahead of another that allocates
+//! and writes (`Encoder::analyse`, `Encoder::encode_analysed`); and with
+//! ADPCM, the predictor search can run on threads beside the encoder's own
+//! ([`Encoder::with_search_threads`]).
+//!
 //! Channels are indexed as FFmpeg indexes them: coded channels in their coded
 //! order (centre, left, right, left surround, right surround for 5.1), then
 //! the LFE. The input is interleaved 32-bit PCM in FFmpeg's — and WAV's —
 //! order: L, R, C, LFE, Ls, Rs.
 //!
-//! Nothing allocates per frame. The state is set up once: about 120 kB, and
-//! 160 kB more for the ADPCM predictor search when it is on.
+//! Nothing allocates per frame but the queues to the search threads. The
+//! state is set up once: about 210 kB, and 160 kB more for the ADPCM
+//! predictor search when it is on, which the search threads share.
 
-use crate::adpcm::{self, Adpcm, mul32, norm, quantize_value};
+use crate::adpcm::{self, Adpcm, Found, Searchers, mul32, mul32_unsigned, norm, quantize_value};
 use crate::core::{BIT_RATES, BITS_PER_SAMPLE, CoreHeader};
 use crate::mdct::{self, Mdct};
 use crate::tables::{
@@ -48,6 +66,7 @@ use crate::tables::{
     STEPSIZE_INV, SoftFloat, VLC_SOURCE,
 };
 use hz_core::bits::BitWriter;
+use std::sync::Arc;
 
 /// Samples per channel in a frame.
 pub const FRAME_SAMPLES: usize = 512;
@@ -65,6 +84,9 @@ const AUBANDS: usize = 25;
 const SNR_FUDGE: i32 = 128;
 const USED_1ABITS: i32 = 1;
 const USED_26ABITS: i32 = 4;
+/// The masking model's absolute threshold and its offset, in centibels.
+const CA_CB: i32 = -1114;
+const CS_CB: i32 = 928;
 
 /// The channel layouts FFmpeg's encoder takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +260,51 @@ const fn build_codes() -> Codes {
     codes
 }
 
+/// Per allocation code 1 to 10, where its values start in `lengths`; per
+/// value, from the lowest, the length of its code in each of the code's
+/// Huffman codebooks, sixteen bits each, the first four in the first word:
+/// adding them up adds up every codebook's bits at once, since no subband's
+/// sixteen samples come to 2^16 bits in one.
+struct HuffmanLengths {
+    start: [u16; CODE_BOOKS],
+    lengths: [[u64; 2]; HUFFMAN_VALUES],
+}
+
+const HUFFMAN_VALUES: usize = {
+    let mut values = 0;
+    let mut i = 0;
+    while i < CODE_BOOKS {
+        values += BITALLOC_SIZES[i] as usize;
+        i += 1;
+    }
+    values
+};
+
+const HUFFMAN_LENGTHS: HuffmanLengths = {
+    let mut packed = HuffmanLengths {
+        start: [0; CODE_BOOKS],
+        lengths: [[0; 2]; HUFFMAN_VALUES],
+    };
+    let mut at = 0;
+    let mut table = 0;
+    while table < CODE_BOOKS {
+        packed.start[table] = at as u16;
+        let mut value = 0;
+        while value < BITALLOC_SIZES[table] as usize {
+            let mut sel = 0;
+            while sel < QUANT_INDEX_GROUP_SIZE[table] as usize {
+                let len = CODES.quant[CODES.quant_start[table][sel] as usize + value].1;
+                packed.lengths[at + value][sel / 4] |= (len as u64) << (16 * (sel % 4));
+                sel += 1;
+            }
+            value += 1;
+        }
+        at += BITALLOC_SIZES[table] as usize;
+        table += 1;
+    }
+    packed
+};
+
 /// The code for quantised `value` in codebook `sel` of allocation code
 /// `table + 1`.
 #[inline(always)]
@@ -251,11 +318,15 @@ pub struct Encoder {
     config: Config,
     state: Box<State>,
     mdct: Mdct,
-    adpcm: Option<Adpcm>,
+    adpcm: Option<Arc<Adpcm>>,
+    /// Threads that search for predictors beside this one, when there are
+    /// any ([`Encoder::with_search_threads`]).
+    searchers: Option<Searchers>,
     writer: BitWriter,
 }
 
 /// Everything per stream and per frame, in one allocation.
+#[cfg_attr(test, derive(Clone))]
 struct State {
     frame_size: usize,
     frame_bits: i32,
@@ -301,16 +372,83 @@ struct State {
     consumed_bits: i32,
     /// Bits that carry the ADPCM predictor indices.
     consumed_adpcm_bits: i32,
+    /// The allocation each subband was last quantised at in this frame, −1
+    /// for none yet: the SNR search tries one offset after another, most of
+    /// which leave most subbands where they were, and a subband's scale
+    /// factor, samples and bits depend on nothing else within a frame.
+    quantized_at: [[i32; SUBBANDS]; MAX_CHANNELS],
+    /// What those samples cost in each Huffman codebook of their allocation.
+    huffman_bits: [[[u16; 7]; SUBBANDS]; MAX_CHANNELS],
+    /// `calc_one_scale`'s scale factor by peak and allocation, once it has
+    /// been asked for: [`NO_SCALE`] until then.
+    scales: [u8; 2048 * 32],
+    /// The frame's input per coded channel, after the last frame's, then
+    /// the LFE's after its history.
+    window: [[i32; 2 * FRAME_SAMPLES]; MAX_CHANNELS],
 
     cos_table: [i32; 2048],
     band_interpolation: [i32; 512],
+    /// The cosine modulation of the analysis, by folded tap and subband.
+    cos_mod: [[i32; SUBBANDS]; 32],
     band_spectrum: [i32; 8],
     /// The auditory filters' response, outer and middle ear included, at
     /// the stream's sample rate: centibels by filter and MDCT bin.
     auf: [[i32; 256]; AUBANDS],
+    /// Per [`DENOMINATOR_LANES`] filters, the bins where one of them can
+    /// raise its denominator, as a range: elsewhere none can, whatever the
+    /// signal.
+    denominator_bins: [(u16, u16); AUBANDS / DENOMINATOR_LANES],
+    /// Per [`CURVE_LANES`] bins, the filters that can raise the
+    /// unnormalised masking curve at one of them, as a range.
+    curve_filters: [(u8, u8); 256 / CURVE_LANES],
+    /// The MDCT's window.
+    mdct_window: [i32; 512],
     cb_to_add: [i32; 256],
-    cb_to_level: [i32; 2048],
+    /// `cb_to_add` by the signed difference of two levels, from −256 to
+    /// 256: nought at either end, where the difference is 256 or more.
+    add_by_difference: [i32; 513],
+    /// The least difference from which `cb_to_add` is nought: an `add_cb`
+    /// of levels that far apart adds nothing to the louder.
+    silent_gap: i32,
+    /// `cb_to_level`, then noughts that no level of one or more reaches.
+    cb_to_level: [i32; 2048 + LEVEL_SPAN],
+    /// For `get_cb`: per bucket of levels, the centibels of its loudest.
+    level_buckets: [u16; 32 << LEVEL_BUCKET_BITS],
     lfe_fir_64i: [i32; 512],
+}
+
+/// A scale factor not yet known: they run from 0 to 124.
+const NO_SCALE: u8 = u8::MAX;
+
+/// Filters whose denominators `adjust_jnd` takes along the bins together.
+const DENOMINATOR_LANES: usize = 5;
+/// Bins `adjust_jnd` looks at together for a run that leaves the
+/// denominators as they are.
+const DENOMINATOR_RUN: usize = 16;
+/// Bins whose unnormalised curve `adjust_jnd` takes along the filters
+/// together.
+const CURVE_LANES: usize = 8;
+
+/// The bits after its leading one that put a level in its bucket for
+/// `get_cb`: a bucket spans 1/64 of an octave, a fraction of a centibel.
+const LEVEL_BUCKET_BITS: u32 = 6;
+/// The most centibels a bucket spans, past its loudest level's.
+const LEVEL_SPAN: usize = 2;
+/// A bucket that spans more, searched as `get_cb` searches.
+const LEVEL_SEARCH: u16 = 0x8000;
+
+/// `get_cb`'s search: the most centibels below full scale whose level is
+/// still `input`'s or above, in a table of levels that falls with the index.
+fn search_level(cb_to_level: &[i32], input: i32) -> usize {
+    let mut res = 0usize;
+    let mut i = 1024;
+    while i > 0 {
+        if cb_to_level[i + res] >= input {
+            res += i;
+        }
+        i >>= 1;
+    }
+    res
 }
 
 /// `ff_exp10`, which FFmpeg computes as a power of two.
@@ -429,18 +567,30 @@ impl Encoder {
             worst_noise_ever: -2047,
             consumed_bits: 0,
             consumed_adpcm_bits: 0,
+            quantized_at: [[-1; SUBBANDS]; MAX_CHANNELS],
+            huffman_bits: [[[0; 7]; SUBBANDS]; MAX_CHANNELS],
+            scales: [NO_SCALE; 2048 * 32],
+            window: [[0; 2 * FRAME_SAMPLES]; MAX_CHANNELS],
             cos_table: [0; 2048],
             band_interpolation: [0; 512],
+            cos_mod: [[0; SUBBANDS]; 32],
             band_spectrum: [0; 8],
             auf: [[0; 256]; AUBANDS],
+            denominator_bins: [(0, 0); AUBANDS / DENOMINATOR_LANES],
+            curve_filters: [(0, 0); 256 / CURVE_LANES],
+            mdct_window: [0; 512],
             cb_to_add: [0; 256],
-            cb_to_level: [0; 2048],
+            add_by_difference: [0; 513],
+            silent_gap: 256,
+            cb_to_level: [0; 2048 + LEVEL_SPAN],
+            level_buckets: [0; 32 << LEVEL_BUCKET_BITS],
             lfe_fir_64i: [0; 512],
         });
         state.init_tables(config.sample_rate);
 
         Ok(Self {
-            adpcm: config.adpcm.then(Adpcm::new),
+            adpcm: config.adpcm.then(|| Arc::new(Adpcm::new())),
+            searchers: None,
             config,
             state,
             mdct: Mdct::new(),
@@ -450,6 +600,20 @@ impl Encoder {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Search for the subbands' predictors on up to `threads` threads
+    /// besides the caller's, when the encoder codes ADPCM: the search is
+    /// most of its work then, and a subband's depends on nothing but that
+    /// subband. The stream is the same to the byte; threads that cannot be
+    /// started leave the search where it was.
+    pub fn with_search_threads(mut self, threads: usize) -> Self {
+        if self.searchers.is_none() && threads > 0 {
+            if let Some(adpcm) = &self.adpcm {
+                self.searchers = Searchers::new(adpcm, threads);
+            }
+        }
+        self
     }
 
     /// Bytes in every frame.
@@ -501,31 +665,81 @@ impl Encoder {
     /// # Panics
     /// If `pcm` is not exactly one frame.
     pub fn encode(&mut self, pcm: &[i32], out: &mut Vec<u8>) {
+        self.analyse_here(pcm);
+        self.allocate_and_write(out);
+    }
+
+    /// The first half of [`Encoder::encode`], which depends on nothing but
+    /// the input — this frame's and the last's: the subband analysis, the
+    /// LFE decimated, the masking curve and the peaks, into `analysis`. An
+    /// encoder that is handed them ([`Encoder::encode_analysed`]) writes the
+    /// frame this one would have; this one keeps the input as its history.
+    ///
+    /// # Panics
+    /// If `pcm` is not exactly one frame.
+    pub(crate) fn analyse(&mut self, pcm: &[i32], analysis: &mut Analysis) {
+        self.analyse_here(pcm);
+        let s = &*self.state;
+        for (into, from) in analysis.subband.iter_mut().zip(&s.subband) {
+            for (into, from) in into.iter_mut().zip(from) {
+                into.copy_from_slice(&from[ADPCM_COEFFS..]);
+            }
+        }
+        analysis.downsampled_lfe = s.downsampled_lfe;
+        analysis.band_masking_cb = s.band_masking_cb;
+        analysis.peak_cb = s.peak_cb;
+        analysis.lfe_peak_cb = s.lfe_peak_cb;
+    }
+
+    /// The second half of [`Encoder::encode`], from an analysis of the
+    /// frame that another encoder of the same configuration made
+    /// ([`Encoder::analyse`]): the predictors, the allocation and the frame.
+    /// This one's history is left as it was, unused.
+    pub(crate) fn encode_analysed(&mut self, analysis: &Analysis, out: &mut Vec<u8>) {
+        let s = &mut *self.state;
+        for (into, from) in s.subband.iter_mut().zip(&analysis.subband) {
+            for (into, from) in into.iter_mut().zip(from) {
+                into[ADPCM_COEFFS..].copy_from_slice(from);
+            }
+        }
+        s.downsampled_lfe = analysis.downsampled_lfe;
+        s.band_masking_cb = analysis.band_masking_cb;
+        s.peak_cb = analysis.peak_cb;
+        s.lfe_peak_cb = analysis.lfe_peak_cb;
+        self.allocate_and_write(out);
+    }
+
+    fn analyse_here(&mut self, pcm: &[i32]) {
         assert_eq!(
             pcm.len(),
             FRAME_SAMPLES * self.state.channels,
             "a frame is {FRAME_SAMPLES} samples of each channel"
         );
         let s = &mut *self.state;
-        s.subband_transform(pcm);
+        s.fill_window(pcm);
+        s.subband_transform();
         if s.lfe_channel {
-            s.lfe_downsample(pcm);
+            s.lfe_downsample();
         }
-        s.calc_masking(&mut self.mdct, pcm);
-        if let Some(adpcm) = &self.adpcm {
-            s.adpcm_analysis(adpcm);
-        }
+        s.calc_masking(&mut self.mdct);
         s.find_peaks();
+        s.shift_history(pcm, self.config.lfe_history_quirk);
+    }
+
+    fn allocate_and_write(&mut self, out: &mut Vec<u8>) {
+        let s = &mut *self.state;
+        if let Some(adpcm) = &self.adpcm {
+            s.adpcm_analysis(adpcm, self.searchers.as_mut());
+        }
         s.assign_bits();
         if s.lfe_channel {
-            let (scale, quant) = s.calc_one_scale(s.lfe_peak_cb, 11);
+            let (scale, quant) = s.scale(s.lfe_peak_cb, 11);
             s.lfe_scale_factor = scale;
             s.lfe_quant = quant;
             for (code, &sample) in s.lfe_codes.iter_mut().zip(&s.downsampled_lfe) {
                 *code = quantize_value(sample, quant);
             }
         }
-        s.shift_history(pcm, self.config.lfe_history_quirk);
         s.fill_in_adpcm_buffer();
 
         let header = self.header();
@@ -613,6 +827,28 @@ impl Encoder {
     }
 }
 
+/// What [`Encoder::analyse`] makes of a frame for [`Encoder::encode_analysed`].
+#[derive(Clone)]
+pub(crate) struct Analysis {
+    subband: [[[i32; SUBBAND_SAMPLES]; SUBBANDS]; MAX_CHANNELS],
+    downsampled_lfe: [i32; LFE_SAMPLES],
+    band_masking_cb: [i32; 32],
+    peak_cb: [[i32; SUBBANDS]; MAX_CHANNELS],
+    lfe_peak_cb: i32,
+}
+
+impl Default for Analysis {
+    fn default() -> Self {
+        Self {
+            subband: [[[0; SUBBAND_SAMPLES]; SUBBANDS]; MAX_CHANNELS],
+            downsampled_lfe: [0; LFE_SAMPLES],
+            band_masking_cb: [0; 32],
+            peak_cb: [[0; SUBBANDS]; MAX_CHANNELS],
+            lfe_peak_cb: 0,
+        }
+    }
+}
+
 /// One subband of a frame, as the stream carries it.
 pub(crate) struct Coded<'a> {
     /// The allocation code; nought for a subband without samples.
@@ -642,7 +878,7 @@ impl State {
             self.cos_table[2048 - i] = c;
         }
 
-        for (i, level) in self.cb_to_level.iter_mut().enumerate() {
+        for (i, level) in self.cb_to_level[..2048].iter_mut().enumerate() {
             *level = (f64::from(0x7fff_ffff) * exp10(-0.005 * i as f64)) as i32;
         }
 
@@ -687,6 +923,95 @@ impl State {
             }
             *spectrum = (200.0 * accum.log10()) as i32;
         }
+
+        self.init_lookups();
+    }
+
+    /// What the hot loops look up instead of computing, made from the tables
+    /// above with integers alone.
+    fn init_lookups(&mut self) {
+        for i in 16..48 {
+            for band in 0..SUBBANDS {
+                self.cos_mod[i - 16][band] = self.cos_t(((2 * band + 1) * (2 * (i + 16) + 1)) << 3);
+            }
+        }
+        for i in 0..512 {
+            self.mdct_window[i] = 0x3fff_ffff - (self.cos_t(4 * i + 2) >> 1);
+        }
+
+        // The denominators start at `CA_CB` and the unnormalised curve at
+        // −2047, and an `add_cb` never lowers what it adds to: with no
+        // `cb_to_add` below nought, a level `silent_gap` (164) cB or more
+        // under either floor leaves it as it is. A bin's power is at most
+        // `add_cb(0, 0)`; the curve adds `a − denominator`, at most
+        // `a − CA_CB`.
+        self.silent_gap = self
+            .cb_to_add
+            .iter()
+            .rposition(|&a| a != 0)
+            .map_or(0, |last| last as i32 + 1);
+        for (at, add) in self.add_by_difference.iter_mut().enumerate() {
+            *add = self.cb_to_add.get(at.abs_diff(256)).copied().unwrap_or(0);
+        }
+        let floors = self.cb_to_add.iter().all(|&a| a >= 0);
+        let most_power = self.cb_to_add[0];
+        let gap = self.silent_gap;
+        let raises_denominator = |a: i32| !floors || most_power + a > CA_CB - gap;
+        let raises_curve = |a: i32| !floors || a - CA_CB > -2047 - gap;
+        // The hull of the indices where `raises` holds, empty when nowhere.
+        fn hull(raises: impl Fn(usize) -> bool, len: usize) -> (usize, usize) {
+            let first = (0..len).find(|&i| raises(i));
+            let last = (0..len).rev().find(|&i| raises(i));
+            match (first, last) {
+                (Some(first), Some(last)) => (first, last + 1),
+                _ => (0, 0),
+            }
+        }
+        for (block, bins) in self.denominator_bins.iter_mut().enumerate() {
+            let filters = &self.auf[block * DENOMINATOR_LANES..][..DENOMINATOR_LANES];
+            let (first, end) = hull(
+                |bin| filters.iter().any(|auf| raises_denominator(auf[bin])),
+                256,
+            );
+            *bins = (first as u16, end as u16);
+        }
+        for (block, filters) in self.curve_filters.iter_mut().enumerate() {
+            let bins = block * CURVE_LANES..(block + 1) * CURVE_LANES;
+            let (first, end) = hull(
+                |j| self.auf[j][bins.clone()].iter().any(|&a| raises_curve(a)),
+                AUBANDS,
+            );
+            *filters = (first as u8, end as u8);
+        }
+
+        // `get_cb` by bucket: a level's bucket is its leading zeros and the
+        // six bits after its leading one. With the levels falling, the
+        // answer for any level in a bucket lies between the answers for its
+        // loudest and its quietest; where those are at most `LEVEL_SPAN`
+        // apart, comparing against the levels just past the loudest's finds
+        // it. A bucket that spans more is searched.
+        let levels = &self.cb_to_level[..2048];
+        let falling = levels.windows(2).all(|w| w[0] >= w[1]);
+        for zeros in 1..32u32 {
+            for sub in 0..1u64 << LEVEL_BUCKET_BITS {
+                let top = ((1 << LEVEL_BUCKET_BITS) | sub) << (31 - LEVEL_BUCKET_BITS);
+                let quietest = top.div_ceil(1 << zeros);
+                let loudest = (top + (1 << (31 - LEVEL_BUCKET_BITS)) - 1) >> zeros;
+                let bucket =
+                    &mut self.level_buckets[(zeros as usize) << LEVEL_BUCKET_BITS | sub as usize];
+                if quietest > loudest {
+                    // No level falls in it.
+                    continue;
+                }
+                let from = search_level(levels, loudest as i32);
+                let to = search_level(levels, quietest as i32);
+                *bucket = if falling && to - from <= LEVEL_SPAN {
+                    from as u16
+                } else {
+                    LEVEL_SEARCH
+                };
+            }
+        }
     }
 
     #[inline(always)]
@@ -694,21 +1019,47 @@ impl State {
         self.cos_table[x & 2047]
     }
 
-    /// The 32-band polyphase analysis of each coded channel.
-    fn subband_transform(&mut self, input: &[i32]) {
+    /// Each coded channel's input, and the LFE's, after its history: what
+    /// the analysis and the masking model see.
+    fn fill_window(&mut self, input: &[i32]) {
         let channels = self.channels;
         for ch in 0..self.fullband_channels {
-            // The history is copied because the masking model needs it too.
-            let mut hist = self.history[ch];
-            let mut hist_start = 0;
             let chi = self.channel_order[ch] as usize;
+            let (history, frame) = self.window[ch].split_at_mut(FRAME_SAMPLES);
+            history.copy_from_slice(&self.history[ch]);
+            for (w, samples) in frame.iter_mut().zip(input.chunks_exact(channels)) {
+                *w = samples[chi];
+            }
+        }
+        if self.lfe_channel {
+            let lfech = self.lfe_index;
+            let (history, frame) = self.window[channels - 1].split_at_mut(FRAME_SAMPLES);
+            history.copy_from_slice(&self.history[channels - 1]);
+            for (w, samples) in frame.iter_mut().zip(input.chunks_exact(channels)) {
+                *w = samples[lfech];
+            }
+        }
+    }
+
+    /// The 32-band polyphase analysis of each coded channel.
+    ///
+    /// Subband sample `subs` is the 512 taps from input sample `32 · subs`
+    /// on, counting the last frame's: the window, then the cosine
+    /// modulation, of products summed in wrapping arithmetic, which any
+    /// order sums alike.
+    fn subband_transform(&mut self) {
+        for ch in 0..self.fullband_channels {
             for subs in 0..SUBBAND_SAMPLES {
+                let taps = &self.window[ch][32 * subs..32 * subs + 512];
                 // All the convolutions at once.
                 let mut accum = [0i32; 64];
-                let mut k = 0;
-                for (j, i) in (hist_start..512).chain(0..hist_start).enumerate() {
-                    accum[k] = accum[k].wrapping_add(mul32(hist[i], self.band_interpolation[j]));
-                    k = (k + 1) & 63;
+                for (taps, coeffs) in taps
+                    .chunks_exact(64)
+                    .zip(self.band_interpolation.chunks_exact(64))
+                {
+                    for ((a, &x), &c) in accum.iter_mut().zip(taps).zip(coeffs) {
+                        *a = a.wrapping_add(mul32_unsigned(x, c));
+                    }
                 }
                 for k in 16..32 {
                     accum[k] = accum[k].wrapping_sub(accum[31 - k]);
@@ -716,75 +1067,79 @@ impl State {
                 for k in 32..48 {
                     accum[k] = accum[k].wrapping_add(accum[95 - k]);
                 }
-                for band in 0..SUBBANDS {
-                    let mut resp = 0i32;
-                    for (i, &a) in accum.iter().enumerate().take(48).skip(16) {
-                        let s = (2 * band + 1) * (2 * (i + 16) + 1);
-                        resp = resp.wrapping_add(mul32(a, self.cos_t(s << 3)) >> 3);
+                let mut resp = [0i32; SUBBANDS];
+                for (&a, cos) in accum[16..48].iter().zip(&self.cos_mod) {
+                    for (r, &c) in resp.iter_mut().zip(cos) {
+                        *r = r.wrapping_add(mul32_unsigned(a, c) >> 3);
                     }
+                }
+                for (band, &resp) in resp.iter().enumerate() {
                     self.subband[ch][band][ADPCM_COEFFS + subs] = if (band + 1) & 2 != 0 {
                         resp.wrapping_neg()
                     } else {
                         resp
                     };
                 }
-                for i in 0..32 {
-                    hist[i + hist_start] = input[(subs * 32 + i) * channels + chi];
-                }
-                hist_start = (hist_start + 32) & 511;
             }
         }
     }
 
     /// The LFE decimated 64 times, through the interpolator's filter.
-    fn lfe_downsample(&mut self, input: &[i32]) {
-        let channels = self.channels;
-        let lfech = self.lfe_index;
-        let mut hist = self.history[channels - 1];
-        let mut hist_start = 0;
-        for lfes in 0..LFE_SAMPLES {
-            let mut accum = 0i32;
-            for (j, i) in (hist_start..512).chain(0..hist_start).enumerate() {
-                accum = accum.wrapping_add(mul32(hist[i], self.lfe_fir_64i[j]));
+    fn lfe_downsample(&mut self) {
+        let window = &self.window[self.channels - 1];
+        for (lfes, out) in self.downsampled_lfe.iter_mut().enumerate() {
+            let taps = &window[64 * lfes..64 * lfes + 512];
+            let mut accum = [0i32; 8];
+            for (taps, coeffs) in taps.chunks_exact(8).zip(self.lfe_fir_64i.chunks_exact(8)) {
+                for ((a, &x), &c) in accum.iter_mut().zip(taps).zip(coeffs) {
+                    *a = a.wrapping_add(mul32(x, c));
+                }
             }
-            self.downsampled_lfe[lfes] = accum;
-            for i in 0..64 {
-                hist[i + hist_start] = input[(lfes * 64 + i) * channels + lfech];
-            }
-            hist_start = (hist_start + 64) & 511;
+            *out = accum.iter().fold(0i32, |s, &a| s.wrapping_add(a));
         }
     }
 
     /// `get_cb`: a level as negative centibels below full scale.
+    ///
+    /// Looked up by bucket ([`State::init_lookups`]): the same answer as
+    /// the search over `cb_to_level`, without its eleven unpredictable
+    /// branches.
     #[inline(always)]
     fn get_cb(&self, input: i32) -> i32 {
         let input = input.wrapping_abs();
-        let mut res = 0usize;
-        let mut i = 1024;
-        while i > 0 {
-            if self.cb_to_level[i + res] >= input {
-                res += i;
-            }
-            i >>= 1;
+        // Nought, and the −2^31 whose absolute value wraps, are under every
+        // level.
+        if (input as u32).wrapping_sub(1) >= 0x7fff_ffff {
+            return -2047;
         }
+        let zeros = input.leading_zeros();
+        let sub = ((input as u32) << zeros >> (31 - LEVEL_BUCKET_BITS)) as usize
+            & ((1 << LEVEL_BUCKET_BITS) - 1);
+        let bucket = self.level_buckets[(zeros as usize) << LEVEL_BUCKET_BITS | sub];
+        if bucket == LEVEL_SEARCH {
+            return -(search_level(&self.cb_to_level, input) as i32);
+        }
+        let from = usize::from(bucket);
+        let res = from
+            + usize::from(self.cb_to_level[from + 1] >= input)
+            + usize::from(self.cb_to_level[from + 2] >= input);
         -(res as i32)
     }
 
-    /// `add_cb`: the sum of two levels in centibels.
+    /// `add_cb`: the sum of two levels in centibels — the louder, and
+    /// `cb_to_add` of how much quieter the other is, nought from 256 cB.
+    /// The levels it sums are within a few thousand centibels of nought, so
+    /// their difference is exact.
     #[inline(always)]
     fn add_cb(&self, a: i32, b: i32) -> i32 {
-        let (a, b) = if a < b { (b, a) } else { (a, b) };
-        if a - b >= 256 {
-            return a;
-        }
-        a + self.cb_to_add[(a - b) as usize]
+        let at = ((a - b + 256) as u32).min(512) as usize;
+        a.max(b) + self.add_by_difference[at]
     }
 
-    fn calc_power(&self, mdct: &mut Mdct, input: &[i32; 512], power: &mut [i32; 256]) {
+    fn calc_power(&self, mdct: &mut Mdct, input: &[i32], power: &mut [i32; 256]) {
         let mut data = [0i32; 2 * mdct::LEN];
-        for (i, d) in data.iter_mut().enumerate() {
-            let window = 0x3fff_ffff - (self.cos_t(4 * i + 2) >> 1);
-            *d = norm(i64::from(mul32(input[i], window)), 4);
+        for ((d, &x), &window) in data.iter_mut().zip(input).zip(&self.mdct_window) {
+            *d = norm(i64::from(mul32(x, window)), 4);
         }
         let mut coeff = [0i32; mdct::LEN];
         mdct.forward(&data, &mut coeff);
@@ -796,40 +1151,85 @@ impl State {
 
     /// The just-noticeable difference of one block of one channel, folded
     /// into `out_cb`.
-    fn adjust_jnd(&self, mdct: &mut Mdct, input: &[i32; 512], out_cb: &mut [i32; 256]) {
-        const CA_CB: i32 = -1114;
-        const CS_CB: i32 = 928;
+    ///
+    /// Each filter's denominator is a chain of `add_cb`s along the bins, so
+    /// they run [`DENOMINATOR_LANES`] filters at a time, side by side; the
+    /// unnormalised curve is a chain along the filters at each bin, so it
+    /// runs [`CURVE_LANES`] bins at a time. Every chain keeps its order. The
+    /// steps left out are those that cannot change what they add to
+    /// ([`State::init_lookups`]).
+    fn adjust_jnd(&self, mdct: &mut Mdct, input: &[i32], out_cb: &mut [i32; 256]) {
         let mut power = [0i32; 256];
         self.calc_power(mdct, input, &mut power);
-        // Can only grow.
+        self.jnd_from_power(&power, out_cb);
+    }
+
+    /// The rest of `adjust_jnd`, from the block's power by bin.
+    fn jnd_from_power(&self, power: &[i32; 256], out_cb: &mut [i32; 256]) {
+        let mut denom = [CA_CB; AUBANDS];
+        for ((denom, filters), &(first, end)) in denom
+            .chunks_exact_mut(DENOMINATOR_LANES)
+            .zip(self.auf.chunks_exact(DENOMINATOR_LANES))
+            .zip(&self.denominator_bins)
+        {
+            let (first, end) = (usize::from(first), usize::from(end));
+            let mut d = [CA_CB; DENOMINATOR_LANES];
+            // A run of bins whose levels are all `silent_gap` cB or more
+            // under a denominator leaves it as it is: an `add_cb` adds
+            // nought to the louder there, and the denominator only grows.
+            let mut bin = first;
+            while bin < end {
+                let n = (end - bin).min(DENOMINATOR_RUN);
+                let power = &power[bin..bin + n];
+                let mut levels = [[0i32; DENOMINATOR_RUN]; DENOMINATOR_LANES];
+                let mut moves = false;
+                for ((levels, auf), &d) in levels.iter_mut().zip(filters).zip(&d) {
+                    let mut loudest = i32::MIN;
+                    for ((level, &p), &a) in levels.iter_mut().zip(power).zip(&auf[bin..bin + n]) {
+                        *level = p + a;
+                        loudest = loudest.max(*level);
+                    }
+                    moves |= loudest > d - self.silent_gap;
+                }
+                if moves {
+                    for i in 0..n {
+                        for (d, levels) in d.iter_mut().zip(&levels) {
+                            *d = self.add_cb(*d, levels[i]);
+                        }
+                    }
+                }
+                bin += n;
+            }
+            denom.copy_from_slice(&d);
+        }
         let mut out_cb_unnorm = [-2047i32; 256];
-        for auf in &self.auf {
-            let mut denom = CA_CB;
-            for (&p, &a) in power.iter().zip(auf) {
-                denom = self.add_cb(denom, p + a);
+        for (block, (unnorm, &(first, end))) in out_cb_unnorm
+            .chunks_exact_mut(CURVE_LANES)
+            .zip(&self.curve_filters)
+            .enumerate()
+        {
+            let (first, end) = (usize::from(first), usize::from(end));
+            // Can only grow.
+            let mut u = [-2047i32; CURVE_LANES];
+            for (auf, &denom) in self.auf[first..end].iter().zip(&denom[first..end]) {
+                let auf = &auf[block * CURVE_LANES..][..CURVE_LANES];
+                for (u, &a) in u.iter_mut().zip(auf) {
+                    *u = self.add_cb(*u, -denom + a);
+                }
             }
-            for (u, &a) in out_cb_unnorm.iter_mut().zip(auf) {
-                *u = self.add_cb(*u, -denom + a);
-            }
+            unnorm.copy_from_slice(&u);
         }
         for (o, &u) in out_cb.iter_mut().zip(&out_cb_unnorm) {
             *o = self.add_cb(*o, -u - CA_CB - CS_CB);
         }
     }
 
-    fn calc_masking(&mut self, mdct: &mut Mdct, input: &[i32]) {
+    fn calc_masking(&mut self, mdct: &mut Mdct) {
         let mut masking = [[-2047i32; 256]; SUBSUBFRAMES];
-        let mut data = [0i32; 512];
         for (ssf, curve) in masking.iter_mut().enumerate() {
             for ch in 0..self.fullband_channels {
-                let chi = self.channel_order[ch] as usize;
                 let first = 128 + 256 * ssf;
-                let from_history = 512 - first;
-                data[..from_history].copy_from_slice(&self.history[ch][first..]);
-                for (k, d) in data[from_history..].iter_mut().enumerate() {
-                    *d = input[k * self.channels + chi];
-                }
-                self.adjust_jnd(mdct, &data, curve);
+                self.adjust_jnd(mdct, &self.window[ch][first..first + 512], curve);
             }
         }
         self.masking_curve_cb = masking;
@@ -889,20 +1289,38 @@ impl State {
         }
     }
 
-    fn adpcm_analysis(&mut self, adpcm: &Adpcm) {
+    /// The predictor of every subband, here or on `searchers`.
+    fn adpcm_analysis(&mut self, adpcm: &Adpcm, searchers: Option<&mut Searchers>) {
         self.consumed_adpcm_bits = 0;
-        let mut estimated_diff = [0i32; SUBBAND_SAMPLES];
-        for ch in 0..self.fullband_channels {
-            for band in 0..SUBBANDS {
-                match adpcm.subband_analysis(&self.subband[ch][band], &mut estimated_diff) {
-                    Some(vq) => {
-                        self.prediction_mode[ch][band] = i32::from(vq);
-                        // Twelve bits for the predictor's index.
-                        self.consumed_adpcm_bits += 12;
-                        self.diff_peak_cb[ch][band] = self.find_peak(&estimated_diff);
-                    }
-                    None => self.prediction_mode[ch][band] = -1,
+        let bands = self.fullband_channels * SUBBANDS;
+        let mut found: [Found; MAX_CHANNELS * SUBBANDS] =
+            [(None, [0; SUBBAND_SAMPLES]); MAX_CHANNELS * SUBBANDS];
+        let found = &mut found[..bands];
+        let subbands = self.subband.iter().flatten().take(bands);
+        match searchers {
+            Some(searchers) => {
+                let mut inputs = [[0; ADPCM_COEFFS + SUBBAND_SAMPLES]; MAX_CHANNELS * SUBBANDS];
+                for (input, subband) in inputs.iter_mut().zip(subbands) {
+                    *input = *subband;
                 }
+                searchers.search(&inputs[..bands], found);
+            }
+            None => {
+                for ((vq, diff), subband) in found.iter_mut().zip(subbands) {
+                    *vq = adpcm.subband_analysis(subband, diff);
+                }
+            }
+        }
+        for (i, (vq, diff)) in found.iter().enumerate() {
+            let (ch, band) = (i / SUBBANDS, i % SUBBANDS);
+            match *vq {
+                Some(vq) => {
+                    self.prediction_mode[ch][band] = i32::from(vq);
+                    // Twelve bits for the predictor's index.
+                    self.consumed_adpcm_bits += 12;
+                    self.diff_peak_cb[ch][band] = self.find_peak(diff);
+                }
+                None => self.prediction_mode[ch][band] = -1,
             }
         }
     }
@@ -958,50 +1376,91 @@ impl State {
         (nscale as i32, quant)
     }
 
-    fn quantize_adpcm(&mut self) {
-        for ch in 0..self.fullband_channels {
-            for band in 0..SUBBANDS {
-                let vq = self.prediction_mode[ch][band];
-                if vq < 0 {
-                    continue;
-                }
-                let diff_peak_cb = self.diff_peak_cb[ch][band];
-                let (scale, quant) = self.calc_one_scale(diff_peak_cb, self.abits[ch][band]);
-                self.scale_factor[ch][band] = scale;
-                self.quant[ch][band] = quant;
-                let step_size = self.step_size(ch, band);
-                let peak = self.cb_to_level[(-diff_peak_cb) as usize];
-                let history = &mut self.adpcm_history[ch][band];
-                let prev: [i32; ADPCM_COEFFS] = history[..ADPCM_COEFFS].try_into().unwrap();
-                let next: &mut [i32; ADPCM_COEFFS] =
-                    (&mut history[ADPCM_COEFFS..]).try_into().unwrap();
-                adpcm::code_subband(
-                    vq as usize,
-                    quant,
-                    SCALE_FACTOR_QUANT7[scale as usize] as i32,
-                    step_size,
-                    &prev,
-                    &self.subband[ch][band][ADPCM_COEFFS..],
-                    next,
-                    &mut self.quantized[ch][band],
-                    peak,
-                );
-            }
+    /// [`State::calc_one_scale`], which depends on nothing but its
+    /// arguments: its search is made once for each, and the multiplier
+    /// made again from the scale factor as it makes it.
+    fn scale(&mut self, peak_cb: i32, abits: i32) -> (i32, SoftFloat) {
+        debug_assert!((0..32).contains(&abits));
+        let at = (-peak_cb) as usize * 32 + abits as usize;
+        if self.scales[at] == NO_SCALE {
+            self.scales[at] = self.calc_one_scale(peak_cb, abits).0 as u8;
         }
+        let nscale = usize::from(self.scales[at]);
+        let abits = abits as usize;
+        let quant = SoftFloat {
+            m: mul32(SCALEFACTOR_INV[nscale].m, STEPSIZE_INV[abits].m),
+            e: SCALEFACTOR_INV[nscale].e + STEPSIZE_INV[abits].e - 17,
+        };
+        (nscale as i32, quant)
     }
 
-    fn quantize_pcm(&mut self) {
-        for ch in 0..self.fullband_channels {
-            for band in 0..SUBBANDS {
-                if self.prediction_mode[ch][band] != -1 {
-                    continue;
+    /// Scale and quantise subband `band` of coded channel `ch` at its
+    /// allocation — `quantize_adpcm` or `quantize_pcm` with the scale factor
+    /// before it — and count what its samples cost in each Huffman codebook
+    /// of the allocation.
+    fn quantize_band(&mut self, ch: usize, band: usize) {
+        let abits = self.abits[ch][band];
+        let vq = self.prediction_mode[ch][band];
+        if vq == -1 {
+            let (scale, quant) = self.scale(self.peak_cb[ch][band], abits);
+            self.scale_factor[ch][band] = scale;
+            self.quant[ch][band] = quant;
+            for (q, &s) in self.quantized[ch][band]
+                .iter_mut()
+                .zip(&self.subband[ch][band][ADPCM_COEFFS..])
+            {
+                *q = quantize_value(s, quant);
+            }
+        } else if vq >= 0 {
+            let diff_peak_cb = self.diff_peak_cb[ch][band];
+            let (scale, quant) = self.scale(diff_peak_cb, abits);
+            self.scale_factor[ch][band] = scale;
+            self.quant[ch][band] = quant;
+            let step_size = self.step_size(ch, band);
+            let peak = self.cb_to_level[(-diff_peak_cb) as usize];
+            let history = &mut self.adpcm_history[ch][band];
+            let prev: [i32; ADPCM_COEFFS] = history[..ADPCM_COEFFS].try_into().unwrap();
+            let next: &mut [i32; ADPCM_COEFFS] = (&mut history[ADPCM_COEFFS..]).try_into().unwrap();
+            adpcm::code_subband(
+                vq as usize,
+                quant,
+                SCALE_FACTOR_QUANT7[scale as usize] as i32,
+                step_size,
+                &prev,
+                &self.subband[ch][band][ADPCM_COEFFS..],
+                next,
+                &mut self.quantized[ch][band],
+                peak,
+            );
+        }
+        if abits != 0 && abits as usize <= CODE_BOOKS {
+            let id = abits as usize - 1;
+            let group = usize::from(QUANT_INDEX_GROUP_SIZE[id]);
+            let quantized = &self.quantized[ch][band];
+            let bits = &mut self.huffman_bits[ch][band][..group];
+            // The values from the lowest the codebooks have.
+            let lowest = i32::from(BITALLOC_OFFSETS[id]);
+            let size = u32::from(BITALLOC_SIZES[id]);
+            if quantized
+                .iter()
+                .all(|&v| (v.wrapping_sub(lowest) as u32) < size)
+            {
+                let lengths = &HUFFMAN_LENGTHS.lengths[usize::from(HUFFMAN_LENGTHS.start[id])..];
+                let mut sum = [0u64; 2];
+                for &v in quantized {
+                    let packed = lengths[(v - lowest) as usize];
+                    sum[0] += packed[0];
+                    sum[1] += packed[1];
                 }
-                let quant = self.quant[ch][band];
-                for (q, &s) in self.quantized[ch][band]
-                    .iter_mut()
-                    .zip(&self.subband[ch][band][ADPCM_COEFFS..])
-                {
-                    *q = quantize_value(s, quant);
+                for (sel, bits) in bits.iter_mut().enumerate() {
+                    *bits = (sum[sel / 4] >> (16 * (sel % 4))) as u16;
+                }
+            } else {
+                for (sel, bits) in bits.iter_mut().enumerate() {
+                    *bits = quantized
+                        .iter()
+                        .map(|&v| u16::from(quant_code(id, sel, v).1))
+                        .sum();
                 }
             }
         }
@@ -1100,19 +1559,18 @@ impl State {
             self.consumed_bits += bits;
         }
 
-        // Scale factors again on every pass, to count the Huffman codes.
+        // Scale factors again on every pass, to count the Huffman codes:
+        // a subband whose allocation this pass leaves where the last pass of
+        // the frame put it has them already.
         for ch in 0..self.fullband_channels {
             for band in 0..SUBBANDS {
-                if self.prediction_mode[ch][band] == -1 {
-                    let (scale, quant) =
-                        self.calc_one_scale(self.peak_cb[ch][band], self.abits[ch][band]);
-                    self.scale_factor[ch][band] = scale;
-                    self.quant[ch][band] = quant;
+                let abits = self.abits[ch][band];
+                if self.quantized_at[ch][band] != abits {
+                    self.quantized_at[ch][band] = abits;
+                    self.quantize_band(ch, band);
                 }
             }
         }
-        self.quantize_adpcm();
-        self.quantize_pcm();
 
         let mut huff_bits = [[[0u32; 7]; CODE_BOOKS]; MAX_CHANNELS];
         let mut clc_bits = [[0u32; CODE_BOOKS]; MAX_CHANNELS];
@@ -1123,11 +1581,11 @@ impl State {
                 if abits != 0 && abits as usize <= CODE_BOOKS {
                     let id = abits as usize - 1;
                     let group = usize::from(QUANT_INDEX_GROUP_SIZE[id]);
-                    for (sel, total) in huff_bits[ch][id].iter_mut().enumerate().take(group) {
-                        *total += self.quantized[ch][band]
-                            .iter()
-                            .map(|&v| u32::from(quant_code(id, sel, v).1))
-                            .sum::<u32>();
+                    for (total, &bits) in huff_bits[ch][id][..group]
+                        .iter_mut()
+                        .zip(&self.huffman_bits[ch][band])
+                    {
+                        *total += u32::from(bits);
                     }
                     clc_bits[ch][id] += BIT_CONSUMPTION[abits as usize] as u32;
                 } else {
@@ -1151,6 +1609,8 @@ impl State {
     /// `assign_bits`: the lowest SNR offset whose frame fits, by a coarse
     /// walk from last frame's and a binary search.
     fn assign_bits(&mut self) {
+        // The frame's subbands, peaks and predictors are new.
+        self.quantized_at = [[-1; SUBBANDS]; MAX_CHANNELS];
         let mut used_abits = 0;
         let mut forbid_zero = true;
         let mut high = 'restart: loop {
@@ -1496,6 +1956,908 @@ pub(crate) mod tests {
             }
             assert_eq!(out.len(), 12 * 2012);
             assert_eq!(fnv1a(&out), want, "adpcm {adpcm}");
+        }
+    }
+
+    /// Silence, then full-scale noise in bursts with a decaying tail, then
+    /// a quiet tone: every allocation from nought to 26 codes, and frames
+    /// whose SNR search walks a long way from the frame before's.
+    fn bursts(frames: usize, channels: usize) -> Vec<i32> {
+        let mut seed = 0x9e37_79b9u32;
+        let mut pcm = Vec::with_capacity(frames * FRAME_SAMPLES * channels);
+        for n in 0..frames * FRAME_SAMPLES {
+            let frame = n / FRAME_SAMPLES;
+            for ch in 0..channels {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed as i32) >> 8 << 8;
+                let s = match frame % 24 {
+                    0..=2 => 0,
+                    3..=7 => noise,
+                    8..=13 => noise >> (2 * (frame % 24 - 7) + ch),
+                    14..=17 => {
+                        let w = (n % (97 + 13 * ch)) as i32 - 48;
+                        w << 20
+                    }
+                    _ => (noise >> 20) << (ch % 3),
+                };
+                pcm.push(s);
+            }
+        }
+        pcm
+    }
+
+    /// Streams and their reconstructions as the encoder wrote them before it
+    /// was made faster, hashed: every layout, rates from the lowest a layout
+    /// takes to the highest, three sample rates, ADPCM on and off. The
+    /// hashes are what this test's body makes run against the encoder and
+    /// decoder of commit 072235e, before the change.
+    #[test]
+    fn the_stream_and_its_reconstruction_are_unchanged() {
+        use crate::core_decode::CoreDecoder;
+        let cases = [
+            (
+                Layout::FivePointOne,
+                48000,
+                1_509_000,
+                false,
+                0x607e_9710_e32b_ab17u64,
+            ),
+            (
+                Layout::FivePointOne,
+                48000,
+                1_509_000,
+                true,
+                0x2b12_de8f_6e36_042f,
+            ),
+            (
+                Layout::FivePointOne,
+                48000,
+                768_000,
+                true,
+                0x9863_bbd7_82e6_812f,
+            ),
+            (
+                Layout::FivePointZero,
+                44100,
+                1_411_200,
+                true,
+                0xab4c_f433_2ba0_922e,
+            ),
+            (
+                Layout::TwoTwo,
+                48000,
+                1_000_000,
+                false,
+                0x7bae_9fdb_f38a_c81d,
+            ),
+            (
+                Layout::Stereo,
+                48000,
+                3_840_000,
+                false,
+                0x31a1_5d6f_38a2_ef0c,
+            ),
+            (Layout::Stereo, 32000, 256_000, true, 0x069e_dcfa_640d_67be),
+            (Layout::Mono, 48000, 160_000, false, 0x960f_b9bd_1430_6794),
+        ];
+        for (case, &(layout, sample_rate, bit_rate, adpcm, want)) in cases.iter().enumerate() {
+            let channels = layout.channels();
+            let mut pcm = if layout == Layout::FivePointOne {
+                fixture(10)
+            } else {
+                fixture(10)
+                    .chunks_exact(6)
+                    .flat_map(|s| s[..channels].to_vec())
+                    .collect()
+            };
+            pcm.extend(bursts(30, channels));
+            let mut encoder = Encoder::new(Config {
+                layout,
+                sample_rate,
+                bit_rate,
+                adpcm,
+                ..Config::reference_five_one()
+            })
+            .unwrap();
+            let mut decoder = CoreDecoder::new();
+            let mut out = Vec::new();
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for frame in pcm.chunks_exact(FRAME_SAMPLES * channels) {
+                out.clear();
+                encoder.encode(frame, &mut out);
+                decoder.decode(&encoder);
+                hash = fnv1a_from(hash, &out);
+                for ch in 0..channels {
+                    let samples = decoder.channel(ch);
+                    hash = fnv1a_from(hash, &samples.map(|s| s.to_le_bytes()).concat());
+                }
+            }
+            assert_eq!(hash, want, "case {case}");
+        }
+    }
+
+    /// The frame an encoder writes from another's analysis is the one it
+    /// writes analysing for itself, and so is the one an encoder searching
+    /// for predictors on threads writes: every layout, ADPCM on and off,
+    /// FFmpeg's LFE history too, across the first frame's restart.
+    #[test]
+    fn analysed_apart_and_searched_on_threads_the_frames_are_the_same() {
+        for (layout, adpcm, bit_rate, lfe_history_quirk) in [
+            (Layout::FivePointOne, false, 1_509_000, false),
+            (Layout::FivePointOne, true, 768_000, true),
+            (Layout::FivePointZero, true, 1_411_200, false),
+            (Layout::Stereo, false, 3_840_000, false),
+            (Layout::Mono, true, 160_000, false),
+        ] {
+            let config = Config {
+                layout,
+                adpcm,
+                bit_rate,
+                lfe_history_quirk,
+                ..Config::reference_five_one()
+            };
+            let mut here = Encoder::new(config.clone()).unwrap();
+            let mut analyser = Encoder::new(config.clone()).unwrap();
+            let mut apart = Encoder::new(config.clone()).unwrap();
+            let mut threads = Encoder::new(config).unwrap().with_search_threads(3);
+            assert_eq!(threads.searchers.is_some(), adpcm);
+            let channels = layout.channels();
+            let mut analysis = Box::default();
+            for (f, frame) in stage_input(24, channels)
+                .chunks_exact(FRAME_SAMPLES * channels)
+                .enumerate()
+            {
+                let mut want = Vec::new();
+                here.encode(frame, &mut want);
+                analyser.analyse(frame, &mut analysis);
+                let mut got = Vec::new();
+                apart.encode_analysed(&analysis, &mut got);
+                assert_eq!(got, want, "{layout:?}, frame {f}: analysed apart");
+                got.clear();
+                threads.encode(frame, &mut got);
+                assert_eq!(got, want, "{layout:?}, frame {f}: searched on threads");
+                if f == 0 {
+                    for encoder in [&mut here, &mut apart, &mut threads] {
+                        encoder.restart_prediction();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The encoder writes the frames it wrote before its stages were made
+    /// faster and some of them moved: the analysis, the predictor search
+    /// and the masking curve as they were, in the order they were in —
+    /// every layout, ADPCM on and off, searched here and on threads.
+    #[test]
+    fn the_encoder_writes_what_it_wrote() {
+        for (layout, adpcm, bit_rate, lfe_history_quirk) in [
+            (Layout::FivePointOne, false, 1_509_000, false),
+            (Layout::FivePointOne, true, 1_509_000, true),
+            (Layout::FivePointZero, true, 768_000, false),
+            (Layout::TwoTwo, false, 1_000_000, false),
+            (Layout::Stereo, true, 3_840_000, false),
+            (Layout::Mono, false, 160_000, false),
+        ] {
+            let config = Config {
+                layout,
+                adpcm,
+                bit_rate,
+                lfe_history_quirk,
+                ..Config::reference_five_one()
+            };
+            let mut was = Encoder::new(config.clone()).unwrap();
+            let mut here = Encoder::new(config.clone()).unwrap();
+            let mut threads = Encoder::new(config).unwrap().with_search_threads(3);
+            let channels = layout.channels();
+            for (f, frame) in stage_input(24, channels)
+                .chunks_exact(FRAME_SAMPLES * channels)
+                .enumerate()
+            {
+                let mut want = Vec::new();
+                before::encode(&mut was, frame, &mut want);
+                for (encoder, how) in [(&mut here, "here"), (&mut threads, "on threads")] {
+                    let mut got = Vec::new();
+                    encoder.encode(frame, &mut got);
+                    assert_eq!(got, want, "{layout:?}, frame {f}, searched {how}");
+                }
+                if f == 0 {
+                    for encoder in [&mut was, &mut here, &mut threads] {
+                        encoder.restart_prediction();
+                    }
+                }
+            }
+        }
+    }
+
+    fn fnv1a_from(hash: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(hash, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// The encoder as it was before it was made faster, kept to compare
+    /// against: each of these is the code it replaced, as it was.
+    mod before {
+        use super::super::*;
+
+        pub fn get_cb(s: &State, input: i32) -> i32 {
+            let input = input.wrapping_abs();
+            let mut res = 0usize;
+            let mut i = 1024;
+            while i > 0 {
+                if s.cb_to_level[i + res] >= input {
+                    res += i;
+                }
+                i >>= 1;
+            }
+            -(res as i32)
+        }
+
+        pub fn add_cb(s: &State, a: i32, b: i32) -> i32 {
+            let (a, b) = if a < b { (b, a) } else { (a, b) };
+            if a - b >= 256 {
+                return a;
+            }
+            a + s.cb_to_add[(a - b) as usize]
+        }
+
+        fn calc_power(s: &State, mdct: &mut Mdct, input: &[i32; 512], power: &mut [i32; 256]) {
+            let mut data = [0i32; 2 * mdct::LEN];
+            for (i, d) in data.iter_mut().enumerate() {
+                let window = 0x3fff_ffff - (s.cos_t(4 * i + 2) >> 1);
+                *d = norm(i64::from(mul32(input[i], window)), 4);
+            }
+            let mut coeff = [0i32; mdct::LEN];
+            mdct.forward(&data, &mut coeff);
+            for (p, &c) in power.iter_mut().zip(&coeff) {
+                let cb = get_cb(s, c);
+                *p = add_cb(s, cb, cb);
+            }
+        }
+
+        pub fn adjust_jnd(s: &State, mdct: &mut Mdct, input: &[i32; 512], out_cb: &mut [i32; 256]) {
+            let mut power = [0i32; 256];
+            calc_power(s, mdct, input, &mut power);
+            jnd_from_power(s, &power, out_cb);
+        }
+
+        pub fn jnd_from_power(s: &State, power: &[i32; 256], out_cb: &mut [i32; 256]) {
+            const CA_CB: i32 = -1114;
+            const CS_CB: i32 = 928;
+            // Can only grow.
+            let mut out_cb_unnorm = [-2047i32; 256];
+            for auf in &s.auf {
+                let mut denom = CA_CB;
+                for (&p, &a) in power.iter().zip(auf) {
+                    denom = add_cb(s, denom, p + a);
+                }
+                for (u, &a) in out_cb_unnorm.iter_mut().zip(auf) {
+                    *u = add_cb(s, *u, -denom + a);
+                }
+            }
+            for (o, &u) in out_cb.iter_mut().zip(&out_cb_unnorm) {
+                *o = add_cb(s, *o, -u - CA_CB - CS_CB);
+            }
+        }
+
+        pub fn subband_transform(s: &mut State, input: &[i32]) {
+            let channels = s.channels;
+            for ch in 0..s.fullband_channels {
+                // The history is copied because the masking model needs it too.
+                let mut hist = s.history[ch];
+                let mut hist_start = 0;
+                let chi = s.channel_order[ch] as usize;
+                for subs in 0..SUBBAND_SAMPLES {
+                    // All the convolutions at once.
+                    let mut accum = [0i32; 64];
+                    let mut k = 0;
+                    for (j, i) in (hist_start..512).chain(0..hist_start).enumerate() {
+                        accum[k] = accum[k].wrapping_add(mul32(hist[i], s.band_interpolation[j]));
+                        k = (k + 1) & 63;
+                    }
+                    for k in 16..32 {
+                        accum[k] = accum[k].wrapping_sub(accum[31 - k]);
+                    }
+                    for k in 32..48 {
+                        accum[k] = accum[k].wrapping_add(accum[95 - k]);
+                    }
+                    for band in 0..SUBBANDS {
+                        let mut resp = 0i32;
+                        for (i, &a) in accum.iter().enumerate().take(48).skip(16) {
+                            let x = (2 * band + 1) * (2 * (i + 16) + 1);
+                            resp = resp.wrapping_add(mul32(a, s.cos_t(x << 3)) >> 3);
+                        }
+                        s.subband[ch][band][ADPCM_COEFFS + subs] = if (band + 1) & 2 != 0 {
+                            resp.wrapping_neg()
+                        } else {
+                            resp
+                        };
+                    }
+                    for i in 0..32 {
+                        hist[i + hist_start] = input[(subs * 32 + i) * channels + chi];
+                    }
+                    hist_start = (hist_start + 32) & 511;
+                }
+            }
+        }
+
+        pub fn lfe_downsample(s: &mut State, input: &[i32]) {
+            let channels = s.channels;
+            let lfech = s.lfe_index;
+            let mut hist = s.history[channels - 1];
+            let mut hist_start = 0;
+            for lfes in 0..LFE_SAMPLES {
+                let mut accum = 0i32;
+                for (j, i) in (hist_start..512).chain(0..hist_start).enumerate() {
+                    accum = accum.wrapping_add(mul32(hist[i], s.lfe_fir_64i[j]));
+                }
+                s.downsampled_lfe[lfes] = accum;
+                for i in 0..64 {
+                    hist[i + hist_start] = input[(lfes * 64 + i) * channels + lfech];
+                }
+                hist_start = (hist_start + 64) & 511;
+            }
+        }
+
+        fn quantize_adpcm(s: &mut State) {
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    let vq = s.prediction_mode[ch][band];
+                    if vq < 0 {
+                        continue;
+                    }
+                    let diff_peak_cb = s.diff_peak_cb[ch][band];
+                    let (scale, quant) = s.calc_one_scale(diff_peak_cb, s.abits[ch][band]);
+                    s.scale_factor[ch][band] = scale;
+                    s.quant[ch][band] = quant;
+                    let step_size = s.step_size(ch, band);
+                    let peak = s.cb_to_level[(-diff_peak_cb) as usize];
+                    let history = &mut s.adpcm_history[ch][band];
+                    let prev: [i32; ADPCM_COEFFS] = history[..ADPCM_COEFFS].try_into().unwrap();
+                    let next: &mut [i32; ADPCM_COEFFS] =
+                        (&mut history[ADPCM_COEFFS..]).try_into().unwrap();
+                    adpcm::code_subband(
+                        vq as usize,
+                        quant,
+                        SCALE_FACTOR_QUANT7[scale as usize] as i32,
+                        step_size,
+                        &prev,
+                        &s.subband[ch][band][ADPCM_COEFFS..],
+                        next,
+                        &mut s.quantized[ch][band],
+                        peak,
+                    );
+                }
+            }
+        }
+
+        fn quantize_pcm(s: &mut State) {
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    if s.prediction_mode[ch][band] != -1 {
+                        continue;
+                    }
+                    let quant = s.quant[ch][band];
+                    for (q, &x) in s.quantized[ch][band]
+                        .iter_mut()
+                        .zip(&s.subband[ch][band][ADPCM_COEFFS..])
+                    {
+                        *q = quantize_value(x, quant);
+                    }
+                }
+            }
+        }
+
+        pub fn calc_masking(s: &mut State, mdct: &mut Mdct, input: &[i32]) {
+            let mut masking = [[-2047i32; 256]; SUBSUBFRAMES];
+            let mut data = [0i32; 512];
+            for (ssf, curve) in masking.iter_mut().enumerate() {
+                for ch in 0..s.fullband_channels {
+                    let chi = s.channel_order[ch] as usize;
+                    let first = 128 + 256 * ssf;
+                    let from_history = 512 - first;
+                    data[..from_history].copy_from_slice(&s.history[ch][first..]);
+                    for (k, d) in data[from_history..].iter_mut().enumerate() {
+                        *d = input[k * s.channels + chi];
+                    }
+                    adjust_jnd(s, mdct, &data, curve);
+                }
+            }
+            s.masking_curve_cb = masking;
+            for i in 0..256 {
+                let mut m = 2048;
+                for curve in &s.masking_curve_cb {
+                    m = m.min(curve[i]);
+                }
+                s.eff_masking_curve_cb[i] = m;
+            }
+
+            for band in 0..32 {
+                s.band_masking_cb[band] = 2048;
+                let mut update = |f: usize, spectrum: i32| {
+                    let value = s.eff_masking_curve_cb[f] - spectrum;
+                    if value < s.band_masking_cb[band] {
+                        s.band_masking_cb[band] = value;
+                    }
+                };
+                if band == 0 {
+                    for f in 0..4 {
+                        update(f, 0);
+                    }
+                } else {
+                    for f in 0..8 {
+                        update(8 * band - 4 + f, s.band_spectrum[7 - f]);
+                    }
+                }
+                if band == 31 {
+                    for f in 0..4 {
+                        update(256 - 4 + f, 0);
+                    }
+                } else {
+                    for f in 0..8 {
+                        update(8 * band + 4 + f, s.band_spectrum[f]);
+                    }
+                }
+            }
+        }
+
+        pub fn adpcm_analysis(s: &mut State, adpcm: &Adpcm) {
+            s.consumed_adpcm_bits = 0;
+            let mut estimated_diff = [0i32; SUBBAND_SAMPLES];
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    match adpcm.subband_analysis(&s.subband[ch][band], &mut estimated_diff) {
+                        Some(vq) => {
+                            s.prediction_mode[ch][band] = i32::from(vq);
+                            // Twelve bits for the predictor's index.
+                            s.consumed_adpcm_bits += 12;
+                            s.diff_peak_cb[ch][band] = s.find_peak(&estimated_diff);
+                        }
+                        None => s.prediction_mode[ch][band] = -1,
+                    }
+                }
+            }
+        }
+
+        /// `Encoder::encode` as it was: its stages in their order, the
+        /// analysis, the LFE's decimation, the masking curve and the
+        /// predictor search as they were, the LFE's scale searched for. The
+        /// SNR search is today's, with an oracle of its own
+        /// (`the_snr_search_passes_are_as_they_were`).
+        pub fn encode(encoder: &mut Encoder, pcm: &[i32], out: &mut Vec<u8>) {
+            let Encoder {
+                config,
+                state,
+                mdct,
+                adpcm,
+                ..
+            } = &mut *encoder;
+            let s = &mut **state;
+            subband_transform(s, pcm);
+            if s.lfe_channel {
+                lfe_downsample(s, pcm);
+            }
+            calc_masking(s, mdct, pcm);
+            if let Some(adpcm) = adpcm {
+                adpcm_analysis(s, adpcm);
+            }
+            s.find_peaks();
+            s.assign_bits();
+            if s.lfe_channel {
+                let (scale, quant) = s.calc_one_scale(s.lfe_peak_cb, 11);
+                s.lfe_scale_factor = scale;
+                s.lfe_quant = quant;
+                for (code, &sample) in s.lfe_codes.iter_mut().zip(&s.downsampled_lfe) {
+                    *code = quantize_value(sample, quant);
+                }
+            }
+            s.shift_history(pcm, config.lfe_history_quirk);
+            s.fill_in_adpcm_buffer();
+
+            let header = encoder.header();
+            let s = &*encoder.state;
+            let w = &mut encoder.writer;
+            w.clear();
+            header.write(w);
+            s.put_primary_audio_header(w);
+            for _ in 0..SUBFRAMES {
+                s.put_subframe(w);
+            }
+            w.align_to(8);
+            let start = out.len();
+            out.extend_from_slice(w.bytes());
+            out.resize(start + s.frame_size, 0);
+        }
+
+        pub fn init_quantization_noise(s: &mut State, noise: i32, forbid_zero: bool) -> i32 {
+            let mut ret = USED_26ABITS | USED_1ABITS;
+            s.consumed_bits = 132 + 333 * s.fullband_channels as i32;
+            s.consumed_bits += s.consumed_adpcm_bits;
+            if s.lfe_channel {
+                s.consumed_bits += 72;
+            }
+
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    let snr_cb = s.peak_cb[ch][band] - s.band_masking_cb[band] - noise;
+                    let abits = if snr_cb >= 1312 {
+                        ret &= !USED_1ABITS;
+                        26
+                    } else if snr_cb >= 222 {
+                        ret &= !(USED_26ABITS | USED_1ABITS);
+                        8 + mul32(snr_cb - 222, 69_000_000)
+                    } else if snr_cb >= 0 {
+                        ret &= !(USED_26ABITS | USED_1ABITS);
+                        2 + mul32(snr_cb, 106_000_000)
+                    } else if forbid_zero || snr_cb >= -140 {
+                        ret &= !USED_26ABITS;
+                        1
+                    } else {
+                        ret &= !(USED_26ABITS | USED_1ABITS);
+                        0
+                    };
+                    s.abits[ch][band] = abits;
+                }
+                let (sel, bits) = State::best_abits_code(&s.abits[ch]);
+                s.bit_allocation_sel[ch] = sel;
+                s.consumed_bits += bits;
+            }
+
+            // Scale factors again on every pass, to count the Huffman codes.
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    if s.prediction_mode[ch][band] == -1 {
+                        let (scale, quant) =
+                            s.calc_one_scale(s.peak_cb[ch][band], s.abits[ch][band]);
+                        s.scale_factor[ch][band] = scale;
+                        s.quant[ch][band] = quant;
+                    }
+                }
+            }
+            quantize_adpcm(s);
+            quantize_pcm(s);
+
+            let mut huff_bits = [[[0u32; 7]; CODE_BOOKS]; MAX_CHANNELS];
+            let mut clc_bits = [[0u32; CODE_BOOKS]; MAX_CHANNELS];
+            let mut bits_counter = 0u32;
+            for ch in 0..s.fullband_channels {
+                for band in 0..SUBBANDS {
+                    let abits = s.abits[ch][band];
+                    if abits != 0 && abits as usize <= CODE_BOOKS {
+                        let id = abits as usize - 1;
+                        let group = usize::from(QUANT_INDEX_GROUP_SIZE[id]);
+                        for (sel, total) in huff_bits[ch][id].iter_mut().enumerate().take(group) {
+                            *total += s.quantized[ch][band]
+                                .iter()
+                                .map(|&v| u32::from(quant_code(id, sel, v).1))
+                                .sum::<u32>();
+                        }
+                        clc_bits[ch][id] += BIT_CONSUMPTION[abits as usize] as u32;
+                    } else {
+                        // Code nought costs −8: no transition mode, no scale factor.
+                        bits_counter =
+                            bits_counter.wrapping_add(BIT_CONSUMPTION[abits as usize] as u32);
+                    }
+                }
+            }
+            for ch in 0..s.fullband_channels {
+                bits_counter = bits_counter.wrapping_add(State::best_code(
+                    &huff_bits[ch],
+                    &clc_bits[ch],
+                    &mut s.quant_index_sel[ch],
+                ));
+            }
+            s.consumed_bits = s.consumed_bits.wrapping_add(bits_counter as i32);
+            ret
+        }
+    }
+
+    /// A generator for the comparisons: full 32-bit range, then every
+    /// magnitude below it in turn.
+    fn lcg(seed: &mut u32) -> i32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let x = *seed as i32;
+        x >> (*seed >> 27)
+    }
+
+    #[test]
+    fn get_cb_finds_what_the_search_finds() {
+        let encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &*encoder.state;
+        assert!(s.cb_to_level[..2048].windows(2).all(|w| w[0] >= w[1]));
+        // Here, every bucket is looked up rather than searched.
+        assert!(!s.level_buckets.contains(&LEVEL_SEARCH));
+        let mut inputs = vec![0, 1, -1, 2, i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1];
+        for &level in &s.cb_to_level[..2048] {
+            for x in [level.wrapping_sub(1), level, level.wrapping_add(1)] {
+                inputs.extend([x, x.wrapping_neg()]);
+            }
+        }
+        for bits in 0..31 {
+            // In 64 bits: the last is `i32::MAX` at the top.
+            for x in [
+                (1i64 << bits) - 1,
+                1 << bits,
+                (1 << bits) + 1,
+                (2 << bits) - 1,
+            ] {
+                let x = x as i32;
+                inputs.extend([x, -x]);
+            }
+        }
+        let mut seed = 1;
+        inputs.extend((0..200_000).map(|_| lcg(&mut seed)));
+        for x in inputs {
+            assert_eq!(s.get_cb(x), before::get_cb(s, x), "{x}");
+        }
+    }
+
+    #[test]
+    fn get_cb_searches_a_bucket_too_wide() {
+        let mut encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &mut *encoder.state;
+        // Every other bucket searched: the same answers either way.
+        for bucket in s.level_buckets.iter_mut().step_by(2) {
+            *bucket = LEVEL_SEARCH;
+        }
+        let mut seed = 7;
+        for _ in 0..100_000 {
+            let x = lcg(&mut seed);
+            assert_eq!(s.get_cb(x), before::get_cb(s, x), "{x}");
+        }
+    }
+
+    /// `cb_to_add` is nought from 164 cB on, and only from there: what
+    /// the masking model leaves out is left out from there.
+    #[test]
+    fn levels_164_cb_apart_add_nothing() {
+        let encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &*encoder.state;
+        assert_eq!(s.silent_gap, 164);
+        assert!(s.cb_to_add[164..].iter().all(|&a| a == 0));
+        assert_ne!(s.cb_to_add[163], 0);
+    }
+
+    #[test]
+    fn add_cb_adds_as_it_did() {
+        let encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &*encoder.state;
+        for a in (-6000..=3000).step_by(7) {
+            for d in -700..=700 {
+                let b = a + d;
+                assert_eq!(s.add_cb(a, b), before::add_cb(s, a, b), "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_remembered_scale_is_the_one_searched_for() {
+        let mut encoder = Encoder::new(Config::reference_five_one()).unwrap();
+        let s = &mut *encoder.state;
+        // Twice over, the second time from what the first remembered.
+        for _ in 0..2 {
+            for peak_cb in -2047..=0 {
+                for abits in 0..27 {
+                    assert_eq!(
+                        s.scale(peak_cb, abits),
+                        s.calc_one_scale(peak_cb, abits),
+                        "{peak_cb} {abits}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mul32_from_the_unsigned_product_is_mul32() {
+        let mut edges = vec![
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            i32::MIN,
+            i32::MIN + 1,
+            i32::MAX,
+            i32::MAX - 1,
+        ];
+        for bits in 0..31 {
+            edges.extend([1 << bits, -(1 << bits), (1 << bits) - 1, 1 - (1 << bits)]);
+        }
+        for &a in &edges {
+            for &b in &edges {
+                assert_eq!(adpcm::mul32_unsigned(a, b), mul32(a, b), "{a} {b}");
+            }
+        }
+        let mut seed = 3;
+        for _ in 0..1_000_000 {
+            let (a, b) = (lcg(&mut seed), lcg(&mut seed));
+            assert_eq!(adpcm::mul32_unsigned(a, b), mul32(a, b), "{a} {b}");
+        }
+    }
+
+    /// Input for the stage comparisons: every channel its own mix of the
+    /// fixture and the bursts, so that frames run from silence to full scale.
+    fn stage_input(frames: usize, channels: usize) -> Vec<i32> {
+        let mut pcm: Vec<i32> = fixture(frames / 2)
+            .chunks_exact(6)
+            .flat_map(|s| (0..channels).map(|ch| s[ch % 6]).collect::<Vec<_>>())
+            .collect();
+        pcm.extend(bursts(frames - frames / 2, channels));
+        pcm
+    }
+
+    #[test]
+    fn the_analysis_and_the_masking_model_are_as_they_were() {
+        for &(sample_rate, _) in &SAMPLE_RATES {
+            for layout in [Layout::FivePointOne, Layout::Stereo, Layout::Mono] {
+                let mut encoder = Encoder::new(Config {
+                    layout,
+                    sample_rate,
+                    bit_rate: 768_000,
+                    ..Config::reference_five_one()
+                })
+                .unwrap();
+                let channels = layout.channels();
+                let frames = if sample_rate == 48000 { 30 } else { 8 };
+                let pcm = stage_input(frames, channels);
+                let mut mdct = Mdct::new();
+                for (f, frame) in pcm.chunks_exact(FRAME_SAMPLES * channels).enumerate() {
+                    let mut was = encoder.state.clone();
+                    let s = &mut *encoder.state;
+                    s.fill_window(frame);
+                    s.subband_transform();
+                    before::subband_transform(&mut was, frame);
+                    assert_eq!(s.subband, was.subband, "{sample_rate} Hz, frame {f}");
+                    if s.lfe_channel {
+                        s.lfe_downsample();
+                        before::lfe_downsample(&mut was, frame);
+                        assert_eq!(s.downsampled_lfe, was.downsampled_lfe);
+                    }
+                    for ssf in 0..SUBSUBFRAMES {
+                        for ch in 0..s.fullband_channels {
+                            let first = 128 + 256 * ssf;
+                            let data: [i32; 512] =
+                                s.window[ch][first..first + 512].try_into().unwrap();
+                            // As `calc_masking` made it: history, then input.
+                            let chi = s.channel_order[ch] as usize;
+                            let from_history = 512 - first;
+                            assert_eq!(data[..from_history], s.history[ch][first..]);
+                            for (k, &d) in data[from_history..].iter().enumerate() {
+                                assert_eq!(d, frame[k * channels + chi]);
+                            }
+                            let mut start = [-2047; 256];
+                            let mut seed = (f * 8 + ch) as u32;
+                            if ch % 2 == 1 {
+                                for v in &mut start {
+                                    *v = (lcg(&mut seed) >> 20).clamp(-2047, 800);
+                                }
+                            }
+                            let (mut ours, mut theirs) = (start, start);
+                            s.adjust_jnd(&mut mdct, &data, &mut ours);
+                            before::adjust_jnd(&was, &mut mdct, &data, &mut theirs);
+                            assert_eq!(ours, theirs, "{sample_rate} Hz, frame {f}, {ch}");
+                        }
+                    }
+                    s.calc_masking(&mut mdct);
+                    s.shift_history(frame, false);
+                }
+            }
+        }
+    }
+
+    /// The masking model from a power spectrum of silence with one or two
+    /// bins at every level a bin can have, at each of them in turn, and
+    /// from noise at every loudness: where the steps left out are left out
+    /// at their bounds, the curve is still the one the model made taking
+    /// every step.
+    #[test]
+    fn the_masking_model_is_as_it_was_from_any_power() {
+        for &(sample_rate, _) in &SAMPLE_RATES {
+            let encoder = Encoder::new(Config {
+                sample_rate,
+                bit_rate: 768_000,
+                ..Config::reference_five_one()
+            })
+            .unwrap();
+            let s = &*encoder.state;
+            // `add_cb(get_cb(x), get_cb(x))`: −2017 for nought, 30 at most.
+            let silence = s.add_cb(-2047, -2047);
+            let loudest = s.add_cb(0, 0);
+            let mut spectra = vec![[silence; 256], [loudest; 256]];
+            let levels = [loudest, 20, 0, -100, -300, -700, -1100, -1500];
+            for bin in 0..256 {
+                for &level in &levels {
+                    let mut power = [silence; 256];
+                    power[bin] = level;
+                    spectra.push(power);
+                    power[255 - bin / 2] = level - 37;
+                    spectra.push(power);
+                }
+            }
+            let mut seed = sample_rate;
+            for spread in 0..12 {
+                let mut power = [silence; 256];
+                for p in &mut power {
+                    *p = (loudest - 150 * spread - (lcg(&mut seed) as u32 % 400) as i32)
+                        .max(silence);
+                }
+                spectra.push(power);
+            }
+            for (case, power) in spectra.iter().enumerate() {
+                let (mut ours, mut theirs) = ([-2047; 256], [-2047; 256]);
+                s.jnd_from_power(power, &mut ours);
+                before::jnd_from_power(s, power, &mut theirs);
+                assert_eq!(ours, theirs, "{sample_rate} Hz, spectrum {case}");
+            }
+        }
+    }
+
+    /// Each pass of the SNR search leaves the frame's allocation, scale
+    /// factors, samples, predictor history and bit count as the passes did
+    /// that quantised every subband every time — through the search's own
+    /// walk, and through offsets that jump about.
+    #[test]
+    fn the_snr_search_passes_are_as_they_were() {
+        for (layout, adpcm, bit_rate) in [
+            (Layout::FivePointOne, false, 1_509_000),
+            (Layout::FivePointOne, true, 768_000),
+            (Layout::Stereo, true, 3_840_000),
+            (Layout::Mono, false, 160_000),
+        ] {
+            let mut encoder = Encoder::new(Config {
+                layout,
+                adpcm,
+                bit_rate,
+                ..Config::reference_five_one()
+            })
+            .unwrap();
+            let channels = layout.channels();
+            let pcm = stage_input(24, channels);
+            let mut seed = 11;
+            for (f, frame) in pcm.chunks_exact(FRAME_SAMPLES * channels).enumerate() {
+                let Encoder {
+                    state, mdct, adpcm, ..
+                } = &mut encoder;
+                let s = &mut **state;
+                s.fill_window(frame);
+                s.subband_transform();
+                if s.lfe_channel {
+                    s.lfe_downsample();
+                }
+                s.calc_masking(mdct);
+                if let Some(adpcm) = adpcm {
+                    s.adpcm_analysis(adpcm, None);
+                }
+                s.find_peaks();
+                let mut was = s.clone();
+                s.quantized_at = [[-1; SUBBANDS]; MAX_CHANNELS];
+                let mut noises = vec![s.worst_quantization_noise];
+                for step in [128, 128, -128, 64, -32, 16, 8, -4, 2, 1, 0, 0, -1] {
+                    noises.push(noises.last().unwrap() + step);
+                }
+                noises.extend((0..12).map(|_| (lcg(&mut seed) >> 21).clamp(-2047, 2047)));
+                for (pass, &noise) in noises.iter().enumerate() {
+                    let forbid_zero = pass % 5 != 4;
+                    let ours = s.init_quantization_noise(noise, forbid_zero);
+                    let theirs = before::init_quantization_noise(&mut was, noise, forbid_zero);
+                    let at = format!("{layout:?}, frame {f}, pass {pass}");
+                    assert_eq!(ours, theirs, "{at}");
+                    assert_eq!(s.consumed_bits, was.consumed_bits, "{at}");
+                    assert_eq!(s.abits, was.abits, "{at}");
+                    assert_eq!(s.bit_allocation_sel, was.bit_allocation_sel, "{at}");
+                    assert_eq!(s.quant_index_sel, was.quant_index_sel, "{at}");
+                    assert_eq!(s.scale_factor, was.scale_factor, "{at}");
+                    assert_eq!(s.quant, was.quant, "{at}");
+                    assert_eq!(s.quantized, was.quantized, "{at}");
+                    assert_eq!(s.adpcm_history, was.adpcm_history, "{at}");
+                }
+                // On through the frame as `encode` goes, from the search.
+                s.assign_bits();
+                s.shift_history(frame, false);
+                s.fill_in_adpcm_buffer();
+            }
         }
     }
 

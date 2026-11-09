@@ -151,3 +151,88 @@ fn the_reconstruction_is_a_frame_behind() {
     let snr = 10.0 * (signal / error).log10();
     assert!(snr > 60.0, "{snr:.1} dB");
 }
+
+/// The synthesis filter as it was, on 64-bit integers: the window taken
+/// in `f64` makes the same samples and the same overlap, block after block,
+/// from silence to inputs that clip.
+#[test]
+fn the_window_in_f64_is_the_integer_window() {
+    struct Before {
+        buffer: [i32; 512],
+        offset: usize,
+        overlap: [i32; 32],
+    }
+    impl Before {
+        fn filter(&mut self, input: &[i32; 32], out: &mut [i32; 32]) {
+            let window = &FIR_32BANDS_NONPERFECT_FIXED;
+            let at = self.offset;
+            imdct_half_32(
+                (&mut self.buffer[at..at + 32])
+                    .try_into()
+                    .expect("32 samples"),
+                input,
+            );
+            let buf = &self.buffer;
+            for i in 0..16 {
+                let mut a = i64::from(self.overlap[i]) << 21;
+                let mut b = i64::from(self.overlap[i + 16]) << 21;
+                let mut c = 0i64;
+                let mut d = 0i64;
+                let mut tap = |j: usize, base: usize| {
+                    a += i64::from(window[i + j]) * i64::from(buf[base + i]);
+                    b += i64::from(window[i + j + 16]) * i64::from(buf[base + 15 - i]);
+                    c += i64::from(window[i + j + 32]) * i64::from(buf[base + 16 + i]);
+                    d += i64::from(window[i + j + 48]) * i64::from(buf[base + 31 - i]);
+                };
+                let mut j = 0;
+                while j < 512 - at {
+                    tap(j, at + j);
+                    j += 64;
+                }
+                while j < 512 {
+                    tap(j, at + j - 512);
+                    j += 64;
+                }
+                out[i] = clip23(norm(a, 21));
+                out[i + 16] = clip23(norm(b, 21));
+                self.overlap[i] = norm(c, 21);
+                self.overlap[i + 16] = norm(d, 21);
+            }
+            self.offset = (at + 512 - 32) & 511;
+        }
+    }
+    let mut before = Before {
+        buffer: [0; 512],
+        offset: 0,
+        overlap: [0; 32],
+    };
+    let mut now = CoreDecoder::new().synthesis[0].clone();
+    let mut seed = 0x2545_f491u32;
+    for block in 0..6000 {
+        let mut input = [0i32; 32];
+        for x in &mut input {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = seed as i32;
+            *x = match block / 500 % 6 {
+                0 => 0,
+                1 => clip23(noise >> 8),
+                2 => noise >> (seed >> 27),
+                3 => noise,
+                4 => {
+                    if block % 2 == 0 {
+                        (1 << 23) - 1
+                    } else {
+                        -(1 << 23)
+                    }
+                }
+                _ => clip23(noise >> 12),
+            };
+        }
+        let (mut ours, mut theirs) = ([0; 32], [0; 32]);
+        now.filter(&input, &mut ours);
+        before.filter(&input, &mut theirs);
+        assert_eq!(ours, theirs, "block {block}");
+        assert_eq!(now.overlap, before.overlap, "block {block}");
+        assert_eq!(now.offset, before.offset);
+    }
+}
