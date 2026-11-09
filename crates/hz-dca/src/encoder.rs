@@ -2572,7 +2572,14 @@ pub(crate) mod tests {
             }
         }
         for bits in 0..31 {
-            for x in [(1 << bits) - 1, 1 << bits, (1 << bits) + 1, (2 << bits) - 1] {
+            // In 64 bits: the last is `i32::MAX` at the top.
+            for x in [
+                (1i64 << bits) - 1,
+                1 << bits,
+                (1 << bits) + 1,
+                (2 << bits) - 1,
+            ] {
+                let x = x as i32;
                 inputs.extend([x, -x]);
             }
         }
