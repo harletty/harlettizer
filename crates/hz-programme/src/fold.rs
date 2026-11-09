@@ -272,12 +272,22 @@ pub struct Folder<T> {
     mixing: Mixing,
     elements: usize,
     pub placer: Placer,
-    /// The fold's scene, mix and cost; after [`Folder::fold`], its `mixed`
-    /// holds the block's elements.
+    /// The fold's mix and cost: after [`Folder::fold`], its `mixed` holds the
+    /// block's elements, and its `cost` and `limiter` what every block folded
+    /// so far came to. Its `scene` is never weighed: a block is placed and
+    /// judged on the scene the reading weighed it as (see [`Folder::fold`]),
+    /// so `mixer.scene` holds nothing.
+    ///
+    /// Once [`Folder::mix_apart`] has taken it, this is a mixer made alike
+    /// that nothing mixes with — no cost, a limiter that never ran — and the
+    /// fold's own is [`Mix::mixer`]. [`Folder::fold`] is not to be called
+    /// then: it would mix with this one, from nothing.
     pub mixer: Mixer,
     read: VecDeque<Block<T>>,
     spare: Vec<Block<T>>,
     energies: Vec<f64>,
+    /// Whether the mix was taken apart ([`Folder::mix_apart`]).
+    apart: bool,
 }
 
 impl<T: Default> Folder<T> {
@@ -311,6 +321,7 @@ impl<T: Default> Folder<T> {
             read: VecDeque::new(),
             spare: Vec::new(),
             energies: Vec::new(),
+            apart: false,
         })
     }
 
@@ -381,7 +392,14 @@ impl<T: Default> Folder<T> {
     /// read — which is the order folded — from the same samples, so each
     /// weighs block `n` from the same state, the one `n` blocks of the same
     /// samples leave, whatever a rule carries from one block to the next.
+    ///
+    /// Not once the mix is taken apart ([`Folder::mix_apart`]): then each
+    /// block is placed with [`Folder::place`] and mixed with [`Mix::mix`].
     pub fn fold(&mut self, ceiling: f64) -> Result<Option<Block<T>>> {
+        debug_assert!(
+            !self.apart,
+            "a fold whose mix was taken apart is placed, not folded"
+        );
         let Some(mut block) = self.read.pop_front() else {
             return Ok(None);
         };
@@ -414,9 +432,12 @@ impl<T: Default> Folder<T> {
     /// last block placed, for [`Mix::mix`] to mix each block
     /// [`Folder::place`] places as [`Folder::fold`] would have; one made
     /// alike is left in its place, which nothing mixes with while the two
-    /// are apart.
+    /// are apart — see [`Folder::mixer`]. Once, and never folded with
+    /// [`Folder::fold`] after.
     pub fn mix_apart(&mut self) -> Result<Mix> {
+        debug_assert!(!self.apart, "a fold's mix is taken apart once");
         let alike = mixer_for(self.members, self.elements, self.sample_rate, &self.mixing)?;
+        self.apart = true;
         Ok(Mix {
             mixer: std::mem::replace(&mut self.mixer, alike),
             previous: self.placer.previous().cloned(),

@@ -304,6 +304,13 @@ pub const HOLDING_AT_LEAST: f64 = 1e-4;
 /// caller's, and `radiated` is left holding the elements' final positions so
 /// that the weights can be re-solved without panning them again.
 ///
+/// Both have to be exactly that — `targets[i]` the vector
+/// `reference.radiated(objects[i].position, objects[i].size, ..)` hands
+/// back, to the bit — and not merely close to it: the search scores a member
+/// of no size on its target in place of panning its position again, and
+/// keeps the vector a winner was scored on in place of panning it a second
+/// time, so a target made any other way would move the answer.
+///
 /// Pinned elements do not move: a bed channel is a speaker feed and belongs at
 /// that speaker, whatever the score says.
 #[allow(clippy::too_many_arguments)]
@@ -410,6 +417,18 @@ pub fn refine(
                     // position, so the target is scored rather than panning
                     // it again.
                     let point = objects[dominant].size.to_bits() == 0.0f64.to_bits();
+                    debug_assert!(
+                        !point || {
+                            let mut panned = Vec::new();
+                            reference.radiated(candidate, 0.0, &mut panned);
+                            panned.len() == targets[dominant].len()
+                                && panned
+                                    .iter()
+                                    .zip(&targets[dominant])
+                                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                        },
+                        "a target is what its member radiates, to the bit"
+                    );
                     let score = if point {
                         scored(
                             &targets[dominant],

@@ -88,9 +88,8 @@ const REFERENCE_DIRECTIONS: usize = 24;
 /// nothing else, and a fold asks for the same positions block after block
 /// while its scene stands still — every object's target, every element where
 /// it stood, every candidate the search tries around it. So the vectors made
-/// last are kept ([`Radiated`]), each under its position and size to the bit,
-/// and one asked for again is the one kept: the same panning of the same
-/// position.
+/// last are kept, each under its position and size to the bit, and one asked
+/// for again is the one kept: the same panning of the same position.
 pub struct Reference {
     shape: Shape,
     kept: RefCell<Radiated>,

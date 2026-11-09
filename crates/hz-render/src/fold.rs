@@ -172,13 +172,28 @@ pub fn elevation_scale(z: f64) -> f64 {
 }
 
 /// One row of speakers at a fixed depth.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct Row {
     y: f64,
     /// `(x, channel)`, ascending in `x`.
     speakers: Vec<(f64, usize)>,
     /// Distance between adjacent speakers in this row.
     spacing: f64,
+}
+
+impl Row {
+    /// Whether `other` is this row to the bit: its depth, its spacing, and
+    /// each speaker's place and channel, in order.
+    fn is(&self, other: &Row) -> bool {
+        self.y.to_bits() == other.y.to_bits()
+            && self.spacing.to_bits() == other.spacing.to_bits()
+            && self.speakers.len() == other.speakers.len()
+            && self
+                .speakers
+                .iter()
+                .zip(&other.speakers)
+                .all(|(a, b)| a.0.to_bits() == b.0.to_bits() && a.1 == b.1)
+    }
 }
 
 /// How many channels the fold renders on before any matrix: 7.1.
@@ -389,11 +404,15 @@ impl ObjectFold {
         }
     }
 
-    /// Whether `other` renders every position as this does: the same rows.
-    /// Every fold renders on 7.1's, whatever it then folds to, so a render
-    /// made once serves every presentation of a set.
+    /// Whether `other` renders every position as this does: the same rows,
+    /// every depth, place and spacing the same to the bit, so that the same
+    /// render makes the same gains whatever the values are — a negative zero
+    /// or a NaN among them. Every fold renders on 7.1's, whatever it then
+    /// folds to, so a render made once serves every presentation of a set.
     pub fn renders_as(&self, other: &ObjectFold) -> bool {
-        std::ptr::eq(self, other) || self.rows == other.rows
+        std::ptr::eq(self, other)
+            || (self.rows.len() == other.rows.len()
+                && self.rows.iter().zip(&other.rows).all(|(a, b)| a.is(b)))
     }
 
     /// The 7.1 gains, before any presentation matrix.
